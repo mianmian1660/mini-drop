@@ -1,0 +1,51 @@
+// ============================================================
+// common.proto — 通用数据结构
+// ============================================================
+// 小白理解：就像 C 语言的 .h 头文件，定义"结构体"
+// 其他 proto 文件可以 import 这个文件来复用这些结构
+// ============================================================
+
+syntax = "proto3";  // 使用 proto3 语法（最新版）
+
+package common;  // 命名空间，防止名字冲突
+// go_package：告诉 protoc 生成的 Go 代码放在哪个 Go 包里
+option go_package = "github.com/mini-drop/apiserver/proto/common";
+
+// ----------------------------------------------------------
+// PidStats：进程的资源占用情况
+// 类似 Linux 的 top 命令看到的信息
+// ----------------------------------------------------------
+message PidStats {
+  int32  pid         = 1;  // 进程 ID
+  double cpuPercent  = 2;  // CPU 使用率，比如 45.5 表示 45.5%
+  uint64 rssKb       = 3;  // 物理内存占用（KB）
+  uint64 readKbPerS  = 4;  // 每秒从磁盘读了多少 KB
+  uint64 writeKbPerS = 5;  // 每秒往磁盘写了多少 KB
+  string comm        = 6;  // 进程名字，比如 "nginx"
+}
+// 注意：每个字段后面的 =1 =2 =3 是"字段编号"，
+// 不是默认值！它们是 protobuf 用来识别字段的序号
+
+// ----------------------------------------------------------
+// File：文件描述（传输小文件用）
+// ----------------------------------------------------------
+message File {
+  string name    = 1;  // 文件名，比如 "perf.data"
+  bytes  content = 2;  // 文件的二进制内容
+  int64  size    = 3;  // 文件大小（字节）
+}
+
+// ----------------------------------------------------------
+// CosConfig：对象存储（MinIO/COS）的连接信息
+// 就像是一把"临时钥匙"，让 Agent 知道上传到哪里
+// ----------------------------------------------------------
+message CosConfig {
+  string endpoint        = 1;  // 存储服务地址，比如 "minio:9000"
+  string accessKeyId     = 2;  // 用户名
+  string secretAccessKey = 3;  // 密码
+  string bucket          = 4;  // 存储桶名（相当于文件夹）
+  string region          = 5;  // 区域（MinIO 可以不填）
+  string sessionToken    = 6;  // 临时令牌（提高安全性）
+  int64  expireTime      = 7;  // 过期时间
+  bool   useSsl          = 8;  // 是否用 HTTPS
+}

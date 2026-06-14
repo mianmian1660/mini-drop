@@ -1,0 +1,47 @@
+// ============================================================
+// init.proto — Agent 初始化协议
+// ============================================================
+// 小白理解：Agent 启动时向 Server 报到，并获取配置
+// 就像新员工入职：先登记信息，然后领工牌和钥匙
+// ============================================================
+
+syntax = "proto3";
+package initpb;
+option go_package = "github.com/mini-drop/apiserver/proto/initpb";
+
+import "common/proto/common.proto";  // CosConfig
+
+// ----------------------------------------------------------
+// InitAgentInfo 服务：Agent 启动时调用
+// ----------------------------------------------------------
+service InitAgentInfo {
+  // RegisterAgent：Agent 向 Server 报到
+  rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
+  
+  // FetchConfig：获取配置（主要是对象存储的钥匙）
+  rpc FetchConfig(FetchConfigRequest) returns (FetchConfigResponse);
+}
+
+// ---------- RegisterAgent ----------
+message RegisterAgentRequest {
+  string hostName     = 1;  // 主机名
+  string ipAddr       = 2;  // IP 地址
+  string uid          = 3;  // Agent 唯一 ID
+  string agentVersion = 4;  // 版本号
+}
+
+message RegisterAgentResponse {
+  int32  code = 1;  // 0=成功
+  string msg  = 2;  // 错误信息
+}
+
+// ---------- FetchConfig ----------
+message FetchConfigRequest {
+  string uid = 1;  // 我是谁
+}
+
+message FetchConfigResponse {
+  int32  code = 1;
+  string msg  = 2;
+  common.CosConfig cosConfig = 3;  // 返回存储配置（地址、用户名、密码等）
+}

@@ -1,0 +1,51 @@
+// ============================================================
+// healthcheck.proto — 心跳协议
+// ============================================================
+// 小白理解：Agent 定期向 Server "报平安"的对话格式
+// 就像保安每小时用对讲机汇报"一切正常"
+// ============================================================
+
+syntax = "proto3";
+package healthcheck;
+option go_package = "github.com/mini-drop/apiserver/proto/healthcheck";
+
+// 引入其他 proto 文件中定义的类型
+import "common/proto/common.proto";    // PidStats
+import "common/proto/hotmethod.proto"; // TaskDesc（任务描述）
+
+// ----------------------------------------------------------
+// service = "服务"，定义了一组可以远程调用的函数
+// HealthCheck 服务只有一个函数：Do（执行心跳）
+//   Agent 调用 Do → 发送 HealthCheckRequest
+//   Server 收到后 → 返回 HealthCheckResponse
+// ----------------------------------------------------------
+service HealthCheck {
+  rpc Do(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ----------------------------------------------------------
+// Agent 发给 Server 的心跳包
+// ----------------------------------------------------------
+message HealthCheckRequest {
+  string hostName          = 1;  // 主机名，比如 "web-server-01"
+  string ipAddr            = 2;  // IP 地址，比如 "192.168.1.100"
+  string uid               = 3;  // Agent 的唯一 ID（类似身份证号）
+  string agentVersion      = 4;  // Agent 版本号
+  common.PidStats selfPstats     = 5;  // Agent 自己的资源占用
+  common.PidStats childrenPstats = 6;  // Agent 的子进程的资源占用
+}
+
+// ----------------------------------------------------------
+// Server 回复给 Agent 的心跳响应
+// ----------------------------------------------------------
+message HealthCheckResponse {
+  // 枚举类型：列出所有可能的状态值
+  enum ServingStatus {
+    UNKNOWN     = 0;  // 未知
+    SERVING     = 1;  // 正常服务中
+    NOT_SERVING = 2;  // 不可用
+  }
+  ServingStatus status      = 1;  // Server 当前状态
+  bool          pending     = 2;  // 是否有待执行的任务？
+  hotmethod.TaskDesc taskDesc = 3;  // 如果有任务，这里放着任务详情
+}

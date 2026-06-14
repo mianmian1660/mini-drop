@@ -1,0 +1,72 @@
+// ============================================================
+// hotmethod.proto — 任务协议（最核心！）
+// ============================================================
+// 小白理解：定义了"任务长什么样"和"结果长什么样"
+// Server 通过 Collect 给 Agent 派任务
+// Agent 通过 NotifyResult 把结果回报给 Server
+// ============================================================
+
+syntax = "proto3";
+package hotmethod;
+option go_package = "github.com/mini-drop/apiserver/proto/hotmethod";
+
+import "google/protobuf/empty.proto";  // Empty = 空消息（不需要参数或返回值时用）
+import "common/proto/common.proto";    // PidStats, File, CosConfig
+
+// ----------------------------------------------------------
+// Hotmethod 服务：两个 RPC 函数
+// ----------------------------------------------------------
+service Hotmethod {
+  // Collect：Server → Agent，"去采集这个"
+  rpc Collect(Target) returns (google.protobuf.Empty);
+  
+  // NotifyResult：Agent → Server，"采集完了，结果是这个"
+  rpc NotifyResult(TaskResult) returns (google.protobuf.Empty);
+}
+
+// ----------------------------------------------------------
+// TaskDesc：一个完整的任务描述
+// 就像外卖订单：点什么（采样参数）、送到哪（目标进程）、用啥工具（采集器类型）
+// ----------------------------------------------------------
+message TaskDesc {
+  string  taskID        = 1;  // 任务唯一 ID，比如 "task-abc123"
+  uint32  taskType      = 2;  // 任务类型：0=通用CPU 1=Java 2=追踪 4=内存 6=Java堆
+  uint32  profilerType  = 3;  // 采集器：0=perf 1=async-profiler 2=pprof 3=eBPF
+  RecordArgv sampleArgv = 4;  // 采样参数（频率、时长、目标PID）
+  string  containerName = 5;  // 容器名（如果是容器环境）
+  uint32  containerType = 6;  // 容器类型
+  uint32  timeoutSec    = 7;  // 超时时间（秒），超过就认为失败
+  common.CosConfig cosConfig = 8;  // 上传结果的存储配置
+  string  scriptContent = 9;  // 脚本内容（ScriptExec 类型任务用）
+}
+
+// ----------------------------------------------------------
+// RecordArgv：采样参数（相当于 perf record 的命令行参数）
+// ----------------------------------------------------------
+message RecordArgv {
+  uint32 hz        = 1;  // 采样频率，比如 99 表示每秒采样 99 次
+  uint64 duration  = 2;  // 采集时长（秒），比如 10 表示采 10 秒
+  int32  pid       = 3;  // 目标进程 PID
+  string callgraph = 4;  // 调用图方式：fp(帧指针) / dwarf / lbr
+  bool   subprocess = 5; // 是否包含子进程
+  string event     = 6;  // 采样事件：cpu-cycles / cache-misses / ...
+}
+
+// ----------------------------------------------------------
+// TaskResult：Agent 采集完成后回报的结果
+// ----------------------------------------------------------
+message TaskResult {
+  string taskID         = 1;  // 对应哪个任务
+  string errorMessage   = 2;  // 错误信息，空字符串 = 成功
+  common.File file      = 3;  // 小文件直接内嵌在消息里
+  string cosKey         = 4;  // 大文件上传到存储后的 key（路径）
+  repeated common.PidStats selfPstats     = 5;  // Agent 自身资源历史
+  repeated common.PidStats childrenPstats = 6;  // 子进程资源历史
+}
+
+// ----------------------------------------------------------
+// Target：目标机器（用 IP 地址标识）
+// ----------------------------------------------------------
+message Target {
+  string ip = 1;  // 目标 IP，比如 "192.168.1.100"
+}

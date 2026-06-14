@@ -1,0 +1,65 @@
+// ============================================================
+// control.proto — 控制协议
+// ============================================================
+// 小白理解：API 后台通过这个协议"指挥" Drop Server
+// 就像经理通过电话给下属分配工作
+// ============================================================
+
+syntax = "proto3";
+package control;
+option go_package = "github.com/mini-drop/apiserver/proto/control";
+
+import "common/proto/hotmethod.proto";  // 需要用到 TaskDesc
+
+// ----------------------------------------------------------
+// Control 服务：API 后台 → Drop Server 的指挥接口
+// ----------------------------------------------------------
+service Control {
+  // CreateTask：创建一个新采集任务
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+  
+  // FetchData：获取某个任务的结果数据
+  rpc FetchData(FetchDataRequest) returns (FetchDataResponse);
+  
+  // StatAgent：查询某台机器上 Agent 的资源占用情况
+  rpc StatAgent(StatAgentRequest) returns (StatAgentResponse);
+}
+
+// ---------- CreateTask ----------
+message CreateTaskRequest {
+  string targetIP         = 1;  // 目标机器 IP（任务发给哪个 Agent）
+  string service          = 2;  // 固定填 "hotmethod"
+  hotmethod.TaskDesc taskDesc = 3;  // 任务详情
+}
+
+message CreateTaskResponse {
+  string taskID = 1;  // 返回生成的任务 ID
+  int32  code   = 2;  // 0=成功，非0=失败
+  string msg    = 3;  // 错误信息（成功时为空）
+}
+
+// ---------- FetchData ----------
+message FetchDataRequest {
+  string targetIP = 1;  // 哪台机器
+  string taskID   = 2;  // 哪个任务
+}
+
+message FetchDataResponse {
+  int32  code = 1;
+  string msg  = 2;
+  bytes  data = 3;  // 返回的二进制数据
+}
+
+// ---------- StatAgent ----------
+message StatAgentRequest {
+  string targetIP = 1;  // 查询哪台机器上的 Agent
+}
+
+message StatAgentResponse {
+  int32  code = 1;
+  string msg  = 2;
+  double cpuPercent  = 3;  // Agent 当前 CPU 占用
+  uint64 memoryKb    = 4;  // Agent 当前内存占用（KB）
+  uint64 readKbPerS  = 5;  // 每秒磁盘读
+  uint64 writeKbPerS = 6;  // 每秒磁盘写
+}
