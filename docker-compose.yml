@@ -1,0 +1,158 @@
+# ============================================================
+# docker-compose.yml — 一键启动整个系统 小白版注释
+# ============================================================
+# 一个命令启动 6 个容器：数据库 + 存储 + Server + Agent + 后台 + 前端
+# 用法：docker compose up
+#
+# YAML 语法小课堂：
+#   缩进表示层级（只能用空格，不能用 Tab）
+#   key: value  = 键值对
+#   - item      = 数组元素
+#   # 注释       = 行注释
+# ============================================================
+
+services:
+
+  # ========================================================
+  # PostgreSQL — 数据库
+  # 存用户、任务、Agent 等所有业务数据
+  # ========================================================
+  postgres:
+    image: postgres:14 # 用官方 PostgreSQL 14 镜像
+    environment:
+      # 环境变量（相当于配置）
+      POSTGRES_PASSWORD: dev # 数据库密码
+      POSTGRES_DB: drop # 创建的数据库名
+    ports:
+      - "5432:5432" # 映射端口：主机:容器
+    volumes:
+      - pgdata:/var/lib/postgresql/data # 数据持久化（删容器不丢数据）
+    healthcheck:
+      # 健康检查
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ========================================================
+  # MinIO — 对象存储（替代腾讯云 COS）
+  # 存 Agent 采集的 perf.data 等大文件
+  # ========================================================
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001" # 启动服务
+    environment:
+      MINIO_ROOT_USER: drop # 管理员用户名
+      MINIO_ROOT_PASSWORD: dropdrop # 管理员密码
+    ports:
+      - "9000:9000" # S3 API 端口
+      - "9001:9001" # Web 管理界面端口
+    volumes:
+      - miniodata:/data # 数据持久化
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ========================================================
+  # drop_server — C++ 调度中心
+  # 接收心跳、派发任务、收结果
+  # ========================================================
+  drop_server:
+    build:
+      # 从 Dockerfile 构建（不从镜像仓库拉）
+      context: ./drop # Dockerfile 所在目录
+      dockerfile: Dockerfile
+    command: ./drop_server # 容器启动后执行的命令
+    ports:
+      - "50051:50051" # gRPC 端口
+    depends_on:
+      # 依赖：等 postgres 就绪再启动
+      postgres:
+        condition: service_healthy
+
+  # ========================================================
+  # drop_agent — C++ 采集探针
+  # 运行在被监控机器上，执行 perf 等采集工具
+  # ========================================================
+  drop_agent:
+    build:
+      context: ./drop
+      dockerfile: Dockerfile
+    command: ./drop_agent drop_server:50051 # 启动后连接 drop_server
+    network_mode: host # 使用宿主机网络（需要 perf 权限）
+    privileged: true # 特权模式（perf 需要）
+    pid: host # 使用宿主机 PID 命名空间
+    cap_add:
+      # 添加 Linux 能力
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - PERFMON
+    depends_on:
+      - drop_server
+
+  # ========================================================
+  # apiserver — Go HTTP 后台
+  # 前端和底层系统之间的"中间人"
+  # ========================================================
+  apiserver:
+    build:
+      context: ./apiserver
+      dockerfile: Dockerfile
+    ports:
+      - "8191:8191" # HTTP API 端口
+    environment:
+      PG_DSN: "host=postgres user=postgres password=dev dbname=drop sslmode=disable"
+      DROP_GRPC: "drop_server:50051" # drop_server 的地址
+      S3_ENDPOINT: "minio:9000" # MinIO 地址
+      S3_ACCESS_KEY: "drop"
+      S3_SECRET_KEY: "dropdrop"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      drop_server:
+        condition: service_started
+
+  # ========================================================
+  # analysis — Python 分析引擎
+  # 一次性运行：被 API 后台调用，分析完就退出
+  # ========================================================
+  analysis:
+    build:
+      context: ./analysis
+      dockerfile: Dockerfile
+    environment:
+      PG_DSN: "host=postgres user=postgres password=dev dbname=drop sslmode=disable"
+      S3_ENDPOINT: "minio:9000"
+      S3_ACCESS_KEY: "drop"
+      S3_SECRET_KEY: "dropdrop"
+    depends_on:
+      - postgres
+      - minio
+    entrypoint: [ "python3", "hotmethod_analyzer.py" ]
+
+  # ========================================================
+  # web_frontend — React 前端（Nginx 托管）
+  # 用户浏览器访问的就是这个
+  # ========================================================
+  web_frontend:
+    build:
+      context: ./web_frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80" # 浏览器默认 HTTP 端口
+    environment:
+      HOST_URL: "http://localhost:8191" # API 后台地址
+    depends_on:
+      - apiserver
+
+# ============================================================
+# 数据卷（Docker 管理的持久化存储）
+# 删掉容器数据还在，除非手动 docker volume rm
+# ============================================================
+volumes:
+  pgdata:
+  miniodata:
