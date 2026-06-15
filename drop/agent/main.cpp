@@ -14,9 +14,9 @@
 #include <thread>   // this_thread::sleep_for（让程序暂停）
 #include <chrono>   // seconds（时间单位）
 
-#include <grpcpp/grpcpp.h>       // gRPC 客户端库
-#include "healthcheck.grpc.pb.h" // 心跳协议的 C++ 生成代码
-#include "init.grpc.pb.h"        // 初始化协议的 C++ 生成代码
+#include <grpcpp/grpcpp.h>                    // gRPC 客户端库
+#include "common/proto/healthcheck.grpc.pb.h" // 心跳协议的 C++ 生成代码
+#include "common/proto/init.grpc.pb.h"        // 初始化协议的 C++ 生成代码
 
 // 只引入 gRPC 相关的几个类（避免名字冲突）
 using grpc::Channel;         // 通信通道（相当于"电话线"）

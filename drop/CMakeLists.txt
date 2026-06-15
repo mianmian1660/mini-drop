@@ -22,63 +22,63 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------- 查找依赖库 ----------
 find_package(Protobuf REQUIRED)   # protobuf 库（必须安装）
-find_package(gRPC CONFIG REQUIRED) # gRPC 库（必须安装）
 find_package(Threads REQUIRED)     # 多线程库（系统自带）
+
+# gRPC 用 pkg-config 查找（旧版系统 gRPC 不提供 cmake config）
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(gRPC REQUIRED IMPORTED_TARGET grpc++ grpc)
+# grpc_cpp_plugin 路径（protoc 编译 .proto 时需要）
+set(gRPC_CPP_PLUGIN /usr/bin/grpc_cpp_plugin)
 
 # Proto 文件所在的目录
 set(PROTO_DIR ${CMAKE_SOURCE_DIR}/common/proto)
+# proto 生成文件的输出目录
+set(PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/gen)
+
+# ---------- 在 cmake 配置阶段就编译 .proto → .cc/.h ----------
+# proto 文件内部 import 路径是 "common/proto/xxx.proto"，
+# 所以生成的文件会放在 gen/common/proto/ 子目录下（保持目录结构）
+execute_process(
+    COMMAND mkdir -p ${PROTO_GEN_DIR}
+)
+foreach(PROTO_FILE
+    common.proto
+    hotmethod.proto
+    healthcheck.proto
+    control.proto
+    init.proto
+)
+    execute_process(
+        COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+            --proto_path=${CMAKE_SOURCE_DIR}
+            --cpp_out=${PROTO_GEN_DIR}
+            --grpc_out=${PROTO_GEN_DIR}
+            --plugin=protoc-gen-grpc=${gRPC_CPP_PLUGIN}
+            ${PROTO_DIR}/${PROTO_FILE}
+        RESULT_VARIABLE PROTOC_RESULT
+    )
+    if(NOT PROTOC_RESULT EQUAL 0)
+        message(FATAL_ERROR "protoc failed for ${PROTO_FILE}")
+    endif()
+endforeach()
 
 # ---------- 定义 proto 生成的源文件列表 ----------
-# 会在 ${CMAKE_BINARY_DIR}/gen/ 目录下生成这些文件
+# 生成的文件位于 gen/common/proto/ 下
+set(PROTO_GEN_SUBDIR ${PROTO_GEN_DIR}/common/proto)
 set(PROTO_SRCS
-    ${CMAKE_BINARY_DIR}/gen/common.pb.cc
-    ${CMAKE_BINARY_DIR}/gen/healthcheck.pb.cc
-    ${CMAKE_BINARY_DIR}/gen/hotmethod.pb.cc
-    ${CMAKE_BINARY_DIR}/gen/control.pb.cc
-    ${CMAKE_BINARY_DIR}/gen/init.pb.cc
+    ${PROTO_GEN_SUBDIR}/common.pb.cc
+    ${PROTO_GEN_SUBDIR}/healthcheck.pb.cc
+    ${PROTO_GEN_SUBDIR}/hotmethod.pb.cc
+    ${PROTO_GEN_SUBDIR}/control.pb.cc
+    ${PROTO_GEN_SUBDIR}/init.pb.cc
 )
 
 # gRPC 相关的生成文件（多了 _grpc 后缀）
 set(PROTO_GRPC_SRCS
-    ${CMAKE_BINARY_DIR}/gen/healthcheck.grpc.pb.cc
-    ${CMAKE_BINARY_DIR}/gen/hotmethod.grpc.pb.cc
-    ${CMAKE_BINARY_DIR}/gen/control.grpc.pb.cc
-    ${CMAKE_BINARY_DIR}/gen/init.grpc.pb.cc
-)
-
-# ---------- 自定义构建步骤：编译 .proto → .cc/.h ----------
-add_custom_target(generate_proto ALL
-    COMMAND mkdir -p ${CMAKE_BINARY_DIR}/gen
-    # 每个 proto 文件都要跑一遍 protoc
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-        --proto_path=${CMAKE_SOURCE_DIR}
-        --cpp_out=${CMAKE_BINARY_DIR}/gen
-        ${PROTO_DIR}/common.proto
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-        --proto_path=${CMAKE_SOURCE_DIR}
-        --cpp_out=${CMAKE_BINARY_DIR}/gen
-        ${PROTO_DIR}/hotmethod.proto
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-        --proto_path=${CMAKE_SOURCE_DIR}
-        --cpp_out=${CMAKE_BINARY_DIR}/gen
-        --grpc_out=${CMAKE_BINARY_DIR}/gen
-        --plugin=protoc-gen-grpc=${gRPC_CPP_PLUGIN}
-        ${PROTO_DIR}/healthcheck.proto
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-        --proto_path=${CMAKE_SOURCE_DIR}
-        --cpp_out=${CMAKE_BINARY_DIR}/gen
-        --grpc_out=${CMAKE_BINARY_DIR}/gen
-        --plugin=protoc-gen-grpc=${gRPC_CPP_PLUGIN}
-        ${PROTO_DIR}/control.proto
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-        --proto_path=${CMAKE_SOURCE_DIR}
-        --cpp_out=${CMAKE_BINARY_DIR}/gen
-        --grpc_out=${CMAKE_BINARY_DIR}/gen
-        --plugin=protoc-gen-grpc=${gRPC_CPP_PLUGIN}
-        ${PROTO_DIR}/init.proto
-    DEPENDS ${PROTO_DIR}/common.proto ${PROTO_DIR}/healthcheck.proto
-            ${PROTO_DIR}/hotmethod.proto ${PROTO_DIR}/control.proto
-            ${PROTO_DIR}/init.proto
+    ${PROTO_GEN_SUBDIR}/healthcheck.grpc.pb.cc
+    ${PROTO_GEN_SUBDIR}/hotmethod.grpc.pb.cc
+    ${PROTO_GEN_SUBDIR}/control.grpc.pb.cc
+    ${PROTO_GEN_SUBDIR}/init.grpc.pb.cc
 )
 
 # ---------- 编译 drop_agent ----------
@@ -88,17 +88,17 @@ add_executable(drop_agent           # 生成可执行文件 drop_agent
 )
 # 头文件搜索路径
 target_include_directories(drop_agent PRIVATE
-    ${CMAKE_BINARY_DIR}/gen         # proto 生成的头文件
+    ${PROTO_GEN_DIR}                # proto 生成的头文件
     ${CMAKE_SOURCE_DIR}             # 项目根目录
     ${Protobuf_INCLUDE_DIRS}        # protobuf 的安装路径
+    ${gRPC_INCLUDE_DIRS}            # gRPC 头文件路径（来自 pkg-config）
 )
 # 链接的库
 target_link_libraries(drop_agent
-    gRPC::grpc++                   # gRPC C++ 库
+    PkgConfig::gRPC                 # gRPC 库（pkg-config 导入的目标）
     ${Protobuf_LIBRARIES}           # protobuf 库
     Threads::Threads                # 线程库
 )
-add_dependencies(drop_agent generate_proto)  # 先编译 proto 再编译 agent
 
 # ---------- 编译 drop_server ----------
 add_executable(drop_server
@@ -106,13 +106,13 @@ add_executable(drop_server
     ${PROTO_SRCS} ${PROTO_GRPC_SRCS}
 )
 target_include_directories(drop_server PRIVATE
-    ${CMAKE_BINARY_DIR}/gen
+    ${PROTO_GEN_DIR}
     ${CMAKE_SOURCE_DIR}
     ${Protobuf_INCLUDE_DIRS}
+    ${gRPC_INCLUDE_DIRS}
 )
 target_link_libraries(drop_server
-    gRPC::grpc++
+    PkgConfig::gRPC
     ${Protobuf_LIBRARIES}
     Threads::Threads
 )
-add_dependencies(drop_server generate_proto)

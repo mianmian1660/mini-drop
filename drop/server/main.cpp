@@ -9,17 +9,20 @@
 //   4. Init 服务        — 处理 Agent 注册
 // ============================================================
 
-#include <iostream> // cout（控制台输出）
-#include <string>   // string
-#include <thread>   // thread
-#include <chrono>   // 时间相关
-#include <memory>   // unique_ptr（智能指针，自动释放内存）
+#include <iostream>      // cout（控制台输出）
+#include <string>        // string
+#include <thread>        // thread
+#include <chrono>        // 时间相关
+#include <memory>        // unique_ptr（智能指针，自动释放内存）
+#include <mutex>         // mutex（保护共享队列）
+#include <queue>         // queue（任务队列）
+#include <unordered_map> // unordered_map（按 IP 保存任务队列）
 
-#include <grpcpp/grpcpp.h>       // gRPC 服务端库
-#include "healthcheck.grpc.pb.h" // 心跳协议
-#include "hotmethod.grpc.pb.h"   // 任务协议
-#include "control.grpc.pb.h"     // 控制协议
-#include "init.grpc.pb.h"        // 初始化协议
+#include <grpcpp/grpcpp.h>                    // gRPC 服务端库
+#include "common/proto/healthcheck.grpc.pb.h" // 心跳协议
+#include "common/proto/hotmethod.grpc.pb.h"   // 任务协议
+#include "common/proto/control.grpc.pb.h"     // 控制协议
+#include "common/proto/init.grpc.pb.h"        // 初始化协议
 
 // 引入 gRPC 服务端需要的类
 using grpc::Server;        // gRPC 服务器
@@ -27,6 +30,9 @@ using grpc::ServerBuilder; // 服务器构建器
 using grpc::ServerContext; // 请求上下文
 using grpc::Status;        // 返回状态
 using namespace std;
+
+static mutex tasks_mutex;
+static unordered_map<string, queue<hotmethod::TaskDesc>> tasks_;
 
 // ============================================================
 // 第1个服务：HealthCheck（心跳）
@@ -46,7 +52,20 @@ class HealthCheckServiceImpl final : public healthcheck::HealthCheck::Service
         // 回复 Agent：我还活着，目前没有任务
         response->set_status(healthcheck::HealthCheckResponse::SERVING);
         response->set_pending(false); // false = 没有任务
-        // TODO: 如果有任务，从队列里取一个 taskDesc 放进去
+        {
+            lock_guard<mutex> lock(tasks_mutex);
+            auto it = tasks_.find(request->ipaddr());
+            if (it != tasks_.end() && !it->second.empty())
+            {
+                response->set_pending(true);
+                response->mutable_taskdesc()->Swap(&it->second.front());
+                it->second.pop();
+                if (it->second.empty())
+                {
+                    tasks_.erase(it);
+                }
+            }
+        }
 
         return Status::OK; // 返回"成功"
     }
