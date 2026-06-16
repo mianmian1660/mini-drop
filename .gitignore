@@ -55,3 +55,11 @@ Thumbs.db             # Windows
 
 # ----- 日志文件 -----
 *.log
+
+# ----- Proto 生成代码（由 protoc/cmake 自动生成，不提交）-----
+drop/gen/
+drop/tools/py_gen/__pycache__/
+
+# ----- 已知的本地生成目录（显式忽略，确保跨平台兼容）-----
+analysis/__pycache__/
+web_frontend/node_modules/

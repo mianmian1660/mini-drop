@@ -100,6 +100,11 @@ target_link_libraries(drop_agent
     Threads::Threads                # 线程库
 )
 
+# ---------- 查找 gRPC 反射库 ----------
+find_library(gRPC_REFLECTION_LIB grpc++_reflection
+    PATHS /usr/lib/x86_64-linux-gnu
+)
+
 # ---------- 编译 drop_server ----------
 add_executable(drop_server
     server/main.cpp
@@ -115,4 +120,5 @@ target_link_libraries(drop_server
     PkgConfig::gRPC
     ${Protobuf_LIBRARIES}
     Threads::Threads
+    ${gRPC_REFLECTION_LIB}          # gRPC 反射库（让 grpcurl 可用）
 )
