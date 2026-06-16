@@ -14,14 +14,20 @@
 build/
 cmake-build-*/
 dist/
-node_modules/         # npm 依赖（由 npm install 生成）
+# npm 依赖（由 npm install 生成）
+node_modules/
 
 # ----- C++ 编译产物 -----
-*.o                   # 目标文件
-*.a                   # 静态库
-*.so                  # 动态库
-*.pb.cc               # protobuf 生成的 C++ 源文件
-*.pb.h                # protobuf 生成的 C++ 头文件
+# 目标文件
+*.o
+# 静态库
+*.a
+# 动态库
+*.so
+# protobuf 生成的 C++ 源文件
+*.pb.cc
+# protobuf 生成的 C++ 头文件
+*.pb.h
 *.grpc.pb.cc
 *.grpc.pb.h
 
@@ -31,23 +37,31 @@ node_modules/         # npm 依赖（由 npm install 生成）
 vendor/
 
 # ----- Python 产物 -----
-__pycache__/          # Python 缓存目录
-*.py[cod]             # 编译后的 .pyc 文件
+# Python 缓存目录
+__pycache__/
+# 编译后的 .pyc 文件
+*.py[cod]
 *.egg-info/
 .eggs/
-.venv/                # 虚拟环境（每个人自己创建）
+# 虚拟环境（每个人自己创建）
+.venv/
 venv/
 
 # ----- IDE 配置（各人用的编辑器不同）-----
-.vscode/              # VS Code 配置
-.idea/                # JetBrains IDE 配置
-*.swp                 # Vim 临时文件
+# VS Code 配置
+.vscode/
+# JetBrains IDE 配置
+.idea/
+# Vim 临时文件
+*.swp
 *.swo
 *~
 
 # ----- 操作系统临时文件 -----
-.DS_Store             # macOS
-Thumbs.db             # Windows
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
 
 # ----- 敏感配置（不要把密码提交到 Git！）-----
 .env
