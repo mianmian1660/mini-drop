@@ -1,0 +1,43 @@
+#!/bin/bash
+# mock_perf - simulate perf for W2 testing
+OUTPUT="perf.data"
+DURATION=5
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) OUTPUT="$2"; shift 2 ;;
+        -F) shift 2 ;;
+        -g|--call-graph) shift 2 ;;
+        -p) shift 2 ;;
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+
+if [[ "$1" == "sleep" ]]; then
+    DURATION="$2"
+fi
+
+echo "[mock_perf] collecting ${DURATION}s, output: ${OUTPUT}" >&2
+sleep "${DURATION}"
+
+cat > "${OUTPUT}" << 'PERFEOF'
+PERFILE2
+# mock perf data
+# simulated stacks:
+main;process_request;mysql_query 1234
+main;process_request;redis_get 567
+main;event_loop;handle_io 890
+main;process_request;json_parse 432
+main;process_request;http_parse 321
+main;event_loop;timer_callback 654
+main;process_request;protobuf_serialize 210
+main;event_loop;epoll_wait 987
+PERFEOF
+
+# append binary padding
+dd if=/dev/zero bs=1024 count=64 >> "${OUTPUT}" 2>/dev/null
+
+FSIZE=$(wc -c < "${OUTPUT}")
+echo "[mock_perf] done, file size: ${FSIZE} bytes" >&2
+exit 0
