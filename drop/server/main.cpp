@@ -1,12 +1,17 @@
 // ============================================================
-// drop_server (Server 主程序) 小白版注释
+// drop_server (Server 主程序) W4 版本
 // ============================================================
 // 这个程序是"调度中心"，运行在一台中心服务器上
 // 它同时启动 4 个 gRPC 服务，各司其职：
-//   1. HealthCheck 服务 — 收心跳、派任务
+//   1. HealthCheck 服务 — 收心跳、派任务、记录 Agent 资源状态
 //   2. Hotmethod 服务  — 收采集结果
 //   3. Control 服务     — 收 API 后台的指令
 //   4. Init 服务        — 处理 Agent 注册
+//
+// W4 新增功能：
+//   - 记录 Agent 自监控 PidStats
+//   - Agent 离线检测（30 秒无心跳判离线）
+//   - 返回默认 COS 配置
 // ============================================================
 
 #include <iostream>      // cout（控制台输出）
@@ -21,11 +26,12 @@
 #include <csignal>       // signal()
 #include <atomic>        // atomic<bool>
 
-#include <grpcpp/grpcpp.h>                    // gRPC 服务端库
-#include "common/proto/healthcheck.grpc.pb.h" // 心跳协议
-#include "common/proto/hotmethod.grpc.pb.h"   // 任务协议
-#include "common/proto/control.grpc.pb.h"     // 控制协议
-#include "common/proto/init.grpc.pb.h"        // 初始化协议
+#include <grpcpp/grpcpp.h>                             // gRPC 服务端库
+#include <grpcpp/ext/proto_server_reflection_plugin.h> // gRPC 反射（让 grpcurl 能发现服务）
+#include "common/proto/healthcheck.grpc.pb.h"          // 心跳协议
+#include "common/proto/hotmethod.grpc.pb.h"            // 任务协议
+#include "common/proto/control.grpc.pb.h"              // 控制协议
+#include "common/proto/init.grpc.pb.h"                 // 初始化协议
 
 // 引入 gRPC 服务端需要的类
 using grpc::Server;        // gRPC 服务器
@@ -34,28 +40,84 @@ using grpc::ServerContext; // 请求上下文
 using grpc::Status;        // 返回状态
 using namespace std;
 
+// W4: Agent 信息结构 — 记录每个 Agent 的心跳时间、状态和资源
+struct AgentInfo
+{
+    string hostname;
+    string ipAddr;
+    string uid;
+    string version;
+    bool online = false;
+    chrono::steady_clock::time_point lastHeartbeat;
+    common::PidStats lastSelfPstats;
+    vector<common::PidStats> lastChildrenPstats;
+};
+
 static mutex tasks_mutex;
 static unordered_map<string, queue<hotmethod::TaskDesc>> tasks_;
+
+// W4: Agent 信息表（按 uid 索引）
+static mutex agents_mutex;
+static unordered_map<string, AgentInfo> agents_;
+
 static atomic<bool> server_running{true};
+static const int AGENT_TIMEOUT_SEC = 30; // 30 秒无心跳判离线
 
 // ============================================================
-// 第1个服务：HealthCheck（心跳）
+// 第1个服务：HealthCheck（心跳）— W4 增强版
 // ============================================================
-// 这是一个"类"，继承了 proto 生成的基类
-// 重写 Do() 方法来实现心跳逻辑
 class HealthCheckServiceImpl final : public healthcheck::HealthCheck::Service
 {
-    // Do：当 Agent 发来心跳时，这个函数被调用
     Status Do(ServerContext *context,
               const healthcheck::HealthCheckRequest *request,
               healthcheck::HealthCheckResponse *response) override
     {
-        cout << "[server] 收到心跳: host=" << request->hostname()
-             << " ip=" << request->ipaddr() << endl;
+        string uid = request->uid();
+        auto now = chrono::steady_clock::now();
 
-        // 回复 Agent：我还活着，目前没有任务
+        // W4: 更新 Agent 信息
+        {
+            lock_guard<mutex> lock(agents_mutex);
+            AgentInfo &info = agents_[uid];
+            bool wasOffline = !info.online;
+
+            info.hostname = request->hostname();
+            info.ipAddr = request->ipaddr();
+            info.uid = uid;
+            info.version = request->agentversion();
+            info.online = true;
+            info.lastHeartbeat = now;
+            if (request->has_selfpstats())
+            {
+                info.lastSelfPstats.CopyFrom(request->selfpstats());
+            }
+            info.lastChildrenPstats.clear();
+            if (request->has_childrenpstats())
+            {
+                info.lastChildrenPstats.push_back(request->childrenpstats());
+            }
+
+            if (wasOffline)
+            {
+                cout << "[server] 🔔 Agent 恢复上线: uid=" << uid
+                     << " host=" << request->hostname()
+                     << " ip=" << request->ipaddr() << endl;
+            }
+        }
+
+        cout << "[server] 收到心跳: host=" << request->hostname()
+             << " ip=" << request->ipaddr()
+             << " uid=" << uid;
+        if (request->has_selfpstats())
+        {
+            cout << " CPU=" << request->selfpstats().cpupercent() << "%"
+                 << " RSS=" << request->selfpstats().rsskb() << "KB";
+        }
+        cout << endl;
+
+        // 回复 Agent
         response->set_status(healthcheck::HealthCheckResponse::SERVING);
-        response->set_pending(false); // false = 没有任务
+        response->set_pending(false);
         {
             lock_guard<mutex> lock(tasks_mutex);
             auto it = tasks_.find(request->ipaddr());
@@ -71,16 +133,15 @@ class HealthCheckServiceImpl final : public healthcheck::HealthCheck::Service
             }
         }
 
-        return Status::OK; // 返回"成功"
+        return Status::OK;
     }
 };
 
 // ============================================================
-// 第2个服务：Hotmethod（任务执行与结果回报）
+// 第2个服务：Hotmethod（任务执行与结果回报）— W4 增强版
 // ============================================================
 class HotmethodServiceImpl final : public hotmethod::Hotmethod::Service
 {
-    // Collect：Server 主动推任务给 Agent（备用通道）
     Status Collect(ServerContext *context,
                    const hotmethod::Target *request,
                    google::protobuf::Empty *response) override
@@ -89,16 +150,26 @@ class HotmethodServiceImpl final : public hotmethod::Hotmethod::Service
         return Status::OK;
     }
 
-    // NotifyResult：Agent 采集完，把结果送回来
     Status NotifyResult(ServerContext *context,
                         const hotmethod::TaskResult *request,
                         google::protobuf::Empty *response) override
     {
         cout << "[server] 收到结果: taskID=" << request->taskid()
-             << " error=" << request->errormessage()
+             << " error=\"" << request->errormessage() << "\""
              << " fileSize=" << request->file().size()
-             << " cosKey=" << request->coskey() << endl;
-        // TODO: 把任务状态更新为"完成"或"失败"，通知 API 后台
+             << " cosKey=" << request->coskey()
+             << " pstats_count=" << request->selfpstats_size()
+             << endl;
+        // W4: 打印 PidStats
+        for (int i = 0; i < request->selfpstats_size(); i++)
+        {
+            const auto &ps = request->selfpstats(i);
+            cout << "[server]   Agent PidStats: pid=" << ps.pid()
+                 << " CPU=" << ps.cpupercent() << "%"
+                 << " RSS=" << ps.rsskb() << "KB"
+                 << " IO_r=" << ps.readkbpers() << "KB/s"
+                 << " IO_w=" << ps.writekbpers() << "KB/s" << endl;
+        }
         return Status::OK;
     }
 };
@@ -176,33 +247,59 @@ class ControlServiceImpl final : public control::Control::Service
 };
 
 // ============================================================
-// 第4个服务：InitAgentInfo（Agent 初始化）
+// 第4个服务：InitAgentInfo（Agent 初始化）— W4 增强版
 // ============================================================
 class InitAgentInfoServiceImpl final : public initpb::InitAgentInfo::Service
 {
-    // RegisterAgent：Agent 启动时来报到
     Status RegisterAgent(ServerContext *context,
                          const initpb::RegisterAgentRequest *request,
                          initpb::RegisterAgentResponse *response) override
     {
         cout << "[server] Agent 注册: host=" << request->hostname()
-             << " ip=" << request->ipaddr() << endl;
+             << " ip=" << request->ipaddr()
+             << " uid=" << request->uid()
+             << " version=" << request->agentversion() << endl;
         response->set_code(0);
+
+        // W4: 初始化 Agent 信息
+        {
+            lock_guard<mutex> lock(agents_mutex);
+            AgentInfo &info = agents_[request->uid()];
+            info.hostname = request->hostname();
+            info.ipAddr = request->ipaddr();
+            info.uid = request->uid();
+            info.version = request->agentversion();
+            info.online = true;
+            info.lastHeartbeat = chrono::steady_clock::now();
+        }
         return Status::OK;
     }
 
-    // FetchConfig：Agent 拉取配置
+    // W4: FetchConfig — 返回 MinIO/COS 配置给 Agent
     Status FetchConfig(ServerContext *context,
                        const initpb::FetchConfigRequest *request,
                        initpb::FetchConfigResponse *response) override
     {
+        cout << "[server] FetchConfig: uid=" << request->uid() << endl;
         response->set_code(0);
+
+        // 返回默认 MinIO 配置
+        auto *cosCfg = response->mutable_cosconfig();
+        cosCfg->set_endpoint("minio:9000");
+        cosCfg->set_accesskeyid("drop");
+        cosCfg->set_secretaccesskey("dropdrop");
+        cosCfg->set_bucket("drop");
+        cosCfg->set_usessl(false);
+        cosCfg->set_region("us-east-1");
+
+        cout << "[server] 下发 COS 配置: endpoint=" << cosCfg->endpoint()
+             << " bucket=" << cosCfg->bucket() << endl;
         return Status::OK;
     }
 };
 
 // ============================================================
-// main：启动所有服务
+// main：启动所有服务 — W4 增强版
 // ============================================================
 int main(int argc, char **argv)
 {
@@ -214,6 +311,9 @@ int main(int argc, char **argv)
     HotmethodServiceImpl hotmethod_service;
     ControlServiceImpl control_service;
     InitAgentInfoServiceImpl init_service;
+
+    // 启用 gRPC 反射（让 grpcurl 能自动发现服务和方法）
+    grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
     // 用 Builder 模式构建服务器
     ServerBuilder builder;
@@ -232,6 +332,26 @@ int main(int argc, char **argv)
            { server_running = false; });
     signal(SIGTERM, [](int)
            { server_running = false; });
+
+    // W4: 启动 Agent 离线检测线程（每 10 秒扫描一次）
+    thread offline_checker([]()
+                           {
+        while (server_running) {
+            this_thread::sleep_for(chrono::seconds(10));
+            auto now = chrono::steady_clock::now();
+            lock_guard<mutex> lock(agents_mutex);
+            for (auto &pair : agents_) {
+                AgentInfo &info = pair.second;
+                auto elapsed = chrono::duration_cast<chrono::seconds>(now - info.lastHeartbeat).count();
+                if (info.online && elapsed > AGENT_TIMEOUT_SEC) {
+                    info.online = false;
+                    cout << "[server] ⚠️  Agent 离线: uid=" << info.uid
+                         << " host=" << info.hostname
+                         << " ip=" << info.ipAddr
+                         << " 最后心跳: " << elapsed << "秒前" << endl;
+                }
+            }
+        } });
 
     // W2 自测模式：设置环境变量 W2_TEST=1 启动，会自动创建一个 demo 任务
     if (getenv("W2_TEST"))
@@ -270,6 +390,7 @@ int main(int argc, char **argv)
     }
 
     cout << "[server] 收到退出信号，正在关闭..." << endl;
+    offline_checker.join();
     server->Shutdown();
     cout << "[server] 已关闭" << endl;
     return 0;
