@@ -17,6 +17,9 @@
 #include <mutex>         // mutex（保护共享队列）
 #include <queue>         // queue（任务队列）
 #include <unordered_map> // unordered_map（按 IP 保存任务队列）
+#include <cstdlib>       // rand(), getenv()
+#include <csignal>       // signal()
+#include <atomic>        // atomic<bool>
 
 #include <grpcpp/grpcpp.h>                    // gRPC 服务端库
 #include "common/proto/healthcheck.grpc.pb.h" // 心跳协议
@@ -33,6 +36,7 @@ using namespace std;
 
 static mutex tasks_mutex;
 static unordered_map<string, queue<hotmethod::TaskDesc>> tasks_;
+static atomic<bool> server_running{true};
 
 // ============================================================
 // 第1个服务：HealthCheck（心跳）
@@ -91,7 +95,9 @@ class HotmethodServiceImpl final : public hotmethod::Hotmethod::Service
                         google::protobuf::Empty *response) override
     {
         cout << "[server] 收到结果: taskID=" << request->taskid()
-             << " error=" << request->errormessage() << endl;
+             << " error=" << request->errormessage()
+             << " fileSize=" << request->file().size()
+             << " cosKey=" << request->coskey() << endl;
         // TODO: 把任务状态更新为"完成"或"失败"，通知 API 后台
         return Status::OK;
     }
@@ -109,11 +115,43 @@ class ControlServiceImpl final : public control::Control::Service
     {
         cout << "[server] CreateTask: targetIP=" << request->targetip() << endl;
 
-        // 目前返回一个假的任务 ID
-        response->set_taskid("demo-task-001");
+        // 生成任务 ID（用时间戳+随机数）
+        string taskID = "task-" + to_string(chrono::system_clock::now().time_since_epoch().count()) + "-" + to_string(rand() % 10000);
+
+        // 如果请求里带了 TaskDesc，就用它；否则构造一个默认的 perf 任务
+        hotmethod::TaskDesc taskDesc;
+        if (request->has_taskdesc())
+        {
+            taskDesc.CopyFrom(request->taskdesc());
+            taskDesc.set_taskid(taskID);
+        }
+        else
+        {
+            // W2 默认：perf 采集 CPU，99Hz，10秒
+            taskDesc.set_taskid(taskID);
+            taskDesc.set_tasktype(0);     // 通用 CPU
+            taskDesc.set_profilertype(0); // perf
+            taskDesc.set_timeoutsec(30);
+            auto *argv = taskDesc.mutable_sampleargv();
+            argv->set_hz(99);
+            argv->set_duration(10);
+            argv->set_pid(-1); // -1 表示采集整个系统
+            argv->set_callgraph("fp");
+            argv->set_event("cpu-cycles");
+        }
+
+        // 把任务放进对应 IP 的队列
+        {
+            lock_guard<mutex> lock(tasks_mutex);
+            tasks_[request->targetip()].push(taskDesc);
+            cout << "[server] 任务入队: taskID=" << taskID
+                 << " targetIP=" << request->targetip()
+                 << " 队列长度=" << tasks_[request->targetip()].size() << endl;
+        }
+
+        response->set_taskid(taskID);
         response->set_code(0); // 0 = 成功
         response->set_msg("ok");
-        // TODO: 把任务放进 tasks_[targetIP] 队列
 
         return Status::OK;
     }
@@ -189,7 +227,50 @@ int main(int argc, char **argv)
     unique_ptr<Server> server(builder.BuildAndStart());
     cout << "[server] drop_server 启动，监听: " << server_address << endl;
 
-    // Wait() 会阻塞主线程，直到服务器被关闭
-    server->Wait();
+    // 信号处理：Ctrl+C 或 kill 时优雅退出
+    signal(SIGINT, [](int)
+           { server_running = false; });
+    signal(SIGTERM, [](int)
+           { server_running = false; });
+
+    // W2 自测模式：设置环境变量 W2_TEST=1 启动，会自动创建一个 demo 任务
+    if (getenv("W2_TEST"))
+    {
+        thread test_thread([&]()
+                           {
+            this_thread::sleep_for(std::chrono::seconds(3));
+            cout << "[server] ==== W2 自测：自动创建 demo 任务 ====" << endl;
+
+            hotmethod::TaskDesc taskDesc;
+            string taskID = "w2-demo-" + to_string(std::chrono::system_clock::now().time_since_epoch().count());
+            taskDesc.set_taskid(taskID);
+            taskDesc.set_tasktype(0);
+            taskDesc.set_profilertype(0);
+            taskDesc.set_timeoutsec(30);
+            auto *argv = taskDesc.mutable_sampleargv();
+            argv->set_hz(99);
+            argv->set_duration(10);
+            argv->set_pid(-1);
+            argv->set_callgraph("fp");
+            argv->set_event("cpu-cycles");
+
+            {
+                lock_guard<mutex> lock(tasks_mutex);
+                tasks_["127.0.0.1"].push(taskDesc);
+            }
+            cout << "[server] demo 任务已入队: taskID=" << taskID
+                 << " targetIP=127.0.0.1" << endl; });
+        test_thread.detach();
+    }
+
+    // 等待退出信号（替代 server->Wait() 的永久阻塞）
+    while (server_running)
+    {
+        this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    cout << "[server] 收到退出信号，正在关闭..." << endl;
+    server->Shutdown();
+    cout << "[server] 已关闭" << endl;
     return 0;
 }
