@@ -1,0 +1,12 @@
+{
+    "hostname": "mini-drop-agent",
+    "uid": "agent-001",
+    "agentVersion": "1.0.0",
+    "heartbeatIntervalSec": 5,
+    "registerTimeoutSec": 10,
+    "serverAddrs": [
+        "localhost:50051",
+        "localhost:50052",
+        "localhost:50053"
+    ]
+}
