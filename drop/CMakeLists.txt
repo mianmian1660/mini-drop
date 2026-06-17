@@ -60,6 +60,8 @@ set(PROTO_GRPC_SRCS
 # ---------- common 模块源文件 ----------
 set(COMMON_SRCS
     common/Perf.cpp
+    common/AsyncProfilerProfiler.cpp
+    common/PprofProfiler.cpp
     common/Process.cpp
     common/COSClient.cpp
     common/Utils.cpp
@@ -86,6 +88,7 @@ find_library(gRPC_REFLECTION_LIB grpc++_reflection
 # ============================================================
 add_executable(drop_agent
     agent/main.cpp
+    agent/Config.cpp
     ${COMMON_SRCS}
     ${PROTO_SRCS} ${PROTO_GRPC_SRCS}
 )
