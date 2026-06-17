@@ -99,7 +99,7 @@ def test_pid_not_exist():
     
     print("\n--- Agent 日志（关键部分）---")
     for line in agent_output.split('\n'):
-        if any(kw in line for kw in ['PID', '不存在', 'error', 'taskID', '收到任务', 'NotifyResult']):
+        if any(kw in line for kw in ['PID', '不存在', 'error', 'taskID', '收到任务', 'NotifyResult', 'perf]']):
             print(line)
     
     print("\n--- Server 日志（关键部分）---")
@@ -202,9 +202,9 @@ def test_normal_perf_with_pidstats():
     
     print("\n--- Agent 日志（关键部分）---")
     for line in agent_output.split('\n'):
-        if any(kw in line for kw in ['PID', 'taskID', '收到任务', 'perf 子进程',
+        if any(kw in line for kw in ['PID', 'taskID', '收到任务', 'perf] 子进程',
                                        'NotifyResult', '自监控', 'CPU=', 'MinIO',
-                                       'cosKey', '采集成功']):
+                                       'cosKey', '采集成功', 'cos]']):
             print(line)
     
     print("\n--- Server 日志（关键部分）---")
@@ -221,7 +221,7 @@ def test_normal_perf_with_pidstats():
     
     checks = {
         "Agent收到任务": "收到任务!" in agent_output,
-        "perf执行": "perf 子进程" in agent_output,
+        "perf执行": "[perf] 子进程" in agent_output,
         "NotifyResult上报": "NotifyResult 上报成功" in agent_output,
         "PidStats心跳": "自监控: CPU=" in agent_output,
         "Server收到结果": "收到结果:" in server_output,
