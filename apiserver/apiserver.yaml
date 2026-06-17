@@ -1,0 +1,36 @@
+# ============================================================
+# apiserver 配置文件
+# 所有配置项都可通过环境变量覆盖（如 PG_DSN, DROP_GRPC 等）
+# ============================================================
+
+# HTTP 服务配置
+server:
+  port: 8191          # 监听端口
+  mode: release       # Gin 运行模式：debug / release / test
+
+# 数据库配置
+database:
+  dsn: "host=localhost user=postgres password=dev dbname=drop sslmode=disable"
+  max_open_conns: 100
+  max_idle_conns: 10
+  conn_max_lifetime_sec: 3600
+
+# gRPC 连接 drop_server
+grpc:
+  addr: "localhost:50051"
+  timeout_sec: 5
+
+# 对象存储 MinIO
+storage:
+  endpoint: "localhost:9000"
+  access_key: "drop"
+  secret_key: "dropdrop"
+  use_ssl: false
+  bucket: "drop-data"
+  presign_expire_sec: 900   # 预签名 URL 有效期（秒），默认 15 分钟
+
+# 日志配置
+log:
+  level: info               # debug / info / warn / error
+  format: json              # json / console
+  output: stdout            # stdout / stderr / 文件路径

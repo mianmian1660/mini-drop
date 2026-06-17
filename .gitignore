@@ -35,6 +35,8 @@ node_modules/
 *.exe
 *.test
 vendor/
+# apiserver 编译产物
+apiserver/apiserver
 
 # ----- Python 产物 -----
 # Python 缓存目录
