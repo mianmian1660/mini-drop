@@ -19,17 +19,27 @@ import (
 
 // CreateTaskReq 创建任务请求体
 type CreateTaskReq struct {
-	Name         string `json:"name" binding:"required"`
-	TaskType     uint32 `json:"task_type"`      // 0=通用 1=Java 2=Tracing
-	ProfilerType uint32 `json:"profiler_type"`  // 0=perf 1=async-profiler 2=pprof
-	TargetIP     string `json:"target_ip" binding:"required"`
-	TargetPID    int32  `json:"target_pid"`
-	Duration     uint64 `json:"duration"`       // 采集秒数
-	Frequency    uint32 `json:"frequency"`      // 采样频率 Hz
-	Callgraph    string `json:"callgraph"`      // fp / dwarf / lbr
-	Event        string `json:"event"`          // cpu-cycles / cache-misses
-	Subprocess   bool   `json:"subprocess"`
+	Name          string `json:"name" binding:"required"`
+	TaskType      uint32 `json:"task_type"`     // 0=通用 1=Java 2=Tracing
+	ProfilerType  uint32 `json:"profiler_type"` // 0=perf 1=async-profiler 2=pprof
+	TargetIP      string `json:"target_ip" binding:"required"`
+	TargetPID     int32  `json:"target_pid"`
+	Duration      uint64 `json:"duration"`      // 采集秒数
+	Frequency     uint32 `json:"frequency"`     // 采样频率 Hz
+	Callgraph     string `json:"callgraph"`     // fp / dwarf / lbr
+	Event         string `json:"event"`         // cpu-cycles / cache-misses
+	Subprocess    bool   `json:"subprocess"`
 	ContainerName string `json:"container_name"`
+}
+
+// PerfParams 性能采集参数，会被序列化为 JSONB 存入 request_params 字段
+type PerfParams struct {
+	TargetPID  int32  `json:"target_pid"`
+	Duration   uint64 `json:"duration"`
+	Frequency  uint32 `json:"frequency"`
+	Callgraph  string `json:"callgraph"`
+	Event      string `json:"event"`
+	Subprocess bool   `json:"subprocess"`
 }
 
 // CreateTask 创建性能采集任务
@@ -65,8 +75,8 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		userName = "默认用户"
 	}
 
-	// 将请求参数序列化为 JSONB
-	paramsJSON, err := util.MarshalJSONB(CreateTaskReq{
+	// 将性能采集参数序列化为 JSONB（只存采参，不存 Name/TargetIP 等已落列的字段）
+	paramsJSON, err := util.MarshalJSONB(PerfParams{
 		TargetPID:  req.TargetPID,
 		Duration:   req.Duration,
 		Frequency:  req.Frequency,
