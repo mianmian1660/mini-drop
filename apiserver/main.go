@@ -70,6 +70,7 @@ func main() {
 
 	// ---------- 5. 初始化 HTTP 服务 ----------
 	srv := server.New(db, logger, cfg)
+	defer srv.Close() // 程序退出时关闭 gRPC 连接
 
 	// ---------- 6. 启动 ----------
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)

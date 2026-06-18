@@ -6,21 +6,31 @@
 package server
 
 import (
+	"context"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/gorm"
 
 	"github.com/mini-drop/apiserver/config"
 	"github.com/mini-drop/apiserver/middleware"
+	"github.com/mini-drop/apiserver/model"
+	pb "github.com/mini-drop/apiserver/proto/control"
+	"github.com/mini-drop/apiserver/util"
 )
 
 // APIServer 是 HTTP 服务的顶层结构体
-// 持有数据库、日志、配置等依赖，通过方法注册路由
+// 持有数据库、日志、配置、gRPC 客户端等依赖
 type APIServer struct {
-	DB     *gorm.DB
-	Logger *zap.Logger
-	Config *config.Config
-	Router *gin.Engine
+	DB        *gorm.DB
+	Logger    *zap.Logger
+	Config    *config.Config
+	Router    *gin.Engine
+	GRPCConn  *grpc.ClientConn       // gRPC 连接（到 drop_server）
+	ControlCli pb.ControlClient      // Control 服务客户端
 }
 
 // New 创建一个新的 APIServer 实例
@@ -42,8 +52,115 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 		Router: router,
 	}
 
+	// 初始化 gRPC 连接（连接失败不阻止启动，后续 CreateTask 会回退到仅写库模式）
+	s.initGRPC()
+
+	// 启动任务状态轮询器（W3：定期检查 Running 任务是否应标记为完成）
+	go s.startTaskPoller()
+
 	s.registerRoutes()
 	return s
+}
+
+// initGRPC 初始化到 drop_server 的 gRPC 连接（非阻塞）
+// 连接在后台进行，HTTP 服务立即启动
+func (s *APIServer) initGRPC() {
+	// 先标记为未连接，后台 goroutine 连接成功后更新
+	s.GRPCConn = nil
+	s.ControlCli = nil
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.Config.GRPC.TimeoutSec)*time.Second)
+		defer cancel()
+
+		conn, err := grpc.DialContext(ctx,
+			s.Config.GRPC.Addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		)
+		if err != nil {
+			s.Logger.Warn("gRPC 连接 drop_server 失败（任务将仅写库，不下发）",
+				zap.String("addr", s.Config.GRPC.Addr),
+				zap.Error(err),
+			)
+			return
+		}
+
+		s.GRPCConn = conn
+		s.ControlCli = pb.NewControlClient(conn)
+		s.Logger.Info("gRPC 连接 drop_server 成功",
+			zap.String("addr", s.Config.GRPC.Addr),
+		)
+	}()
+}
+
+// Close 关闭资源（gRPC 连接等）
+func (s *APIServer) Close() {
+	if s.GRPCConn != nil {
+		if err := s.GRPCConn.Close(); err != nil {
+			s.Logger.Error("关闭 gRPC 连接失败", zap.Error(err))
+		}
+	}
+}
+
+// GrpcConnected 返回 gRPC 是否已连接
+func (s *APIServer) GrpcConnected() bool {
+	return s.ControlCli != nil
+}
+
+// startTaskPoller 后台任务状态轮询器（W3）
+// 定期扫描 status=1(RUNNING) 的任务，将超时或已完成的任务标记为终态
+// 生产环境中应替换为 gRPC 回调或消息队列通知
+func (s *APIServer) startTaskPoller() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.pollRunningTasks()
+	}
+}
+
+// pollRunningTasks 检查 RUNNING 任务是否应标记为完成/失败
+func (s *APIServer) pollRunningTasks() {
+	var tasks []model.HotmethodTask
+
+	// 查出所有 status=1 (RUNNING) 的任务
+	if err := s.DB.Where("status = ?", 1).Find(&tasks).Error; err != nil {
+		s.Logger.Error("轮询任务状态失败", zap.Error(err))
+		return
+	}
+
+	for _, task := range tasks {
+		if task.BeginTime == nil {
+			continue
+		}
+
+		// 解析任务参数获取采集时长
+		var params PerfParams
+		if err := util.UnmarshalJSONB(task.RequestParams, &params); err != nil {
+			s.Logger.Warn("解析任务参数失败", zap.String("tid", task.TID), zap.Error(err))
+			continue
+		}
+
+		// 计算预期完成时间 = beginTime + duration + 30s 上传缓冲
+		expectedDuration := time.Duration(params.Duration) * time.Second
+		uploadBuffer := 30 * time.Second
+		deadline := task.BeginTime.Add(expectedDuration).Add(uploadBuffer)
+
+		if time.Now().After(deadline) {
+			// 超时，标记为完成（MVP 阶段简化处理）
+			now := time.Now()
+			s.DB.Model(&task).Updates(map[string]interface{}{
+				"status":      2,
+				"status_info": "采集完成（超时自动标记）",
+				"end_time":    &now,
+			})
+			s.Logger.Info("任务自动标记为完成",
+				zap.String("tid", task.TID),
+				zap.String("name", task.Name),
+			)
+		}
+	}
 }
 
 // registerRoutes 注册所有 API 路由

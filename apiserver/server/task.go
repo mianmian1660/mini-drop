@@ -7,6 +7,8 @@
 package server
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -14,6 +16,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/mini-drop/apiserver/model"
+	pb_common "github.com/mini-drop/apiserver/proto/common"
+	pb_control "github.com/mini-drop/apiserver/proto/control"
+	pb_hotmethod "github.com/mini-drop/apiserver/proto/hotmethod"
 	"github.com/mini-drop/apiserver/util"
 )
 
@@ -119,6 +124,20 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		return
 	}
 
+	// W3: 通过 gRPC 下发任务到 drop_server
+	if s.GrpcConnected() {
+		s.dispatchTask(task, req)
+	} else {
+		s.Logger.Warn("gRPC 未连接，任务仅写库未下发",
+			zap.String("tid", tid),
+		)
+		// 标记为失败，等待后续手动重试或 cron 重发
+		s.DB.Model(task).Updates(map[string]interface{}{
+			"status":      3,
+			"status_info": "gRPC 未连接，任务无法下发到 drop_server",
+		})
+	}
+
 	s.Logger.Info("任务创建成功",
 		zap.String("tid", tid),
 		zap.String("target_ip", req.TargetIP),
@@ -130,6 +149,80 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		"data": gin.H{
 			"tid": tid,
 		},
+	})
+}
+
+// dispatchTask 通过 gRPC 将任务下发到 drop_server
+// 如果下发失败，更新数据库状态为失败
+func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
+	// 构建 CosConfig（使用配置中的 MinIO 凭证）
+	cosCfg := &pb_common.CosConfig{
+		Endpoint:        s.Config.Storage.Endpoint,
+		AccessKeyId:     s.Config.Storage.AccessKey,
+		SecretAccessKey: s.Config.Storage.SecretKey,
+		Bucket:          s.Config.Storage.Bucket,
+		UseSsl:          s.Config.Storage.UseSSL,
+	}
+
+	// 构建 RecordArgv（采集参数）
+	recordArgv := &pb_hotmethod.RecordArgv{
+		Hz:         req.Frequency,
+		Duration:   req.Duration,
+		Pid:        req.TargetPID,
+		Callgraph:  req.Callgraph,
+		Subprocess: req.Subprocess,
+		Event:      req.Event,
+	}
+
+	// 构建 TaskDesc
+	taskDesc := &pb_hotmethod.TaskDesc{
+		TaskID:        task.TID,
+		TaskType:      req.TaskType,
+		ProfilerType:  req.ProfilerType,
+		SampleArgv:    recordArgv,
+		ContainerName: req.ContainerName,
+		TimeoutSec:    uint32(req.Duration + 30), // 多给 30s 上传时间
+		CosConfig:     cosCfg,
+	}
+
+	// 构建 CreateTaskRequest
+	pbReq := &pb_control.CreateTaskRequest{
+		TargetIP: req.TargetIP,
+		Service:  "hotmethod",
+		TaskDesc: taskDesc,
+	}
+
+	// 调用 gRPC（带超时）
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(s.Config.GRPC.TimeoutSec)*time.Second)
+	defer cancel()
+
+	resp, err := s.ControlCli.CreateTask(ctx, pbReq)
+	if err != nil {
+		errMsg := fmt.Sprintf("gRPC 下发失败: %v", err)
+		s.Logger.Error("任务下发到 drop_server 失败",
+			zap.String("tid", task.TID),
+			zap.String("target_ip", req.TargetIP),
+			zap.Error(err),
+		)
+		s.DB.Model(task).Updates(map[string]interface{}{
+			"status":      3,
+			"status_info": errMsg,
+		})
+		return
+	}
+
+	// 下发成功，更新状态为"已下发"
+	s.Logger.Info("任务已下发到 drop_server",
+		zap.String("tid", task.TID),
+		zap.String("grpc_resp_code", fmt.Sprintf("%d", resp.Code)),
+	)
+
+	now := time.Now()
+	s.DB.Model(task).Updates(map[string]interface{}{
+		"status":      1, // 执行中
+		"status_info": fmt.Sprintf("已下发到 drop_server, code=%d msg=%s", resp.Code, resp.Msg),
+		"begin_time":  &now,
 	})
 }
 
@@ -278,6 +371,33 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 			"message": "重试任务创建失败: " + err.Error(),
 		})
 		return
+	}
+
+	// W3: 重试任务也通过 gRPC 下发
+	if s.GrpcConnected() {
+		// 从原任务的 request_params 重建采集参数
+		var oldParams PerfParams
+		if err := util.UnmarshalJSONB(oldTask.RequestParams, &oldParams); err != nil {
+			s.Logger.Warn("解析原任务参数失败，使用默认值", zap.Error(err))
+		}
+		req := CreateTaskReq{
+			Name:         newTask.Name,
+			TaskType:     newTask.Type,
+			ProfilerType: newTask.ProfilerType,
+			TargetIP:     newTask.TargetIP,
+			TargetPID:    oldParams.TargetPID,
+			Duration:     oldParams.Duration,
+			Frequency:    oldParams.Frequency,
+			Callgraph:    oldParams.Callgraph,
+			Event:        oldParams.Event,
+			Subprocess:   oldParams.Subprocess,
+		}
+		s.dispatchTask(&newTask, req)
+	} else {
+		s.DB.Model(&newTask).Updates(map[string]interface{}{
+			"status":      3,
+			"status_info": "gRPC 未连接，重试任务无法下发",
+		})
 	}
 
 	s.Logger.Info("任务重试成功",
