@@ -34,6 +34,7 @@ from storage import MinIOStorage, create_storage
 from error import ErrorCode, ErrorInfo, exit_ok, exit_error
 from flamegraph import generate_flamegraph, get_folded_stacks
 from collapsed_data_parser import analyze_collapsed
+from analysis_advisor import generate_suggestions as advisor_generate_suggestions
 
 
 # ============================================================
@@ -309,7 +310,7 @@ def _upload_output(storage, bucket: str, tid: str,
         return ""
 
 
-def h_analyze_cpu_flamegrap(conn, storage_cfg: dict, task: dict,
+def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                             bucket: str, tid: str) -> list:
     """
     CPU 火焰图分析（task_type=0）
@@ -397,13 +398,62 @@ def h_analyze_cpu_flamegrap(conn, storage_cfg: dict, task: dict,
     if top_key:
         outputs.append(top_key)
 
-    # --- 7. 写入 Top5 热点到 analysis_suggestions ---
+    # --- 7. 规则建议引擎：匹配热点函数 → 生成优化建议 ---
+    suggestions_result = {}
     if top_json and top_json.get("self_time_top"):
+        try:
+            # 确定规则文件路径
+            rules_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "rules.yaml"
+            )
+            suggestions_result = advisor_generate_suggestions(
+                top_json,
+                task_name=task_name,
+                rules_file=rules_file,
+            )
+            print(f"[analysis] 规则引擎匹配到 "
+                  f"{len(suggestions_result.get('suggestions', []))} 条建议",
+                  file=sys.stderr)
+
+            # 上传 suggestions.md
+            md_content = suggestions_result.get("suggestions_md", "")
+            if md_content:
+                md_key = _upload_output(storage, bucket, tid,
+                                        "suggestions.md", md_content,
+                                        "text/markdown")
+                if md_key:
+                    outputs.append(md_key)
+
+            # 上传 suggestions.json
+            sugg_json = {
+                "suggestions": suggestions_result.get("suggestions", []),
+                "rules_loaded": suggestions_result.get("rules_loaded", 0),
+            }
+            sugg_key = _upload_output(storage, bucket, tid,
+                                      "suggestions.json", sugg_json,
+                                      "application/json")
+            if sugg_key:
+                outputs.append(sugg_key)
+
+            # 写入 Top5 匹配到的建议到 analysis_suggestions 表
+            matched = suggestions_result.get("suggestions", [])
+            for item in matched[:5]:
+                insert_suggestion(conn, tid,
+                                  item["function"],
+                                  item["advice"])
+
+        except Exception as e:
+            print(f"[analysis] 规则建议生成失败: {e}", file=sys.stderr)
+            # 规则引擎失败不阻塞主流程
+
+    # --- 8. 如果没有规则匹配，写 Top5 热点基本信息 ---
+    if not suggestions_result.get("suggestions") and top_json.get("self_time_top"):
         for item in top_json["self_time_top"][:5]:
             func_name = item["function"]
             pct = item["percentage"]
             suggestion = (f"函数 '{func_name}' 占 CPU {pct}%，"
-                          f"建议检查是否存在优化空间")
+                          f"建议人工审查是否存在优化空间")
             insert_suggestion(conn, tid, func_name, suggestion)
 
     print(f"[analysis] CPU 火焰图分析完成: {len(outputs)} 个产物", file=sys.stderr)
