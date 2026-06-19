@@ -67,6 +67,14 @@ export default function TaskListPage() {
         loadTasks();
     }, [loadTasks]);
 
+    // W3: 任务列表自动刷新（10 秒轮询）
+    useEffect(() => {
+        const interval = setInterval(() => {
+            loadTasks();
+        }, 10000);
+        return () => clearInterval(interval);
+    }, [loadTasks]);
+
     // 按回车触发搜索
     const handleSearchKeyDown = (e) => {
         if (e.key === 'Enter') {
