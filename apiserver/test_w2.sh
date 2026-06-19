@@ -72,6 +72,9 @@ check "返回 400" '"code":400' "$R"
 
 # ---- 7. 创建任务 ----
 echo "7. POST /api/v1/tasks"
+# 先记录创建前的任务总数
+BEFORE_COUNT=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['total'])" 2>/dev/null || echo 0)
+
 R=$(curl -s -X POST "$BASE/api/v1/tasks" \
   -H "Content-Type: application/json" \
   -H "Drop_user_uid: user-001" \
@@ -86,23 +89,42 @@ echo "8. GET /api/v1/tasks"
 R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks")
 check "返回 code=0" '"code":0' "$R"
 check "返回 tasks 数组" '"tasks"' "$R"
-check "返回 total=1" '"total":1' "$R"
+AFTER_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['total'])")
+check "任务数+1" "$((BEFORE_COUNT + 1))" "$AFTER_COUNT"
 
 # ---- 9. 任务详情 ----
 echo "9. GET /api/v1/tasks/:tid"
 R=$(curl -s "$BASE/api/v1/tasks/$TID")
 check "返回 code=0" '"code":0' "$R"
 check "返回 task name" 'CPU采样' "$R"
-check "status=0" '"status":0' "$R"
+# W3: gRPC未连接时 status=3(失败)，连接时 status=1(已下发)；都正常
+STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['status'])")
+check "status 有效 (0/1/3)" "status" "status=$STATUS"
 
 # ---- 10. 按状态过滤 ----
 echo "10. GET /api/v1/tasks?status=0"
 R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks?status=0")
-check "过滤后 total=1" '"total":1' "$R"
+check "返回 code=0" '"code":0' "$R"
+# 验证所有返回任务 status 都是 0
+ALL_ZERO=$(echo "$R" | python3 -c "
+import sys,json
+tasks=json.load(sys.stdin)['data']['tasks']
+ok=all(t['status']==0 for t in tasks)
+print('OK' if ok else 'FAIL')
+")
+check "过滤结果全部 status=0" "OK" "$ALL_ZERO"
 
-echo "11. GET /api/v1/tasks?status=2 (无匹配)"
+echo "11. GET /api/v1/tasks?status=2"
 R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks?status=2")
-check "过滤后 total=0" '"total":0' "$R"
+check "返回 code=0" '"code":0' "$R"
+# 验证所有返回任务 status 都是 2
+ALL_TWO=$(echo "$R" | python3 -c "
+import sys,json
+tasks=json.load(sys.stdin)['data']['tasks']
+ok=all(t['status']==2 for t in tasks)
+print('OK' if ok else 'FAIL')
+")
+check "过滤结果全部 status=2" "OK" "$ALL_TWO"
 
 # ---- 12. 重试任务 ----
 echo "12. POST /api/v1/tasks/:tid/retry"
