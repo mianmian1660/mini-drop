@@ -32,6 +32,8 @@ import traceback
 # 引入同目录下的模块
 from storage import MinIOStorage, create_storage
 from error import ErrorCode, ErrorInfo, exit_ok, exit_error
+from flamegraph import generate_flamegraph, get_folded_stacks
+from collapsed_data_parser import analyze_collapsed
 
 
 # ============================================================
@@ -230,17 +232,11 @@ def insert_suggestion(conn, tid: str, func_name: str,
         print(f"[analysis] 插入建议失败: {e}", file=sys.stderr)
 
 
-def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
-                          bucket: str, tid: str, task_type: int) -> list:
+def _connect_storage(storage_cfg: dict):
     """
-    根据任务类型执行对应的分析逻辑
-
-    当前 W1 阶段：仅验证文件存在，实际分析留到 W2 实现
-    返回: 产物 URL 列表（目前为空）
+    尝试连接 MinIO，返回 (MinIOStorage, bool)
+    bool 表示是否连接成功
     """
-    outputs = []
-
-    # ----- 连接 MinIO 并列出该任务的文件 -----
     try:
         storage = MinIOStorage(
             endpoint=storage_cfg["endpoint"],
@@ -248,34 +244,187 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
             secret_key=storage_cfg["secret_key"],
             use_ssl=storage_cfg["use_ssl"],
         )
-
-        # 确保 bucket 存在
-        if not storage.ensure_bucket(bucket):
-            print(f"[analysis] 警告: 无法访问 Bucket '{bucket}'，"
-                  f"MinIO 可能未启动，跳过存储操作",
-                  file=sys.stderr)
-        else:
-            # 列出该 tid 下的所有文件
-            files = storage.list_objects(bucket, prefix=f"{tid}/")
-            if not files:
-                print(f"[analysis] 警告: 任务 {tid} 在 MinIO 上没有文件，"
-                      f"请确认 Agent 已上传采集数据",
-                      file=sys.stderr)
-            else:
-                print(f"[analysis] 找到 {len(files)} 个文件:", file=sys.stderr)
-                for f in files:
-                    print(f"[analysis]   - {f.name} ({f.size} bytes)", file=sys.stderr)
-
+        if storage.ensure_bucket(storage_cfg.get("bucket", "drop-data")):
+            return storage, True
+        return storage, False
     except Exception as e:
-        # MinIO 不可用时不致命，W1 阶段允许跳过
-        print(f"[analysis] 警告: MinIO 连接失败 ({e})，跳过存储操作",
+        print(f"[analysis] MinIO 不可用: {e}", file=sys.stderr)
+        return None, False
+
+
+def _download_perf_data(storage, bucket: str, tid: str,
+                        local_path: str) -> bool:
+    """
+    从 MinIO 下载 perf.data 到本地
+
+    返回: True=下载成功, False=失败
+    """
+    if storage is None:
+        return False
+
+    perf_key = f"{tid}/perf.data"
+    if not storage.object_exists(bucket, perf_key):
+        print(f"[analysis] MinIO 上不存在 {perf_key}", file=sys.stderr)
+        return False
+
+    try:
+        data = storage.get_object(bucket, perf_key)
+        if data is None:
+            return False
+        with open(local_path, "wb") as f:
+            f.write(data)
+        print(f"[analysis] 下载 perf.data → {local_path} ({len(data)} bytes)",
               file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"[analysis] 下载 perf.data 失败: {e}", file=sys.stderr)
+        return False
+
+
+def _upload_output(storage, bucket: str, tid: str,
+                   filename: str, content, content_type: str = "application/octet-stream") -> str:
+    """
+    上传分析产物到 MinIO
+
+    返回: MinIO key，失败返回空字符串
+    """
+    if storage is None:
+        return ""
+
+    key = f"{tid}/{filename}"
+    try:
+        if isinstance(content, str):
+            data = content.encode("utf-8")
+        elif isinstance(content, bytes):
+            data = content
+        else:
+            import json
+            data = json.dumps(content, ensure_ascii=False).encode("utf-8")
+
+        if storage.put_object(bucket, key, data, content_type):
+            return key
+        return ""
+    except Exception as e:
+        print(f"[analysis] 上传 {filename} 失败: {e}", file=sys.stderr)
+        return ""
+
+
+def h_analyze_cpu_flamegrap(conn, storage_cfg: dict, task: dict,
+                            bucket: str, tid: str) -> list:
+    """
+    CPU 火焰图分析（task_type=0）
+
+    完整流水线:
+      1. 从 MinIO 下载 perf.data
+      2. perf script → stackcollapse → flamegraph.pl → SVG
+      3. 解析折叠栈 → TopN 热点 JSON
+      4. 上传产物（flamegraph.svg / folded.txt / top.json）到 MinIO
+      5. 写 Top5 热点到 analysis_suggestions 表
+
+    返回: 产物 URL/key 列表
+    """
+    outputs = []
+
+    # --- 1. 连接 MinIO ---
+    storage, storage_ok = _connect_storage(storage_cfg)
+
+    # --- 2. 获取 perf.data ---
+    # 优先从 MinIO 下载，其次用本地测试文件
+    local_perf = f"/tmp/{tid}_perf.data"
+    has_perf = False
+
+    if storage_ok:
+        has_perf = _download_perf_data(storage, bucket, tid, local_perf)
+
+    if not has_perf:
+        # MinIO 不可用或文件不存在时，尝试用本地 perf.data（仅本地测试用）
+        test_files = [
+            f"/tmp/{tid}_perf.data",
+            "/tmp/test_perf3.data",
+            "/tmp/test_perf.data",
+        ]
+        for tf in test_files:
+            if os.path.exists(tf) and os.path.getsize(tf) > 0:
+                local_perf = tf
+                has_perf = True
+                print(f"[analysis] 使用本地测试文件: {local_perf}", file=sys.stderr)
+                break
+
+    if not has_perf:
+        print(f"[analysis] 错误: 找不到 perf.data，无法生成火焰图", file=sys.stderr)
+        return outputs
+
+    # --- 3. 生成火焰图 SVG ---
+    task_name = task.get("name", tid)
+    title = f"CPU Flame Graph: {task_name}"
+
+    print(f"[analysis] 开始生成火焰图 ...", file=sys.stderr)
+    try:
+        svg_content = generate_flamegraph(local_perf, title=title)
+    except Exception as e:
+        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
+                   f"火焰图生成失败: {e}",
+                   traceback.format_exc())
+
+    # --- 4. 获取折叠栈 ---
+    try:
+        folded_text = get_folded_stacks(local_perf)
+    except Exception as e:
+        print(f"[analysis] 折叠栈生成失败: {e}", file=sys.stderr)
+        folded_text = ""
+
+    # --- 5. 解析折叠栈 → TopN 热点 ---
+    top_json = {}
+    if folded_text:
+        try:
+            top_json = analyze_collapsed(folded_text, top_n=20)
+        except Exception as e:
+            print(f"[analysis] 热点分析失败: {e}", file=sys.stderr)
+
+    # --- 6. 上传产物到 MinIO ---
+    svg_key = _upload_output(storage, bucket, tid,
+                             "flamegraph.svg", svg_content, "image/svg+xml")
+    if svg_key:
+        outputs.append(svg_key)
+
+    folded_key = _upload_output(storage, bucket, tid,
+                                "folded.txt", folded_text, "text/plain")
+    if folded_key:
+        outputs.append(folded_key)
+
+    top_key = _upload_output(storage, bucket, tid,
+                             "top.json", top_json, "application/json")
+    if top_key:
+        outputs.append(top_key)
+
+    # --- 7. 写入 Top5 热点到 analysis_suggestions ---
+    if top_json and top_json.get("self_time_top"):
+        for item in top_json["self_time_top"][:5]:
+            func_name = item["function"]
+            pct = item["percentage"]
+            suggestion = (f"函数 '{func_name}' 占 CPU {pct}%，"
+                          f"建议检查是否存在优化空间")
+            insert_suggestion(conn, tid, func_name, suggestion)
+
+    print(f"[analysis] CPU 火焰图分析完成: {len(outputs)} 个产物", file=sys.stderr)
+    return outputs
+
+
+def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
+                          bucket: str, tid: str, task_type: int) -> list:
+    """
+    根据任务类型执行对应的分析逻辑
+
+    返回: 产物 URL/key 列表
+    """
+    outputs = []
 
     # ---------- 按 task_type 分发分析 ----------
     try:
         if task_type == TASK_TYPE_GENERIC:
-            # W2 将实现: perf script → stackcollapse → flamegraph.pl → SVG
-            print(f"[analysis] CPU 火焰图分析 (W2 实现)", file=sys.stderr)
+            # CPU 火焰图：perf script → stackcollapse → flamegraph.pl → SVG
+            outputs = _analyze_cpu_flamegraph(conn, storage_cfg, task,
+                                              bucket, tid)
 
         elif task_type == TASK_TYPE_JAVA:
             # W5 将实现: async-profiler 折叠栈解析
@@ -299,7 +448,6 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
                    f"分析过程异常: {e}",
                    traceback.format_exc())
 
-    # 关闭 MinIO 客户端（MinIO Python SDK 无需显式关闭）
     return outputs
 
 
