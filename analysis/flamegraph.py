@@ -192,6 +192,9 @@ def generate_flamegraph(perf_data_path: str,
                         colors: str = "hot") -> str:
     """
     一键生成火焰图 SVG：perf.data → SVG
+    支持两种输入：
+      1. 标准 perf.data（通过 perf script 解析）
+      2. 已折叠的栈数据（以分号分隔，直接跳过 perf script）
 
     用法:
         svg = generate_flamegraph("/path/to/perf.data", title="my app")
@@ -199,7 +202,7 @@ def generate_flamegraph(perf_data_path: str,
             f.write(svg)
 
     参数:
-        perf_data_path: perf.data 文件路径
+        perf_data_path: perf.data 文件路径（或已折叠栈文件）
         title:          火焰图标题
         width:          SVG 宽度
         colors:         配色方案
@@ -217,17 +220,34 @@ def generate_flamegraph(perf_data_path: str,
     print(f"[flamegraph] ===== 开始生成火焰图 =====", file=sys.stderr)
     print(f"[flamegraph] 输入: {perf_data_path}", file=sys.stderr)
 
-    # 步骤 1: perf script
-    script_output = run_perf_script(perf_data_path)
-
-    # 步骤 2: stackcollapse
-    folded = run_stackcollapse(script_output)
+    # 智能检测：如果文件内容已经是折叠栈格式（含分号分隔），跳过 perf script
+    folded = _detect_and_fold(perf_data_path)
 
     # 步骤 3: flamegraph
     svg = run_flamegraph(folded, title=title, width=width, colors=colors)
 
     print(f"[flamegraph] ===== 火焰图生成完毕 =====", file=sys.stderr)
     return svg
+
+
+def _detect_and_fold(perf_data_path: str) -> str:
+    """智能折叠：检测输入格式，自动选择处理方式"""
+    try:
+        with open(perf_data_path, 'r', errors='replace') as f:
+            first_line = f.readline().strip()
+            # 如果第一行包含分号，说明已经是 collapsed stacks 格式
+            if ';' in first_line and ' ' in first_line:
+                f.seek(0)
+                folded = f.read()
+                print(f"[flamegraph] 检测到已折叠栈格式（{len(folded)} 字节），跳过 perf script",
+                      file=sys.stderr)
+                return folded
+    except Exception:
+        pass
+
+    # 标准 perf.data 流程
+    script_output = run_perf_script(perf_data_path)
+    return run_stackcollapse(script_output)
 
 
 # ----------------------------------------------------------
@@ -245,5 +265,4 @@ def get_folded_stacks(perf_data_path: str) -> str:
         折叠后的栈文本
     """
     _check_dependencies()
-    script_output = run_perf_script(perf_data_path)
-    return run_stackcollapse(script_output)
+    return _detect_and_fold(perf_data_path)

@@ -47,10 +47,11 @@ namespace drop_server
         response->set_code(0);
 
         auto *cosCfg = response->mutable_cosconfig();
-        cosCfg->set_endpoint("minio:9000");
+        // 使用 localhost 因为 agent 以 network_mode=host 运行
+        cosCfg->set_endpoint("localhost:9000");
         cosCfg->set_accesskeyid("drop");
         cosCfg->set_secretaccesskey("dropdrop");
-        cosCfg->set_bucket("drop");
+        cosCfg->set_bucket("drop-data");
         cosCfg->set_usessl(false);
         cosCfg->set_region("us-east-1");
 

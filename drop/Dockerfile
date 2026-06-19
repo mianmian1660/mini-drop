@@ -45,15 +45,21 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   libprotobuf23   = protobuf 运行时库
 #   linux-tools-generic = perf 工具（采集性能需要）
 #   perl            = 火焰图脚本需要
-#   curl            = 健康检查用
+#   curl            = 健康检查 + MinIO API 调用
+#   wget            = 下载 mc (MinIO Client)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgrpc++1 \
     libprotobuf23 \
     linux-tools-generic \
     perl \
     curl \
+    wget \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt-lists/*
+
+# 安装 MinIO Client (mc)，用于上传采集结果到 MinIO
+RUN wget -q https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc \
+    && chmod +x /usr/local/bin/mc
 
 WORKDIR /app
 # 从阶段1复制编译好的两个程序
