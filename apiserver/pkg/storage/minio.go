@@ -16,15 +16,25 @@ import (
 
 // MinIOStorage MinIO 对象存储实现
 type MinIOStorage struct {
-	client   *minio.Client
-	endpoint string
+	client         *minio.Client
+	endpoint       string
+	publicEndpoint string // 浏览器可访问的地址（用于预签名 URL）
+	accessKey      string
+	secretKey      string
+	useSSL         bool
 }
 
 // NewMinIOStorage 创建一个新的 MinIO 存储客户端
-// endpoint: MinIO 地址（如 localhost:9000）
+// endpoint: MinIO 服务器地址（如 minio:9000，Docker 内部网络）
+// publicEndpoint: 浏览器可访问的地址（如 localhost:9000），用于生成预签名 URL
 // accessKey / secretKey: MinIO 认证凭证
 // useSSL: 是否使用 HTTPS
 func NewMinIOStorage(endpoint, accessKey, secretKey string, useSSL bool) (*MinIOStorage, error) {
+	return NewMinIOStorageWithPublic(endpoint, endpoint, accessKey, secretKey, useSSL)
+}
+
+// NewMinIOStorageWithPublic 创建 MinIO 客户端，支持独立的公网/浏览器访问地址
+func NewMinIOStorageWithPublic(endpoint, publicEndpoint, accessKey, secretKey string, useSSL bool) (*MinIOStorage, error) {
 	client, err := minio.New(endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 		Secure: useSSL,
@@ -34,8 +44,12 @@ func NewMinIOStorage(endpoint, accessKey, secretKey string, useSSL bool) (*MinIO
 	}
 
 	return &MinIOStorage{
-		client:   client,
-		endpoint: endpoint,
+		client:         client,
+		endpoint:       endpoint,
+		publicEndpoint: publicEndpoint,
+		accessKey:      accessKey,
+		secretKey:      secretKey,
+		useSSL:         useSSL,
 	}, nil
 }
 
@@ -80,9 +94,18 @@ func (m *MinIOStorage) GetObject(ctx context.Context, bucket, key string) (io.Re
 	return obj, nil
 }
 
-// PresignedGetURL 生成预签名下载 URL
+// PresignedGetURL 生成预签名下载 URL（使用浏览器可访问的 publicEndpoint）
 func (m *MinIOStorage) PresignedGetURL(ctx context.Context, bucket, key string, expires time.Duration) (string, error) {
-	u, err := m.client.PresignedGetObject(ctx, bucket, key, expires, nil)
+	// 使用 publicEndpoint 创建临时客户端生成预签名 URL
+	publicClient, err := minio.New(m.publicEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(m.accessKey, m.secretKey, ""),
+		Secure: m.useSSL,
+	})
+	if err != nil {
+		return "", fmt.Errorf("创建公开 MinIO 客户端失败: %w", err)
+	}
+
+	u, err := publicClient.PresignedGetObject(ctx, bucket, key, expires, nil)
 	if err != nil {
 		return "", fmt.Errorf("生成预签名 URL 失败: %w", err)
 	}

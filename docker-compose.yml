@@ -105,7 +105,8 @@ services:
     environment:
       PG_DSN: "host=postgres user=postgres password=dev dbname=drop sslmode=disable"
       DROP_GRPC: "drop_server:50051" # drop_server 的地址
-      S3_ENDPOINT: "minio:9000" # MinIO 地址
+      S3_ENDPOINT: "minio:9000" # MinIO 地址（Docker 内部网络）
+      S3_PUBLIC_ENDPOINT: "localhost:9000" # 浏览器访问地址（预签名 URL 用）
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"
     depends_on:

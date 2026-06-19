@@ -140,14 +140,22 @@ func (s *APIServer) Close() {
 
 // initStorage 初始化 MinIO 对象存储（W4）
 // 连接 MinIO 并确保 drop-data 桶存在
+// 使用 publicEndpoint 生成浏览器可访问的预签名 URL
 func (s *APIServer) initStorage() error {
 	cfg := s.Config.Storage
 	if cfg.Endpoint == "" {
 		return fmt.Errorf("存储 endpoint 未配置")
 	}
 
-	minioStore, err := storage.NewMinIOStorage(
+	// 如果未配置 public_endpoint，默认使用 endpoint
+	publicEndpoint := cfg.PublicEndpoint
+	if publicEndpoint == "" {
+		publicEndpoint = cfg.Endpoint
+	}
+
+	minioStore, err := storage.NewMinIOStorageWithPublic(
 		cfg.Endpoint,
+		publicEndpoint,
 		cfg.AccessKey,
 		cfg.SecretKey,
 		cfg.UseSSL,
@@ -166,6 +174,7 @@ func (s *APIServer) initStorage() error {
 	s.Storage = minioStore
 	s.Logger.Info("MinIO 存储初始化成功",
 		zap.String("endpoint", cfg.Endpoint),
+		zap.String("public_endpoint", publicEndpoint),
 		zap.String("bucket", cfg.Bucket),
 	)
 	return nil

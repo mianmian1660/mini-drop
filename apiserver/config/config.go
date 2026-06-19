@@ -44,12 +44,13 @@ type GRPCConfig struct {
 
 // StorageConfig 对象存储配置
 type StorageConfig struct {
-	Endpoint        string `mapstructure:"endpoint"`
-	AccessKey       string `mapstructure:"access_key"`
-	SecretKey       string `mapstructure:"secret_key"`
-	UseSSL          bool   `mapstructure:"use_ssl"`
-	Bucket          string `mapstructure:"bucket"`
-	PresignExpireSec int   `mapstructure:"presign_expire_sec"`
+	Endpoint         string `mapstructure:"endpoint"`
+	PublicEndpoint   string `mapstructure:"public_endpoint"` // 浏览器可访问的地址（预签名URL用）
+	AccessKey        string `mapstructure:"access_key"`
+	SecretKey        string `mapstructure:"secret_key"`
+	UseSSL           bool   `mapstructure:"use_ssl"`
+	Bucket           string `mapstructure:"bucket"`
+	PresignExpireSec int    `mapstructure:"presign_expire_sec"`
 }
 
 // LogConfig 日志配置
@@ -99,6 +100,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("grpc.addr", "localhost:50051")
 	v.SetDefault("grpc.timeout_sec", 5)
 	v.SetDefault("storage.endpoint", "localhost:9000")
+	v.SetDefault("storage.public_endpoint", "localhost:9000")
 	v.SetDefault("storage.access_key", "drop")
 	v.SetDefault("storage.secret_key", "dropdrop")
 	v.SetDefault("storage.use_ssl", false)
@@ -118,6 +120,13 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envS3 := os.Getenv("S3_ENDPOINT"); envS3 != "" {
 		v.Set("storage.endpoint", envS3)
+		// 如果未单独配置 public_endpoint，默认用 S3_ENDPOINT
+		if os.Getenv("S3_PUBLIC_ENDPOINT") == "" {
+			v.Set("storage.public_endpoint", envS3)
+		}
+	}
+	if envS3Pub := os.Getenv("S3_PUBLIC_ENDPOINT"); envS3Pub != "" {
+		v.Set("storage.public_endpoint", envS3Pub)
 	}
 	if envAK := os.Getenv("S3_ACCESS_KEY"); envAK != "" {
 		v.Set("storage.access_key", envAK)
