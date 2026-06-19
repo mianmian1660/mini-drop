@@ -117,8 +117,8 @@ services:
         condition: service_started
 
   # ========================================================
-  # analysis — Python 分析引擎
-  # 一次性运行：被 API 后台调用，分析完就退出
+  # analysis — Python 分析引擎（守护模式）
+  # 轮询数据库中已完成的任务，自动触发火焰图/热点/建议分析
   # ========================================================
   analysis:
     build:
@@ -132,7 +132,7 @@ services:
     depends_on:
       - postgres
       - minio
-    entrypoint: [ "python3", "hotmethod_analyzer.py" ]
+    entrypoint: [ "python3", "analysis_daemon.py", "--interval", "5" ]
 
   # ========================================================
   # web_frontend — React 前端（Nginx 托管）
