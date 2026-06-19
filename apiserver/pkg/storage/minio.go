@@ -94,22 +94,18 @@ func (m *MinIOStorage) GetObject(ctx context.Context, bucket, key string) (io.Re
 	return obj, nil
 }
 
-// PresignedGetURL 生成预签名下载 URL（使用浏览器可访问的 publicEndpoint）
+// PresignedGetURL 生成预签名下载 URL（bucket 已设为公开读取时返回直接 URL）
 func (m *MinIOStorage) PresignedGetURL(ctx context.Context, bucket, key string, expires time.Duration) (string, error) {
-	// 使用 publicEndpoint 创建临时客户端生成预签名 URL
-	publicClient, err := minio.New(m.publicEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(m.accessKey, m.secretKey, ""),
-		Secure: m.useSSL,
-	})
-	if err != nil {
-		return "", fmt.Errorf("创建公开 MinIO 客户端失败: %w", err)
+	// Bucket 已在 docker-compose 启动时设为 public-read，直接返回 URL
+	scheme := "http"
+	if m.useSSL {
+		scheme = "https"
 	}
-
-	u, err := publicClient.PresignedGetObject(ctx, bucket, key, expires, nil)
-	if err != nil {
-		return "", fmt.Errorf("生成预签名 URL 失败: %w", err)
+	publicHost := m.publicEndpoint
+	if publicHost == "" {
+		publicHost = m.endpoint
 	}
-	return u.String(), nil
+	return fmt.Sprintf("%s://%s/%s/%s", scheme, publicHost, bucket, key), nil
 }
 
 // ListObjects 列出指定前缀下的所有文件
