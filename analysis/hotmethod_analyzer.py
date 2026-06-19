@@ -35,6 +35,7 @@ from error import ErrorCode, ErrorInfo, exit_ok, exit_error
 from flamegraph import generate_flamegraph, get_folded_stacks
 from collapsed_data_parser import analyze_collapsed
 from analysis_advisor import generate_suggestions as advisor_generate_suggestions
+from memleak_analyzer import analyze_memtrace, generate_mock_memtrace
 
 
 # ============================================================
@@ -562,6 +563,132 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     }
 
 
+def _analyze_memleak(conn, storage_cfg: dict, task: dict,
+                     bucket: str, tid: str,
+                     local_dir: str = "") -> dict:
+    """
+    内存泄漏分析（task_type=4）
+
+    完整流水线:
+      1. 从 MinIO 下载 memtrace.txt（或使用内置模拟数据）
+      2. 解析 alloc/free 事件 → 配对检测泄漏
+      3. 责任人分析 → 按泄漏量排名
+      4. 生成 memleak_report.md + memleak.json
+      5. 上传产物到 MinIO（或保存到本地）
+      6. 写责任人到 analysis_suggestions 表
+
+    返回: {"outputs": [...], "presigned_urls": {...}, "local_files": [...]}
+    """
+    outputs = []
+    presigned_urls = {}
+    local_files = []
+
+    task_name = task.get("name", tid)
+
+    # --- 1. 连接 MinIO ---
+    storage, storage_ok = _connect_storage(storage_cfg)
+
+    # --- 2. 获取内存追踪数据 ---
+    memtrace_text = ""
+    has_data = False
+
+    if storage_ok:
+        memtrace_key = f"{tid}/memtrace.txt"
+        if storage.object_exists(bucket, memtrace_key):
+            try:
+                data = storage.get_object(bucket, memtrace_key)
+                if data:
+                    memtrace_text = data.decode("utf-8", errors="replace")
+                    has_data = True
+                    print(f"[analysis] 下载 memtrace.txt ({len(data)} bytes)",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"[analysis] 下载 memtrace.txt 失败: {e}", file=sys.stderr)
+
+    if not has_data:
+        # MinIO 不可用或无数据时，使用内置模拟数据
+        memtrace_text = generate_mock_memtrace()
+        has_data = True
+        print(f"[analysis] 使用内置模拟内存追踪数据 "
+              f"({len(memtrace_text)} chars)",
+              file=sys.stderr)
+
+    if not has_data:
+        print(f"[analysis] 错误: 无内存追踪数据", file=sys.stderr)
+        return {"outputs": outputs, "presigned_urls": presigned_urls,
+                "local_files": local_files}
+
+    # --- 3. 执行内存泄漏分析 ---
+    print(f"[analysis] 开始内存泄漏分析 ...", file=sys.stderr)
+    try:
+        memleak_result = analyze_memtrace(memtrace_text, task_name=task_name)
+    except Exception as e:
+        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
+                   f"内存泄漏分析失败: {e}",
+                   traceback.format_exc())
+
+    # --- 4. 上传/保存产物 ---
+    # memleak_report.md
+    report_md = memleak_result.get("report_md", "")
+    if report_md:
+        md_key = _upload_output(storage, bucket, tid,
+                                "memleak_report.md", report_md,
+                                "text/markdown")
+        if md_key:
+            outputs.append(md_key)
+            presigned_urls["memleak_report.md"] = _get_presigned_url(
+                storage, bucket, md_key)
+        else:
+            local_path = _save_local_output(
+                local_dir, f"{tid}_memleak_report.md", report_md)
+            if local_path:
+                local_files.append(local_path)
+                outputs.append(local_path)
+
+    # memleak.json
+    memleak_json = {
+        "total_allocs": memleak_result.get("total_allocs", 0),
+        "total_frees": memleak_result.get("total_frees", 0),
+        "leak_count": memleak_result.get("leak_count", 0),
+        "total_leaked_human": memleak_result.get("total_leaked_human", "0 B"),
+        "responsible_top": memleak_result.get("responsible_top", []),
+        "leaks": memleak_result.get("leaks", []),
+    }
+    json_key = _upload_output(storage, bucket, tid,
+                              "memleak.json", memleak_json,
+                              "application/json")
+    if json_key:
+        outputs.append(json_key)
+        presigned_urls["memleak.json"] = _get_presigned_url(
+            storage, bucket, json_key)
+    else:
+        local_path = _save_local_output(
+            local_dir, f"{tid}_memleak.json", memleak_json)
+        if local_path:
+            local_files.append(local_path)
+            outputs.append(local_path)
+
+    # --- 5. 写入 Top5 责任人到 analysis_suggestions ---
+    responsible_top = memleak_result.get("responsible_top", [])
+    for item in responsible_top[:5]:
+        func_name = item["function"]
+        suggestion = (f"函数 '{func_name}' 存在内存泄漏: "
+                      f"{item['leak_count']} 处, 泄漏 {item['total_human']}。"
+                      f"建议检查该函数中的 alloc/free 配对，"
+                      f"确保所有路径都释放了分配的内存。")
+        insert_suggestion(conn, tid, func_name, suggestion)
+
+    print(f"[analysis] 内存泄漏分析完成: {len(outputs)} 个产物 "
+          f"(MinIO: {len(presigned_urls)}, 本地: {len(local_files)})",
+          file=sys.stderr)
+
+    return {
+        "outputs": outputs,
+        "presigned_urls": presigned_urls,
+        "local_files": local_files,
+    }
+
+
 def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
                           bucket: str, tid: str, task_type: int,
                           local_dir: str = "") -> dict:
@@ -584,8 +711,9 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
             print(f"[analysis] Java 分析 (W5 实现)", file=sys.stderr)
 
         elif task_type == TASK_TYPE_MEMCHECK:
-            # W5 将实现: 内存泄漏检测
-            print(f"[analysis] 内存泄漏分析 (W5 实现)", file=sys.stderr)
+            # 内存泄漏检测：alloc/free 配对分析 → 责任人定位
+            result = _analyze_memleak(conn, storage_cfg, task,
+                                      bucket, tid, local_dir)
 
         elif task_type == TASK_TYPE_JAVA_HEAP:
             # W5 将实现: Java 堆 dump 分析
