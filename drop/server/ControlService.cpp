@@ -4,6 +4,7 @@
 
 #include "server/ControlService.h"
 #include "server/TaskQueue.h"
+#include "server/AgentInfo.h"
 
 #include <iostream>
 #include <string>
@@ -73,10 +74,36 @@ namespace drop_server
 
     grpc::Status ControlServiceImpl::StatAgent(
         grpc::ServerContext * /*context*/,
-        const control::StatAgentRequest * /*request*/,
+        const control::StatAgentRequest *request,
         control::StatAgentResponse *response)
     {
-        response->set_code(0);
+        string targetIP = request->targetip();
+
+        // 在 agents_ 中查找该 IP 对应的 Agent
+        {
+            lock_guard<mutex> lock(agents_mutex);
+            for (const auto &pair : agents_)
+            {
+                const AgentInfo &info = pair.second;
+                if (info.ipAddr == targetIP)
+                {
+                    response->set_code(0);
+                    response->set_msg("ok");
+                    response->set_cpupercent(info.lastSelfPstats.cpupercent());
+                    response->set_memorykb(info.lastSelfPstats.rsskb());
+
+                    cout << "[server] StatAgent: ip=" << targetIP
+                         << " host=" << info.hostname
+                         << " online=" << info.online
+                         << " cpu=" << info.lastSelfPstats.cpupercent() << "%" << endl;
+                    return grpc::Status::OK;
+                }
+            }
+        }
+
+        // 未找到该 IP
+        response->set_code(404);
+        response->set_msg("agent not found: " + targetIP);
         return grpc::Status::OK;
     }
 
