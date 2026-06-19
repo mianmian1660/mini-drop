@@ -1,14 +1,14 @@
 // ============================================================
 // pages/HomePage.js — 主页（/）
 // ============================================================
-// 功能：Agent 列表 + 我的任务列表 + 新建任务按钮
-// 接真实 apiserver API，不再使用 mock 数据
+// 功能：Agent 列表 + 我的任务列表（含搜索/分页） + 新建任务按钮
 // ============================================================
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { agents, tasks } from '../api';
 import CreateTaskModal from '../components/CreateTaskModal';
+import Pagination from '../components/Pagination';
 
 const styles = {
     container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
@@ -20,6 +20,11 @@ const styles = {
     badge: { padding: '2px 8px', borderRadius: 10, fontSize: 12, fontWeight: 'bold' },
     empty: { textAlign: 'center', padding: 40, color: '#999' },
     loading: { textAlign: 'center', padding: 40, color: '#999' },
+    searchRow: { display: 'flex', gap: 12, marginBottom: 16 },
+    input: { flex: 1, padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14 },
+    select: { padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14, background: '#fff' },
+    toolbar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+    totalInfo: { fontSize: 13, color: '#999' },
 };
 
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
@@ -32,38 +37,79 @@ export default function HomePage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
 
-    // 组件加载时从后端拉数据
-    useEffect(() => {
-        loadData();
-    }, []);
+    // 任务列表的分页 & 搜索状态
+    const [keyword, setKeyword] = useState('');
+    const [searchText, setSearchText] = useState('');
+    const [statusFilter, setStatusFilter] = useState('');
+    const [page, setPage] = useState(1);
+    const [pageSize] = useState(5);   // 主页任务列表每页 5 条
+    const [total, setTotal] = useState(0);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
-    const loadData = async () => {
-        setLoading(true);
-        setError('');
+    // 加载 Agent 列表（不分页）
+    const loadAgents = async () => {
         try {
-            const [agentRes, taskRes] = await Promise.all([
-                agents.list(),
-                tasks.list(),
-            ]);
-            // 后端返回格式: { code: 0, data: { agents: [...], total: N } }
-            if (agentRes.code === 0) {
-                setAgentList(agentRes.data?.agents || []);
-            }
-            if (taskRes.code === 0) {
-                setTaskList(taskRes.data?.tasks || []);
+            const res = await agents.list();
+            if (res.code === 0) {
+                setAgentList(res.data?.agents || []);
             }
         } catch (err) {
-            console.error('加载数据失败:', err);
-            setError('无法连接到后端服务，请确认 apiserver 已启动');
-        } finally {
-            setLoading(false);
+            console.error('加载 Agent 列表失败:', err);
         }
     };
 
-    // 任务创建成功后刷新列表
+    // 加载任务列表（分页+搜索）
+    const loadTasks = useCallback(async () => {
+        try {
+            const res = await tasks.list({
+                page,
+                pageSize,
+                keyword: searchText,
+                status: statusFilter || undefined,
+            });
+            if (res.code === 0) {
+                setTaskList(res.data?.tasks || []);
+                setTotal(res.data?.total || 0);
+            }
+        } catch (err) {
+            console.error('加载任务列表失败:', err);
+        }
+    }, [page, pageSize, searchText, statusFilter]);
+
+    // 组件加载 + 搜索/翻页变化时拉数据
+    useEffect(() => {
+        setLoading(true);
+        setError('');
+        Promise.all([loadAgents(), loadTasks()])
+            .catch(err => {
+                console.error('加载数据失败:', err);
+                setError('无法连接到后端服务，请确认 apiserver 已启动');
+            })
+            .finally(() => setLoading(false));
+    }, [loadTasks]);
+
+    // 按回车触发搜索
+    const handleSearchKeyDown = (e) => {
+        if (e.key === 'Enter') {
+            setSearchText(keyword.trim());
+            setPage(1);
+        }
+    };
+
+    // 状态筛选
+    const handleStatusChange = (e) => {
+        setStatusFilter(e.target.value);
+        setPage(1);
+    };
+
+    // 任务创建成功
     const handleTaskCreated = () => {
         setShowCreate(false);
-        loadData();
+        setPage(1);
+        setSearchText('');
+        setKeyword('');
+        // 重新加载
+        Promise.all([loadAgents(), loadTasks()]).finally(() => setLoading(false));
     };
 
     if (loading) {
@@ -123,10 +169,43 @@ export default function HomePage() {
 
             {showCreate && <CreateTaskModal onClose={() => setShowCreate(false)} onSuccess={handleTaskCreated} />}
 
-            {/* ===== 任务表格 ===== */}
+            {/* ===== 任务搜索 + 筛选 ===== */}
             <div style={styles.card}>
+                <div style={styles.searchRow}>
+                    <input
+                        style={styles.input}
+                        placeholder="搜索任务名称 / ID / IP（回车搜索）"
+                        value={keyword}
+                        onChange={e => setKeyword(e.target.value)}
+                        onKeyDown={handleSearchKeyDown}
+                    />
+                    <select style={styles.select} value={statusFilter} onChange={handleStatusChange}>
+                        <option value="">全部状态</option>
+                        <option value="0">待处理</option>
+                        <option value="1">执行中</option>
+                        <option value="2">已完成</option>
+                        <option value="3">失败</option>
+                    </select>
+                </div>
+
+                <div style={styles.toolbar}>
+                    <span style={styles.totalInfo}>共 {total} 条任务</span>
+                    {searchText && (
+                        <span style={{ ...styles.totalInfo, color: '#4a6cf7' }}>
+                            搜索: "{searchText}"
+                            <button
+                                style={{ color: '#f44336', cursor: 'pointer', background: 'none', border: 'none', fontSize: 12, marginLeft: 8 }}
+                                onClick={() => { setKeyword(''); setSearchText(''); setPage(1); }}
+                            >
+                                清除
+                            </button>
+                        </span>
+                    )}
+                </div>
+
+                {/* ===== 任务表格 ===== */}
                 {taskList.length === 0 ? (
-                    <p style={styles.empty}>暂无任务，点击"新建采样"开始</p>
+                    <p style={styles.empty}>{searchText ? '没有匹配的任务' : '暂无任务，点击"新建采样"开始'}</p>
                 ) : (
                     <table style={styles.table}>
                         <thead>
@@ -142,7 +221,7 @@ export default function HomePage() {
                         <tbody>
                             {taskList.map(t => (
                                 <tr key={t.tid}>
-                                    <td style={styles.td}>{t.tid}</td>
+                                    <td style={{ ...styles.td, fontSize: 12, color: '#888' }}>{t.tid}</td>
                                     <td style={styles.td}>{t.name}</td>
                                     <td style={styles.td}>{t.target_ip}</td>
                                     <td style={styles.td}>
@@ -159,6 +238,9 @@ export default function HomePage() {
                         </tbody>
                     </table>
                 )}
+
+                {/* 分页 */}
+                <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
             </div>
         </div>
     );
