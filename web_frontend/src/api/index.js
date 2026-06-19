@@ -35,8 +35,8 @@ export const agents = {
 export const tasks = {
     // 创建任务（POST /api/v1/tasks）
     create: (data) => client.post('/api/v1/tasks', data),
-    // 任务列表（GET /api/v1/tasks）
-    list: () => client.get('/api/v1/tasks'),
+    // 任务列表（GET /api/v1/tasks?page=&pageSize=&keyword=&status=）
+    list: (params = {}) => client.get('/api/v1/tasks', { params }),
     // 任务详情（GET /api/v1/tasks/:tid）
     detail: (tid) => client.get(`/api/v1/tasks/${tid}`),
     // 删除任务（DELETE /api/v1/tasks/:tid）
