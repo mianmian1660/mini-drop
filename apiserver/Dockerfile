@@ -31,6 +31,8 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 # --from=builder：从阶段1的镜像里拿编译好的二进制文件
 COPY --from=builder /app/apiserver .
+# 复制配置文件（Docker 内使用环境变量覆盖关键参数）
+COPY --from=builder /app/apiserver.yaml ./apiserver.yaml
 
 # 文档说明：这个容器用 8191 端口
 EXPOSE 8191
