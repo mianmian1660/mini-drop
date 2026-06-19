@@ -44,3 +44,10 @@ export const tasks = {
     // 重试任务（POST /api/v1/tasks/:tid/retry）
     retry: (tid) => client.post(`/api/v1/tasks/${tid}/retry`),
 };
+
+// ---------- 文件（W4: 火焰图等产物） ----------
+export const cosfiles = {
+    // 列出任务产物文件（GET /api/v1/cosfiles?tid=xxx）
+    // 返回每个文件的 name / size / download_url（预签名）
+    list: (tid) => client.get('/api/v1/cosfiles', { params: { tid } }),
+};

@@ -6,7 +6,7 @@
 // ============================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { tasks } from '../api';
+import { tasks, cosfiles } from '../api';
 
 const styles = {
     container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
@@ -51,9 +51,13 @@ export default function TaskResultPage() {
     const [task, setTask] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
-    const [polling, setPolling] = useState(false);  // W3: 是否正在轮询
+    const [polling, setPolling] = useState(false);  // W3: 是否正在轮询任务状态
+    // W4: 火焰图文件状态
+    const [flameFiles, setFlameFiles] = useState([]);      // 所有产物文件
+    const [flameSvgUrl, setFlameSvgUrl] = useState('');    // 火焰图 SVG 的预签名 URL
+    const [analysisPolling, setAnalysisPolling] = useState(false);  // 是否在等分析结果
 
-    // W3: 加载任务详情（提取为 useCallback 便于轮询复用）
+    // W4: 加载任务详情 + 产物文件
     const loadTask = useCallback(async (isPoll = false) => {
         if (!isPoll) setLoading(true);
         else setPolling(true);
@@ -61,10 +65,20 @@ export default function TaskResultPage() {
         try {
             const res = await tasks.detail(tid);
             if (res.code === 0) {
-                // apiserver 返回 { data: { task: {...} } }
+                // apiserver 返回 { data: { task: {...}, files: [...] } }
                 const taskData = res.data?.task || res.data;
                 setTask(taskData);
                 setError('');
+
+                // W4: 提取产物文件列表，查找火焰图 SVG
+                const files = res.data?.files || [];
+                setFlameFiles(files);
+                const svgFile = files.find(f =>
+                    f.name && (f.name.endsWith('.svg') || f.name.includes('flamegraph'))
+                );
+                if (svgFile?.download_url) {
+                    setFlameSvgUrl(svgFile.download_url);
+                }
             } else {
                 if (!isPoll) setError(res.message || '任务不存在');
             }
@@ -73,6 +87,28 @@ export default function TaskResultPage() {
         } finally {
             setLoading(false);
             setPolling(false);
+        }
+    }, [tid]);
+
+    // W4: 单独加载产物文件列表（用于分析完成后轮询）
+    const loadFiles = useCallback(async () => {
+        setAnalysisPolling(true);
+        try {
+            const res = await cosfiles.list(tid);
+            if (res.code === 0) {
+                const files = res.data?.files || [];
+                setFlameFiles(files);
+                const svgFile = files.find(f =>
+                    f.name && (f.name.endsWith('.svg') || f.name.includes('flamegraph'))
+                );
+                if (svgFile?.download_url) {
+                    setFlameSvgUrl(svgFile.download_url);
+                }
+            }
+        } catch (err) {
+            console.error('加载文件列表失败:', err);
+        } finally {
+            setAnalysisPolling(false);
         }
     }, [tid]);
 
@@ -94,8 +130,20 @@ export default function TaskResultPage() {
             loadTask(true);
         }, 3000);
 
-        return () => clearInterval(interval);    // 组件卸载或状态变化时清理
+        return () => clearInterval(interval);
     }, [task?.status, loadTask]);
+
+    // W4: 任务已完成但无火焰图 → 每 5 秒轮询分析结果
+    useEffect(() => {
+        if (!task || task.status !== 2) return;       // 非完成状态不轮询
+        if (flameSvgUrl) return;                       // 已有火焰图，停止
+
+        const interval = setInterval(() => {
+            loadFiles();
+        }, 5000);
+
+        return () => clearInterval(interval);
+    }, [task?.status, flameSvgUrl, loadFiles]);
 
     if (loading) return <div style={styles.container}><p style={styles.loading}>⏳ 加载中...</p></div>;
     if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
@@ -178,20 +226,53 @@ export default function TaskResultPage() {
             {/* ===== 火焰图 ===== */}
             <h3>🔥 火焰图</h3>
             <div style={styles.flameBox}>
-                {task.status === 2 ? (
-                    task.flamegraph_url ? (
+                {flameSvgUrl ? (
+                    // W4: 有火焰图 → iframe 加载 SVG（支持鼠标交互）
+                    <div>
                         <iframe
-                            src={task.flamegraph_url}
+                            src={flameSvgUrl}
                             title="火焰图"
-                            style={{ width: '100%', height: 400, border: 'none' }}
+                            style={{
+                                width: '100%', height: 500, border: '1px solid #e0e0e0',
+                                borderRadius: 4, background: '#fff',
+                            }}
                         />
-                    ) : (
-                        <div>
-                            <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>📊</p>
-                            <p>任务已完成，等待分析引擎生成火焰图...</p>
-                            <p style={{ fontSize: 12 }}>（analysis 服务运行后将自动生成）</p>
-                        </div>
-                    )
+                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>
+                            💡 点击函数框可放大，右键可缩小
+                        </p>
+                    </div>
+                ) : task.status === 2 ? (
+                    // 任务完成但分析结果未出
+                    <div>
+                        <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>🔬</p>
+                        <p>任务采集已完成，正在等待分析引擎生成火焰图...</p>
+                        {analysisPolling && (
+                            <p style={{ fontSize: 13, color: '#1565c0', marginTop: 8 }}>
+                                🔄 每 5 秒检查分析结果...
+                            </p>
+                        )}
+                        {flameFiles.length > 0 && (
+                            <div style={{ marginTop: 12, textAlign: 'left', maxWidth: 500, margin: '12px auto' }}>
+                                <p style={{ fontSize: 13, fontWeight: 'bold' }}>已有产物文件：</p>
+                                {flameFiles.map(f => (
+                                    <div key={f.name} style={{ fontSize: 12, padding: '4px 0', color: '#666' }}>
+                                        📄 {f.name} ({formatSize(f.size)})
+                                        {f.download_url && (
+                                            <a href={f.download_url} target="_blank" rel="noreferrer"
+                                                style={{ marginLeft: 8, color: '#4a6cf7', fontSize: 11 }}>
+                                                下载
+                                            </a>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                        {flameFiles.length === 0 && !analysisPolling && (
+                            <p style={{ fontSize: 12, color: '#999', marginTop: 8 }}>
+                                暂无产物文件（analysis 服务未运行或尚未产出）
+                            </p>
+                        )}
+                    </div>
                 ) : task.status === 3 ? (
                     <div>
                         <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>❌</p>
@@ -238,4 +319,17 @@ export default function TaskResultPage() {
             </div>
         </div>
     );
+}
+
+// W4: 文件大小格式化工具
+function formatSize(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    let size = bytes;
+    while (size >= 1024 && i < units.length - 1) {
+        size /= 1024;
+        i++;
+    }
+    return size.toFixed(1) + ' ' + units[i];
 }
