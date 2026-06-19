@@ -1,10 +1,11 @@
 // ============================================================
 // pages/TaskResultPage.js — 任务详情页（/task/result?tid=xxx）
 // ============================================================
-// 功能：基本信息 + 火焰图（iframe/占位） + 热点 TopN
+// 功能：基本信息（自动刷新） + 火焰图 + 热点 TopN
+// W3：新增 3 秒轮询，任务执行中自动刷新状态
 // ============================================================
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { tasks } from '../api';
 
 const styles = {
@@ -17,10 +18,31 @@ const styles = {
     loading: { textAlign: 'center', padding: 60, color: '#999' },
     error: { textAlign: 'center', padding: 60, color: '#f44336' },
     flameBox: { textAlign: 'center', padding: 40, background: '#f5f5fa', color: '#999', borderRadius: 8, minHeight: 300 },
+    // W3: 轮询指示器
+    pollingBar: {
+        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+        padding: '8px 16px', background: '#e3f2fd', borderRadius: 6, marginBottom: 16,
+        fontSize: 13, color: '#1565c0',
+    },
+    // W3: 状态进度条
+    progressBar: { display: 'flex', gap: 0, marginBottom: 16 },
+    progressStep: (active, done) => ({
+        flex: 1, textAlign: 'center', padding: '8px 4px', fontSize: 12,
+        background: done ? '#4caf50' : active ? '#2196f3' : '#e0e0e0',
+        color: done || active ? '#fff' : '#999',
+        borderRadius: 4, margin: '0 2px',
+    }),
 };
 
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
 const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败' };
+
+// W3: 状态步骤定义
+const statusSteps = [
+    { key: 0, label: '📋 已创建' },
+    { key: 1, label: '⚙️ 执行中' },
+    { key: 2, label: '✅ 已完成' },
+];
 
 export default function TaskResultPage() {
     const params = new URLSearchParams(window.location.search);
@@ -29,7 +51,32 @@ export default function TaskResultPage() {
     const [task, setTask] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
+    const [polling, setPolling] = useState(false);  // W3: 是否正在轮询
 
+    // W3: 加载任务详情（提取为 useCallback 便于轮询复用）
+    const loadTask = useCallback(async (isPoll = false) => {
+        if (!isPoll) setLoading(true);
+        else setPolling(true);
+
+        try {
+            const res = await tasks.detail(tid);
+            if (res.code === 0) {
+                // apiserver 返回 { data: { task: {...} } }
+                const taskData = res.data?.task || res.data;
+                setTask(taskData);
+                setError('');
+            } else {
+                if (!isPoll) setError(res.message || '任务不存在');
+            }
+        } catch (err) {
+            if (!isPoll) setError('加载任务详情失败: ' + (err.message || '未知错误'));
+        } finally {
+            setLoading(false);
+            setPolling(false);
+        }
+    }, [tid]);
+
+    // 初始加载
     useEffect(() => {
         if (!tid) {
             setError('缺少任务 ID 参数');
@@ -37,23 +84,18 @@ export default function TaskResultPage() {
             return;
         }
         loadTask();
-    }, [tid]);
+    }, [tid, loadTask]);
 
-    const loadTask = async () => {
-        setLoading(true);
-        try {
-            const res = await tasks.detail(tid);
-            if (res.code === 0) {
-                setTask(res.data);
-            } else {
-                setError(res.message || '任务不存在');
-            }
-        } catch (err) {
-            setError('加载任务详情失败: ' + (err.message || '未知错误'));
-        } finally {
-            setLoading(false);
-        }
-    };
+    // W3: 任务未完成时 3 秒轮询
+    useEffect(() => {
+        if (!task || task.status >= 2) return;  // 已完成/失败 → 停止轮询
+
+        const interval = setInterval(() => {
+            loadTask(true);
+        }, 3000);
+
+        return () => clearInterval(interval);    // 组件卸载或状态变化时清理
+    }, [task?.status, loadTask]);
 
     if (loading) return <div style={styles.container}><p style={styles.loading}>⏳ 加载中...</p></div>;
     if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
@@ -61,10 +103,35 @@ export default function TaskResultPage() {
 
     const statusColor = statusColors[task.status] || '#999';
     const statusName = statusNames[task.status] || '未知';
+    const isRunning = task.status < 2;
 
     return (
         <div style={styles.container}>
             <h2>任务详情: {tid}</h2>
+
+            {/* W3: 轮询状态提示 */}
+            {isRunning && (
+                <div style={styles.pollingBar}>
+                    <span>🔄</span>
+                    <span>任务执行中，每 3 秒自动刷新状态...</span>
+                    {polling && <span style={{ fontSize: 11, opacity: 0.7 }}>刷新中</span>}
+                </div>
+            )}
+
+            {/* W3: 状态进度条 */}
+            <div style={styles.progressBar}>
+                {statusSteps.map((step, i) => (
+                    <div key={step.key} style={styles.progressStep(
+                        task.status === step.key,
+                        task.status > step.key
+                    )}>
+                        {step.label}
+                    </div>
+                ))}
+                {task.status === 3 && (
+                    <div style={styles.progressStep(true, false)}>❌ 失败</div>
+                )}
+            </div>
 
             {/* ===== 基本信息 ===== */}
             <div style={styles.card}>
@@ -92,11 +159,11 @@ export default function TaskResultPage() {
                         </tr>
                         <tr>
                             <td style={{ ...styles.td, fontWeight: 'bold' }}>开始时间</td>
-                            <td style={styles.td}>{task.begin_time || '-'}</td>
+                            <td style={styles.td}>{task.begin_time || (task.status >= 1 ? '已开始' : '等待中')}</td>
                         </tr>
                         <tr>
                             <td style={{ ...styles.td, fontWeight: 'bold' }}>结束时间</td>
-                            <td style={styles.td}>{task.end_time || '-'}</td>
+                            <td style={styles.td}>{task.end_time || (task.status >= 2 ? '已完成' : '进行中')}</td>
                         </tr>
                         <tr>
                             <td style={{ ...styles.td, fontWeight: 'bold' }}>采集参数</td>
@@ -112,7 +179,6 @@ export default function TaskResultPage() {
             <h3>🔥 火焰图</h3>
             <div style={styles.flameBox}>
                 {task.status === 2 ? (
-                    // 任务完成：尝试加载火焰图 SVG
                     task.flamegraph_url ? (
                         <iframe
                             src={task.flamegraph_url}
@@ -126,10 +192,16 @@ export default function TaskResultPage() {
                             <p style={{ fontSize: 12 }}>（analysis 服务运行后将自动生成）</p>
                         </div>
                     )
+                ) : task.status === 3 ? (
+                    <div>
+                        <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>❌</p>
+                        <p>任务执行失败，无法生成火焰图</p>
+                        {task.status_info && <p style={{ fontSize: 13, color: '#f44336' }}>原因: {task.status_info}</p>}
+                    </div>
                 ) : (
                     <div>
                         <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>⏳</p>
-                        <p>任务尚未完成，火焰图将在采集完成后生成</p>
+                        <p>任务执行中，火焰图将在采集完成后自动生成</p>
                     </div>
                 )}
             </div>
@@ -160,7 +232,7 @@ export default function TaskResultPage() {
                     </table>
                 ) : (
                     <p style={{ textAlign: 'center', padding: 40, color: '#999' }}>
-                        暂无热点数据，分析完成后将显示
+                        {task.status >= 2 ? '暂无热点数据，分析完成后将显示' : '任务完成后将自动分析热点函数'}
                     </p>
                 )}
             </div>
