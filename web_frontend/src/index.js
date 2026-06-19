@@ -11,20 +11,21 @@
 //   BrowserRouter            = 让 React 支持 URL 路由（多个页面）
 // ============================================================
 
-import React from 'react';                     // React 核心库
-import ReactDOM from 'react-dom/client';       // React 的 DOM 渲染器
-import { BrowserRouter } from 'react-router-dom'; // 路由库（让 URL 和页面关联）
-import App from './App';                       // 引入主组件
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+import ErrorBoundary from './components/ErrorBoundary';
 
-// 找到 HTML 中的 <div id="root"></div>
 const root = ReactDOM.createRoot(document.getElementById('root'));
 
-// 渲染整个应用
 root.render(
     <React.StrictMode>
-        {/* BrowserRouter 包裹整个应用，提供路由功能 */}
-        <BrowserRouter>
-            <App />  {/* 主组件：包含顶部导航 + 页面路由 */}
-        </BrowserRouter>
+        {/* ErrorBoundary 捕获子组件渲染错误，防止白屏 */}
+        <ErrorBoundary>
+            <BrowserRouter>
+                <App />
+            </BrowserRouter>
+        </ErrorBoundary>
     </React.StrictMode>
 );
