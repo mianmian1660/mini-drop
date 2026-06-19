@@ -279,7 +279,7 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 	})
 }
 
-// GetTaskDetail 获取任务详情
+// GetTaskDetail 获取任务详情（含产物下载链接）
 // GET /api/v1/tasks/:tid
 func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	tid := c.Param("tid")
@@ -293,9 +293,20 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		return
 	}
 
+	// W4: 如果存储已连接，列出该任务下的产物文件并生成下载链接
+	result := gin.H{"task": task}
+	if s.StorageConnected() {
+		files, err := s.listTaskFiles(tid)
+		if err != nil {
+			s.Logger.Warn("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
+		} else {
+			result["files"] = files
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
-		"data": task,
+		"data": result,
 	})
 }
 
@@ -413,7 +424,7 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 	})
 }
 
-// ListCOSFiles 列出任务产物文件
+// ListCOSFiles 列出任务产物文件并提供签名下载链接
 // GET /api/v1/cosfiles?tid=xxx
 func (s *APIServer) ListCOSFiles(c *gin.Context) {
 	tid := c.Query("tid")
@@ -425,13 +436,158 @@ func (s *APIServer) ListCOSFiles(c *gin.Context) {
 		return
 	}
 
-	// MVP 阶段：返回空列表，后续对接 MinIO
-	s.Logger.Info("查询产物文件", zap.String("tid", tid))
+	// 检查存储是否可用
+	if !s.StorageConnected() {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{
+				"files":  []interface{}{},
+				"notice": "对象存储未连接，文件列表不可用",
+			},
+		})
+		return
+	}
+
+	files, err := s.listTaskFiles(tid)
+	if err != nil {
+		s.Logger.Error("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":    500,
+			"message": "列出文件失败: " + err.Error(),
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": gin.H{
-			"files": []interface{}{},
+			"files": files,
+			"total": len(files),
+		},
+	})
+}
+
+// listTaskFiles 列出指定 tid 下的所有产物文件，并生成签名下载 URL
+func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	bucket := s.Config.Storage.Bucket
+	prefix := tid + "/" // MinIO 中以 tid/ 为前缀存放该任务的所有产物
+
+	objects, err := s.Storage.ListObjects(ctx, bucket, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	expireDuration := time.Duration(s.Config.Storage.PresignExpireSec) * time.Second
+
+	var files []map[string]interface{}
+	for _, obj := range objects {
+		fileInfo := map[string]interface{}{
+			"name":          obj.Name,
+			"size":          obj.Size,
+			"last_modified": obj.LastModified,
+			"content_type":  obj.ContentType,
+		}
+
+		// 生成预签名下载 URL
+		presignedURL, err := s.Storage.PresignedGetURL(ctx, bucket, obj.Name, expireDuration)
+		if err != nil {
+			s.Logger.Warn("生成签名 URL 失败",
+				zap.String("key", obj.Name),
+				zap.Error(err),
+			)
+			fileInfo["download_url"] = ""
+			fileInfo["url_error"] = err.Error()
+		} else {
+			fileInfo["download_url"] = presignedURL
+		}
+		files = append(files, fileInfo)
+	}
+
+	if files == nil {
+		files = []map[string]interface{}{}
+	}
+
+	return files, nil
+}
+
+// UploadTestFile 测试文件上传（W4 验收用）
+// POST /api/v1/cosfiles/upload
+// 上传一个文件到指定 tid 目录下，验证 MinIO 存储链路
+func (s *APIServer) UploadTestFile(c *gin.Context) {
+	tid := c.PostForm("tid")
+	if tid == "" {
+		tid = c.Query("tid")
+	}
+	if tid == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "缺少 tid 参数",
+		})
+		return
+	}
+
+	if !s.StorageConnected() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"code":    503,
+			"message": "对象存储未连接",
+		})
+		return
+	}
+
+	// 获取上传文件
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "读取上传文件失败: " + err.Error(),
+		})
+		return
+	}
+	defer file.Close()
+
+	// 构建对象路径：tid/filename
+	objectKey := fmt.Sprintf("%s/%s", tid, header.Filename)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	contentType := header.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	if err := s.Storage.PutObject(ctx, s.Config.Storage.Bucket, objectKey, file, header.Size, contentType); err != nil {
+		s.Logger.Error("文件上传失败",
+			zap.String("tid", tid),
+			zap.String("key", objectKey),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":    500,
+			"message": "文件上传失败: " + err.Error(),
+		})
+		return
+	}
+
+	// 生成下载签名 URL
+	expireDuration := time.Duration(s.Config.Storage.PresignExpireSec) * time.Second
+	downloadURL, _ := s.Storage.PresignedGetURL(ctx, s.Config.Storage.Bucket, objectKey, expireDuration)
+
+	s.Logger.Info("文件上传成功",
+		zap.String("tid", tid),
+		zap.String("key", objectKey),
+		zap.Int64("size", header.Size),
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"data": gin.H{
+			"key":          objectKey,
+			"size":         header.Size,
+			"download_url": downloadURL,
 		},
 	})
 }

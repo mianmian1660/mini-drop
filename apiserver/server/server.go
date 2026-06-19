@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,19 +19,21 @@ import (
 	"github.com/mini-drop/apiserver/config"
 	"github.com/mini-drop/apiserver/middleware"
 	"github.com/mini-drop/apiserver/model"
+	"github.com/mini-drop/apiserver/pkg/storage"
 	pb "github.com/mini-drop/apiserver/proto/control"
 	"github.com/mini-drop/apiserver/util"
 )
 
 // APIServer 是 HTTP 服务的顶层结构体
-// 持有数据库、日志、配置、gRPC 客户端等依赖
+// 持有数据库、日志、配置、gRPC 客户端、对象存储等依赖
 type APIServer struct {
-	DB        *gorm.DB
-	Logger    *zap.Logger
-	Config    *config.Config
-	Router    *gin.Engine
-	GRPCConn  *grpc.ClientConn       // gRPC 连接（到 drop_server）
-	ControlCli pb.ControlClient      // Control 服务客户端
+	DB         *gorm.DB
+	Logger     *zap.Logger
+	Config     *config.Config
+	Router     *gin.Engine
+	GRPCConn   *grpc.ClientConn       // gRPC 连接（到 drop_server）
+	ControlCli pb.ControlClient       // Control 服务客户端
+	Storage    storage.Storage        // 对象存储（MinIO）
 }
 
 // New 创建一个新的 APIServer 实例
@@ -50,6 +53,15 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 		Logger: logger,
 		Config: cfg,
 		Router: router,
+	}
+
+	// 初始化对象存储（MinIO）
+	if err := s.initStorage(); err != nil {
+		logger.Warn("MinIO 初始化失败（文件上传/签名功能不可用）",
+			zap.String("endpoint", cfg.Storage.Endpoint),
+			zap.Error(err),
+		)
+		// 不阻止启动，降级运行
 	}
 
 	// 初始化 gRPC 连接（连接失败不阻止启动，后续 CreateTask 会回退到仅写库模式）
@@ -101,6 +113,44 @@ func (s *APIServer) Close() {
 			s.Logger.Error("关闭 gRPC 连接失败", zap.Error(err))
 		}
 	}
+}
+
+// initStorage 初始化 MinIO 对象存储（W4）
+// 连接 MinIO 并确保 drop-data 桶存在
+func (s *APIServer) initStorage() error {
+	cfg := s.Config.Storage
+	if cfg.Endpoint == "" {
+		return fmt.Errorf("存储 endpoint 未配置")
+	}
+
+	minioStore, err := storage.NewMinIOStorage(
+		cfg.Endpoint,
+		cfg.AccessKey,
+		cfg.SecretKey,
+		cfg.UseSSL,
+	)
+	if err != nil {
+		return fmt.Errorf("连接 MinIO 失败: %w", err)
+	}
+
+	// 确保 bucket 存在
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := minioStore.EnsureBucket(ctx, cfg.Bucket); err != nil {
+		return fmt.Errorf("创建 Bucket 失败: %w", err)
+	}
+
+	s.Storage = minioStore
+	s.Logger.Info("MinIO 存储初始化成功",
+		zap.String("endpoint", cfg.Endpoint),
+		zap.String("bucket", cfg.Bucket),
+	)
+	return nil
+}
+
+// StorageConnected 返回对象存储是否已连接
+func (s *APIServer) StorageConnected() bool {
+	return s.Storage != nil
 }
 
 // GrpcConnected 返回 gRPC 是否已连接
@@ -188,11 +238,12 @@ func (s *APIServer) registerRoutes() {
 		api.DELETE("/tasks/:tid", s.DeleteTask)
 		api.POST("/tasks/:tid/retry", s.RetryTask)
 
-		// 文件管理
+		// 文件管理（W4: MinIO 存储集成）
 		api.GET("/cosfiles", s.ListCOSFiles)
+		api.POST("/cosfiles/upload", s.UploadTestFile)
 	}
 
 	s.Logger.Info("路由注册完成",
-		zap.Int("api_count", 11),
+		zap.Int("api_count", 12),
 	)
 }
