@@ -72,6 +72,9 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 启动任务状态轮询器（W3：定期检查 Running 任务是否应标记为完成）
 	go s.startTaskPoller()
 
+	// W3: 启动 Agent 自动发现（每 30 秒同步一次）
+	go s.startAgentDiscoverer()
+
 	// 初始化定时任务调度器（W5：恢复 DB 中的 cron 任务并启动）
 	s.initCron()
 
@@ -79,7 +82,7 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	return s
 }
 
-// initGRPC 初始化到 drop_server 的 gRPC 连接（非阻塞）
+// initGRPC 初始化到 drop_server 的 gRPC 连接（非阻塞，带重试）
 // 连接在后台进行，HTTP 服务立即启动
 func (s *APIServer) initGRPC() {
 	// 先标记为未连接，后台 goroutine 连接成功后更新
@@ -87,25 +90,37 @@ func (s *APIServer) initGRPC() {
 	s.ControlCli = nil
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.Config.GRPC.TimeoutSec)*time.Second)
-		defer cancel()
+		// 重试连接，最多尝试 10 次，每次间隔 2 秒
+		for i := 0; i < 10; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.Config.GRPC.TimeoutSec)*time.Second)
 
-		conn, err := grpc.DialContext(ctx,
-			s.Config.GRPC.Addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
-		)
-		if err != nil {
-			s.Logger.Warn("gRPC 连接 drop_server 失败（任务将仅写库，不下发）",
+			conn, err := grpc.DialContext(ctx,
+				s.Config.GRPC.Addr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithBlock(),
+			)
+			cancel()
+
+			if err != nil {
+				s.Logger.Warn("gRPC 连接 drop_server 失败，将重试...",
+					zap.String("addr", s.Config.GRPC.Addr),
+					zap.Int("attempt", i+1),
+					zap.Error(err),
+				)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			s.GRPCConn = conn
+			s.ControlCli = pb.NewControlClient(conn)
+			s.Logger.Info("gRPC 连接 drop_server 成功",
 				zap.String("addr", s.Config.GRPC.Addr),
-				zap.Error(err),
+				zap.Int("attempts", i+1),
 			)
 			return
 		}
 
-		s.GRPCConn = conn
-		s.ControlCli = pb.NewControlClient(conn)
-		s.Logger.Info("gRPC 连接 drop_server 成功",
+		s.Logger.Error("gRPC 连接 drop_server 最终失败（任务将仅写库，不下发）",
 			zap.String("addr", s.Config.GRPC.Addr),
 		)
 	}()
@@ -217,6 +232,69 @@ func (s *APIServer) pollRunningTasks() {
 				zap.String("tid", task.TID),
 				zap.String("name", task.Name),
 			)
+		}
+	}
+}
+
+// startAgentDiscoverer 后台 Agent 自动发现（W3: 每 30 秒通过 gRPC 探测在线 Agent）
+func (s *APIServer) startAgentDiscoverer() {
+	// 启动后等待 gRPC 连接建立
+	time.Sleep(5 * time.Second)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if s.ControlCli == nil {
+			continue
+		}
+
+		// 获取 DB 中已有的 Agent IP 列表
+		var agents []model.AgentInfo
+		if err := s.DB.Select("ip_addr").Find(&agents).Error; err != nil {
+			continue
+		}
+
+		ips := map[string]bool{"127.0.0.1": true}
+		for _, a := range agents {
+			ips[a.IPAddr] = true
+		}
+
+		for ip := range ips {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			req := &pb.StatAgentRequest{TargetIP: ip}
+			resp, err := s.ControlCli.StatAgent(ctx, req)
+			cancel()
+
+			if err != nil || resp.GetCode() != 0 {
+				// Agent 不可达 → 标记离线
+				s.DB.Model(&model.AgentInfo{}).
+					Where("ip_addr = ?", ip).
+					Update("online", false)
+				continue
+			}
+
+			// Agent 在线 → 更新或创建
+			var existing model.AgentInfo
+			result := s.DB.Where("ip_addr = ?", ip).First(&existing)
+			now := time.Now()
+			if result.Error == nil {
+				s.DB.Model(&existing).Updates(map[string]interface{}{
+					"online":    true,
+					"last_seen": now,
+				})
+			} else {
+				agent := model.AgentInfo{
+					Hostname:    ip,
+					IPAddr:      ip,
+					Online:      true,
+					Version:     "1.0.0",
+					Environment: "production",
+					LastSeen:    now,
+				}
+				s.DB.Create(&agent)
+				s.Logger.Info("自动发现新 Agent", zap.String("ip", ip))
+			}
 		}
 	}
 }
