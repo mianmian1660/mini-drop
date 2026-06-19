@@ -80,7 +80,7 @@ services:
     build:
       context: ./drop
       dockerfile: Dockerfile
-    command: ./drop_agent drop_server:50051 # 启动后连接 drop_server
+    command: ./drop_agent localhost:50051 # network_mode=host 时用 localhost 访问 drop_server
     network_mode: host # 使用宿主机网络（需要 perf 权限）
     privileged: true # 特权模式（perf 需要）
     pid: host # 使用宿主机 PID 命名空间
