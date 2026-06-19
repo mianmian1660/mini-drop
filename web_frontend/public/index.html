@@ -5,6 +5,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Mini-Drop 性能分析平台</title>
+    <!--
+      运行时配置：必须在 React 加载之前执行
+      window.config 被 api/client.js 读取，决定后端地址
+    -->
+    <script src="%PUBLIC_URL%/config.js"></script>
 </head>
 
 <body>
