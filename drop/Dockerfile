@@ -21,7 +21,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    pkg-config \
     protobuf-compiler \
+    protobuf-compiler-grpc \
     libprotobuf-dev \
     libgrpc++-dev \
     libgrpc-dev \
@@ -30,10 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY . .
 
-# CMake 构建：
-#   cmake ..        = 生成 Makefile
-#   make -j$(nproc) = 用所有 CPU 核心并行编译
-RUN mkdir -p build && cd build && cmake .. && make -j$(nproc)
+# CMake 构建（先清理本地残留的 CMakeCache，避免路径冲突）
+RUN rm -rf build && mkdir -p build && cd build && cmake .. && make -j$(nproc)
 
 # ---------- 阶段2：运行 ----------
 FROM ubuntu:22.04
