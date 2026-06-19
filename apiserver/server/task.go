@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -226,18 +227,29 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
 	})
 }
 
-// ListTasks 获取任务列表
-// GET /api/v1/tasks?page=1&pageSize=20&status=0
+// ListTasks 获取任务列表（支持分页、搜索、状态筛选）
+// GET /api/v1/tasks?page=1&pageSize=20&status=0&keyword=xxx
 func (s *APIServer) ListTasks(c *gin.Context) {
-	// 分页参数
+	// 分页参数（从 query string 解析，带默认值）
 	page := 1
 	pageSize := 20
-	// 简化分页获取（后续可用 query 参数）
+	if p, err := strconv.Atoi(c.DefaultQuery("page", "1")); err == nil && p > 0 {
+		page = p
+	}
+	if ps, err := strconv.Atoi(c.DefaultQuery("pageSize", "20")); err == nil && ps > 0 && ps <= 100 {
+		pageSize = ps
+	}
 
 	var tasks []model.HotmethodTask
 	var total int64
 
 	query := s.DB.Model(&model.HotmethodTask{})
+
+	// 按关键词搜索（任务名称 / 任务 ID）
+	if keyword := c.Query("keyword"); keyword != "" {
+		like := "%" + keyword + "%"
+		query = query.Where("name LIKE ? OR tid LIKE ? OR target_ip LIKE ?", like, like, like)
+	}
 
 	// 按状态筛选
 	if status := c.Query("status"); status != "" {
