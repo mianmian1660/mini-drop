@@ -1,0 +1,6 @@
+# Docker 构建时忽略这些文件，减少构建上下文大小
+node_modules
+build
+.git
+*.md
+.DS_Store
