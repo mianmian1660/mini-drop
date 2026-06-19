@@ -55,10 +55,22 @@ client.interceptors.response.use(
     (error) => {
         // 401 鉴权失败 → 跳转登录
         if (error.response?.status === 401) {
-            // 记录当前页面，登录后跳回来
             const redirect = encodeURIComponent(window.location.href);
             window.location.href = '/login?redirect=' + redirect;
         }
+
+        // W5: 网络错误 → 附加友好消息
+        if (!error.response) {
+            // 无响应 = 网络不通或后端未启动
+            error.userMessage = '无法连接到后端服务，请确认 apiserver 已启动';
+        } else if (error.response.status >= 500) {
+            error.userMessage = '服务器内部错误，请稍后重试';
+        } else if (error.response.status === 404) {
+            error.userMessage = '请求的资源不存在';
+        } else if (error.response.status === 403) {
+            error.userMessage = '没有权限执行此操作';
+        }
+
         return Promise.reject(error);
     }
 );
