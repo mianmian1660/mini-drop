@@ -310,8 +310,61 @@ def _upload_output(storage, bucket: str, tid: str,
         return ""
 
 
+def _save_local_output(local_dir: str, filename: str, content) -> str:
+    """
+    保存分析产物到本地目录（MinIO 不可用时的降级方案）
+
+    返回: 本地文件路径，失败返回空字符串
+    """
+    if not local_dir:
+        return ""
+
+    try:
+        os.makedirs(local_dir, exist_ok=True)
+        filepath = os.path.join(local_dir, filename)
+
+        if isinstance(content, str):
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+        elif isinstance(content, bytes):
+            with open(filepath, "wb") as f:
+                f.write(content)
+        else:
+            import json
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(content, f, ensure_ascii=False, indent=2)
+
+        print(f"[analysis] 本地保存: {filepath}", file=sys.stderr)
+        return filepath
+    except Exception as e:
+        print(f"[analysis] 本地保存 {filename} 失败: {e}", file=sys.stderr)
+        return ""
+
+
+def _get_presigned_url(storage, bucket: str, key: str,
+                       expire_sec: int = 900) -> str:
+    """
+    获取预签名下载 URL
+
+    返回: URL 字符串，失败返回空字符串
+    """
+    if storage is None or not key:
+        return ""
+
+    try:
+        url = storage.presigned_get_url(bucket, key, expire_sec)
+        if url:
+            print(f"[analysis] 预签名 URL: {key}", file=sys.stderr)
+            return url
+        return ""
+    except Exception as e:
+        print(f"[analysis] 生成预签名 URL 失败 ({key}): {e}", file=sys.stderr)
+        return ""
+
+
 def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
-                            bucket: str, tid: str) -> list:
+                            bucket: str, tid: str,
+                            local_dir: str = "") -> dict:
     """
     CPU 火焰图分析（task_type=0）
 
@@ -319,10 +372,12 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
       1. 从 MinIO 下载 perf.data
       2. perf script → stackcollapse → flamegraph.pl → SVG
       3. 解析折叠栈 → TopN 热点 JSON
-      4. 上传产物（flamegraph.svg / folded.txt / top.json）到 MinIO
-      5. 写 Top5 热点到 analysis_suggestions 表
+      4. 规则建议引擎 → suggestions.md
+      5. 上传产物到 MinIO（或保存到本地 local_dir）
+      6. 生成预签名 URL（MinIO 可用时）
+      7. 写结果到 analysis_suggestions 表
 
-    返回: 产物 URL/key 列表
+    返回: {"outputs": [...], "presigned_urls": {...}, "local_files": [...]}
     """
     outputs = []
 
@@ -382,21 +437,45 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
         except Exception as e:
             print(f"[analysis] 热点分析失败: {e}", file=sys.stderr)
 
-    # --- 6. 上传产物到 MinIO ---
+    # --- 6. 上传产物到 MinIO / 保存到本地 ---
+    presigned_urls = {}
+    local_files = []
+
+    # 火焰图 SVG
     svg_key = _upload_output(storage, bucket, tid,
                              "flamegraph.svg", svg_content, "image/svg+xml")
     if svg_key:
         outputs.append(svg_key)
+        presigned_urls["flamegraph.svg"] = _get_presigned_url(storage, bucket, svg_key)
+    else:
+        local_path = _save_local_output(local_dir, f"{tid}_flamegraph.svg", svg_content)
+        if local_path:
+            local_files.append(local_path)
+            outputs.append(local_path)
 
+    # 折叠栈
     folded_key = _upload_output(storage, bucket, tid,
                                 "folded.txt", folded_text, "text/plain")
     if folded_key:
         outputs.append(folded_key)
+        presigned_urls["folded.txt"] = _get_presigned_url(storage, bucket, folded_key)
+    else:
+        local_path = _save_local_output(local_dir, f"{tid}_folded.txt", folded_text)
+        if local_path:
+            local_files.append(local_path)
+            outputs.append(local_path)
 
+    # TopN JSON
     top_key = _upload_output(storage, bucket, tid,
                              "top.json", top_json, "application/json")
     if top_key:
         outputs.append(top_key)
+        presigned_urls["top.json"] = _get_presigned_url(storage, bucket, top_key)
+    else:
+        local_path = _save_local_output(local_dir, f"{tid}_top.json", top_json)
+        if local_path:
+            local_files.append(local_path)
+            outputs.append(local_path)
 
     # --- 7. 规则建议引擎：匹配热点函数 → 生成优化建议 ---
     suggestions_result = {}
@@ -416,7 +495,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                   f"{len(suggestions_result.get('suggestions', []))} 条建议",
                   file=sys.stderr)
 
-            # 上传 suggestions.md
+            # 上传/保存 suggestions.md
             md_content = suggestions_result.get("suggestions_md", "")
             if md_content:
                 md_key = _upload_output(storage, bucket, tid,
@@ -424,8 +503,16 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                                         "text/markdown")
                 if md_key:
                     outputs.append(md_key)
+                    presigned_urls["suggestions.md"] = _get_presigned_url(
+                        storage, bucket, md_key)
+                else:
+                    local_path = _save_local_output(
+                        local_dir, f"{tid}_suggestions.md", md_content)
+                    if local_path:
+                        local_files.append(local_path)
+                        outputs.append(local_path)
 
-            # 上传 suggestions.json
+            # 上传/保存 suggestions.json
             sugg_json = {
                 "suggestions": suggestions_result.get("suggestions", []),
                 "rules_loaded": suggestions_result.get("rules_loaded", 0),
@@ -435,6 +522,14 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                                       "application/json")
             if sugg_key:
                 outputs.append(sugg_key)
+                presigned_urls["suggestions.json"] = _get_presigned_url(
+                    storage, bucket, sugg_key)
+            else:
+                local_path = _save_local_output(
+                    local_dir, f"{tid}_suggestions.json", sugg_json)
+                if local_path:
+                    local_files.append(local_path)
+                    outputs.append(local_path)
 
             # 写入 Top5 匹配到的建议到 analysis_suggestions 表
             matched = suggestions_result.get("suggestions", [])
@@ -456,25 +551,33 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                           f"建议人工审查是否存在优化空间")
             insert_suggestion(conn, tid, func_name, suggestion)
 
-    print(f"[analysis] CPU 火焰图分析完成: {len(outputs)} 个产物", file=sys.stderr)
-    return outputs
+    print(f"[analysis] CPU 火焰图分析完成: {len(outputs)} 个产物 "
+          f"(MinIO: {len(presigned_urls)}, 本地: {len(local_files)})",
+          file=sys.stderr)
+
+    return {
+        "outputs": outputs,
+        "presigned_urls": presigned_urls,
+        "local_files": local_files,
+    }
 
 
 def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
-                          bucket: str, tid: str, task_type: int) -> list:
+                          bucket: str, tid: str, task_type: int,
+                          local_dir: str = "") -> dict:
     """
     根据任务类型执行对应的分析逻辑
 
-    返回: 产物 URL/key 列表
+    返回: {"outputs": [...], "presigned_urls": {...}, "local_files": [...]}
     """
-    outputs = []
+    result = {"outputs": [], "presigned_urls": {}, "local_files": []}
 
     # ---------- 按 task_type 分发分析 ----------
     try:
         if task_type == TASK_TYPE_GENERIC:
             # CPU 火焰图：perf script → stackcollapse → flamegraph.pl → SVG
-            outputs = _analyze_cpu_flamegraph(conn, storage_cfg, task,
-                                              bucket, tid)
+            result = _analyze_cpu_flamegraph(conn, storage_cfg, task,
+                                             bucket, tid, local_dir)
 
         elif task_type == TASK_TYPE_JAVA:
             # W5 将实现: async-profiler 折叠栈解析
@@ -498,7 +601,7 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
                    f"分析过程异常: {e}",
                    traceback.format_exc())
 
-    return outputs
+    return result
 
 
 def main():
@@ -522,6 +625,8 @@ def main():
                         help="任务类型: 0=CPU火焰图 1=Java 2=Tracing 4=内存 6=Java堆")
     parser.add_argument("--config", default="/etc/analysis/config.ini",
                         help="配置文件路径（默认 /etc/analysis/config.ini）")
+    parser.add_argument("--local-output-dir", default="",
+                        help="本地输出目录（MinIO 不可用时将结果保存到此目录）")
     args = parser.parse_args()
 
     print(f"[analysis] ========================================", file=sys.stderr)
@@ -546,9 +651,10 @@ def main():
         update_analysis_status(conn, args.task_id, 1, "分析中")
 
         # ---------- 6. 执行分析 ----------
-        outputs = run_analysis_for_type(
+        analysis_result = run_analysis_for_type(
             conn, storage_cfg, task, bucket,
-            args.task_id, args.task_type
+            args.task_id, args.task_type,
+            local_dir=args.local_output_dir,
         )
 
         # ---------- 7. 标记分析完成 ----------
@@ -559,7 +665,9 @@ def main():
             "task_id": args.task_id,
             "status": "success",
             "analysis_status": 2,
-            "outputs": outputs,
+            "outputs": analysis_result.get("outputs", []),
+            "presigned_urls": analysis_result.get("presigned_urls", {}),
+            "local_files": analysis_result.get("local_files", []),
         }
         exit_ok(result)
 
