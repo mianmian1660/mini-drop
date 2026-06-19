@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,6 +35,7 @@ type APIServer struct {
 	GRPCConn   *grpc.ClientConn       // gRPC 连接（到 drop_server）
 	ControlCli pb.ControlClient       // Control 服务客户端
 	Storage    storage.Storage        // 对象存储（MinIO）
+	Cron       *cron.Cron             // 定时任务调度器（W5）
 }
 
 // New 创建一个新的 APIServer 实例
@@ -69,6 +71,9 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 
 	// 启动任务状态轮询器（W3：定期检查 Running 任务是否应标记为完成）
 	go s.startTaskPoller()
+
+	// 初始化定时任务调度器（W5：恢复 DB 中的 cron 任务并启动）
+	s.initCron()
 
 	s.registerRoutes()
 	return s
@@ -106,8 +111,11 @@ func (s *APIServer) initGRPC() {
 	}()
 }
 
-// Close 关闭资源（gRPC 连接等）
+// Close 关闭资源（gRPC 连接、cron 调度器等）
 func (s *APIServer) Close() {
+	if s.Cron != nil {
+		s.Cron.Stop()
+	}
 	if s.GRPCConn != nil {
 		if err := s.GRPCConn.Close(); err != nil {
 			s.Logger.Error("关闭 gRPC 连接失败", zap.Error(err))
@@ -241,9 +249,24 @@ func (s *APIServer) registerRoutes() {
 		// 文件管理（W4: MinIO 存储集成）
 		api.GET("/cosfiles", s.ListCOSFiles)
 		api.POST("/cosfiles/upload", s.UploadTestFile)
+
+		// 用户组管理（W5）
+		api.POST("/groups", s.CreateGroup)
+		api.GET("/groups", s.ListGroups)
+		api.GET("/groups/:gid", s.GetGroupDetail)
+		api.PUT("/groups/:gid", s.UpdateGroup)
+		api.DELETE("/groups/:gid", s.DeleteGroup)
+		api.POST("/groups/:gid/members", s.AddGroupMember)
+		api.DELETE("/groups/:gid/members/:uid", s.RemoveGroupMember)
+
+		// 定时任务管理（W5）
+		api.POST("/schedule/task", s.CreateSchedule)
+		api.GET("/schedule/tasks", s.ListSchedules)
+		api.DELETE("/schedule/:sid", s.DeleteSchedule)
+		api.POST("/schedule/:sid/toggle", s.ToggleSchedule)
 	}
 
 	s.Logger.Info("路由注册完成",
-		zap.Int("api_count", 12),
+		zap.Int("api_count", 21),
 	)
 }

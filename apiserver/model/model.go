@@ -87,10 +87,12 @@ type MultiTask struct {
 // Group — 用户组表
 // ----------------------------------------------------------
 type Group struct {
-	ID      uint   `gorm:"primaryKey" json:"id"`
-	GID     string `gorm:"column:gid;uniqueIndex;size:64" json:"gid"`
-	Name    string `gorm:"column:name;size:128" json:"name"`
-	OwnerID string `gorm:"column:owner_id;size:64" json:"owner_id"`
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	GID       string    `gorm:"column:gid;uniqueIndex;size:64" json:"gid"`
+	Name      string    `gorm:"column:name;size:128" json:"name"`
+	OwnerID   string    `gorm:"column:owner_id;size:64" json:"owner_id"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 // ----------------------------------------------------------
@@ -114,6 +116,28 @@ type AnalysisSuggestion struct {
 }
 
 // ----------------------------------------------------------
+// ScheduleTask — 定时任务表（W5）
+// ----------------------------------------------------------
+type ScheduleTask struct {
+	ID           uint           `gorm:"primaryKey" json:"id"`
+	SID          string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
+	Name         string         `gorm:"column:name;size:256" json:"name"`
+	CronExpr     string         `gorm:"column:cron_expr;size:128" json:"cron_expr"`       // cron 表达式
+	TaskType     uint32         `gorm:"column:task_type;default:0" json:"task_type"`
+	ProfilerType uint32         `gorm:"column:profiler_type;default:0" json:"profiler_type"`
+	TargetIP     string         `gorm:"column:target_ip;size:45" json:"target_ip"`
+	RequestParams []byte        `gorm:"column:request_params;type:jsonb" json:"request_params"`
+	Enabled      bool           `gorm:"column:enabled;default:true" json:"enabled"`
+	LastRunAt    *time.Time     `gorm:"column:last_run_at" json:"last_run_at"`
+	NextRunAt    *time.Time     `gorm:"column:next_run_at" json:"next_run_at"`
+	UID          string         `gorm:"column:uid;size:64" json:"uid"`
+	UserName     string         `gorm:"column:user_name;size:128" json:"user_name"`
+	CreatedAt    time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt    time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt    gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+// ----------------------------------------------------------
 // AutoMigrate：一键创建/更新所有表
 // 调用这个方法，GORM 会检查每张表是否存在：
 //   不存在 → 创建
@@ -129,5 +153,6 @@ func AutoMigrate(db *gorm.DB) error {
 		&Group{},
 		&GroupMember{},
 		&AnalysisSuggestion{},
+		&ScheduleTask{},
 	)
 }
