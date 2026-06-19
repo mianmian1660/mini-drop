@@ -324,9 +324,10 @@ func (s *APIServer) registerRoutes() {
 		api.DELETE("/tasks/:tid", s.DeleteTask)
 		api.POST("/tasks/:tid/retry", s.RetryTask)
 
-		// 文件管理（W4: MinIO 存储集成）
+		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)
 		api.POST("/cosfiles/upload", s.UploadTestFile)
+		api.GET("/files/:filename", s.ServeLocalFile)  // W4: 本地文件服务
 
 		// 用户组管理（W5）
 		api.POST("/groups", s.CreateGroup)

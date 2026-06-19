@@ -10,7 +10,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -438,6 +441,7 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 
 // ListCOSFiles 列出任务产物文件并提供签名下载链接
 // GET /api/v1/cosfiles?tid=xxx
+// W4: MinIO 不可用时回退到本地文件系统
 func (s *APIServer) ListCOSFiles(c *gin.Context) {
 	tid := c.Query("tid")
 	if tid == "" {
@@ -448,35 +452,141 @@ func (s *APIServer) ListCOSFiles(c *gin.Context) {
 		return
 	}
 
-	// 检查存储是否可用
-	if !s.StorageConnected() {
-		c.JSON(http.StatusOK, gin.H{
-			"code": 0,
-			"data": gin.H{
-				"files":  []interface{}{},
-				"notice": "对象存储未连接，文件列表不可用",
-			},
-		})
-		return
+	var files []map[string]interface{}
+	var notice string
+
+	// 优先 MinIO，不可用时回退到本地文件
+	if s.StorageConnected() {
+		var err error
+		files, err = s.listTaskFiles(tid)
+		if err != nil {
+			s.Logger.Error("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code":    500,
+				"message": "列出文件失败: " + err.Error(),
+			})
+			return
+		}
+	} else {
+		// W4: MinIO 不可用 → 扫描本地输出目录
+		files = s.listLocalFiles(tid)
+		if len(files) > 0 {
+			notice = "使用本地文件（MinIO 未连接）"
+		} else {
+			notice = "对象存储未连接，本地也无产物文件"
+		}
 	}
 
-	files, err := s.listTaskFiles(tid)
-	if err != nil {
-		s.Logger.Error("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code":    500,
-			"message": "列出文件失败: " + err.Error(),
-		})
-		return
+	response := gin.H{
+		"files": files,
+		"total": len(files),
+	}
+	if notice != "" {
+		response["notice"] = notice
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
-		"data": gin.H{
-			"files": files,
-			"total": len(files),
-		},
+		"data": response,
 	})
+}
+
+// listLocalFiles 列出本地输出目录中的产物文件（MinIO 降级方案）
+// 本地目录: /tmp/drop-output/
+// 文件命名: <tid>_flamegraph.svg, <tid>_top.json 等
+func (s *APIServer) listLocalFiles(tid string) []map[string]interface{} {
+	localDir := "/tmp/drop-output"
+	entries, err := os.ReadDir(localDir)
+	if err != nil {
+		return []map[string]interface{}{}
+	}
+
+	prefix := tid + "_"
+	var files []map[string]interface{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		filename := entry.Name()
+		if !strings.HasPrefix(filename, prefix) {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		// 生成本地下载 URL
+		downloadURL := fmt.Sprintf("/api/v1/files/%s", filename)
+
+		files = append(files, map[string]interface{}{
+			"name":          filename,
+			"size":          info.Size(),
+			"last_modified": info.ModTime(),
+			"content_type":  mimeType(filename),
+			"download_url":  downloadURL,
+			"source":        "local",
+		})
+	}
+
+	return files
+}
+
+// ServeLocalFile 提供本地文件下载（MinIO 降级方案）
+// GET /api/v1/files/:filename
+func (s *APIServer) ServeLocalFile(c *gin.Context) {
+	filename := c.Param("filename")
+
+	// 安全检查：防止目录穿越
+	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "非法路径"})
+		return
+	}
+
+	localPath := filepath.Join("/tmp/drop-output", filename)
+
+	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "文件不存在: " + filename})
+		return
+	}
+
+	ext := filepath.Ext(filename)
+	switch ext {
+	case ".svg":
+		c.Header("Content-Type", "image/svg+xml")
+	case ".json":
+		c.Header("Content-Type", "application/json")
+	case ".md":
+		c.Header("Content-Type", "text/markdown; charset=utf-8")
+	case ".txt":
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+	default:
+		c.Header("Content-Type", "application/octet-stream")
+	}
+	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filename))
+	c.File(localPath)
+}
+
+// mimeType 根据文件扩展名返回 MIME 类型
+func mimeType(filename string) string {
+	ext := filepath.Ext(filename)
+	switch ext {
+	case ".svg":
+		return "image/svg+xml"
+	case ".json":
+		return "application/json"
+	case ".md":
+		return "text/markdown"
+	case ".txt":
+		return "text/plain"
+	case ".html":
+		return "text/html"
+	case ".png":
+		return "image/png"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // listTaskFiles 列出指定 tid 下的所有产物文件，并生成签名下载 URL
