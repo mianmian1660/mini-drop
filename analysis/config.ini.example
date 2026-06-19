@@ -1,0 +1,44 @@
+# ============================================================
+# config.ini — 分析引擎配置文件示例
+# ============================================================
+# 将此文件复制为 config.ini 并修改配置项
+# 所有配置项均可通过环境变量覆盖（优先级更高）
+#
+# 用法:
+#   cp config.ini.example config.ini
+#   python3 hotmethod_analyzer.py --task-id xxx --config ./config.ini
+# ============================================================
+
+# ----------------------------------------------------------
+# 数据库配置（PostgreSQL）
+# ----------------------------------------------------------
+[database]
+# PostgreSQL 连接串，格式: host=... user=... password=... dbname=... sslmode=disable
+# 环境变量覆盖: PG_DSN
+dsn = host=localhost user=postgres password=dev dbname=drop sslmode=disable
+
+# ----------------------------------------------------------
+# 对象存储配置（MinIO / COS）
+# ----------------------------------------------------------
+[storage]
+# MinIO 服务地址
+# 环境变量覆盖: S3_ENDPOINT
+endpoint = localhost:9000
+
+# 访问密钥
+# 环境变量覆盖: S3_ACCESS_KEY
+access_key = drop
+
+# 秘密密钥
+# 环境变量覆盖: S3_SECRET_KEY
+secret_key = dropdrop
+
+# 是否使用 HTTPS（true / false）
+use_ssl = false
+
+# 存储桶名称
+# 环境变量覆盖: S3_BUCKET
+bucket = drop-data
+
+# 预签名 URL 有效期（秒），默认 15 分钟
+presign_expire_sec = 900
