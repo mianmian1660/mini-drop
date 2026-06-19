@@ -1,0 +1,169 @@
+// ============================================================
+// pages/TaskResultPage.js — 任务详情页（/task/result?tid=xxx）
+// ============================================================
+// 功能：基本信息 + 火焰图（iframe/占位） + 热点 TopN
+// ============================================================
+
+import React, { useState, useEffect } from 'react';
+import { tasks } from '../api';
+
+const styles = {
+    container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
+    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
+    table: { width: '100%', borderCollapse: 'collapse' },
+    th: { textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid #e0e0e0', color: '#666', fontSize: 13 },
+    td: { padding: '12px 16px', borderBottom: '1px solid #f0f0f0', fontSize: 14 },
+    badge: { padding: '2px 8px', borderRadius: 10, fontSize: 12, fontWeight: 'bold' },
+    loading: { textAlign: 'center', padding: 60, color: '#999' },
+    error: { textAlign: 'center', padding: 60, color: '#f44336' },
+    flameBox: { textAlign: 'center', padding: 40, background: '#f5f5fa', color: '#999', borderRadius: 8, minHeight: 300 },
+};
+
+const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
+const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败' };
+
+export default function TaskResultPage() {
+    const params = new URLSearchParams(window.location.search);
+    const tid = params.get('tid');
+
+    const [task, setTask] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+
+    useEffect(() => {
+        if (!tid) {
+            setError('缺少任务 ID 参数');
+            setLoading(false);
+            return;
+        }
+        loadTask();
+    }, [tid]);
+
+    const loadTask = async () => {
+        setLoading(true);
+        try {
+            const res = await tasks.detail(tid);
+            if (res.code === 0) {
+                setTask(res.data);
+            } else {
+                setError(res.message || '任务不存在');
+            }
+        } catch (err) {
+            setError('加载任务详情失败: ' + (err.message || '未知错误'));
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    if (loading) return <div style={styles.container}><p style={styles.loading}>⏳ 加载中...</p></div>;
+    if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
+    if (!task) return <div style={styles.container}><p style={styles.error}>任务不存在</p></div>;
+
+    const statusColor = statusColors[task.status] || '#999';
+    const statusName = statusNames[task.status] || '未知';
+
+    return (
+        <div style={styles.container}>
+            <h2>任务详情: {tid}</h2>
+
+            {/* ===== 基本信息 ===== */}
+            <div style={styles.card}>
+                <h3>基本信息</h3>
+                <table style={styles.table}>
+                    <tbody>
+                        <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold', width: 120 }}>任务名称</td>
+                            <td style={styles.td}>{task.name || '-'}</td>
+                        </tr>
+                        <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold' }}>状态</td>
+                            <td style={styles.td}>
+                                <span style={{ ...styles.badge, background: statusColor, color: '#fff' }}>{statusName}</span>
+                                {task.status_info && <span style={{ marginLeft: 8, color: '#999', fontSize: 13 }}>({task.status_info})</span>}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold' }}>目标 IP</td>
+                            <td style={styles.td}>{task.target_ip || '-'}</td>
+                        </tr>
+                        <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold' }}>创建时间</td>
+                            <td style={styles.td}>{task.create_time || '-'}</td>
+                        </tr>
+                        <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold' }}>开始时间</td>
+                            <td style={styles.td}>{task.begin_time || '-'}</td>
+                        </tr>
+                        <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold' }}>结束时间</td>
+                            <td style={styles.td}>{task.end_time || '-'}</td>
+                        </tr>
+                        <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold' }}>采集参数</td>
+                            <td style={styles.td}>
+                                {task.request_params ? JSON.stringify(task.request_params) : '-'}
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            {/* ===== 火焰图 ===== */}
+            <h3>🔥 火焰图</h3>
+            <div style={styles.flameBox}>
+                {task.status === 2 ? (
+                    // 任务完成：尝试加载火焰图 SVG
+                    task.flamegraph_url ? (
+                        <iframe
+                            src={task.flamegraph_url}
+                            title="火焰图"
+                            style={{ width: '100%', height: 400, border: 'none' }}
+                        />
+                    ) : (
+                        <div>
+                            <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>📊</p>
+                            <p>任务已完成，等待分析引擎生成火焰图...</p>
+                            <p style={{ fontSize: 12 }}>（analysis 服务运行后将自动生成）</p>
+                        </div>
+                    )
+                ) : (
+                    <div>
+                        <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>⏳</p>
+                        <p>任务尚未完成，火焰图将在采集完成后生成</p>
+                    </div>
+                )}
+            </div>
+
+            {/* ===== 热点 TopN ===== */}
+            <h3>🔥 热点 TopN</h3>
+            <div style={styles.card}>
+                {task.top_functions && task.top_functions.length > 0 ? (
+                    <table style={styles.table}>
+                        <thead>
+                            <tr>
+                                <th style={styles.th}>#</th>
+                                <th style={styles.th}>函数名</th>
+                                <th style={styles.th}>采样次数</th>
+                                <th style={styles.th}>占比</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {task.top_functions.map((f, i) => (
+                                <tr key={i}>
+                                    <td style={styles.td}>{i + 1}</td>
+                                    <td style={styles.td}>{f.name}</td>
+                                    <td style={styles.td}>{f.samples}</td>
+                                    <td style={styles.td}>{f.percent}%</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                ) : (
+                    <p style={{ textAlign: 'center', padding: 40, color: '#999' }}>
+                        暂无热点数据，分析完成后将显示
+                    </p>
+                )}
+            </div>
+        </div>
+    );
+}
