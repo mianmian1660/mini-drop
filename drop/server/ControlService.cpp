@@ -23,19 +23,21 @@ namespace drop_server
     {
         cout << "[server] CreateTask: targetIP=" << request->targetip() << endl;
 
-        // 生成任务 ID
-        string taskID = "task-" + to_string(chrono::system_clock::now().time_since_epoch().count()) +
-                        "-" + to_string(rand() % 10000);
-
         hotmethod::TaskDesc taskDesc;
+        string taskID;
+
         if (request->has_taskdesc())
         {
+            // 使用 apiserver 下发的 TID，保证端到端 TID 一致
             taskDesc.CopyFrom(request->taskdesc());
-            taskDesc.set_taskid(taskID);
+            taskID = taskDesc.taskid();
+            cout << "[server]   使用 apiserver TID: " << taskID << endl;
         }
         else
         {
-            // 默认：perf 采集 CPU，99Hz，10秒
+            // 无 TaskDesc：生成默认任务（自测/调试用）
+            taskID = "task-" + to_string(chrono::system_clock::now().time_since_epoch().count()) +
+                     "-" + to_string(rand() % 10000);
             taskDesc.set_taskid(taskID);
             taskDesc.set_tasktype(0);
             taskDesc.set_profilertype(0);
@@ -46,6 +48,7 @@ namespace drop_server
             argv->set_pid(-1);
             argv->set_callgraph("fp");
             argv->set_event("cpu-cycles");
+            cout << "[server]   生成默认 TID: " << taskID << endl;
         }
 
         {
