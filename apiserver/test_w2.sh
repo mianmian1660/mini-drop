@@ -98,7 +98,7 @@ R=$(curl -s "$BASE/api/v1/tasks/$TID")
 check "返回 code=0" '"code":0' "$R"
 check "返回 task name" 'CPU采样' "$R"
 # W3: gRPC未连接时 status=3(失败)，连接时 status=1(已下发)；都正常
-STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['status'])")
+STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['task']['status'])")
 check "status 有效 (0/1/3)" "status" "status=$STATUS"
 
 # ---- 10. 按状态过滤 ----
