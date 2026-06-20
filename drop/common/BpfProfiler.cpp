@@ -59,7 +59,6 @@ namespace drop
         switch (mode)
         {
         case BpfMode::CPU:
-            s += "BEGIN { printf(\"# Mini-Drop eBPF CPU Profiler\\n\"); }\n\n";
             if (pid > 0)
                 s += "profile:hz:" + to_string(hz) + "\n/pid == " + to_string(pid) + "/\n{\n    @samples[ustack] = count();\n}\n\n";
             else
@@ -68,7 +67,6 @@ namespace drop
             break;
 
         case BpfMode::IO_LATENCY:
-            s += "BEGIN { printf(\"# Mini-Drop eBPF IO Latency Profiler\\n\"); }\n\n";
             s += "kprobe:blk_account_io_start\n{\n    @start[tid] = nsecs;\n    @io_cnt = count();\n}\n\n";
             s += "kprobe:blk_account_io_done\n{\n";
             s += "    $ns = nsecs;\n    if (@start[tid]) {\n";
@@ -80,7 +78,6 @@ namespace drop
             break;
 
         case BpfMode::SCHED_LATENCY:
-            s += "BEGIN { printf(\"# Mini-Drop eBPF Scheduler Latency Profiler\\n\"); }\n\n";
             s += "kprobe:try_to_wake_up\n{\n    $p = (struct task_struct *)arg0;\n    @wake[$p->pid] = nsecs;\n}\n\n";
             s += "kprobe:finish_task_switch\n{\n    $prev = (struct task_struct *)arg0;\n    $ns = nsecs;\n";
             s += "    if (@wake[$prev->pid]) {\n";
@@ -115,8 +112,87 @@ namespace drop
                 continue;
             if (mode == BpfMode::CPU)
             {
-                // bpftrace -f folded 已经是折叠栈格式，直接输出
-                of << line << "\n";
+                // bpftrace v0.14 文本输出可能是单行或多行：
+                // 单行: @samples[func1;func2]: 42
+                // 多行: @samples[\n  func1\n  func2\n]: 42
+                // 转换为标准折叠栈: func1;func2 42
+                if (line.find("@samples[") == 0)
+                {
+                    string stack;
+                    string count;
+
+                    // 检查是否单行格式（同一行有 ]:）
+                    size_t endBr = line.rfind("]:");
+                    if (endBr != string::npos)
+                    {
+                        size_t startBr = line.find("[");
+                        stack = line.substr(startBr + 1, endBr - startBr - 1);
+                        count = line.substr(endBr + 2);
+                    }
+                    else
+                    {
+                        // 多行格式：收集后续行
+                        stack = line.substr(line.find("[") + 1);
+                        while (getline(in, line))
+                        {
+                            if (line.find("]:") != string::npos)
+                            {
+                                size_t cb = line.rfind("]:");
+                                if (cb != string::npos)
+                                {
+                                    stack += line.substr(0, cb);
+                                    count = line.substr(cb + 2);
+                                }
+                                break;
+                            }
+                            stack += line;
+                        }
+                    }
+
+                    // 清理：将 \n 替换为 ;
+                    string cleanStack;
+                    for (char c : stack)
+                    {
+                        if (c == '\n' || c == '\r')
+                            continue;
+                        if (c == ' ' && (cleanStack.empty() || cleanStack.back() == ';'))
+                            continue;
+                        cleanStack += c;
+                    }
+                    // 去首尾空格并压缩内部空格
+                    size_t ss = cleanStack.find_first_not_of(" \t");
+                    size_t se = cleanStack.find_last_not_of(" \t");
+                    if (ss != string::npos && se != string::npos)
+                        cleanStack = cleanStack.substr(ss, se - ss + 1);
+                    // 将空白分隔替换为 ;
+                    string finalStack;
+                    bool inSpace = false;
+                    for (char c : cleanStack)
+                    {
+                        if (c == ' ' || c == '\t')
+                        {
+                            if (!inSpace)
+                            {
+                                finalStack += ';';
+                                inSpace = true;
+                            }
+                        }
+                        else
+                        {
+                            finalStack += c;
+                            inSpace = false;
+                        }
+                    }
+
+                    // 清理 count
+                    size_t cs = count.find_first_not_of(" \t\n\r");
+                    size_t ce = count.find_last_not_of(" \t\n\r");
+                    if (cs != string::npos && ce != string::npos)
+                        count = count.substr(cs, ce - cs + 1);
+
+                    if (!finalStack.empty() && !count.empty())
+                        of << finalStack << " " << count << "\n";
+                }
             }
             else
             {
@@ -163,11 +239,6 @@ namespace drop
             vector<string> as;
             vector<const char *> av;
             as.push_back("bpftrace");
-            if (mode == BpfMode::CPU)
-            {
-                as.push_back("-f");
-                as.push_back("folded");
-            }
             as.push_back(scriptPath);
             for (auto &a : as)
                 av.push_back(a.c_str());

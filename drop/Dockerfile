@@ -52,6 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgrpc++1 \
     libprotobuf23 \
     linux-tools-generic \
+    linux-headers-generic \
+    linux-libc-dev \
     bpftrace \
     perl \
     curl \

@@ -230,7 +230,6 @@ static pair<int, string> run_profiler(
             if (task.sampleargv().event() == "io" || task.sampleargv().event() == "blk")
             {
                 ofstream mockIO(path);
-                mockIO << "# eBPF IO Latency Histogram (mock)\n";
                 mockIO << "@io_lat_us:\n";
                 mockIO << "[1, 2)        42 |@@@@@@@@@\n";
                 mockIO << "[2, 4)        88 |@@@@@@@@@@@@@@@@@@@\n";
@@ -317,6 +316,8 @@ static hotmethod::TaskResult build_task_result(
                 actualPath = outputPath + ".jfr";
             else if (file_exists(outputPath + ".pb.gz"))
                 actualPath = outputPath + ".pb.gz";
+            else if (file_exists(outputPath + ".bpf"))
+                actualPath = outputPath + ".bpf";
         }
 
         string fileContent = drop::read_file_content(actualPath);
