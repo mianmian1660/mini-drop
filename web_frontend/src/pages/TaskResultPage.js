@@ -34,13 +34,19 @@ const styles = {
         fontWeight: active || done || failed ? 700 : 500,
     }),
     notice: { display: 'flex', gap: 8, alignItems: 'center', background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 13 },
-    visualFrame: { width: '100%', minHeight: 520, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
+    flameFrame: { width: '100%', height: 560, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
+    histogramStage: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 420, border: '1px solid #d0d7de', borderRadius: 6, background: '#fbfcfe', padding: 16, overflow: 'hidden' },
+    histogramImage: { width: '100%', height: 'clamp(340px, 42vw, 520px)', objectFit: 'contain', display: 'block' },
     visualEmpty: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 260, color: '#667085', textAlign: 'center', background: '#f8fafc', border: '1px dashed #cbd5e1', borderRadius: 6, padding: 24 },
     split: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(300px, 1fr)', gap: 16, alignItems: 'start' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
     td: { padding: '10px 12px', borderBottom: '1px solid #edf0f3', fontSize: 13, verticalAlign: 'top' },
-    codeBlock: { margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#0f172a', color: '#e2e8f0', borderRadius: 6, padding: 12, fontSize: 12, lineHeight: 1.55 },
+    paramList: { display: 'grid', gap: 10 },
+    paramRow: { display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'center', padding: '10px 0', borderBottom: '1px solid #edf0f3' },
+    paramLabel: { color: '#667085', fontSize: 12, whiteSpace: 'nowrap' },
+    paramValue: { color: '#202124', fontSize: 13, fontWeight: 700, textAlign: 'right', wordBreak: 'break-word' },
+    paramHint: { margin: '12px 0 0 0', color: '#667085', fontSize: 12, lineHeight: 1.55 },
     fileList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(290px, 1fr))', gap: 10 },
     fileItem: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '11px 12px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fbfcfe' },
     fileName: { fontSize: 13, color: '#202124', wordBreak: 'break-all', fontWeight: 600 },
@@ -202,7 +208,7 @@ export default function TaskResultPage() {
 
                 <div style={styles.card}>
                     <h3 style={styles.sectionTitle}>采集参数</h3>
-                    <pre style={styles.codeBlock}>{JSON.stringify(task.request_params || {}, null, 2)}</pre>
+                    <ParameterPanel task={task} />
                 </div>
             </div>
 
@@ -232,12 +238,34 @@ function Metric({ label, value }) {
 
 function VisualResult({ artifact, task, isBpfTask }) {
     if (artifact?.url) {
+        if (artifact.type === 'bpf' || isBpfTask) {
+            return (
+                <div>
+                    <div style={styles.histogramStage}>
+                        <img
+                            src={artifact.url}
+                            alt={isBpfTask ? 'eBPF 直方图' : '可视化结果'}
+                            style={styles.histogramImage}
+                        />
+                    </div>
+                    <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                        <a href={artifact.downloadUrl || artifact.url} target="_blank" rel="noreferrer" style={{ ...styles.button, ...styles.primaryButton }} download={displayFileName(artifact.name)}>
+                            下载可视化文件
+                        </a>
+                        <a href={artifact.url} target="_blank" rel="noreferrer" style={styles.button}>
+                            新窗口查看
+                        </a>
+                    </div>
+                </div>
+            );
+        }
+
         return (
             <div>
                 <iframe
                     src={artifact.url}
                     title={isBpfTask ? 'eBPF Histogram' : 'Flame Graph'}
-                    style={styles.visualFrame}
+                    style={styles.flameFrame}
                 />
                 <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                     <a href={artifact.downloadUrl || artifact.url} target="_blank" rel="noreferrer" style={{ ...styles.button, ...styles.primaryButton }} download={displayFileName(artifact.name)}>
@@ -262,6 +290,35 @@ function VisualResult({ artifact, task, isBpfTask }) {
         <div style={styles.visualEmpty}>
             <strong>{text}</strong>
             {task.status_info && <span style={{ marginTop: 8, fontSize: 13 }}>{task.status_info}</span>}
+        </div>
+    );
+}
+
+function ParameterPanel({ task }) {
+    const params = task.request_params || {};
+    const rows = [
+        ['采集器', profilerLabel(task.profiler_type, task.type, params.event)],
+        ['目标 PID', Number(params.target_pid || 0) > 0 ? params.target_pid : '整机'],
+        ['采样时长', params.duration ? `${params.duration} 秒` : '-'],
+        ['采样频率', params.frequency ? `${params.frequency} Hz` : '-'],
+        ['事件/模式', eventLabel(params.event)],
+        ['调用图', params.callgraph || '-'],
+        ['子进程', params.subprocess ? '包含' : '不包含'],
+    ];
+
+    return (
+        <div>
+            <div style={styles.paramList}>
+                {rows.map(([label, value]) => (
+                    <div key={label} style={styles.paramRow}>
+                        <span style={styles.paramLabel}>{label}</span>
+                        <span style={styles.paramValue}>{value}</span>
+                    </div>
+                ))}
+            </div>
+            <p style={styles.paramHint}>
+                这些参数来自任务创建请求，分析产物会在采集完成后自动关联到当前任务。
+            </p>
         </div>
     );
 }
@@ -466,6 +523,15 @@ function profilerLabel(profilerType, taskType, event) {
     if (pt === 2) return 'pprof';
     if (pt === 3) return 'eBPF CPU';
     return 'perf CPU';
+}
+
+function eventLabel(event) {
+    if (!event) return '-';
+    if (event === 'sched') return '调度延迟';
+    if (event === 'io' || event === 'blk') return 'IO 延迟';
+    if (event === 'cpu-cycles') return 'CPU cycles';
+    if (event === 'cpu') return 'CPU profile';
+    return event;
 }
 
 function formatTime(value) {
