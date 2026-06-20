@@ -518,7 +518,7 @@ function ArtifactsPanel({ files }) {
                                     </a>
                                 )}
                                 {file.download_url ? (
-                                    <a href={file.download_url} target="_blank" rel="noreferrer" download={displayFileName(file.name)} style={{ ...styles.button, ...styles.primaryButton }}>
+                                    <a href={file.download_url} download={displayFileName(file.name)} style={{ ...styles.button, ...styles.primaryButton }}>
                                         下载
                                     </a>
                                 ) : (

@@ -748,8 +748,9 @@ func (s *APIServer) listLocalFiles(tid string) []map[string]interface{} {
 			continue
 		}
 
-		// 生成本地下载 URL
-		downloadURL := fmt.Sprintf("/api/v1/files/%s", filename)
+		// 下载走 attachment，避免浏览器直接打开文本/JSON/SVG。
+		downloadURL := fmt.Sprintf("/api/v1/files/%s?download=1", url.PathEscape(filename))
+		viewURL := fmt.Sprintf("/api/v1/files/%s", url.PathEscape(filename))
 
 		fileInfo := map[string]interface{}{
 			"name":          filename,
@@ -760,7 +761,7 @@ func (s *APIServer) listLocalFiles(tid string) []map[string]interface{} {
 			"source":        "local",
 		}
 		if filepath.Ext(filename) == ".svg" {
-			fileInfo["view_url"] = downloadURL
+			fileInfo["view_url"] = viewURL
 		}
 		files = append(files, fileInfo)
 	}
@@ -791,7 +792,7 @@ func (s *APIServer) ServeLocalFile(c *gin.Context) {
 	case ".svg":
 		c.Header("Content-Type", "image/svg+xml")
 	case ".json":
-		c.Header("Content-Type", "application/json")
+		c.Header("Content-Type", "application/json; charset=utf-8")
 	case ".md":
 		c.Header("Content-Type", "text/markdown; charset=utf-8")
 	case ".txt":
@@ -799,7 +800,11 @@ func (s *APIServer) ServeLocalFile(c *gin.Context) {
 	default:
 		c.Header("Content-Type", "application/octet-stream")
 	}
-	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filename))
+	disposition := "inline"
+	if c.Query("download") == "1" {
+		disposition = "attachment"
+	}
+	c.Header("Content-Disposition", contentDisposition(disposition, filename))
 	c.File(localPath)
 }
 
@@ -836,10 +841,46 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 	defer reader.Close()
 
 	c.Header("Content-Type", mimeType(key))
-	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filepath.Base(key)))
+	c.Header("Content-Disposition", contentDisposition("inline", filepath.Base(key)))
 	c.Status(http.StatusOK)
 	if _, err := io.Copy(c.Writer, reader); err != nil {
 		s.Logger.Warn("代理输出对象存储文件失败", zap.String("key", key), zap.Error(err))
+	}
+}
+
+// DownloadCOSFile 通过 apiserver 代理下载对象存储产物，强制 attachment。
+// GET /api/v1/cosfiles/download?key=tid/top.json
+func (s *APIServer) DownloadCOSFile(c *gin.Context) {
+	key := c.Query("key")
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 key 参数"})
+		return
+	}
+	if strings.Contains(key, "..") || strings.Contains(key, "\\") || strings.HasPrefix(key, "/") {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "非法对象路径"})
+		return
+	}
+	if !s.StorageConnected() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"code": 503, "message": "对象存储未连接"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, key)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "文件不存在: " + key})
+		return
+	}
+	defer reader.Close()
+
+	filename := filepath.Base(key)
+	c.Header("Content-Type", mimeType(key))
+	c.Header("Content-Disposition", contentDisposition("attachment", filename))
+	c.Status(http.StatusOK)
+	if _, err := io.Copy(c.Writer, reader); err != nil {
+		s.Logger.Warn("代理下载对象存储文件失败", zap.String("key", key), zap.Error(err))
 	}
 }
 
@@ -850,18 +891,24 @@ func mimeType(filename string) string {
 	case ".svg":
 		return "image/svg+xml"
 	case ".json":
-		return "application/json"
+		return "application/json; charset=utf-8"
 	case ".md":
-		return "text/markdown"
+		return "text/markdown; charset=utf-8"
 	case ".txt":
-		return "text/plain"
+		return "text/plain; charset=utf-8"
 	case ".html":
-		return "text/html"
+		return "text/html; charset=utf-8"
 	case ".png":
 		return "image/png"
 	default:
 		return "application/octet-stream"
 	}
+}
+
+func contentDisposition(disposition string, filename string) string {
+	asciiName := strings.NewReplacer("\\", "_", "\"", "_", "\r", "_", "\n", "_").Replace(filename)
+	escapedName := url.PathEscape(filename)
+	return fmt.Sprintf("%s; filename=\"%s\"; filename*=UTF-8''%s", disposition, asciiName, escapedName)
 }
 
 // listTaskFiles 列出指定 tid 下的所有产物文件，并生成签名下载 URL
@@ -877,8 +924,6 @@ func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) 
 		return nil, err
 	}
 
-	expireDuration := time.Duration(s.Config.Storage.PresignExpireSec) * time.Second
-
 	var files []map[string]interface{}
 	for _, obj := range objects {
 		contentType := obj.ContentType
@@ -892,18 +937,7 @@ func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) 
 			"content_type":  contentType,
 		}
 
-		// 生成预签名下载 URL
-		presignedURL, err := s.Storage.PresignedGetURL(ctx, bucket, obj.Name, expireDuration)
-		if err != nil {
-			s.Logger.Warn("生成签名 URL 失败",
-				zap.String("key", obj.Name),
-				zap.Error(err),
-			)
-			fileInfo["download_url"] = ""
-			fileInfo["url_error"] = err.Error()
-		} else {
-			fileInfo["download_url"] = presignedURL
-		}
+		fileInfo["download_url"] = "/api/v1/cosfiles/download?key=" + url.QueryEscape(obj.Name)
 		if filepath.Ext(obj.Name) == ".svg" {
 			fileInfo["view_url"] = "/api/v1/cosfiles/view?key=" + url.QueryEscape(obj.Name)
 		}

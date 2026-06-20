@@ -379,6 +379,7 @@ func (s *APIServer) registerRoutes() {
 		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)
 		api.GET("/cosfiles/view", s.ViewCOSFile)
+		api.GET("/cosfiles/download", s.DownloadCOSFile)
 		api.POST("/cosfiles/upload", s.UploadTestFile)
 		api.GET("/files/:filename", s.ServeLocalFile) // W4: 本地文件服务
 

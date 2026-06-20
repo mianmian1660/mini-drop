@@ -79,3 +79,6 @@ drop/tools/py_gen/__pycache__/
 # ----- 已知的本地生成目录（显式忽略，确保跨平台兼容）-----
 analysis/__pycache__/
 web_frontend/node_modules/
+
+# ----- 本地演示材料（不上传 GitHub）-----
+演示视频思路.md
