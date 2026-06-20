@@ -53,9 +53,9 @@ func (s *APIServer) initCron() {
 	s.Logger.Info("Cron 调度器已启动")
 }
 
-// addCronJob 向 cron 调度器添加一个定时任务
-func (s *APIServer) addCronJob(sch model.ScheduleTask) {
-	_, err := s.Cron.AddFunc(sch.CronExpr, func() {
+// addCronJob 向 cron 调度器添加一个定时任务，返回 EntryID
+func (s *APIServer) addCronJob(sch model.ScheduleTask) cron.EntryID {
+	entryID, err := s.Cron.AddFunc(sch.CronExpr, func() {
 		s.executeScheduledTask(sch)
 	})
 	if err != nil {
@@ -64,6 +64,22 @@ func (s *APIServer) addCronJob(sch model.ScheduleTask) {
 			zap.String("cron", sch.CronExpr),
 			zap.Error(err),
 		)
+		return 0
+	}
+	if s.CronJobs == nil {
+		s.CronJobs = make(map[string]cron.EntryID)
+	}
+	s.CronJobs[sch.SID] = entryID
+	s.Logger.Info("cron 任务已添加", zap.String("sid", sch.SID), zap.Int("entryID", int(entryID)))
+	return entryID
+}
+
+// removeCronJob 从 cron 调度器中移除定时任务
+func (s *APIServer) removeCronJob(sid string) {
+	if entryID, ok := s.CronJobs[sid]; ok {
+		s.Cron.Remove(entryID)
+		delete(s.CronJobs, sid)
+		s.Logger.Info("cron 任务已移除", zap.String("sid", sid), zap.Int("entryID", int(entryID)))
 	}
 }
 
@@ -246,8 +262,11 @@ func (s *APIServer) DeleteSchedule(c *gin.Context) {
 		return
 	}
 
-	s.Logger.Info("定时任务已删除", zap.String("sid", sid))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "定时任务已删除"})
+	// 从 cron 调度器中立即停止
+	s.removeCronJob(sid)
+
+	s.Logger.Info("定时任务已删除并停止", zap.String("sid", sid))
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "定时任务已删除并停止"})
 }
 
 // ----------------------------------------------------------
@@ -266,8 +285,13 @@ func (s *APIServer) ToggleSchedule(c *gin.Context) {
 	newEnabled := !sch.Enabled
 	s.DB.Model(&sch).Update("enabled", newEnabled)
 
-	// 从 cron 中移除旧的，如果启用则重新添加
-	// cron v3 不支持移除单个 entry，这里简化处理：重启时从 DB 恢复
+	// 动态管理 cron 调度器：真正停止/启动
+	if newEnabled {
+		sch.Enabled = true
+		s.addCronJob(sch)
+	} else {
+		s.removeCronJob(sid)
+	}
 
 	s.Logger.Info("定时任务状态已切换",
 		zap.String("sid", sid),

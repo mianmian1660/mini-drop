@@ -87,7 +87,7 @@ export default function TaskResultPage() {
                 }
                 // eBPF: 检测直方图 SVG
                 const bpfFile = files.find(f =>
-                    f.name && f.name.includes('bpf_histogram')
+                    f.name && f.name.includes('bpf_histogram') || f.name.includes('bpf_data')
                 );
                 if (bpfFile?.download_url) {
                     setBpfSvgUrl(bpfFile.download_url);
@@ -119,7 +119,7 @@ export default function TaskResultPage() {
                 }
                 // eBPF: 检测直方图 SVG
                 const bpfFile = files.find(f =>
-                    f.name && f.name.includes('bpf_histogram')
+                    f.name && f.name.includes('bpf_histogram') || f.name.includes('bpf_data')
                 );
                 if (bpfFile?.download_url) {
                     setBpfSvgUrl(bpfFile.download_url);
@@ -153,10 +153,10 @@ export default function TaskResultPage() {
         return () => clearInterval(interval);
     }, [task?.status, loadTask]);
 
-    // W4: 任务已完成但无火焰图 → 每 5 秒轮询分析结果
+    // W4: 任务已完成但无产物 → 每 5 秒轮询分析结果
     useEffect(() => {
         if (!task || task.status !== 2) return;       // 非完成状态不轮询
-        if (flameSvgUrl) return;                       // 已有火焰图，停止
+        if (flameSvgUrl || bpfSvgUrl) return;          // 已有火焰图或直方图，停止
 
         const interval = setInterval(() => {
             loadFiles();
@@ -247,22 +247,17 @@ export default function TaskResultPage() {
             <h3>🔥 火焰图</h3>
             <div style={styles.flameBox}>
                 {flameSvgUrl ? (
-                    // W4: 有火焰图 → iframe 加载 SVG（支持鼠标交互）
                     <div>
-                        <iframe
-                            src={flameSvgUrl}
-                            title="火焰图"
-                            style={{
-                                width: '100%', height: 500, border: '1px solid #e0e0e0',
-                                borderRadius: 4, background: '#fff',
-                            }}
-                        />
-                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>
-                            💡 点击函数框可放大，右键可缩小
-                        </p>
+                        <iframe src={flameSvgUrl} title="火焰图"
+                            style={{ width: '100%', height: 500, border: '1px solid #e0e0e0', borderRadius: 4, background: '#fff' }} />
+                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>💡 点击函数框可放大，右键可缩小</p>
+                    </div>
+                ) : bpfSvgUrl ? (
+                    // eBPF IO/调度模式：直方图已生成，不需要火焰图
+                    <div>
+                        <p style={{ fontSize: 14, color: '#4caf50' }}>✅ eBPF 直方图已生成，请查看下方「📊 eBPF 内核探针」区域</p>
                     </div>
                 ) : task.status === 2 ? (
-                    // 任务完成但分析结果未出
                     <div>
                         <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>🔬</p>
                         <p>任务采集已完成，正在等待分析引擎生成火焰图...</p>

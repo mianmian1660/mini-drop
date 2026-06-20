@@ -709,9 +709,12 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
     if storage_ok:
         try:
             key = f"{tid}/perf.data"
-            storage.get_object(bucket, key, local_bpf)
-            if os.path.exists(local_bpf) and os.path.getsize(local_bpf) > 0:
-                has_data = True
+            data = storage.get_object(bucket, key)
+            if data:
+                with open(local_bpf, 'wb') as f:
+                    f.write(data)
+                if os.path.exists(local_bpf) and os.path.getsize(local_bpf) > 0:
+                    has_data = True
         except Exception as e:
             print(f"[analysis] MinIO 下载 bpf 数据失败: {e}", file=sys.stderr)
 
@@ -771,7 +774,9 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
         for lf in local_files:
             key = f"{tid}/{lf['name']}"
             try:
-                storage.put_object(bucket, key, lf["path"])
+                with open(lf["path"], 'rb') as f:
+                    file_data = f.read()
+                storage.put_object(bucket, key, file_data)
                 url = storage.presigned_get_url(bucket, key)
                 if url:
                     presigned_urls[lf["name"]] = url

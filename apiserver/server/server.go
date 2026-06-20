@@ -36,6 +36,7 @@ type APIServer struct {
 	ControlCli pb.ControlClient       // Control 服务客户端
 	Storage    storage.Storage        // 对象存储（MinIO）
 	Cron       *cron.Cron             // 定时任务调度器（W5）
+	CronJobs   map[string]cron.EntryID // SID → cron EntryID 映射（支持动态停止/删除）
 }
 
 // New 创建一个新的 APIServer 实例
