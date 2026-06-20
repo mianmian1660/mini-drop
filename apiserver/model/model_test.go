@@ -75,7 +75,7 @@ func TestMultiTaskFields(t *testing.T) {
 
 func TestStatusConstants(t *testing.T) {
 	task := HotmethodTask{}
-	statuses := []int{0, 1, 2, 3}
+	statuses := []int{0, 1, 2, 3, 4}
 	for _, s := range statuses {
 		task.Status = s
 		if task.Status != s {

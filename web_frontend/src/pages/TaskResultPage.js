@@ -61,8 +61,8 @@ const styles = {
     loading: { textAlign: 'center', padding: 60, color: '#667085' },
 };
 
-const statusColors = { 0: '#d97706', 1: '#2563eb', 2: '#16a34a', 3: '#dc2626' };
-const statusNames = { 0: 'PENDING', 1: 'RUNNING / UPLOADING', 2: 'DONE', 3: 'FAILED' };
+const statusColors = { 0: '#d97706', 1: '#2563eb', 2: '#16a34a', 3: '#dc2626', 4: '#7c3aed' };
+const statusNames = { 0: 'PENDING', 1: 'RUNNING', 2: 'DONE', 3: 'FAILED', 4: 'UPLOADING' };
 const analysisNames = { 0: '待分析', 1: '分析中', 2: '分析完成', 3: '分析失败' };
 const progressSteps = ['PENDING', 'RUNNING', 'UPLOADING', 'ANALYZING', 'DONE'];
 
@@ -164,7 +164,7 @@ export default function TaskResultPage() {
     const analysisStatus = Number(task.analysis_status);
     const statusName = statusNames[status] || 'UNKNOWN';
     const statusColor = statusColors[status] || '#667085';
-    const shouldPoll = status < 2 || (status === 2 && analysisStatus < 2 && !artifact);
+    const shouldPoll = isActiveTaskStatus(status) || (status === 2 && analysisStatus < 2 && !artifact);
 
     return (
         <div style={styles.container}>
@@ -456,7 +456,7 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN' }) {
                 </div>
             ) : (
                 <p style={{ textAlign: 'center', padding: 32, color: '#667085', margin: 0 }}>
-                    {status >= 2 ? '暂无热点数据。请确认 top.json 已生成，或下载 folded.txt / perf.data 排查。' : '任务完成后将自动分析热点函数。'}
+                    {isFinalTaskStatus(status) ? '暂无热点数据。请确认 top.json 已生成，或下载 folded.txt / perf.data 排查。' : '任务完成后将自动分析热点函数。'}
                 </p>
             )}
         </div>
@@ -489,7 +489,7 @@ function SuggestionsPanel({ suggestions, bpfHistogram, isBpfTask, status }) {
                 </div>
             ) : (
                 <p style={{ textAlign: 'center', padding: 28, color: '#667085', margin: 0 }}>
-                    {status >= 2 ? '暂无建议。CPU 任务需要 suggestions.json，eBPF 任务需要有效直方图摘要。' : '任务完成后将自动生成分析建议。'}
+                    {isFinalTaskStatus(status) ? '暂无建议。CPU 任务需要 suggestions.json，eBPF 任务需要有效直方图摘要。' : '任务完成后将自动生成分析建议。'}
                 </p>
             )}
         </div>
@@ -555,8 +555,8 @@ function hasVisual(files) {
 function isStepDone(index, status, analysisStatus, artifact) {
     if (status === 3) return false;
     if (index === 0) return status > 0;
-    if (index === 1) return status >= 2;
-    if (index === 2) return status >= 2;
+    if (index === 1) return status === 4 || status === 2;
+    if (index === 2) return status === 2;
     if (index === 3) return analysisStatus >= 2 || Boolean(artifact);
     if (index === 4) return status === 2 && (analysisStatus >= 2 || Boolean(artifact));
     return false;
@@ -566,10 +566,18 @@ function isStepActive(index, status, analysisStatus, artifact) {
     if (status === 3) return index === 4;
     if (index === 0) return status === 0;
     if (index === 1) return status === 1;
-    if (index === 2) return status === 2 && analysisStatus === 0 && !artifact;
+    if (index === 2) return status === 4;
     if (index === 3) return status === 2 && analysisStatus === 1 && !artifact;
     if (index === 4) return status === 2 && (analysisStatus >= 2 || Boolean(artifact));
     return false;
+}
+
+function isActiveTaskStatus(status) {
+    return status === 0 || status === 1 || status === 4;
+}
+
+function isFinalTaskStatus(status) {
+    return status === 2 || status === 3;
 }
 
 function statusLabel(status) {
@@ -579,6 +587,7 @@ function statusLabel(status) {
     if (n === 1) return 'RUNNING';
     if (n === 2) return 'DONE';
     if (n === 3) return 'FAILED';
+    if (n === 4) return 'UPLOADING';
     return String(status);
 }
 

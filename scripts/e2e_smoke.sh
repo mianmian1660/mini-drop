@@ -46,6 +46,18 @@ event_count="$(printf '%s' "$detail_resp" | json_get "len(d['data'].get('status_
 test "$event_count" -ge 1 || fail "task status event recorded"
 pass "task status event recorded"
 
+upload_event_count=0
+for _ in $(seq 1 12); do
+  detail_resp="$(curl -fsS "$BASE/api/v1/tasks/$tid")"
+  upload_event_count="$(printf '%s' "$detail_resp" | json_get "sum(1 for e in d['data'].get('status_events', []) if e.get('to_status') == 4 and e.get('reason'))")"
+  if test "$upload_event_count" -ge 1; then
+    break
+  fi
+  sleep 1
+done
+test "$upload_event_count" -ge 1 || fail "task uploading transition recorded"
+pass "task uploading transition recorded"
+
 bad_code="$(curl -s -o /tmp/mini-drop-e2e-bad.json -w '%{http_code}' -X POST "$BASE/api/v1/tasks" \
   -H 'Content-Type: application/json' \
   -d "{\"target_ip\":\"$TARGET_IP\"}")"

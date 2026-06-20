@@ -26,8 +26,8 @@ const styles = {
     totalInfo: { fontSize: 13, color: '#999' },
 };
 
-const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
-const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败' };
+const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed' };
+const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
 
 export default function TaskListPage() {
     const [taskList, setTaskList] = useState([]);
@@ -129,6 +129,7 @@ export default function TaskListPage() {
                         <option value="">全部状态</option>
                         <option value="0">待处理</option>
                         <option value="1">执行中</option>
+                        <option value="4">上传中</option>
                         <option value="2">已完成</option>
                         <option value="3">失败</option>
                     </select>

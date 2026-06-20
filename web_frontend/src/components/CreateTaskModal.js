@@ -9,7 +9,12 @@ import { Link } from 'react-router-dom';
 import { tasks, agents, schedules } from '../api';
 
 const S = {
-    card: { background: '#f8f9ff', borderRadius: 8, padding: 24, marginBottom: 16, border: '1px solid #e0e4ff' },
+    overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15, 23, 42, 0.45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '48px 16px 24px', overflowY: 'auto' },
+    card: { width: 'min(960px, 100%)', background: '#fff', borderRadius: 8, padding: 24, border: '1px solid #d0d7de', boxShadow: '0 24px 64px rgba(15, 23, 42, 0.28)' },
+    header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 18, borderBottom: '1px solid #edf0f3', paddingBottom: 12 },
+    title: { margin: 0, fontSize: 20, color: '#111827' },
+    close: { background: '#f8fafc', color: '#475467', border: '1px solid #d0d7de', width: 34, height: 34, borderRadius: 6, cursor: 'pointer', fontSize: 18, lineHeight: 1 },
+    section: { background: '#f8f9ff', borderRadius: 8, padding: 16, marginTop: 8, border: '1px solid #e0e4ff' },
     input: { width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14, marginBottom: 12, boxSizing: 'border-box' },
     select: { width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14, marginBottom: 12, boxSizing: 'border-box', background: '#fff' },
     label: { display: 'block', marginBottom: 4, fontWeight: 'bold', fontSize: 13, color: '#555' },
@@ -56,8 +61,8 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 const list = r.data?.agents || [];
                 setAgentList(list);
                 const on = list.filter(a => a.online);
-                if (on.length > 0 && !f.target_ip)
-                    setF(p => ({ ...p, target_ip: on[0].ip_addr }));
+                if (on.length > 0)
+                    setF(p => p.target_ip ? p : ({ ...p, target_ip: on[0].ip_addr }));
             }
         }).catch(() => { }).finally(() => setAload(false));
     }, []);
@@ -116,8 +121,15 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 : 'perf CPU火焰图';
 
     return (
-        <div style={S.card}>
-            <h3>新建采样任务</h3>
+        <div style={S.overlay} onClick={onClose}>
+            <div style={S.card} onClick={e => e.stopPropagation()}>
+                <div style={S.header}>
+                    <div>
+                        <h3 style={S.title}>新建采样任务</h3>
+                        <div style={S.hint}>选择 Agent 和采集器后提交，任务会自动进入状态流转。</div>
+                    </div>
+                    <button style={S.close} onClick={onClose} disabled={sub} aria-label="关闭">×</button>
+                </div>
 
             <div style={{ marginBottom: 16 }}>
                 <label style={S.label}>目标 Agent *</label>
@@ -164,7 +176,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
             <p style={S.hint}>📌 将生成: {modeLabel}</p>
 
             {/* 持续采集 */}
-            <div style={{ ...S.card, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
+            <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
                 <label style={S.chk}>
                     <input type="checkbox" checked={f.continuous} onChange={e => up('continuous', e.target.checked)} />
                     <span style={{ fontWeight: 'bold', fontSize: 14 }}>🔄 持续采集 (Continuous Profiling)</span>
@@ -195,6 +207,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                     {sub ? '提交中...' : f.continuous ? '创建持续采集' : '提交任务'}
                 </button>
                 <button style={{ ...S.btn, background: '#999' }} onClick={onClose} disabled={sub}>取消</button>
+            </div>
             </div>
         </div>
     );

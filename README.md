@@ -150,8 +150,8 @@ make verify
 Web/API 使用以下状态表达任务主流程：
 
 - `PENDING`: 任务已创建，等待下发
-- `RUNNING`: 已下发到 drop_server，等待 Agent 采集/上传
-- `UPLOADING`: 当前实现中与 `RUNNING` 共用数据库状态，通过 `status_info` reason 展示上传/下发阶段
+- `RUNNING`: 已下发到 drop_server，等待 Agent 采集
+- `UPLOADING`: 采集窗口结束，等待 Agent 上传产物或等待产物可见
 - `DONE`: 采集完成，等待或已完成分析
 - `FAILED`: 下发、采集或分析失败，`status_info` 记录原因
 
@@ -162,7 +162,7 @@ Web/API 使用以下状态表达任务主流程：
 - `2`: 分析完成
 - `3`: 分析失败
 
-每次关键迁移都会更新 `status_info` 或分析 reason，Web 任务详情页会实时展示。
+每次任务状态迁移都会写入 `task_status_events`，包含 `from_status`、`to_status`、`reason`、`source` 和时间戳；Web 任务详情页会实时展示这些 reason。
 
 ## 提交规范
 

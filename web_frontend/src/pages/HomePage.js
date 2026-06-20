@@ -56,8 +56,8 @@ const styles = {
     smallStatus: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: 52, padding: '2px 8px', borderRadius: 999, fontSize: 12, fontWeight: 700 },
 };
 
-const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
-const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败' };
+const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed' };
+const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
 
 export default function HomePage() {
     const [agentList, setAgentList] = useState([]);
@@ -80,7 +80,7 @@ export default function HomePage() {
     const [total, setTotal] = useState(0);
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const onlineAgents = agentList.filter(a => a.online).length;
-    const runningTasks = taskList.filter(t => t.status === 1).length;
+    const runningTasks = taskList.filter(t => t.status === 1 || t.status === 4).length;
     const failedTasks = taskList.filter(t => t.status === 3).length;
 
     // 加载 Agent 列表（不分页）
@@ -226,7 +226,7 @@ export default function HomePage() {
 
             <div style={styles.metricGrid}>
                 <Metric label="在线 Agent" value={`${onlineAgents}/${agentList.length}`} />
-                <Metric label="当前页运行任务" value={runningTasks} />
+                <Metric label="当前页运行/上传任务" value={runningTasks} />
                 <Metric label="当前页失败任务" value={failedTasks} />
                 <Metric label="任务总数" value={total} />
             </div>
@@ -341,6 +341,7 @@ export default function HomePage() {
                         <option value="">全部状态</option>
                         <option value="0">待处理</option>
                         <option value="1">执行中</option>
+                        <option value="4">上传中</option>
                         <option value="2">已完成</option>
                         <option value="3">失败</option>
                     </select>

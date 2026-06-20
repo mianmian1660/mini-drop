@@ -1045,8 +1045,8 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		if t.EndTime != nil {
 			tp.EndTime = t.EndTime
 		}
-		// 状态 >= 2 (完成) 且 analysis_status >= 2 (分析完成) 视为有结果
-		tp.HasResult = t.Status >= 2 && t.AnalysisStatus >= 2
+		// DONE 且 analysis_status >= 2 (分析完成) 视为有结果，UPLOADING 仍需继续轮询。
+		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus >= 2
 		timeline = append(timeline, tp)
 	}
 

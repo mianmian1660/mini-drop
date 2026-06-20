@@ -192,7 +192,7 @@ func (s *APIServer) GrpcConnected() bool {
 }
 
 // startTaskPoller 后台任务状态轮询器（W3）
-// 定期扫描 status=1(RUNNING) 的任务，将超时或已完成的任务标记为终态
+// 定期扫描 RUNNING / UPLOADING 任务，补齐 PENDING -> RUNNING -> UPLOADING -> DONE/FAILED 状态链。
 // 生产环境中应替换为 gRPC 回调或消息队列通知
 func (s *APIServer) startTaskPoller() {
 	ticker := time.NewTicker(5 * time.Second)
@@ -203,16 +203,16 @@ func (s *APIServer) startTaskPoller() {
 	}
 }
 
-// pollRunningTasks 检查 RUNNING 任务是否应标记为完成/失败
+// pollRunningTasks 检查 RUNNING / UPLOADING 任务是否应推进状态。
 func (s *APIServer) pollRunningTasks() {
 	var tasks []model.HotmethodTask
 
-	// 查出所有 status=1 (RUNNING) 的任务
-	if err := s.DB.Where("status = ?", 1).Find(&tasks).Error; err != nil {
+	if err := s.DB.Where("status IN ?", []int{TaskStatusRunning, TaskStatusUploading}).Find(&tasks).Error; err != nil {
 		s.Logger.Error("轮询任务状态失败", zap.Error(err))
 		return
 	}
 
+	now := time.Now()
 	for _, task := range tasks {
 		if task.BeginTime == nil {
 			continue
@@ -228,18 +228,53 @@ func (s *APIServer) pollRunningTasks() {
 		// 计算预期完成时间 = beginTime + duration + 30s 上传缓冲
 		expectedDuration := time.Duration(params.Duration) * time.Second
 		uploadBuffer := 30 * time.Second
+		uploadStart := task.BeginTime.Add(expectedDuration)
 		deadline := task.BeginTime.Add(expectedDuration).Add(uploadBuffer)
 
-		if time.Now().After(deadline) {
-			// 超时，标记为完成（MVP 阶段简化处理）
-			now := time.Now()
-			_ = s.transitionTaskStatus(&task, TaskStatusDone, "采集完成（超时自动标记）", "task_poller", map[string]interface{}{"end_time": &now})
-			s.Logger.Info("任务自动标记为完成",
+		if task.Status == TaskStatusRunning && !now.Before(uploadStart) {
+			_ = s.transitionTaskStatus(&task, TaskStatusUploading, "采集窗口结束，等待 Agent 上传产物", "task_poller", nil)
+			s.Logger.Info("任务进入上传阶段",
 				zap.String("tid", task.TID),
 				zap.String("name", task.Name),
 			)
+			continue
+		}
+
+		if task.Status == TaskStatusUploading {
+			hasArtifacts := s.taskHasArtifacts(task.TID)
+			if hasArtifacts || now.After(deadline) {
+				reason := "采集产物已上传，任务完成"
+				if !hasArtifacts {
+					reason = "上传等待窗口结束，任务自动标记完成"
+				}
+				endTime := now
+				_ = s.transitionTaskStatus(&task, TaskStatusDone, reason, "task_poller", map[string]interface{}{"end_time": &endTime})
+				s.Logger.Info("任务自动标记为完成",
+					zap.String("tid", task.TID),
+					zap.String("name", task.Name),
+					zap.Bool("has_artifacts", hasArtifacts),
+				)
+			}
 		}
 	}
+}
+
+func (s *APIServer) taskHasArtifacts(tid string) bool {
+	if tid == "" {
+		return false
+	}
+	if s.StorageConnected() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		objects, err := s.Storage.ListObjects(ctx, s.Config.Storage.Bucket, tid+"/")
+		if err == nil && len(objects) > 0 {
+			return true
+		}
+		if err != nil {
+			s.Logger.Warn("检查任务产物失败", zap.String("tid", tid), zap.Error(err))
+		}
+	}
+	return len(s.listLocalFiles(tid)) > 0
 }
 
 // startAgentDiscoverer 后台 Agent 自动发现（W3: 每 30 秒通过 gRPC 探测在线 Agent）

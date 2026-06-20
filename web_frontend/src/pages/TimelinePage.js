@@ -15,12 +15,12 @@ const S = {
     timeline: { position: 'relative', paddingLeft: 30, borderLeft: '3px solid #4a6cf7', marginLeft: 10 },
     point: (st) => ({
         position: 'relative', marginBottom: 20, padding: '10px 16px',
-        background: st === 2 ? '#e8f5e9' : st === 3 ? '#ffebee' : st === 1 ? '#e3f2fd' : '#f5f5f5',
+        background: st === 2 ? '#e8f5e9' : st === 3 ? '#ffebee' : st === 4 ? '#f3e8ff' : st === 1 ? '#e3f2fd' : '#f5f5f5',
         borderRadius: 6, border: '1px solid #eee',
     }),
     dot: (st) => ({
         position: 'absolute', left: -39, top: 12, width: 14, height: 14, borderRadius: '50%',
-        background: st === 2 ? '#4caf50' : st === 3 ? '#f44336' : st === 1 ? '#2196f3' : '#ccc',
+        background: st === 2 ? '#4caf50' : st === 3 ? '#f44336' : st === 4 ? '#7c3aed' : st === 1 ? '#2196f3' : '#ccc',
         border: '2px solid #fff', boxShadow: '0 0 0 2px #4a6cf7',
     }),
     loading: { textAlign: 'center', padding: 60, color: '#999' },
@@ -33,7 +33,15 @@ const S = {
     }),
 };
 
-const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败' };
+const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
+const statusBadgeColor = (status) => {
+    if (status === 2) return '#4caf50';
+    if (status === 3) return '#f44336';
+    if (status === 4) return '#7c3aed';
+    if (status === 1) return '#2196f3';
+    return '#ffc107';
+};
+const isActiveTask = (status) => status === 0 || status === 1 || status === 4;
 
 export default function TimelinePage() {
     const [schList, setSchList] = useState([]);
@@ -64,7 +72,7 @@ export default function TimelinePage() {
 
     // 自动轮询
     useEffect(() => {
-        const hasRunning = points.some(p => p.status < 2);
+        const hasRunning = points.some(p => isActiveTask(p.status));
         if (!hasRunning || !masterTid) return;
         const iv = setInterval(() => loadTimeline(masterTid), 5000);
         return () => clearInterval(iv);
@@ -159,7 +167,7 @@ export default function TimelinePage() {
                                         <strong>{i + 1}. {p.name || p.tid}</strong>
                                         <span style={{
                                             marginLeft: 10, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 'bold',
-                                            background: p.status === 2 ? '#4caf50' : p.status === 3 ? '#f44336' : p.status === 1 ? '#2196f3' : '#ffc107',
+                                            background: statusBadgeColor(p.status),
                                             color: '#fff'
                                         }}>{ST[p.status] || '未知'}</span>
                                         {p.has_result && <span style={{ marginLeft: 6, fontSize: 11, color: '#4caf50' }}>✅ 有结果</span>}

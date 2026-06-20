@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	TaskStatusCreated = 0
-	TaskStatusRunning = 1
-	TaskStatusDone    = 2
-	TaskStatusFailed  = 3
+	TaskStatusCreated   = 0
+	TaskStatusRunning   = 1
+	TaskStatusDone      = 2
+	TaskStatusFailed    = 3
+	TaskStatusUploading = 4
 )
 
 func (s *APIServer) transitionTaskStatus(task *model.HotmethodTask, toStatus int, reason string, source string, extra map[string]interface{}) error {
