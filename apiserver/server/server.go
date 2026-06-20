@@ -233,11 +233,7 @@ func (s *APIServer) pollRunningTasks() {
 		if time.Now().After(deadline) {
 			// 超时，标记为完成（MVP 阶段简化处理）
 			now := time.Now()
-			s.DB.Model(&task).Updates(map[string]interface{}{
-				"status":      2,
-				"status_info": "采集完成（超时自动标记）",
-				"end_time":    &now,
-			})
+			_ = s.transitionTaskStatus(&task, TaskStatusDone, "采集完成（超时自动标记）", "task_poller", map[string]interface{}{"end_time": &now})
 			s.Logger.Info("任务自动标记为完成",
 				zap.String("tid", task.TID),
 				zap.String("name", task.Name),
@@ -277,10 +273,12 @@ func (s *APIServer) startAgentDiscoverer() {
 			cancel()
 
 			if err != nil || resp.GetCode() != 0 {
-				// Agent 不可达 → 标记离线
-				s.DB.Model(&model.AgentInfo{}).
-					Where("ip_addr = ?", ip).
-					Update("online", false)
+				// Agent 不可达 → 标记离线并写审计
+				var existing model.AgentInfo
+				if s.DB.Where("ip_addr = ?", ip).First(&existing).Error == nil && existing.Online {
+					s.DB.Model(&existing).Update("online", false)
+					s.recordAgentAudit(existing.IPAddr, existing.Hostname, "offline", "30s 自动发现探测失败，判定 Agent 离线")
+				}
 				continue
 			}
 
@@ -289,6 +287,9 @@ func (s *APIServer) startAgentDiscoverer() {
 			result := s.DB.Where("ip_addr = ?", ip).First(&existing)
 			now := time.Now()
 			if result.Error == nil {
+				if !existing.Online {
+					s.recordAgentAudit(existing.IPAddr, existing.Hostname, "recovered", "30s 自动发现探测成功，Agent 恢复在线")
+				}
 				s.DB.Model(&existing).Updates(map[string]interface{}{
 					"online":    true,
 					"last_seen": now,
@@ -303,6 +304,7 @@ func (s *APIServer) startAgentDiscoverer() {
 					LastSeen:    now,
 				}
 				s.DB.Create(&agent)
+				s.recordAgentAudit(agent.IPAddr, agent.Hostname, "registered", "30s 自动发现发现新 Agent")
 				s.Logger.Info("自动发现新 Agent", zap.String("ip", ip))
 			}
 		}
@@ -325,6 +327,7 @@ func (s *APIServer) registerRoutes() {
 
 		// Agent 管理
 		api.GET("/agents", s.ListAgents)
+		api.GET("/agents/audits", s.ListAgentAudits)
 		api.GET("/agent/stat", s.StatAgent)
 
 		// 任务管理

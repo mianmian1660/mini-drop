@@ -14,9 +14,9 @@
 package model
 
 import (
-	"time"  // 时间类型
+	"time" // 时间类型
 
-	"gorm.io/gorm"  // GORM 软删除
+	"gorm.io/gorm" // GORM 软删除
 )
 
 // ----------------------------------------------------------
@@ -48,6 +48,18 @@ type AgentInfo struct {
 }
 
 // ----------------------------------------------------------
+// AgentAuditLog — Agent 在线/离线/恢复审计表
+// ----------------------------------------------------------
+type AgentAuditLog struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	IPAddr    string    `gorm:"column:ip_addr;size:45;index" json:"ip_addr"`
+	Hostname  string    `gorm:"column:hostname;size:256" json:"hostname"`
+	Event     string    `gorm:"column:event;size:64" json:"event"`
+	Reason    string    `gorm:"column:reason;size:1024" json:"reason"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+// ----------------------------------------------------------
 // HotmethodTask — 任务表（最核心的表！）
 // ----------------------------------------------------------
 type HotmethodTask struct {
@@ -68,6 +80,19 @@ type HotmethodTask struct {
 	EndTime        *time.Time     `gorm:"column:end_time" json:"end_time"`
 	MasterTaskTID  string         `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
 	DeletedAt      gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+// ----------------------------------------------------------
+// TaskStatusEvent — 任务状态迁移审计表
+// ----------------------------------------------------------
+type TaskStatusEvent struct {
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	TID        string    `gorm:"column:tid;size:64;index" json:"tid"`
+	FromStatus int       `gorm:"column:from_status" json:"from_status"`
+	ToStatus   int       `gorm:"column:to_status" json:"to_status"`
+	Reason     string    `gorm:"column:reason;size:1024" json:"reason"`
+	Source     string    `gorm:"column:source;size:64" json:"source"`
+	CreatedAt  time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
 // ----------------------------------------------------------
@@ -119,22 +144,22 @@ type AnalysisSuggestion struct {
 // ScheduleTask — 定时任务表（W5）
 // ----------------------------------------------------------
 type ScheduleTask struct {
-	ID           uint           `gorm:"primaryKey" json:"id"`
-	SID          string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
-	Name         string         `gorm:"column:name;size:256" json:"name"`
-	CronExpr     string         `gorm:"column:cron_expr;size:128" json:"cron_expr"`       // cron 表达式
-	TaskType     uint32         `gorm:"column:task_type;default:0" json:"task_type"`
-	ProfilerType uint32         `gorm:"column:profiler_type;default:0" json:"profiler_type"`
-	TargetIP     string         `gorm:"column:target_ip;size:45" json:"target_ip"`
-	RequestParams []byte        `gorm:"column:request_params;type:jsonb" json:"request_params"`
-	Enabled      bool           `gorm:"column:enabled;default:true" json:"enabled"`
-	LastRunAt    *time.Time     `gorm:"column:last_run_at" json:"last_run_at"`
-	NextRunAt    *time.Time     `gorm:"column:next_run_at" json:"next_run_at"`
-	UID          string         `gorm:"column:uid;size:64" json:"uid"`
-	UserName     string         `gorm:"column:user_name;size:128" json:"user_name"`
-	CreatedAt    time.Time      `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt    time.Time      `gorm:"column:updated_at" json:"updated_at"`
-	DeletedAt    gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	ID            uint           `gorm:"primaryKey" json:"id"`
+	SID           string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
+	Name          string         `gorm:"column:name;size:256" json:"name"`
+	CronExpr      string         `gorm:"column:cron_expr;size:128" json:"cron_expr"` // cron 表达式
+	TaskType      uint32         `gorm:"column:task_type;default:0" json:"task_type"`
+	ProfilerType  uint32         `gorm:"column:profiler_type;default:0" json:"profiler_type"`
+	TargetIP      string         `gorm:"column:target_ip;size:45" json:"target_ip"`
+	RequestParams []byte         `gorm:"column:request_params;type:jsonb" json:"request_params"`
+	Enabled       bool           `gorm:"column:enabled;default:true" json:"enabled"`
+	LastRunAt     *time.Time     `gorm:"column:last_run_at" json:"last_run_at"`
+	NextRunAt     *time.Time     `gorm:"column:next_run_at" json:"next_run_at"`
+	UID           string         `gorm:"column:uid;size:64" json:"uid"`
+	UserName      string         `gorm:"column:user_name;size:128" json:"user_name"`
+	CreatedAt     time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt     time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
 }
 
 // ----------------------------------------------------------
@@ -148,7 +173,9 @@ func AutoMigrate(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&UserInfo{},
 		&AgentInfo{},
+		&AgentAuditLog{},
 		&HotmethodTask{},
+		&TaskStatusEvent{},
 		&MultiTask{},
 		&Group{},
 		&GroupMember{},

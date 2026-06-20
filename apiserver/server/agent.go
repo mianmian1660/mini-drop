@@ -9,13 +9,14 @@ package server
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	pb "github.com/mini-drop/apiserver/proto/control"
 	"github.com/mini-drop/apiserver/model"
+	pb "github.com/mini-drop/apiserver/proto/control"
 )
 
 // ListAgents 获取 Agent 列表
@@ -36,6 +37,8 @@ func (s *APIServer) ListAgents(c *gin.Context) {
 	// W3: 尝试通过 gRPC 刷新每个 Agent 的在线状态
 	if s.ControlCli != nil {
 		for i := range agents {
+			s.ensureAgentAudited(&agents[i])
+			s.markAgentOfflineIfStale(&agents[i])
 			s.refreshAgentStatus(&agents[i])
 		}
 	}
@@ -72,8 +75,10 @@ func (s *APIServer) refreshAgentStatus(agent *model.AgentInfo) {
 	if err != nil {
 		// gRPC 不可达 → 标记离线
 		if agent.Online {
+			reason := "gRPC StatAgent 失败，30s 心跳检查判定离线"
 			agent.Online = false
 			s.DB.Model(agent).Update("online", false)
+			s.recordAgentAudit(agent.IPAddr, agent.Hostname, "offline", reason)
 		}
 		return
 	}
@@ -83,10 +88,43 @@ func (s *APIServer) refreshAgentStatus(agent *model.AgentInfo) {
 		if !agent.Online {
 			agent.Online = true
 			s.DB.Model(agent).Update("online", true)
+			s.recordAgentAudit(agent.IPAddr, agent.Hostname, "recovered", "gRPC StatAgent 成功，Agent 恢复在线")
 		}
 		agent.LastSeen = time.Now()
 		s.DB.Model(agent).Update("last_seen", time.Now())
 	}
+}
+
+func (s *APIServer) markAgentOfflineIfStale(agent *model.AgentInfo) {
+	if agent == nil || !agent.Online || agent.LastSeen.IsZero() {
+		return
+	}
+	if time.Since(agent.LastSeen) <= 30*time.Second {
+		return
+	}
+	reason := "超过 30s 未收到 Agent 心跳"
+	agent.Online = false
+	s.DB.Model(agent).Update("online", false)
+	s.recordAgentAudit(agent.IPAddr, agent.Hostname, "offline", reason)
+}
+
+func (s *APIServer) ensureAgentAudited(agent *model.AgentInfo) {
+	if agent == nil || agent.IPAddr == "" {
+		return
+	}
+	var count int64
+	if err := s.DB.Model(&model.AgentAuditLog{}).Where("ip_addr = ?", agent.IPAddr).Count(&count).Error; err != nil {
+		return
+	}
+	if count > 0 {
+		return
+	}
+	event := "registered"
+	reason := "已有 Agent 首次纳入审计"
+	if agent.Online {
+		reason = "已有在线 Agent 首次纳入审计"
+	}
+	s.recordAgentAudit(agent.IPAddr, agent.Hostname, event, reason)
 }
 
 // discoverAgents 自动发现 Agent（探测已知 IP 列表）
@@ -142,6 +180,9 @@ func (s *APIServer) discoverAgents() []model.AgentInfo {
 			result := s.DB.Where("ip_addr = ?", ip).First(&existing)
 			if result.Error == nil {
 				// 已存在 → 更新在线状态
+				if !existing.Online {
+					s.recordAgentAudit(existing.IPAddr, existing.Hostname, "recovered", "自动发现探测成功，Agent 恢复在线")
+				}
 				s.DB.Model(&existing).Updates(map[string]interface{}{
 					"online":    true,
 					"last_seen": now,
@@ -152,6 +193,7 @@ func (s *APIServer) discoverAgents() []model.AgentInfo {
 			} else {
 				// 不存在 → 创建
 				s.DB.Create(&agent)
+				s.recordAgentAudit(agent.IPAddr, agent.Hostname, "registered", "自动发现新 Agent")
 				discovered = append(discovered, agent)
 			}
 
@@ -190,6 +232,9 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 			// 同时更新 DB
 			var agent model.AgentInfo
 			if s.DB.Where("ip_addr = ?", ip).First(&agent).Error == nil {
+				if !agent.Online {
+					s.recordAgentAudit(agent.IPAddr, agent.Hostname, "recovered", "实时资源查询成功，Agent 恢复在线")
+				}
 				agent.Online = true
 				agent.LastSeen = time.Now()
 				s.DB.Save(&agent)
@@ -198,15 +243,15 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"code": 0,
 				"data": gin.H{
-					"hostname":      agent.Hostname,
-					"ip_addr":       ip,
-					"online":        true,
-					"version":       agent.Version,
-					"environment":   agent.Environment,
-					"last_seen":     agent.LastSeen,
-					"cpu_percent":   resp.GetCpuPercent(),
-					"memory_kb":     resp.GetMemoryKb(),
-					"read_kb_per_s": resp.GetReadKbPerS(),
+					"hostname":       agent.Hostname,
+					"ip_addr":        ip,
+					"online":         true,
+					"version":        agent.Version,
+					"environment":    agent.Environment,
+					"last_seen":      agent.LastSeen,
+					"cpu_percent":    resp.GetCpuPercent(),
+					"memory_kb":      resp.GetMemoryKb(),
+					"read_kb_per_s":  resp.GetReadKbPerS(),
 					"write_kb_per_s": resp.GetWriteKbPerS(),
 				},
 			})
@@ -227,16 +272,48 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": gin.H{
-			"hostname":    agent.Hostname,
-			"ip_addr":     agent.IPAddr,
-			"online":      agent.Online,
-			"version":     agent.Version,
-			"environment": agent.Environment,
-			"last_seen":   agent.LastSeen,
-			"cpu_percent":  0.0,
-			"memory_kb":    0,
-			"read_kb_per_s": 0.0,
+			"hostname":       agent.Hostname,
+			"ip_addr":        agent.IPAddr,
+			"online":         agent.Online,
+			"version":        agent.Version,
+			"environment":    agent.Environment,
+			"last_seen":      agent.LastSeen,
+			"cpu_percent":    0.0,
+			"memory_kb":      0,
+			"read_kb_per_s":  0.0,
 			"write_kb_per_s": 0.0,
+		},
+	})
+}
+
+// ListAgentAudits 获取 Agent 在线/离线/恢复审计日志
+// GET /api/v1/agents/audits?limit=20
+func (s *APIServer) ListAgentAudits(c *gin.Context) {
+	limit := 20
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+
+	var audits []model.AgentAuditLog
+	if err := s.DB.Order("created_at DESC, id DESC").Limit(limit).Find(&audits).Error; err != nil {
+		s.Logger.Error("查询 Agent 审计日志失败", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":    500,
+			"message": "查询 Agent 审计日志失败",
+		})
+		return
+	}
+	if audits == nil {
+		audits = []model.AgentAuditLog{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"data": gin.H{
+			"audits": audits,
+			"total":  len(audits),
 		},
 	})
 }

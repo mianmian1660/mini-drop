@@ -130,6 +130,7 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		})
 		return
 	}
+	s.recordTaskStatusEvent(task.TID, -1, TaskStatusCreated, "任务已创建，等待下发", "apiserver")
 
 	// W3: 通过 gRPC 下发任务到 drop_server
 	if s.GrpcConnected() {
@@ -139,10 +140,7 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 			zap.String("tid", tid),
 		)
 		// 标记为失败，等待后续手动重试或 cron 重发
-		s.DB.Model(task).Updates(map[string]interface{}{
-			"status":      3,
-			"status_info": "gRPC 未连接，任务无法下发到 drop_server",
-		})
+		_ = s.transitionTaskStatus(task, TaskStatusFailed, "gRPC 未连接，任务无法下发到 drop_server", "apiserver", nil)
 	}
 
 	s.Logger.Info("任务创建成功",
@@ -212,10 +210,7 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
 			zap.String("target_ip", req.TargetIP),
 			zap.Error(err),
 		)
-		s.DB.Model(task).Updates(map[string]interface{}{
-			"status":      3,
-			"status_info": errMsg,
-		})
+		_ = s.transitionTaskStatus(task, TaskStatusFailed, errMsg, "apiserver", nil)
 		return
 	}
 
@@ -226,11 +221,11 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
 	)
 
 	now := time.Now()
-	s.DB.Model(task).Updates(map[string]interface{}{
-		"status":      1, // 执行中
-		"status_info": fmt.Sprintf("已下发到 drop_server, code=%d msg=%s", resp.Code, resp.Msg),
-		"begin_time":  &now,
-	})
+	_ = s.transitionTaskStatus(task, TaskStatusRunning,
+		fmt.Sprintf("已下发到 drop_server, code=%d msg=%s", resp.Code, resp.Msg),
+		"apiserver",
+		map[string]interface{}{"begin_time": &now},
+	)
 }
 
 // ListTasks 获取任务列表（支持分页、搜索、状态筛选）
@@ -316,6 +311,7 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	var topFuncs []map[string]interface{}
 	var bpfData map[string]interface{}
 	var suggestions []map[string]interface{}
+	statusEvents := s.fetchTaskStatusEvents(tid)
 
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
@@ -355,6 +351,7 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	if len(suggestions) > 0 {
 		result["suggestions"] = suggestions
 	}
+	result["status_events"] = statusEvents
 	result["files"] = files
 
 	c.JSON(http.StatusOK, gin.H{
@@ -550,6 +547,17 @@ func normalizeSuggestions(data map[string]interface{}) []map[string]interface{} 
 	return suggestions
 }
 
+func (s *APIServer) fetchTaskStatusEvents(tid string) []model.TaskStatusEvent {
+	var events []model.TaskStatusEvent
+	if err := s.DB.Where("tid = ?", tid).Order("created_at ASC, id ASC").Find(&events).Error; err != nil {
+		return []model.TaskStatusEvent{}
+	}
+	if events == nil {
+		return []model.TaskStatusEvent{}
+	}
+	return events
+}
+
 // DeleteTask 软删除任务
 // DELETE /api/v1/tasks/:tid
 func (s *APIServer) DeleteTask(c *gin.Context) {
@@ -623,6 +631,7 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 		})
 		return
 	}
+	s.recordTaskStatusEvent(newTask.TID, -1, TaskStatusCreated, "重试任务已创建，等待下发", "apiserver")
 
 	// W3: 重试任务也通过 gRPC 下发
 	if s.GrpcConnected() {
@@ -645,10 +654,7 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 		}
 		s.dispatchTask(&newTask, req)
 	} else {
-		s.DB.Model(&newTask).Updates(map[string]interface{}{
-			"status":      3,
-			"status_info": "gRPC 未连接，重试任务无法下发",
-		})
+		_ = s.transitionTaskStatus(&newTask, TaskStatusFailed, "gRPC 未连接，重试任务无法下发", "apiserver", nil)
 	}
 
 	s.Logger.Info("任务重试成功",

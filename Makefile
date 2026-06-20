@@ -7,7 +7,7 @@ TARGET_IP ?= 127.0.0.1
 DURATION ?= 6
 FREQUENCY ?= 99
 
-.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health test verify
+.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health test e2e verify
 
 health:
 	@echo "[health] API: $(API)"
@@ -59,6 +59,9 @@ test:
 	cd apiserver && go test ./...
 	cd analysis && python3 test_analysis.py
 	cd web_frontend && npm run build
+
+e2e:
+	bash scripts/e2e_smoke.sh
 
 verify: test
 	git diff --check

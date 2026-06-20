@@ -11,13 +11,20 @@ import CreateTaskModal from '../components/CreateTaskModal';
 import Pagination from '../components/Pagination';
 
 const styles = {
-    container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
-    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
-    btn: { background: '#4a6cf7', color: '#fff', border: 'none', padding: '10px 20px', borderRadius: 6, cursor: 'pointer', fontSize: 14 },
+    container: { maxWidth: 1280, margin: '0 auto', padding: 24, fontFamily: 'Arial, sans-serif', color: '#202124' },
+    pageHead: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-end', marginBottom: 18 },
+    eyebrow: { margin: '0 0 6px 0', color: '#667085', fontSize: 13 },
+    title: { margin: 0, fontSize: 28, lineHeight: 1.2 },
+    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 3px rgba(16,24,40,0.08)' },
+    metricGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 16 },
+    metric: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 16 },
+    metricLabel: { color: '#667085', fontSize: 12, marginBottom: 8 },
+    metricValue: { fontSize: 24, fontWeight: 700 },
+    btn: { background: '#315efb', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 6, cursor: 'pointer', fontSize: 14, fontWeight: 700 },
     table: { width: '100%', borderCollapse: 'collapse' },
-    th: { textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid #e0e0e0', color: '#666', fontSize: 13 },
-    td: { padding: '12px 16px', borderBottom: '1px solid #f0f0f0', fontSize: 14 },
-    badge: { padding: '2px 8px', borderRadius: 10, fontSize: 12, fontWeight: 'bold' },
+    th: { textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
+    td: { padding: '12px 16px', borderBottom: '1px solid #edf0f3', fontSize: 14, verticalAlign: 'top' },
+    badge: { display: 'inline-flex', alignItems: 'center', padding: '3px 9px', borderRadius: 999, fontSize: 12, fontWeight: 'bold' },
     empty: { textAlign: 'center', padding: 40, color: '#999' },
     loading: { textAlign: 'center', padding: 40, color: '#999' },
     searchRow: { display: 'flex', gap: 12, marginBottom: 16 },
@@ -25,6 +32,11 @@ const styles = {
     select: { padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14, background: '#fff' },
     toolbar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
     totalInfo: { fontSize: 13, color: '#999' },
+    sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, margin: '24px 0 12px' },
+    sectionTitle: { margin: 0, fontSize: 22 },
+    subtle: { color: '#667085', fontSize: 12 },
+    auditList: { display: 'grid', gap: 10 },
+    auditItem: { display: 'grid', gridTemplateColumns: '130px minmax(120px, 1fr) 120px minmax(0, 2fr)', gap: 12, padding: '10px 12px', background: '#fbfcfe', border: '1px solid #edf0f3', borderRadius: 6, fontSize: 13 },
 };
 
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
@@ -33,6 +45,7 @@ const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败
 export default function HomePage() {
     const [agentList, setAgentList] = useState([]);
     const [taskList, setTaskList] = useState([]);
+    const [auditList, setAuditList] = useState([]);
     const [showCreate, setShowCreate] = useState(false);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -45,6 +58,9 @@ export default function HomePage() {
     const [pageSize] = useState(5);   // 主页任务列表每页 5 条
     const [total, setTotal] = useState(0);
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const onlineAgents = agentList.filter(a => a.online).length;
+    const runningTasks = taskList.filter(t => t.status === 1).length;
+    const failedTasks = taskList.filter(t => t.status === 3).length;
 
     // 加载 Agent 列表（不分页）
     const loadAgents = async () => {
@@ -55,6 +71,17 @@ export default function HomePage() {
             }
         } catch (err) {
             console.error('加载 Agent 列表失败:', err);
+        }
+    };
+
+    const loadAudits = async () => {
+        try {
+            const res = await agents.audits({ limit: 8 });
+            if (res.code === 0) {
+                setAuditList(res.data?.audits || []);
+            }
+        } catch (err) {
+            console.error('加载 Agent 审计日志失败:', err);
         }
     };
 
@@ -80,7 +107,7 @@ export default function HomePage() {
     useEffect(() => {
         setLoading(true);
         setError('');
-        Promise.all([loadAgents(), loadTasks()])
+        Promise.all([loadAgents(), loadTasks(), loadAudits()])
             .catch(err => {
                 console.error('加载数据失败:', err);
                 setError('无法连接到后端服务，请确认 apiserver 已启动');
@@ -117,7 +144,7 @@ export default function HomePage() {
         setSearchText('');
         setKeyword('');
         // 重新加载
-        Promise.all([loadAgents(), loadTasks()]).finally(() => setLoading(false));
+        Promise.all([loadAgents(), loadTasks(), loadAudits()]).finally(() => setLoading(false));
     };
 
     if (loading) {
@@ -126,6 +153,23 @@ export default function HomePage() {
 
     return (
         <div style={styles.container}>
+            <div style={styles.pageHead}>
+                <div>
+                    <p style={styles.eyebrow}>Mini-Drop 控制台</p>
+                    <h2 style={styles.title}>性能采集与分析</h2>
+                </div>
+                <button style={styles.btn} onClick={() => setShowCreate(!showCreate)}>
+                    {showCreate ? '取消' : '+ 新建采样'}
+                </button>
+            </div>
+
+            <div style={styles.metricGrid}>
+                <Metric label="在线 Agent" value={`${onlineAgents}/${agentList.length}`} />
+                <Metric label="当前页运行任务" value={runningTasks} />
+                <Metric label="当前页失败任务" value={failedTasks} />
+                <Metric label="任务总数" value={total} />
+            </div>
+
             {error && (
                 <div style={{ ...styles.card, background: '#fff3f3', border: '1px solid #ffcdd2' }}>
                     <p style={{ color: '#d32f2f', margin: 0 }}>⚠️ {error}</p>
@@ -133,7 +177,10 @@ export default function HomePage() {
             )}
 
             {/* ===== Agent 列表 ===== */}
-            <h2>Agent 列表</h2>
+            <div style={styles.sectionHead}>
+                <h2 style={styles.sectionTitle}>Agent 列表</h2>
+                <span style={styles.subtle}>每 5s 心跳；超过 30s 未探测到会判定离线并写审计</span>
+            </div>
             <div style={styles.card}>
                 {agentList.length === 0 ? (
                     <p style={styles.empty}>暂无 Agent 在线，请先启动 drop_agent</p>
@@ -159,7 +206,7 @@ export default function HomePage() {
                                         </span>
                                     </td>
                                     <td style={styles.td}>{a.version}</td>
-                                    <td style={styles.td}>{a.last_seen || '-'}</td>
+                                    <td style={styles.td}>{formatTime(a.last_seen) || '-'}</td>
                                 </tr>
                             ))}
                         </tbody>
@@ -167,12 +214,31 @@ export default function HomePage() {
                 )}
             </div>
 
+            <div style={styles.sectionHead}>
+                <h2 style={styles.sectionTitle}>Agent 审计日志</h2>
+                <span style={styles.subtle}>记录注册、离线、恢复原因</span>
+            </div>
+            <div style={styles.card}>
+                {auditList.length === 0 ? (
+                    <p style={styles.empty}>暂无 Agent 审计日志</p>
+                ) : (
+                    <div style={styles.auditList}>
+                        {auditList.map(a => (
+                            <div key={a.id} style={styles.auditItem}>
+                                <span>{formatTime(a.created_at)}</span>
+                                <strong>{a.ip_addr}</strong>
+                                <span style={{ ...styles.badge, background: auditColor(a.event), color: '#fff', justifyContent: 'center' }}>{auditName(a.event)}</span>
+                                <span>{a.reason || '-'}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+
             {/* ===== 任务列表标题 + 新建按钮 ===== */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <h2>任务列表</h2>
-                <button style={styles.btn} onClick={() => setShowCreate(!showCreate)}>
-                    {showCreate ? '取消' : '+ 新建采样'}
-                </button>
+            <div style={styles.sectionHead}>
+                <h2 style={styles.sectionTitle}>任务列表</h2>
+                <span style={styles.subtle}>状态 reason 来自最近一次状态迁移</span>
             </div>
 
             {showCreate && <CreateTaskModal onClose={() => setShowCreate(false)} onSuccess={handleTaskCreated} />}
@@ -222,6 +288,7 @@ export default function HomePage() {
                                 <th style={styles.th}>名称</th>
                                 <th style={styles.th}>目标IP</th>
                                 <th style={styles.th}>状态</th>
+                                <th style={styles.th}>Reason</th>
                                 <th style={styles.th}>创建时间</th>
                                 <th style={styles.th}>操作</th>
                             </tr>
@@ -237,7 +304,8 @@ export default function HomePage() {
                                             {statusNames[t.status] || '未知'}
                                         </span>
                                     </td>
-                                    <td style={styles.td}>{t.create_time}</td>
+                                    <td style={{ ...styles.td, color: '#667085', maxWidth: 260 }}>{t.status_info || '-'}</td>
+                                    <td style={styles.td}>{formatTime(t.create_time)}</td>
                                     <td style={styles.td}>
                                         <Link to={`/task/result?tid=${t.tid}`} style={{ color: '#4a6cf7' }}>查看</Link>
                                     </td>
@@ -252,4 +320,34 @@ export default function HomePage() {
             </div>
         </div>
     );
+}
+
+function Metric({ label, value }) {
+    return (
+        <div style={styles.metric}>
+            <div style={styles.metricLabel}>{label}</div>
+            <div style={styles.metricValue}>{value}</div>
+        </div>
+    );
+}
+
+function formatTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+}
+
+function auditName(event) {
+    if (event === 'registered') return '注册';
+    if (event === 'offline') return '离线';
+    if (event === 'recovered') return '恢复';
+    return event || '事件';
+}
+
+function auditColor(event) {
+    if (event === 'offline') return '#dc2626';
+    if (event === 'recovered') return '#16a34a';
+    if (event === 'registered') return '#2563eb';
+    return '#64748b';
 }

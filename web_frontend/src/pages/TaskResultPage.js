@@ -75,6 +75,7 @@ export default function TaskResultPage() {
     const [topFunctions, setTopFunctions] = useState([]);
     const [bpfHistogram, setBpfHistogram] = useState(null);
     const [suggestions, setSuggestions] = useState([]);
+    const [statusEvents, setStatusEvents] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [polling, setPolling] = useState(false);
@@ -106,6 +107,7 @@ export default function TaskResultPage() {
             setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
             setBpfHistogram(data.bpf_histogram || null);
             setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
+            setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
             applyFiles(data.files || []);
             setError('');
         } catch (err) {
@@ -207,6 +209,8 @@ export default function TaskResultPage() {
                     <Metric label="状态 reason" value={task.status_info || '-'} />
                 </div>
             </div>
+
+            <StatusEventsPanel events={statusEvents} />
 
             <div style={styles.split}>
                 <div style={styles.card}>
@@ -334,6 +338,42 @@ function ParameterPanel({ task }) {
             <p style={styles.paramHint}>
                 这些参数来自任务创建请求，分析产物会在采集完成后自动关联到当前任务。
             </p>
+        </div>
+    );
+}
+
+function StatusEventsPanel({ events }) {
+    return (
+        <div style={styles.card}>
+            <h3 style={styles.sectionTitle}>状态迁移 Reason</h3>
+            {events.length > 0 ? (
+                <div style={{ overflowX: 'auto' }}>
+                    <table style={styles.table}>
+                        <thead>
+                            <tr>
+                                <th style={styles.th}>时间</th>
+                                <th style={styles.th}>迁移</th>
+                                <th style={styles.th}>来源</th>
+                                <th style={styles.th}>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {events.map(event => (
+                                <tr key={event.id}>
+                                    <td style={styles.td}>{formatTime(event.created_at)}</td>
+                                    <td style={styles.td}>{statusLabel(event.from_status)} -> {statusLabel(event.to_status)}</td>
+                                    <td style={styles.td}>{event.source || '-'}</td>
+                                    <td style={styles.td}>{event.reason || '-'}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            ) : (
+                <p style={{ textAlign: 'center', padding: 24, color: '#667085', margin: 0 }}>
+                    旧任务暂无迁移审计；新建任务会记录每次状态变化及 reason。
+                </p>
+            )}
         </div>
     );
 }
@@ -530,6 +570,16 @@ function isStepActive(index, status, analysisStatus, artifact) {
     if (index === 3) return status === 2 && analysisStatus === 1 && !artifact;
     if (index === 4) return status === 2 && (analysisStatus >= 2 || Boolean(artifact));
     return false;
+}
+
+function statusLabel(status) {
+    const n = Number(status);
+    if (n < 0) return 'INIT';
+    if (n === 0) return 'PENDING';
+    if (n === 1) return 'RUNNING';
+    if (n === 2) return 'DONE';
+    if (n === 3) return 'FAILED';
+    return String(status);
 }
 
 function resolveUrl(url) {

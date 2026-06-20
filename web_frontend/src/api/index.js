@@ -27,6 +27,8 @@ export const users = {
 export const agents = {
     // Agent 列表（GET /api/v1/agents）
     list: () => client.get('/api/v1/agents'),
+    // Agent 审计日志（GET /api/v1/agents/audits）
+    audits: (params = {}) => client.get('/api/v1/agents/audits', { params }),
     // Agent 资源统计（GET /api/v1/agent/stat?ip=xxx）
     stat: (ip) => client.get('/api/v1/agent/stat', { params: { ip } }),
 };

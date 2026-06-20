@@ -66,7 +66,7 @@ func main() {
 	if err := model.AutoMigrate(db); err != nil {
 		logger.Fatal("数据库迁移失败", zap.Error(err))
 	}
-	logger.Info("数据库迁移完成（7 张表已就绪）")
+	logger.Info("数据库迁移完成（业务表与审计表已就绪）")
 
 	// ---------- 5. 初始化 HTTP 服务 ----------
 	srv := server.New(db, logger, cfg)
