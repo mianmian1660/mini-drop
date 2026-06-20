@@ -93,11 +93,25 @@ services:
     network_mode: host # 使用宿主机网络（需要 perf 权限）
     privileged: true # 特权模式（perf 需要）
     pid: host # 使用宿主机 PID 命名空间
+    security_opt:
+      - apparmor:unconfined # bpftrace 访问 tracefs/debugfs 时避免被 AppArmor 拦截
     cap_add:
       # 添加 Linux 能力
       - SYS_ADMIN
       - SYS_PTRACE
       - PERFMON
+      - BPF
+      - SYS_RESOURCE
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+      - /sys/kernel/tracing:/sys/kernel/tracing:rw
+      - /sys/kernel/tracing:/sys/kernel/debug/tracing:rw
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      - /lib/modules:/lib/modules:ro
     depends_on:
       - drop_server
 

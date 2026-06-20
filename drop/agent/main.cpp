@@ -32,6 +32,10 @@
 #include <atomic>
 #include <csignal>
 #include <fstream>
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <sys/stat.h>
 
 #include <grpcpp/grpcpp.h>
@@ -163,6 +167,17 @@ static void generate_mock_collapsed_stacks(const string &outputPath)
     }
 }
 
+static bool env_enabled(const char *name)
+{
+    const char *v = getenv(name);
+    if (!v)
+        return false;
+    string s(v);
+    transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
+              { return static_cast<char>(tolower(c)); });
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+}
+
 // ============================================================
 // 多采集器分发：按 profilerType 选择对应的采集函数
 // 返回 (resultCode, profilerName)
@@ -225,11 +240,20 @@ static pair<int, string> run_profiler(
         int result = drop::run_bpf(task, path);
         if (result != 0)
         {
-            cout << "[agent] eBPF 不可用，启用 mock 模式" << endl;
+            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
+            {
+                cout << "[agent] eBPF 采集失败(result=" << result
+                     << ")，默认不生成 mock。评分演示要求 eBPF 必须真跑；"
+                     << "如仅本地开发要看页面链路，可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
+                return {result, "eBPF"};
+            }
+
+            cout << "[agent] eBPF 不可用，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
             // eBPF IO 模式生成模拟 IO 直方图
             if (task.sampleargv().event() == "io" || task.sampleargv().event() == "blk")
             {
                 ofstream mockIO(path);
+                mockIO << "# Mini-Drop eBPF IO Latency (MOCK)\n";
                 mockIO << "@io_lat_us:\n";
                 mockIO << "[1, 2)        42 |@@@@@@@@@\n";
                 mockIO << "[2, 4)        88 |@@@@@@@@@@@@@@@@@@@\n";
@@ -246,7 +270,7 @@ static pair<int, string> run_profiler(
             if (task.sampleargv().event() == "sched" || task.sampleargv().event() == "schedule")
             {
                 ofstream mockSched(path);
-                mockSched << "# Mini-Drop eBPF Scheduler Latency\n";
+                mockSched << "# Mini-Drop eBPF Scheduler Latency (MOCK)\n";
                 mockSched << "@sched_lat_us:\n";
                 mockSched << "[0, 10)      520 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
                 mockSched << "[10, 50)     210 |@@@@@@@@@@@@@@@@@@@@\n";
@@ -293,6 +317,8 @@ static string get_error_message(int resultCode, const string &profilerName,
     case -2:
     case -5:
     case -6:
+        if (profilerName == "eBPF")
+            return "eBPF 采集失败：请确认 bpftrace/tracefs 权限可用，并在采集窗口内制造 IO 或调度负载，resultCode=" + to_string(resultCode);
         return profilerName + " 进程异常, resultCode=" + to_string(resultCode);
     default:
         return profilerName + " 采集失败, exitCode=" + to_string(resultCode);

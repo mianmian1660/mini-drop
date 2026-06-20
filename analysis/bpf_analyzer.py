@@ -96,6 +96,7 @@ def parse_bpf_histogram(text: str) -> dict:
         if total_match:
             result["total_events"] = int(total_match.group(1))
     
+    buckets = merge_histogram_buckets(buckets)
     result["buckets"] = buckets
     
     # 如果没有显式 total，用 bucket 计数和
@@ -113,8 +114,8 @@ def parse_bpf_histogram(text: str) -> dict:
             all_values.sort()
             n = len(all_values)
             result["summary"] = {
-                "min": buckets[0]["low"],
-                "max": buckets[-1]["high"],
+                "min": min(b["low"] for b in buckets),
+                "max": max(b["high"] for b in buckets),
                 "p50": all_values[n // 2],
                 "p95": all_values[int(n * 0.95)] if n > 20 else all_values[-1],
                 "p99": all_values[int(n * 0.99)] if n > 100 else all_values[-1],
@@ -122,6 +123,21 @@ def parse_bpf_histogram(text: str) -> dict:
             }
     
     return result
+
+
+def merge_histogram_buckets(buckets: list) -> list:
+    """合并 bpftrace 退出时重复打印的同一延迟桶，并按桶边界排序。"""
+    merged = {}
+    for bucket in buckets:
+        key = (bucket["range"], bucket["low"], bucket["high"])
+        if key not in merged:
+            merged[key] = dict(bucket)
+            continue
+        merged[key]["count"] += bucket["count"]
+        if len(bucket.get("bar", "")) > len(merged[key].get("bar", "")):
+            merged[key]["bar"] = bucket["bar"]
+
+    return sorted(merged.values(), key=lambda b: (b["low"], b["high"], b["range"]))
 
 
 def parse_hist_value(value: str, default: float = 0.0) -> float:

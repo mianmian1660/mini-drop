@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdio>
+#include <cctype>
 
 using namespace std;
 using namespace std::chrono;
@@ -43,6 +44,7 @@ namespace drop
     static void postprocess(const string &raw, const string &out, BpfMode mode);
     static int exec_bpftrace(const string &scriptPath, const string &outputPath,
                              const hotmethod::TaskDesc &taskDesc, BpfMode mode);
+    static bool has_histogram_bucket(const string &path);
 
     // ---- 生成 bpftrace 脚本 ----
     static string make_script(BpfMode mode, const hotmethod::TaskDesc &taskDesc)
@@ -67,24 +69,47 @@ namespace drop
             break;
 
         case BpfMode::IO_LATENCY:
-            s += "kprobe:blk_account_io_start\n{\n    @start[tid] = nsecs;\n    @io_cnt = count();\n}\n\n";
-            s += "kprobe:blk_account_io_done\n{\n";
-            s += "    $ns = nsecs;\n    if (@start[tid]) {\n";
-            s += "        $lat = ($ns - @start[tid]) / 1000;\n";
-            s += "        @io_lat_us = hist($lat);\n        delete(@start[tid]);\n    }\n}\n\n";
-            s += "interval:s:" + to_string(dur) + "\n{\n    exit();\n}\n\n";
-            s += "END {\n    print(@io_lat_us);\n    printf(\"# Total IO: %d\\n\", @io_cnt);\n";
-            s += "    clear(@start); clear(@io_cnt); clear(@io_lat_us);\n}\n";
+            s += "#define dev_t unsigned int\n";
+            s += "#define sector_t unsigned long\n\n";
+            s += "tracepoint:block:block_rq_issue\n{\n";
+            s += "    @rq_start[args->dev, args->sector] = nsecs;\n";
+            s += "}\n\n";
+            s += "tracepoint:block:block_rq_complete\n/@rq_start[args->dev, args->sector]/\n{\n";
+            s += "    $lat = (nsecs - @rq_start[args->dev, args->sector]) / 1000;\n";
+            s += "    @io_lat_us = hist($lat);\n";
+            s += "    @io_events = count();\n";
+            s += "    delete(@rq_start[args->dev, args->sector]);\n";
+            s += "}\n\n";
+            s += "interval:s:" + to_string(dur) + "\n{\n";
+            s += "    printf(\"# Mini-Drop eBPF IO Latency\\n\");\n";
+            s += "    print(@io_lat_us);\n";
+            s += "    print(@io_events);\n";
+            s += "    clear(@rq_start); clear(@io_events); clear(@io_lat_us);\n";
+            s += "    exit();\n";
+            s += "}\n";
             break;
 
         case BpfMode::SCHED_LATENCY:
-            s += "kprobe:try_to_wake_up\n{\n    $p = (struct task_struct *)arg0;\n    @wake[$p->pid] = nsecs;\n}\n\n";
-            s += "kprobe:finish_task_switch\n{\n    $prev = (struct task_struct *)arg0;\n    $ns = nsecs;\n";
-            s += "    if (@wake[$prev->pid]) {\n";
-            s += "        $lat = ($ns - @wake[$prev->pid]) / 1000;\n";
-            s += "        @sched_lat_us = hist($lat);\n        delete(@wake[$prev->pid]);\n    }\n}\n\n";
-            s += "interval:s:" + to_string(dur) + "\n{\n    exit();\n}\n\n";
-            s += "END {\n    print(@sched_lat_us);\n    clear(@wake); clear(@sched_lat_us);\n}\n";
+            s += "#define pid_t int\n\n";
+            s += "tracepoint:sched:sched_wakeup\n{\n";
+            s += "    @wake[args->pid] = nsecs;\n";
+            s += "}\n\n";
+            s += "tracepoint:sched:sched_wakeup_new\n{\n";
+            s += "    @wake[args->pid] = nsecs;\n";
+            s += "}\n\n";
+            s += "tracepoint:sched:sched_switch\n/@wake[args->next_pid]/\n{\n";
+            s += "    $lat = (nsecs - @wake[args->next_pid]) / 1000;\n";
+            s += "    @sched_lat_us = hist($lat);\n";
+            s += "    @sched_events = count();\n";
+            s += "    delete(@wake[args->next_pid]);\n";
+            s += "}\n\n";
+            s += "interval:s:" + to_string(dur) + "\n{\n";
+            s += "    printf(\"# Mini-Drop eBPF Scheduler Latency\\n\");\n";
+            s += "    print(@sched_lat_us);\n";
+            s += "    print(@sched_events);\n";
+            s += "    clear(@wake); clear(@sched_events); clear(@sched_lat_us);\n";
+            s += "    exit();\n";
+            s += "}\n";
             break;
         }
         return s;
@@ -201,6 +226,25 @@ namespace drop
         }
         in.close();
         of.close();
+    }
+
+    static bool has_histogram_bucket(const string &path)
+    {
+        ifstream in(path);
+        if (!in.is_open())
+            return false;
+
+        string line;
+        while (getline(in, line))
+        {
+            size_t pos = line.find_first_not_of(" \t");
+            if (pos == string::npos)
+                continue;
+            char c = line[pos];
+            if (c == '[' || c == '(')
+                return true;
+        }
+        return false;
     }
 
     // ---- fork+exec bpftrace ----
@@ -333,6 +377,13 @@ namespace drop
             if (!ck.is_open() || ck.peek() == ifstream::traits_type::eof())
             {
                 cerr << "[bpf] 输出文件为空" << endl;
+                return -2;
+            }
+            ck.close();
+
+            if (mode != BpfMode::CPU && !has_histogram_bucket(outputPath))
+            {
+                cerr << "[bpf] 未采到直方图桶，请确认现场负载存在并适当加长 duration" << endl;
                 return -2;
             }
         }

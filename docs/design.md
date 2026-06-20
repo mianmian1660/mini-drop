@@ -226,9 +226,9 @@ perf 和 eBPF 都依赖宿主机内核能力。尤其是 `perf record` 的真实
 - Linux 内核支持 perf_event 和 tracepoint。
 - 容器能访问必要的内核调试/追踪接口。
 - 虚拟机或宿主机能暴露 CPU PMU/性能计数器。
-- eBPF 演示环境中 bpftrace 可用，并具备足够权限。
+- eBPF 演示环境中 `bpftrace` 可用，并具备足够权限，能够访问 `block` 和 `sched` tracepoint。
 
-为了让开发者在权限不足的环境里仍能看到页面链路，Agent 保留 mock fallback。但评分要求里 eBPF 必须真跑，perf 火焰图也应尽量使用真实 perf 产物；如果当前 VMware 无法勾选 CPU 性能计数器，需要在演示说明里明确这是虚拟化环境限制，并优先更换到可开启 PMU 的 Linux 裸机、云主机或其他虚拟化环境。
+评分要求里 eBPF 必须真跑，演示视频需要现场触发 IO 或调度异常并在 Web 上看到分布变化。因此 Agent 默认不会把 eBPF 失败静默伪装成成功的 mock 图；只有显式设置 `DROP_ALLOW_EBPF_MOCK=1` 时才允许本地开发降级。perf 火焰图也应尽量使用真实 perf 产物；如果当前 VMware 无法勾选 CPU 性能计数器，需要在演示说明里明确这是虚拟化环境限制，并优先更换到可开启 PMU、且能运行 bpftrace 的 Linux 裸机、云主机或其他虚拟化环境。
 
 ### 8.5 UI 优先展示可验证结果
 
@@ -297,7 +297,7 @@ Mini-Drop 的性能自证主要从三个角度做：
    Agent 上报 CPU、内存、读写吞吐。Web Agent 详情页能直接看到 Agent 自身资源开销，避免采集探针对业务造成不可见影响。
 
 3. Demo 可制造可见变化  
-   `make demo-ebpf-io` 用 `dd` 制造 IO 写入，`make demo-ebpf-sched` 用短 CPU 忙等制造调度样本。eBPF 直方图应能在真实 Linux 权限环境下看到分布变化，作为采集器有效性的自证。CPU perf 火焰图需要额外确认演示环境暴露 PMU/性能计数器；如果 VMware 无法开启该能力，则应在报告和演示中说明环境限制，并将真实 perf 采样放到可用 Linux 环境中验证。
+   `make demo-ebpf-io` 用 `dd` 持续制造 IO 写入，`make demo-ebpf-sched` 用 4 个 CPU 忙等循环制造调度样本。eBPF 直方图必须在真实 Linux 权限环境下看到分布变化，作为采集器有效性的自证。CPU perf 火焰图需要额外确认演示环境暴露 PMU/性能计数器；如果 VMware 无法开启该能力，则应在报告和演示中说明环境限制，并将真实 perf 采样放到可用 Linux 环境中验证。
 
 ## 11. AI 协作说明
 
@@ -341,4 +341,3 @@ Mini-Drop 的性能自证主要从三个角度做：
 
 7. 加强安全与权限模型  
    增加用户/组权限、Agent 归属、任务访问控制、下载链接权限和审计导出能力，使系统更接近生产平台。
-

@@ -4,7 +4,7 @@ API ?= http://localhost:8191
 USER_UID ?= demo
 USER_NAME ?= demo
 TARGET_IP ?= 127.0.0.1
-DURATION ?= 6
+DURATION ?= 15
 FREQUENCY ?= 99
 
 .PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health test coverage e2e verify
@@ -31,8 +31,8 @@ demo-cpu:
 		if [[ -n "$$TID" ]]; then echo "[demo-cpu] result: http://localhost/task/result?tid=$$TID"; fi
 
 demo-ebpf-io:
-	@echo "[demo-ebpf-io] 制造一次短 IO 写入并创建 eBPF IO 直方图任务"
-	@(dd if=/dev/zero of=/tmp/mini-drop-demo-io.dat bs=1M count=128 conv=fsync >/tmp/mini-drop-demo-io.log 2>&1 || true) &
+	@echo "[demo-ebpf-io] 持续制造 IO 写入并创建 eBPF IO 直方图任务"
+	@timeout $$(( $(DURATION) + 8 ))s bash -c 'while true; do dd if=/dev/zero of=/tmp/mini-drop-demo-io.dat bs=1M count=256 conv=fsync; rm -f /tmp/mini-drop-demo-io.dat; done' >/tmp/mini-drop-demo-io.log 2>&1 &
 	@RESP=$$(curl -fsS -X POST "$(API)/api/v1/tasks" \
 		-H "Content-Type: application/json" \
 		-H "Drop_user_uid: $(USER_UID)" \
@@ -43,8 +43,8 @@ demo-ebpf-io:
 		if [[ -n "$$TID" ]]; then echo "[demo-ebpf-io] result: http://localhost/task/result?tid=$$TID"; fi
 
 demo-ebpf-sched:
-	@echo "[demo-ebpf-sched] 制造一次短 CPU 忙等并创建 eBPF 调度直方图任务"
-	@(timeout 8s bash -c 'while :; do :; done' >/dev/null 2>&1 || true) &
+	@echo "[demo-ebpf-sched] 持续制造 CPU 竞争并创建 eBPF 调度直方图任务"
+	@timeout $$(( $(DURATION) + 8 ))s bash -c 'for i in $$(seq 1 4); do while :; do :; done & done; wait' >/dev/null 2>&1 &
 	@RESP=$$(curl -fsS -X POST "$(API)/api/v1/tasks" \
 		-H "Content-Type: application/json" \
 		-H "Drop_user_uid: $(USER_UID)" \

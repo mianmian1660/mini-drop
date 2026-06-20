@@ -45,6 +45,15 @@ def t_parse_bpf_histogram_suffix_buckets():
     assert r["buckets"][1]["low"]==1024 and r["buckets"][1]["high"]==2048
     assert r["total_events"]==10
 
+def t_parse_bpf_histogram_merges_duplicate_buckets():
+    from bpf_analyzer import parse_bpf_histogram
+    text = "@io_lat_us:\n[1K, 2K) 3 |@@@\n[2K, 4K) 2 |@@\n\n@io_lat_us:\n[1K, 2K) 1 |@\n"
+    r = parse_bpf_histogram(text)
+    assert len(r["buckets"]) == 2
+    assert r["buckets"][0]["range"] == "[1K, 2K)"
+    assert r["buckets"][0]["count"] == 4
+    assert r["summary"]["max"] == 4096
+
 def t_parse_bpf_histogram_empty():
     from bpf_analyzer import parse_bpf_histogram
     r = parse_bpf_histogram("")
