@@ -1,107 +1,99 @@
 // ============================================================
 // pages/TaskResultPage.js — 任务详情页（/task/result?tid=xxx）
 // ============================================================
-// 功能：基本信息（自动刷新） + 火焰图 + 热点 TopN
-// W3：新增 3 秒轮询，任务执行中自动刷新状态
+// 任务状态 + 可视化结果 + TopN/直方图摘要 + 产物下载
 // ============================================================
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { tasks, cosfiles } from '../api';
 
 const styles = {
-    container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
-    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
-    table: { width: '100%', borderCollapse: 'collapse' },
-    th: { textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid #e0e0e0', color: '#666', fontSize: 13 },
-    td: { padding: '12px 16px', borderBottom: '1px solid #f0f0f0', fontSize: 14 },
-    badge: { padding: '2px 8px', borderRadius: 10, fontSize: 12, fontWeight: 'bold' },
-    loading: { textAlign: 'center', padding: 60, color: '#999' },
-    error: { textAlign: 'center', padding: 60, color: '#f44336' },
-    flameBox: { textAlign: 'center', padding: 40, background: '#f5f5fa', color: '#999', borderRadius: 8, minHeight: 300 },
-    fileList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 },
-    fileItem: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '10px 12px', border: '1px solid #eee', borderRadius: 6, background: '#fafafa' },
-    fileName: { fontSize: 13, color: '#333', wordBreak: 'break-all' },
-    downloadLink: { background: '#4a6cf7', color: '#fff', fontSize: 12, whiteSpace: 'nowrap', textDecoration: 'none', fontWeight: 'bold', borderRadius: 4, padding: '6px 10px' },
-    // W3: 轮询指示器
-    pollingBar: {
-        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-        padding: '8px 16px', background: '#e3f2fd', borderRadius: 6, marginBottom: 16,
-        fontSize: 13, color: '#1565c0',
-    },
-    // W3: 状态进度条
-    progressBar: { display: 'flex', gap: 0, marginBottom: 16 },
-    progressStep: (active, done) => ({
-        flex: 1, textAlign: 'center', padding: '8px 4px', fontSize: 12,
-        background: done ? '#4caf50' : active ? '#2196f3' : '#e0e0e0',
-        color: done || active ? '#fff' : '#999',
-        borderRadius: 4, margin: '0 2px',
+    container: { maxWidth: 1280, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif', color: '#202124' },
+    header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 16 },
+    titleBlock: { minWidth: 0 },
+    pageTitle: { margin: '0 0 6px 0', fontSize: 24, lineHeight: 1.25 },
+    subtitle: { margin: 0, color: '#667085', fontSize: 13, wordBreak: 'break-all' },
+    button: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #d0d7de', background: '#fff', color: '#24292f', textDecoration: 'none', borderRadius: 6, padding: '8px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer' },
+    primaryButton: { border: '1px solid #315efb', background: '#315efb', color: '#fff' },
+    card: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
+    sectionTitle: { margin: '0 0 12px 0', fontSize: 17 },
+    grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 12 },
+    metric: { border: '1px solid #edf0f3', background: '#fbfcfe', borderRadius: 6, padding: 12, minHeight: 58 },
+    metricLabel: { fontSize: 12, color: '#667085', marginBottom: 6 },
+    metricValue: { fontSize: 14, color: '#202124', wordBreak: 'break-word' },
+    badge: { display: 'inline-flex', alignItems: 'center', borderRadius: 999, padding: '4px 10px', fontSize: 12, fontWeight: 700, color: '#fff' },
+    progressBar: { display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 6, marginBottom: 16 },
+    progressStep: (active, done, failed) => ({
+        textAlign: 'center',
+        padding: '8px 6px',
+        fontSize: 12,
+        borderRadius: 6,
+        background: failed ? '#fee4e2' : done ? '#dcfce7' : active ? '#dbeafe' : '#f1f5f9',
+        color: failed ? '#b42318' : done ? '#166534' : active ? '#1d4ed8' : '#64748b',
+        border: failed ? '1px solid #fda29b' : active ? '1px solid #93c5fd' : '1px solid transparent',
+        fontWeight: active || done || failed ? 700 : 500,
     }),
+    notice: { display: 'flex', gap: 8, alignItems: 'center', background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 13 },
+    visualFrame: { width: '100%', minHeight: 520, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
+    visualEmpty: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 260, color: '#667085', textAlign: 'center', background: '#f8fafc', border: '1px dashed #cbd5e1', borderRadius: 6, padding: 24 },
+    split: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(300px, 1fr)', gap: 16, alignItems: 'start' },
+    table: { width: '100%', borderCollapse: 'collapse' },
+    th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
+    td: { padding: '10px 12px', borderBottom: '1px solid #edf0f3', fontSize: 13, verticalAlign: 'top' },
+    codeBlock: { margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#0f172a', color: '#e2e8f0', borderRadius: 6, padding: 12, fontSize: 12, lineHeight: 1.55 },
+    fileList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(290px, 1fr))', gap: 10 },
+    fileItem: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '11px 12px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fbfcfe' },
+    fileName: { fontSize: 13, color: '#202124', wordBreak: 'break-all', fontWeight: 600 },
+    fileMeta: { fontSize: 11, color: '#667085', marginTop: 4 },
+    error: { textAlign: 'center', padding: 60, color: '#b42318' },
+    loading: { textAlign: 'center', padding: 60, color: '#667085' },
 };
 
-const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
-const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败' };
+const statusColors = { 0: '#d97706', 1: '#2563eb', 2: '#16a34a', 3: '#dc2626' };
+const statusNames = { 0: 'PENDING', 1: 'RUNNING / UPLOADING', 2: 'DONE', 3: 'FAILED' };
 const analysisNames = { 0: '待分析', 1: '分析中', 2: '分析完成', 3: '分析失败' };
-
-// W3: 状态步骤定义
-const statusSteps = [
-    { key: 0, label: '📋 已创建' },
-    { key: 1, label: '⚙️ 执行中' },
-    { key: 2, label: '✅ 已完成' },
-];
+const progressSteps = ['PENDING', 'RUNNING', 'UPLOADING', 'ANALYZING', 'DONE'];
 
 export default function TaskResultPage() {
     const params = new URLSearchParams(window.location.search);
     const tid = params.get('tid');
 
     const [task, setTask] = useState(null);
+    const [files, setFiles] = useState([]);
+    const [topFunctions, setTopFunctions] = useState([]);
+    const [bpfHistogram, setBpfHistogram] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
-    const [polling, setPolling] = useState(false);  // W3: 是否正在轮询任务状态
-    // W4: 火焰图文件状态
-    const [flameFiles, setFlameFiles] = useState([]);      // 所有产物文件
-    const [flameSvgUrl, setFlameSvgUrl] = useState('');    // 火焰图 SVG 的预签名 URL
-    const [bpfSvgUrl, setBpfSvgUrl] = useState('');        // eBPF 直方图 SVG URL
-    const [analysisPolling, setAnalysisPolling] = useState(false);  // 是否在等分析结果
+    const [polling, setPolling] = useState(false);
 
-    const applyFiles = useCallback((files = []) => {
-        const safeFiles = Array.isArray(files)
-            ? files.map(f => ({
+    const applyFiles = useCallback((inputFiles = []) => {
+        const safeFiles = Array.isArray(inputFiles)
+            ? inputFiles.map(f => ({
                 ...f,
-                download_url: resolveDownloadUrl(f?.download_url),
-                view_url: resolveDownloadUrl(f?.view_url),
+                download_url: resolveUrl(f?.download_url),
+                view_url: resolveUrl(f?.view_url),
             }))
             : [];
-        setFlameFiles(safeFiles);
-
-        const flameFile = safeFiles.find(isFlamegraphFile);
-        const bpfFile = safeFiles.find(isBpfHistogramFile);
-
-        setFlameSvgUrl(flameFile?.view_url || flameFile?.download_url || '');
-        setBpfSvgUrl(bpfFile?.view_url || bpfFile?.download_url || '');
+        setFiles(safeFiles);
     }, []);
 
-    // W4: 加载任务详情 + 产物文件
     const loadTask = useCallback(async (isPoll = false) => {
+        if (!tid) return;
         if (!isPoll) setLoading(true);
-        else setPolling(true);
+        setPolling(isPoll);
 
         try {
             const res = await tasks.detail(tid);
-            if (res.code === 0) {
-                // apiserver 返回 { data: { task: {...}, files: [...], top_functions: [...] } }
-                const taskData = { ...(res.data?.task || res.data || {}) };
-                // 合并 TopN 数据（API 返回到 data.top_functions）
-                const topFuncs = res.data?.top_functions || [];
-                if (topFuncs.length > 0) {
-                    taskData.top_functions = topFuncs;
-                }
-                setTask(taskData);
-                setError('');
-
-                applyFiles(res.data?.files || []);
-            } else {
+            if (res.code !== 0) {
                 if (!isPoll) setError(res.message || '任务不存在');
+                return;
             }
+            const data = res.data || {};
+            setTask(data.task || {});
+            setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
+            setBpfHistogram(data.bpf_histogram || null);
+            applyFiles(data.files || []);
+            setError('');
         } catch (err) {
             if (!isPoll) setError('加载任务详情失败: ' + (err.message || '未知错误'));
         } finally {
@@ -110,22 +102,16 @@ export default function TaskResultPage() {
         }
     }, [tid, applyFiles]);
 
-    // W4: 单独加载产物文件列表（用于分析完成后轮询）
     const loadFiles = useCallback(async () => {
-        setAnalysisPolling(true);
+        if (!tid) return;
         try {
             const res = await cosfiles.list(tid);
-            if (res.code === 0) {
-                applyFiles(res.data?.files || []);
-            }
+            if (res.code === 0) applyFiles(res.data?.files || []);
         } catch (err) {
             console.error('加载文件列表失败:', err);
-        } finally {
-            setAnalysisPolling(false);
         }
     }, [tid, applyFiles]);
 
-    // 初始加载
     useEffect(() => {
         if (!tid) {
             setError('缺少任务 ID 参数');
@@ -135,203 +121,206 @@ export default function TaskResultPage() {
         loadTask();
     }, [tid, loadTask]);
 
-    // W3: 任务未完成时 3 秒轮询
     useEffect(() => {
-        if (!task || task.status >= 2) return;  // 已完成/失败 → 停止轮询
+        if (!task || Number(task.status) >= 2) return;
+        const timer = setInterval(() => loadTask(true), 3000);
+        return () => clearInterval(timer);
+    }, [task, loadTask]);
 
-        const interval = setInterval(() => {
+    useEffect(() => {
+        if (!task || Number(task.status) !== 2) return;
+        if (hasVisual(files)) return;
+        const timer = setInterval(() => {
             loadTask(true);
-        }, 3000);
-
-        return () => clearInterval(interval);
-    }, [task?.status, loadTask]);
-
-    // W4: 任务已完成但无产物 → 每 5 秒轮询分析结果
-    useEffect(() => {
-        if (!task || task.status !== 2) return;       // 非完成状态不轮询
-        if (flameSvgUrl || bpfSvgUrl) return;          // 已有火焰图或直方图，停止
-
-        const interval = setInterval(() => {
             loadFiles();
         }, 5000);
+        return () => clearInterval(timer);
+    }, [task, files, loadTask, loadFiles]);
 
-        return () => clearInterval(interval);
-    }, [task?.status, flameSvgUrl, bpfSvgUrl, loadFiles]);
+    const artifact = useMemo(() => pickVisualArtifact(files), [files]);
 
-    if (loading) return <div style={styles.container}><p style={styles.loading}>⏳ 加载中...</p></div>;
+    if (loading) return <div style={styles.container}><p style={styles.loading}>加载中...</p></div>;
     if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
     if (!task) return <div style={styles.container}><p style={styles.error}>任务不存在</p></div>;
 
-    const statusColor = statusColors[task.status] || '#999';
-    const statusName = statusNames[task.status] || '未知';
-    const analysisName = analysisNames[task.analysis_status] || '未知';
-    const isRunning = task.status < 2;
-    const isBpfHistogramTask = Number(task.type) === 5;
-    const waitingArtifactText = isBpfHistogramTask
-        ? '任务采集已完成，正在等待分析引擎生成 eBPF 直方图...'
-        : '任务采集已完成，正在等待分析引擎生成火焰图...';
+    const isBpfTask = Number(task.type) === 5 || Boolean(bpfHistogram);
+    const status = Number(task.status);
+    const analysisStatus = Number(task.analysis_status);
+    const statusName = statusNames[status] || 'UNKNOWN';
+    const statusColor = statusColors[status] || '#667085';
+    const shouldPoll = status < 2 || (status === 2 && analysisStatus < 2 && !artifact);
 
     return (
         <div style={styles.container}>
-            <h2>任务详情: {tid}</h2>
+            <div style={styles.header}>
+                <div style={styles.titleBlock}>
+                    <h2 style={styles.pageTitle}>{task.name || '任务详情'}</h2>
+                    <p style={styles.subtitle}>{tid}</p>
+                </div>
+                <button style={styles.button} onClick={() => loadTask(true)} disabled={polling}>
+                    {polling ? '刷新中...' : '刷新'}
+                </button>
+            </div>
 
-            {/* W3: 轮询状态提示 */}
-            {isRunning && (
-                <div style={styles.pollingBar}>
-                    <span>🔄</span>
-                    <span>任务执行中，每 3 秒自动刷新状态...</span>
-                    {polling && <span style={{ fontSize: 11, opacity: 0.7 }}>刷新中</span>}
+            {shouldPoll && (
+                <div style={styles.notice}>
+                    <span>自动刷新中：采集、上传和分析完成后，页面会显示可视化结果与下载入口。</span>
                 </div>
             )}
 
-            {/* W3: 状态进度条 */}
             <div style={styles.progressBar}>
-                {statusSteps.map((step, i) => (
-                    <div key={step.key} style={styles.progressStep(
-                        task.status === step.key,
-                        task.status > step.key
-                    )}>
-                        {step.label}
-                    </div>
-                ))}
-                {task.status === 3 && (
-                    <div style={styles.progressStep(true, false)}>❌ 失败</div>
-                )}
+                {progressSteps.map((label, index) => {
+                    const done = isStepDone(index, status, analysisStatus, artifact);
+                    const active = isStepActive(index, status, analysisStatus, artifact);
+                    return (
+                        <div key={label} style={styles.progressStep(active, done, status === 3)}>
+                            {status === 3 && index === 4 ? 'FAILED' : label}
+                        </div>
+                    );
+                })}
             </div>
 
-            {/* ===== 基本信息 ===== */}
             <div style={styles.card}>
-                <h3>基本信息</h3>
-                <table style={styles.table}>
-                    <tbody>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold', width: 120 }}>任务名称</td>
-                            <td style={styles.td}>{task.name || '-'}</td>
-                        </tr>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold' }}>状态</td>
-                            <td style={styles.td}>
-                                <span style={{ ...styles.badge, background: statusColor, color: '#fff' }}>{statusName}</span>
-                                {task.status_info && <span style={{ marginLeft: 8, color: '#999', fontSize: 13 }}>({task.status_info})</span>}
-                            </td>
-                        </tr>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold' }}>分析状态</td>
-                            <td style={styles.td}>{analysisName}</td>
-                        </tr>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold' }}>目标 IP</td>
-                            <td style={styles.td}>{task.target_ip || '-'}</td>
-                        </tr>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold' }}>创建时间</td>
-                            <td style={styles.td}>{task.create_time || '-'}</td>
-                        </tr>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold' }}>开始时间</td>
-                            <td style={styles.td}>{task.begin_time || (task.status >= 1 ? '已开始' : '等待中')}</td>
-                        </tr>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold' }}>结束时间</td>
-                            <td style={styles.td}>{task.end_time || (task.status >= 2 ? '已完成' : '进行中')}</td>
-                        </tr>
-                        <tr>
-                            <td style={{ ...styles.td, fontWeight: 'bold' }}>采集参数</td>
-                            <td style={styles.td}>
-                                {task.request_params ? JSON.stringify(task.request_params) : '-'}
-                            </td>
-                        </tr>
-                    </tbody>
-                </table>
+                <h3 style={styles.sectionTitle}>任务概览</h3>
+                <div style={styles.grid}>
+                    <Metric label="任务状态" value={<span style={{ ...styles.badge, background: statusColor }}>{statusName}</span>} />
+                    <Metric label="分析状态" value={analysisNames[analysisStatus] || '未知'} />
+                    <Metric label="采集器" value={profilerLabel(task.profiler_type, task.type, task.request_params?.event)} />
+                    <Metric label="目标 Agent" value={task.target_ip || '-'} />
+                    <Metric label="创建时间" value={formatTime(task.create_time)} />
+                    <Metric label="开始时间" value={formatTime(task.begin_time) || '-'} />
+                    <Metric label="结束时间" value={formatTime(task.end_time) || '-'} />
+                    <Metric label="状态 reason" value={task.status_info || '-'} />
+                </div>
             </div>
 
-            {/* ===== 可视化结果 ===== */}
-            <h3>{isBpfHistogramTask ? '📊 eBPF 内核探针' : '🔥 火焰图'}</h3>
-            <div style={styles.flameBox}>
-                {bpfSvgUrl ? (
-                    <div>
-                        <iframe
-                            src={bpfSvgUrl}
-                            title="eBPF Histogram"
-                            style={{
-                                width: '100%', height: 420, border: '1px solid #e0e0e0',
-                                borderRadius: 4, background: '#fff',
-                            }}
-                        />
-                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>
-                            eBPF 延迟分布直方图
-                        </p>
-                    </div>
-                ) : flameSvgUrl ? (
-                    <div>
-                        <iframe src={flameSvgUrl} title="火焰图"
-                            style={{ width: '100%', height: 500, border: '1px solid #e0e0e0', borderRadius: 4, background: '#fff' }} />
-                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>点击函数框可放大，右键可缩小</p>
-                    </div>
-                ) : task.status === 2 ? (
-                    <div>
-                        <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>🔬</p>
-                        <p>{waitingArtifactText}</p>
-                        {analysisPolling && (
-                            <p style={{ fontSize: 13, color: '#1565c0', marginTop: 8 }}>
-                                🔄 每 5 秒检查分析结果...
-                            </p>
-                        )}
-                        {flameFiles.length === 0 && !analysisPolling && (
-                            <p style={{ fontSize: 12, color: '#999', marginTop: 8 }}>
-                                暂无产物文件（analysis 服务未运行或尚未产出）
-                            </p>
-                        )}
-                    </div>
-                ) : task.status === 3 ? (
-                    <div>
-                        <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>❌</p>
-                        <p>任务执行失败，无法生成火焰图</p>
-                        {task.status_info && <p style={{ fontSize: 13, color: '#f44336' }}>原因: {task.status_info}</p>}
-                    </div>
-                ) : (
-                    <div>
-                        <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>⏳</p>
-                        <p>任务执行中，火焰图将在采集完成后自动生成</p>
-                    </div>
-                )}
+            <div style={styles.split}>
+                <div style={styles.card}>
+                    <h3 style={styles.sectionTitle}>{isBpfTask ? 'eBPF 直方图' : '火焰图'}</h3>
+                    <VisualResult artifact={artifact} task={task} isBpfTask={isBpfTask} />
+                </div>
+
+                <div style={styles.card}>
+                    <h3 style={styles.sectionTitle}>采集参数</h3>
+                    <pre style={styles.codeBlock}>{JSON.stringify(task.request_params || {}, null, 2)}</pre>
+                </div>
             </div>
 
-            {/* ===== 产物文件下载 ===== */}
-            <h3>产物文件</h3>
-            <div style={styles.card}>
-                {flameFiles.length > 0 ? (
-                    <div style={styles.fileList}>
-                        {flameFiles.map((f, i) => (
-                            <div key={f.name || f.download_url || i} style={styles.fileItem}>
-                                <div>
-                                    <div style={styles.fileName}>{displayFileName(f.name)}</div>
-                                    <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>
-                                        {f.content_type || 'application/octet-stream'} · {formatSize(f.size)}
-                                        {f.source && ` · ${f.source}`}
-                                    </div>
-                                </div>
-                                {f.download_url ? (
-                                    <a href={f.download_url} target="_blank" rel="noreferrer" download={displayFileName(f.name)} style={styles.downloadLink}>
-                                        下载文件
-                                    </a>
-                                ) : (
-                                    <span style={{ fontSize: 12, color: '#aaa', whiteSpace: 'nowrap' }}>无链接</span>
-                                )}
-                            </div>
-                        ))}
-                    </div>
-                ) : (
-                    <p style={{ textAlign: 'center', padding: 24, color: '#999' }}>
-                        暂无产物文件
-                    </p>
-                )}
-            </div>
+            {isBpfTask ? (
+                <BPFHistogramPanel histogram={bpfHistogram} />
+            ) : (
+                <TopFunctionsPanel topFunctions={topFunctions} status={status} />
+            )}
 
-            {/* ===== 热点 TopN ===== */}
-            <h3>🔥 热点 TopN</h3>
-            <div style={styles.card}>
-                {task.top_functions && task.top_functions.length > 0 ? (
+            {isBpfTask && topFunctions.length > 0 && (
+                <TopFunctionsPanel topFunctions={topFunctions} status={status} title="热点 TopN" />
+            )}
+
+            <ArtifactsPanel files={files} />
+        </div>
+    );
+}
+
+function Metric({ label, value }) {
+    return (
+        <div style={styles.metric}>
+            <div style={styles.metricLabel}>{label}</div>
+            <div style={styles.metricValue}>{value}</div>
+        </div>
+    );
+}
+
+function VisualResult({ artifact, task, isBpfTask }) {
+    if (artifact?.url) {
+        return (
+            <div>
+                <iframe
+                    src={artifact.url}
+                    title={isBpfTask ? 'eBPF Histogram' : 'Flame Graph'}
+                    style={styles.visualFrame}
+                />
+                <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                    <a href={artifact.downloadUrl || artifact.url} target="_blank" rel="noreferrer" style={{ ...styles.button, ...styles.primaryButton }} download={displayFileName(artifact.name)}>
+                        下载可视化文件
+                    </a>
+                    <a href={artifact.url} target="_blank" rel="noreferrer" style={styles.button}>
+                        新窗口查看
+                    </a>
+                </div>
+            </div>
+        );
+    }
+
+    const status = Number(task.status);
+    const text = status === 3
+        ? '任务失败，未生成可视化产物。'
+        : status === 2
+            ? (isBpfTask ? '采集已完成，正在等待分析引擎生成直方图。' : '采集已完成，正在等待分析引擎生成火焰图。')
+            : (isBpfTask ? 'eBPF 采集中，直方图会在分析完成后显示。' : 'CPU 采集中，火焰图会在分析完成后显示。');
+
+    return (
+        <div style={styles.visualEmpty}>
+            <strong>{text}</strong>
+            {task.status_info && <span style={{ marginTop: 8, fontSize: 13 }}>{task.status_info}</span>}
+        </div>
+    );
+}
+
+function BPFHistogramPanel({ histogram }) {
+    const buckets = Array.isArray(histogram?.buckets) ? histogram.buckets : [];
+    const summary = histogram?.summary || {};
+
+    return (
+        <div style={styles.card}>
+            <h3 style={styles.sectionTitle}>直方图摘要</h3>
+            {histogram ? (
+                <>
+                    <div style={styles.grid}>
+                        <Metric label="类型" value={histogram.type || 'unknown'} />
+                        <Metric label="总事件数" value={histogram.total_events ?? 0} />
+                        <Metric label="单位" value={histogram.unit || 'us'} />
+                        <Metric label="P50 / P95 / P99" value={`${formatNumber(summary.p50)} / ${formatNumber(summary.p95)} / ${formatNumber(summary.p99)}`} />
+                    </div>
+                    {buckets.length > 0 ? (
+                        <div style={{ overflowX: 'auto', marginTop: 14 }}>
+                            <table style={styles.table}>
+                                <thead>
+                                    <tr>
+                                        <th style={styles.th}>区间</th>
+                                        <th style={styles.th}>次数</th>
+                                        <th style={styles.th}>低值</th>
+                                        <th style={styles.th}>高值</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {buckets.slice(0, 30).map((bucket, index) => (
+                                        <tr key={`${bucket.range}-${index}`}>
+                                            <td style={styles.td}>{bucket.range}</td>
+                                            <td style={styles.td}>{bucket.count}</td>
+                                            <td style={styles.td}>{formatNumber(bucket.low)}</td>
+                                            <td style={styles.td}>{formatNumber(bucket.high)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    ) : (
+                        <p style={{ color: '#667085', margin: '12px 0 0 0' }}>暂无桶数据。</p>
+                    )}
+                </>
+            ) : (
+                <p style={{ color: '#667085', margin: 0 }}>等待 bpf_data.json 生成后显示摘要。</p>
+            )}
+        </div>
+    );
+}
+
+function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN' }) {
+    return (
+        <div style={styles.card}>
+            <h3 style={styles.sectionTitle}>{title}</h3>
+            {topFunctions.length > 0 ? (
+                <div style={{ overflowX: 'auto' }}>
                     <table style={styles.table}>
                         <thead>
                             <tr>
@@ -342,28 +331,108 @@ export default function TaskResultPage() {
                             </tr>
                         </thead>
                         <tbody>
-                            {task.top_functions.map((f, i) => (
-                                <tr key={i}>
-                                    <td style={styles.td}>{f.rank || i + 1}</td>
-                                    <td style={styles.td}>{f.function || f.name || '-'}</td>
-                                    <td style={styles.td}>{f.samples || 0}</td>
-                                    <td style={styles.td}>{f.percentage || f.percent || 0}%</td>
+                            {topFunctions.map((item, index) => (
+                                <tr key={`${item.function || item.name || 'fn'}-${index}`}>
+                                    <td style={styles.td}>{item.rank || index + 1}</td>
+                                    <td style={styles.td}>{item.function || item.name || '-'}</td>
+                                    <td style={styles.td}>{item.samples || item.count || 0}</td>
+                                    <td style={styles.td}>{formatPercent(item.percentage ?? item.percent)}</td>
                                 </tr>
                             ))}
                         </tbody>
                     </table>
-                ) : (
-                    <p style={{ textAlign: 'center', padding: 40, color: '#999' }}>
-                        {task.status >= 2 ? '暂无热点数据，分析完成后将显示' : '任务完成后将自动分析热点函数'}
-                    </p>
-                )}
-            </div>
+                </div>
+            ) : (
+                <p style={{ textAlign: 'center', padding: 32, color: '#667085', margin: 0 }}>
+                    {status >= 2 ? '暂无热点数据。请确认 top.json 已生成，或下载 folded.txt / perf.data 排查。' : '任务完成后将自动分析热点函数。'}
+                </p>
+            )}
         </div>
     );
 }
 
-function normalizeFileName(file) {
-    return (file?.name || '').toString();
+function ArtifactsPanel({ files }) {
+    return (
+        <div style={styles.card}>
+            <h3 style={styles.sectionTitle}>产物文件下载</h3>
+            {files.length > 0 ? (
+                <div style={styles.fileList}>
+                    {files.map((file, index) => (
+                        <div key={file.name || index} style={styles.fileItem}>
+                            <div style={{ minWidth: 0 }}>
+                                <div style={styles.fileName}>{displayFileName(file.name)}</div>
+                                <div style={styles.fileMeta}>
+                                    {file.content_type || 'application/octet-stream'} · {formatSize(file.size)}
+                                    {file.source ? ` · ${file.source}` : ''}
+                                </div>
+                            </div>
+                            <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                                {file.view_url && (
+                                    <a href={file.view_url} target="_blank" rel="noreferrer" style={styles.button}>
+                                        查看
+                                    </a>
+                                )}
+                                {file.download_url ? (
+                                    <a href={file.download_url} target="_blank" rel="noreferrer" download={displayFileName(file.name)} style={{ ...styles.button, ...styles.primaryButton }}>
+                                        下载
+                                    </a>
+                                ) : (
+                                    <span style={{ color: '#98a2b3', fontSize: 12 }}>无链接</span>
+                                )}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            ) : (
+                <p style={{ textAlign: 'center', padding: 24, color: '#667085', margin: 0 }}>暂无产物文件</p>
+            )}
+        </div>
+    );
+}
+
+function pickVisualArtifact(files) {
+    const bpf = files.find(isBpfHistogramFile);
+    const flame = files.find(isFlamegraphFile);
+    const picked = bpf || flame;
+    if (!picked) return null;
+    return {
+        name: picked.name,
+        url: picked.view_url || picked.download_url || '',
+        downloadUrl: picked.download_url || picked.view_url || '',
+        type: bpf ? 'bpf' : 'flamegraph',
+    };
+}
+
+function hasVisual(files) {
+    return Boolean(pickVisualArtifact(files));
+}
+
+function isStepDone(index, status, analysisStatus, artifact) {
+    if (status === 3) return false;
+    if (index === 0) return status > 0;
+    if (index === 1) return status >= 2;
+    if (index === 2) return status >= 2;
+    if (index === 3) return analysisStatus >= 2 || Boolean(artifact);
+    if (index === 4) return status === 2 && (analysisStatus >= 2 || Boolean(artifact));
+    return false;
+}
+
+function isStepActive(index, status, analysisStatus, artifact) {
+    if (status === 3) return index === 4;
+    if (index === 0) return status === 0;
+    if (index === 1) return status === 1;
+    if (index === 2) return status === 2 && analysisStatus === 0 && !artifact;
+    if (index === 3) return status === 2 && analysisStatus === 1 && !artifact;
+    if (index === 4) return status === 2 && (analysisStatus >= 2 || Boolean(artifact));
+    return false;
+}
+
+function resolveUrl(url) {
+    if (!url) return '';
+    if (/^https?:\/\//i.test(url)) return url;
+    if (!url.startsWith('/')) return url;
+    const hostUrl = window.config?.HOST_URL || '';
+    return hostUrl ? hostUrl.replace(/\/$/, '') + url : url;
 }
 
 function displayFileName(name) {
@@ -372,18 +441,8 @@ function displayFileName(name) {
     return parts[parts.length - 1] || name;
 }
 
-function resolveDownloadUrl(url) {
-    if (!url) return '';
-    if (/^https?:\/\//i.test(url)) return url;
-    if (!url.startsWith('/')) return url;
-
-    const hostUrl = window.config?.HOST_URL || '';
-    if (!hostUrl) return url;
-    return hostUrl.replace(/\/$/, '') + url;
-}
-
 function isBpfHistogramFile(file) {
-    const name = normalizeFileName(file).toLowerCase();
+    const name = String(file?.name || '').toLowerCase();
     return name.endsWith('.svg') && (
         name.includes('bpf_histogram') ||
         name.includes('bpf-latency') ||
@@ -392,21 +451,52 @@ function isBpfHistogramFile(file) {
 }
 
 function isFlamegraphFile(file) {
-    const name = normalizeFileName(file).toLowerCase();
-    return name.endsWith('.svg') &&
-        name.includes('flamegraph') &&
-        !name.includes('bpf_histogram');
+    const name = String(file?.name || '').toLowerCase();
+    return name.endsWith('.svg') && name.includes('flamegraph') && !name.includes('bpf_histogram');
 }
 
-// W4: 文件大小格式化工具
+function profilerLabel(profilerType, taskType, event) {
+    const pt = Number(profilerType);
+    if (Number(taskType) === 5) {
+        if (event === 'sched') return 'eBPF 调度延迟';
+        if (event === 'io' || event === 'blk') return 'eBPF IO 延迟';
+        return 'eBPF 内核探针';
+    }
+    if (pt === 1) return 'async-profiler';
+    if (pt === 2) return 'pprof';
+    if (pt === 3) return 'eBPF CPU';
+    return 'perf CPU';
+}
+
+function formatTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+}
+
 function formatSize(bytes) {
-    if (!bytes || bytes === 0) return '0 B';
+    if (!bytes) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
+    let size = Number(bytes);
     let i = 0;
-    let size = bytes;
     while (size >= 1024 && i < units.length - 1) {
         size /= 1024;
-        i++;
+        i += 1;
     }
-    return size.toFixed(1) + ' ' + units[i];
+    return `${size.toFixed(1)} ${units[i]}`;
+}
+
+function formatPercent(value) {
+    if (value === undefined || value === null || value === '') return '0%';
+    const n = Number(value);
+    if (Number.isNaN(n)) return `${value}%`;
+    return `${n.toFixed(n >= 10 ? 1 : 2)}%`;
+}
+
+function formatNumber(value) {
+    if (value === undefined || value === null || value === '') return '-';
+    const n = Number(value);
+    if (Number.isNaN(n)) return String(value);
+    return n >= 100 ? n.toFixed(0) : n.toFixed(2);
 }

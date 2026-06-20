@@ -243,6 +243,21 @@ static pair<int, string> run_profiler(
                 mockIO.close();
                 return {0, "eBPF(mock-io)"};
             }
+            if (task.sampleargv().event() == "sched" || task.sampleargv().event() == "schedule")
+            {
+                ofstream mockSched(path);
+                mockSched << "# Mini-Drop eBPF Scheduler Latency\n";
+                mockSched << "@sched_lat_us:\n";
+                mockSched << "[0, 10)      520 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
+                mockSched << "[10, 50)     210 |@@@@@@@@@@@@@@@@@@@@\n";
+                mockSched << "[50, 100)     68 |@@@@@@\n";
+                mockSched << "[100, 250)    24 |@@\n";
+                mockSched << "[250, 500)     7 |@\n";
+                mockSched << "[500, 1K)      2 |\n";
+                mockSched << "# Total Scheduler Wakeups: 831\n";
+                mockSched.close();
+                return {0, "eBPF(mock-sched)"};
+            }
             generate_mock_collapsed_stacks(outputPath);
             return {0, "eBPF(mock)"};
         }

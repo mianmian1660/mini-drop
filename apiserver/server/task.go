@@ -311,8 +311,10 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		return
 	}
 
-	result := gin.H{"task": task}
+	result := gin.H{"task": taskDetailResponse(task)}
 	files := []map[string]interface{}{}
+	var topFuncs []map[string]interface{}
+	var bpfData map[string]interface{}
 
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
@@ -323,20 +325,24 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 			files = storageFiles
 
 			// 尝试从 MinIO 读取 top.json → TopN 热点数据
-			topFuncs := s.fetchTopFunctions(tid)
-			if len(topFuncs) > 0 {
-				result["top_functions"] = topFuncs
-			}
+			topFuncs = s.fetchTopFunctions(tid)
+			bpfData = s.fetchBPFData(tid)
 		}
 	}
 	if len(files) == 0 {
 		files = s.listLocalFiles(tid)
-		if _, ok := result["top_functions"]; !ok {
-			topFuncs := s.fetchLocalTopFunctions(tid)
-			if len(topFuncs) > 0 {
-				result["top_functions"] = topFuncs
-			}
+		if len(topFuncs) == 0 {
+			topFuncs = s.fetchLocalTopFunctions(tid)
 		}
+		if bpfData == nil {
+			bpfData = s.fetchLocalBPFData(tid)
+		}
+	}
+	if len(topFuncs) > 0 {
+		result["top_functions"] = topFuncs
+	}
+	if bpfData != nil {
+		result["bpf_histogram"] = bpfData
 	}
 	result["files"] = files
 
@@ -344,6 +350,32 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		"code": 0,
 		"data": result,
 	})
+}
+
+func taskDetailResponse(task model.HotmethodTask) gin.H {
+	var params map[string]interface{}
+	if len(task.RequestParams) > 0 {
+		_ = json.Unmarshal(task.RequestParams, &params)
+	}
+
+	return gin.H{
+		"id":              task.ID,
+		"tid":             task.TID,
+		"name":            task.Name,
+		"type":            task.Type,
+		"profiler_type":   task.ProfilerType,
+		"target_ip":       task.TargetIP,
+		"request_params":  params,
+		"status":          task.Status,
+		"status_info":     task.StatusInfo,
+		"analysis_status": task.AnalysisStatus,
+		"uid":             task.UID,
+		"user_name":       task.UserName,
+		"create_time":     task.CreateTime,
+		"begin_time":      task.BeginTime,
+		"end_time":        task.EndTime,
+		"master_task_tid": task.MasterTaskTID,
+	}
 }
 
 // fetchLocalTopFunctions 从 /tmp/drop-output/{tid}_top.json 读取 TopN
@@ -360,16 +392,7 @@ func (s *APIServer) fetchLocalTopFunctions(tid string) []map[string]interface{} 
 		return nil
 	}
 
-	if selfTop, ok := topData["self_time_top"].([]interface{}); ok {
-		funcs := make([]map[string]interface{}, 0, len(selfTop))
-		for _, item := range selfTop {
-			if m, ok := item.(map[string]interface{}); ok {
-				funcs = append(funcs, m)
-			}
-		}
-		return funcs
-	}
-	return nil
+	return normalizeTopFunctions(topData)
 }
 
 // fetchTopFunctions 从 MinIO 读取 {tid}/top.json 并解析 TopN
@@ -392,17 +415,59 @@ func (s *APIServer) fetchTopFunctions(tid string) []map[string]interface{} {
 		return nil
 	}
 
-	// 提取 self_time_top
-	if selfTop, ok := topData["self_time_top"].([]interface{}); ok {
-		funcs := make([]map[string]interface{}, 0, len(selfTop))
-		for _, item := range selfTop {
+	return normalizeTopFunctions(topData)
+}
+
+func normalizeTopFunctions(topData map[string]interface{}) []map[string]interface{} {
+	for _, key := range []string{"self_time_top", "top_functions", "inclusive_time_top"} {
+		items, ok := topData[key].([]interface{})
+		if !ok {
+			continue
+		}
+		funcs := make([]map[string]interface{}, 0, len(items))
+		for _, item := range items {
 			if m, ok := item.(map[string]interface{}); ok {
 				funcs = append(funcs, m)
 			}
 		}
-		return funcs
+		if len(funcs) > 0 {
+			return funcs
+		}
 	}
 	return nil
+}
+
+// fetchBPFData 从 MinIO 读取 {tid}/bpf_data.json，给前端展示直方图摘要和桶表。
+func (s *APIServer) fetchBPFData(tid string) map[string]interface{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, tid+"/bpf_data.json")
+	if err != nil {
+		return nil
+	}
+	defer reader.Close()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(reader).Decode(&data); err != nil {
+		return nil
+	}
+	return data
+}
+
+func (s *APIServer) fetchLocalBPFData(tid string) map[string]interface{} {
+	localPath := filepath.Join("/tmp/drop-output", tid+"_bpf_data.json")
+	f, err := os.Open(localPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(f).Decode(&data); err != nil {
+		return nil
+	}
+	return data
 }
 
 // DeleteTask 软删除任务
