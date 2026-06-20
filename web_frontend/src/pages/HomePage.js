@@ -21,6 +21,8 @@ const styles = {
     metricLabel: { color: '#667085', fontSize: 12, marginBottom: 8 },
     metricValue: { fontSize: 24, fontWeight: 700 },
     btn: { background: '#315efb', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 6, cursor: 'pointer', fontSize: 14, fontWeight: 700 },
+    btnSecondary: { background: '#fff', color: '#315efb', border: '1px solid #c7d2fe', padding: '7px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 700 },
+    btnMuted: { background: '#f8fafc', color: '#475467', border: '1px solid #d0d7de', padding: '7px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 700 },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
     td: { padding: '12px 16px', borderBottom: '1px solid #edf0f3', fontSize: 14, verticalAlign: 'top' },
@@ -37,6 +39,21 @@ const styles = {
     subtle: { color: '#667085', fontSize: 12 },
     auditList: { display: 'grid', gap: 10 },
     auditItem: { display: 'grid', gridTemplateColumns: '130px minmax(120px, 1fr) 120px minmax(0, 2fr)', gap: 12, padding: '10px 12px', background: '#fbfcfe', border: '1px solid #edf0f3', borderRadius: 6, fontSize: 13 },
+    agentDetail: { display: 'grid', gridTemplateColumns: 'minmax(280px, 0.85fr) minmax(360px, 1.15fr)', gap: 18, background: '#0f172a', color: '#e5edf8', border: '1px solid #1e293b', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 16px 40px rgba(15,23,42,0.22)' },
+    agentDetailHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 14 },
+    agentName: { margin: 0, fontSize: 20, lineHeight: 1.25, color: '#fff' },
+    agentMeta: { margin: '6px 0 0', color: '#94a3b8', fontSize: 13, wordBreak: 'break-all' },
+    detailGrid: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(120px, 1fr))', gap: 10 },
+    detailTile: { background: '#162033', border: '1px solid #243047', borderRadius: 6, padding: 12 },
+    tileLabel: { color: '#94a3b8', fontSize: 12, marginBottom: 6 },
+    tileValue: { color: '#f8fafc', fontSize: 18, fontWeight: 700 },
+    policyRow: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(120px, 1fr))', gap: 10, marginTop: 14 },
+    policyPill: { background: '#101827', border: '1px solid #334155', borderRadius: 6, padding: '10px 12px', color: '#cbd5e1', fontSize: 13 },
+    terminal: { background: '#07111f', border: '1px solid #1e293b', borderRadius: 6, padding: 12, minHeight: 258, fontFamily: 'Menlo, Consolas, monospace', fontSize: 12, overflow: 'auto' },
+    terminalLine: { display: 'grid', gridTemplateColumns: '142px 78px minmax(80px, 1fr)', gap: 10, alignItems: 'baseline', padding: '6px 0', borderBottom: '1px solid rgba(148,163,184,0.12)' },
+    terminalTime: { color: '#7dd3fc' },
+    terminalReason: { color: '#dbeafe', wordBreak: 'break-word' },
+    smallStatus: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: 52, padding: '2px 8px', borderRadius: 999, fontSize: 12, fontWeight: 700 },
 };
 
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
@@ -46,6 +63,10 @@ export default function HomePage() {
     const [agentList, setAgentList] = useState([]);
     const [taskList, setTaskList] = useState([]);
     const [auditList, setAuditList] = useState([]);
+    const [selectedAgentIp, setSelectedAgentIp] = useState('');
+    const [agentDetail, setAgentDetail] = useState(null);
+    const [detailLoading, setDetailLoading] = useState(false);
+    const [detailError, setDetailError] = useState('');
     const [showCreate, setShowCreate] = useState(false);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -63,7 +84,7 @@ export default function HomePage() {
     const failedTasks = taskList.filter(t => t.status === 3).length;
 
     // 加载 Agent 列表（不分页）
-    const loadAgents = async () => {
+    const loadAgents = useCallback(async () => {
         try {
             const res = await agents.list();
             if (res.code === 0) {
@@ -72,9 +93,9 @@ export default function HomePage() {
         } catch (err) {
             console.error('加载 Agent 列表失败:', err);
         }
-    };
+    }, []);
 
-    const loadAudits = async () => {
+    const loadAudits = useCallback(async () => {
         try {
             const res = await agents.audits({ limit: 8 });
             if (res.code === 0) {
@@ -83,7 +104,30 @@ export default function HomePage() {
         } catch (err) {
             console.error('加载 Agent 审计日志失败:', err);
         }
-    };
+    }, []);
+
+    const loadAgentDetail = useCallback(async (ip, options = {}) => {
+        if (!ip) return;
+        if (!options.silent) {
+            setDetailLoading(true);
+        }
+        setDetailError('');
+        try {
+            const res = await agents.detail(ip);
+            if (res.code === 0) {
+                setAgentDetail(res.data || null);
+            } else {
+                setDetailError(res.message || '加载 Agent 详情失败');
+            }
+        } catch (err) {
+            console.error('加载 Agent 详情失败:', err);
+            setDetailError(err?.message || '加载 Agent 详情失败');
+        } finally {
+            if (!options.silent) {
+                setDetailLoading(false);
+            }
+        }
+    }, []);
 
     // 加载任务列表（分页+搜索）
     const loadTasks = useCallback(async () => {
@@ -113,7 +157,7 @@ export default function HomePage() {
                 setError('无法连接到后端服务，请确认 apiserver 已启动');
             })
             .finally(() => setLoading(false));
-    }, [loadTasks]);
+    }, [loadAgents, loadAudits, loadTasks]);
 
     // W3: 任务列表自动刷新（10 秒轮询，检测状态变化）
     useEffect(() => {
@@ -122,6 +166,17 @@ export default function HomePage() {
         }, 10000);
         return () => clearInterval(interval);
     }, [loadTasks]);
+
+    // Agent 详情打开时按心跳节奏自动刷新，只在界面保留最近 10 条审计。
+    useEffect(() => {
+        if (!selectedAgentIp) return undefined;
+        loadAgentDetail(selectedAgentIp, { silent: true });
+        const interval = setInterval(() => {
+            loadAgentDetail(selectedAgentIp, { silent: true });
+            loadAgents();
+        }, 5000);
+        return () => clearInterval(interval);
+    }, [selectedAgentIp, loadAgentDetail, loadAgents]);
 
     // 按回车触发搜索
     const handleSearchKeyDown = (e) => {
@@ -145,6 +200,12 @@ export default function HomePage() {
         setKeyword('');
         // 重新加载
         Promise.all([loadAgents(), loadTasks(), loadAudits()]).finally(() => setLoading(false));
+    };
+
+    const handleAgentOpen = (ip) => {
+        setSelectedAgentIp(ip);
+        setAgentDetail(null);
+        loadAgentDetail(ip);
     };
 
     if (loading) {
@@ -193,6 +254,7 @@ export default function HomePage() {
                                 <th style={styles.th}>状态</th>
                                 <th style={styles.th}>版本</th>
                                 <th style={styles.th}>最后心跳</th>
+                                <th style={styles.th}>操作</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -207,12 +269,34 @@ export default function HomePage() {
                                     </td>
                                     <td style={styles.td}>{a.version}</td>
                                     <td style={styles.td}>{formatTime(a.last_seen) || '-'}</td>
+                                    <td style={styles.td}>
+                                        <button
+                                            style={selectedAgentIp === a.ip_addr ? styles.btnMuted : styles.btnSecondary}
+                                            onClick={() => handleAgentOpen(a.ip_addr)}
+                                        >
+                                            {selectedAgentIp === a.ip_addr ? '已打开' : '查看'}
+                                        </button>
+                                    </td>
                                 </tr>
                             ))}
                         </tbody>
                     </table>
                 )}
             </div>
+
+            {selectedAgentIp && (
+                <AgentDetailPanel
+                    detail={agentDetail}
+                    loading={detailLoading}
+                    error={detailError}
+                    onRefresh={() => loadAgentDetail(selectedAgentIp)}
+                    onClose={() => {
+                        setSelectedAgentIp('');
+                        setAgentDetail(null);
+                        setDetailError('');
+                    }}
+                />
+            )}
 
             <div style={styles.sectionHead}>
                 <h2 style={styles.sectionTitle}>Agent 审计日志</h2>
@@ -322,6 +406,89 @@ export default function HomePage() {
     );
 }
 
+function AgentDetailPanel({ detail, loading, error, onRefresh, onClose }) {
+    const agent = detail?.agent || {};
+    const stat = detail?.stat || {};
+    const audits = (detail?.audits || []).slice(0, 10);
+    const online = Boolean(agent.online);
+    const source = stat.source === 'grpc' ? '实时 gRPC' : '数据库快照';
+
+    return (
+        <div style={styles.agentDetail}>
+            <div>
+                <div style={styles.agentDetailHead}>
+                    <div>
+                        <h3 style={styles.agentName}>{agent.hostname || 'Agent 详情'}</h3>
+                        <p style={styles.agentMeta}>{agent.ip_addr || '正在加载'} · {agent.version || 'version unknown'} · {source}</p>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                        <button style={styles.btnMuted} onClick={onRefresh} disabled={loading}>
+                            {loading ? '刷新中' : '刷新'}
+                        </button>
+                        <button style={styles.btnMuted} onClick={onClose}>收起</button>
+                    </div>
+                </div>
+
+                {error && (
+                    <div style={{ background: '#3f1d24', border: '1px solid #7f1d1d', color: '#fecaca', borderRadius: 6, padding: 10, marginBottom: 12, fontSize: 13 }}>
+                        {error}
+                    </div>
+                )}
+
+                <div style={styles.detailGrid}>
+                    <StatTile label="在线状态" value={online ? 'ONLINE' : 'OFFLINE'} tone={online ? '#86efac' : '#fca5a5'} />
+                    <StatTile label="最后心跳" value={formatTime(agent.last_seen) || '-'} />
+                    <StatTile label="CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
+                    <StatTile label="内存" value={formatMemory(stat.memory_kb)} />
+                    <StatTile label="读吞吐" value={`${formatMetric(stat.read_kb_per_s, 1)} KB/s`} />
+                    <StatTile label="写吞吐" value={`${formatMetric(stat.write_kb_per_s, 1)} KB/s`} />
+                </div>
+
+                <div style={styles.policyRow}>
+                    <div style={styles.policyPill}>Agent 每 {detail?.heartbeat_interval_sec || 5}s 心跳上报</div>
+                    <div style={styles.policyPill}>Server 超过 {detail?.offline_after_sec || 30}s 判定离线</div>
+                </div>
+            </div>
+
+            <div>
+                <div style={{ ...styles.agentDetailHead, marginBottom: 8 }}>
+                    <div>
+                        <h3 style={{ ...styles.agentName, fontSize: 17 }}>Heartbeat Stream</h3>
+                        <p style={styles.agentMeta}>最近 10 条在线/离线/恢复审计</p>
+                    </div>
+                    <span style={{ color: '#94a3b8', fontSize: 12 }}>{formatTime(detail?.server_time)}</span>
+                </div>
+                <div style={styles.terminal}>
+                    {loading && audits.length === 0 ? (
+                        <div style={styles.terminalReason}>loading agent heartbeat stream...</div>
+                    ) : audits.length === 0 ? (
+                        <div style={styles.terminalReason}>no audit records yet</div>
+                    ) : (
+                        audits.map(item => (
+                            <div key={item.id} style={styles.terminalLine}>
+                                <span style={styles.terminalTime}>{formatTime(item.created_at)}</span>
+                                <span style={{ ...styles.smallStatus, background: auditColor(item.event), color: '#fff' }}>
+                                    {auditName(item.event)}
+                                </span>
+                                <span style={styles.terminalReason}>{item.reason || '-'}</span>
+                            </div>
+                        ))
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function StatTile({ label, value, tone }) {
+    return (
+        <div style={styles.detailTile}>
+            <div style={styles.tileLabel}>{label}</div>
+            <div style={{ ...styles.tileValue, color: tone || styles.tileValue.color }}>{value}</div>
+        </div>
+    );
+}
+
 function Metric({ label, value }) {
     return (
         <div style={styles.metric}>
@@ -336,6 +503,18 @@ function formatTime(value) {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
     return date.toLocaleString();
+}
+
+function formatMetric(value, digits = 1) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '0.0';
+    return num.toFixed(digits);
+}
+
+function formatMemory(kb) {
+    const num = Number(kb);
+    if (!Number.isFinite(num) || num <= 0) return '0 MB';
+    return `${(num / 1024).toFixed(1)} MB`;
 }
 
 function auditName(event) {

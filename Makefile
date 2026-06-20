@@ -7,7 +7,7 @@ TARGET_IP ?= 127.0.0.1
 DURATION ?= 6
 FREQUENCY ?= 99
 
-.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health test e2e verify
+.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health test coverage e2e verify
 
 health:
 	@echo "[health] API: $(API)"
@@ -60,8 +60,12 @@ test:
 	cd analysis && python3 test_analysis.py
 	cd web_frontend && npm run build
 
+coverage:
+	cd apiserver && go test ./... -coverprofile=/tmp/mini-drop-apiserver.cover
+	cd apiserver && go tool cover -func=/tmp/mini-drop-apiserver.cover | tail -1
+
 e2e:
 	bash scripts/e2e_smoke.sh
 
-verify: test
+verify: test coverage
 	git diff --check

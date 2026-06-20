@@ -20,7 +20,17 @@ pass "healthz"
 agents_resp="$(curl -fsS "$BASE/api/v1/agents")"
 agent_count="$(printf '%s' "$agents_resp" | json_get "len(d['data']['agents'])")"
 test "$agent_count" -ge 1 || fail "agent list has online/discovered agent"
+agent_ip="$(printf '%s' "$agents_resp" | json_get "d['data']['agents'][0]['ip_addr']")"
 pass "agent list"
+
+agent_detail_resp="$(curl -fsS "$BASE/api/v1/agent/detail?ip=$agent_ip")"
+heartbeat_sec="$(printf '%s' "$agent_detail_resp" | json_get "d['data']['heartbeat_interval_sec']")"
+offline_sec="$(printf '%s' "$agent_detail_resp" | json_get "d['data']['offline_after_sec']")"
+agent_detail_audits="$(printf '%s' "$agent_detail_resp" | json_get "len(d['data'].get('audits', []))")"
+test "$heartbeat_sec" = "5" || fail "agent detail heartbeat policy"
+test "$offline_sec" = "30" || fail "agent detail offline policy"
+test "$agent_detail_audits" -le 10 || fail "agent detail keeps latest 10 audits"
+pass "agent detail heartbeat policy"
 
 create_resp="$(curl -fsS -X POST "$BASE/api/v1/tasks" \
   -H 'Content-Type: application/json' \

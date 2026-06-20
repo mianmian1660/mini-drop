@@ -328,6 +328,7 @@ func (s *APIServer) registerRoutes() {
 		// Agent 管理
 		api.GET("/agents", s.ListAgents)
 		api.GET("/agents/audits", s.ListAgentAudits)
+		api.GET("/agent/detail", s.GetAgentDetail)
 		api.GET("/agent/stat", s.StatAgent)
 
 		// 任务管理

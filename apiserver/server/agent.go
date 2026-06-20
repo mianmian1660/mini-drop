@@ -262,6 +262,7 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 	// gRPC 不可达 → 回退到 DB 查询
 	var agent model.AgentInfo
 	if err := s.DB.Where("ip_addr = ?", ip).First(&agent).Error; err != nil {
+		s.Logger.Warn("查询 Agent 资源统计失败", zap.String("ip", ip), zap.Error(err))
 		c.JSON(http.StatusNotFound, gin.H{
 			"code":    404,
 			"message": "Agent 不存在: " + ip,
@@ -282,6 +283,94 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 			"memory_kb":      0,
 			"read_kb_per_s":  0.0,
 			"write_kb_per_s": 0.0,
+		},
+	})
+}
+
+// GetAgentDetail 获取单个 Agent 的心跳策略、实时资源和最近审计日志。
+// GET /api/v1/agent/detail?ip=xxx
+func (s *APIServer) GetAgentDetail(c *gin.Context) {
+	ip := c.Query("ip")
+	if ip == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "缺少 ip 参数",
+		})
+		return
+	}
+
+	var agent model.AgentInfo
+	if err := s.DB.Where("ip_addr = ?", ip).First(&agent).Error; err != nil {
+		s.Logger.Warn("查询 Agent 详情失败", zap.String("ip", ip), zap.Error(err))
+		c.JSON(http.StatusNotFound, gin.H{
+			"code":    404,
+			"message": "Agent 不存在: " + ip,
+		})
+		return
+	}
+
+	s.ensureAgentAudited(&agent)
+	s.markAgentOfflineIfStale(&agent)
+
+	stat := gin.H{
+		"cpu_percent":    0.0,
+		"memory_kb":      0,
+		"read_kb_per_s":  0.0,
+		"write_kb_per_s": 0.0,
+		"source":         "db",
+	}
+
+	if s.ControlCli != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := s.ControlCli.StatAgent(ctx, &pb.StatAgentRequest{TargetIP: ip})
+		cancel()
+		if err == nil && resp.GetCode() == 0 {
+			if !agent.Online {
+				s.recordAgentAudit(agent.IPAddr, agent.Hostname, "recovered", "Agent 详情页实时探测成功，Agent 恢复在线")
+			}
+			agent.Online = true
+			agent.LastSeen = time.Now()
+			if err := s.DB.Model(&agent).Updates(map[string]interface{}{
+				"online":    true,
+				"last_seen": agent.LastSeen,
+			}).Error; err != nil {
+				s.Logger.Warn("更新 Agent 详情心跳失败", zap.String("ip", ip), zap.Error(err))
+			}
+			stat = gin.H{
+				"cpu_percent":    resp.GetCpuPercent(),
+				"memory_kb":      resp.GetMemoryKb(),
+				"read_kb_per_s":  resp.GetReadKbPerS(),
+				"write_kb_per_s": resp.GetWriteKbPerS(),
+				"source":         "grpc",
+			}
+		} else if err != nil {
+			s.Logger.Warn("Agent 详情实时探测失败", zap.String("ip", ip), zap.Error(err))
+		} else {
+			s.Logger.Warn("Agent 详情实时探测返回失败状态", zap.String("ip", ip), zap.Int32("code", resp.GetCode()), zap.String("msg", resp.GetMsg()))
+		}
+	}
+
+	var audits []model.AgentAuditLog
+	if err := s.DB.Where("ip_addr = ?", ip).
+		Order("created_at DESC, id DESC").
+		Limit(10).
+		Find(&audits).Error; err != nil {
+		s.Logger.Warn("查询 Agent 详情审计日志失败", zap.String("ip", ip), zap.Error(err))
+		audits = []model.AgentAuditLog{}
+	}
+	if audits == nil {
+		audits = []model.AgentAuditLog{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"data": gin.H{
+			"agent":                  agent,
+			"stat":                   stat,
+			"heartbeat_interval_sec": 5,
+			"offline_after_sec":      30,
+			"server_time":            time.Now(),
+			"audits":                 audits,
 		},
 	})
 }
