@@ -18,6 +18,10 @@ const styles = {
     loading: { textAlign: 'center', padding: 60, color: '#999' },
     error: { textAlign: 'center', padding: 60, color: '#f44336' },
     flameBox: { textAlign: 'center', padding: 40, background: '#f5f5fa', color: '#999', borderRadius: 8, minHeight: 300 },
+    fileList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 },
+    fileItem: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '10px 12px', border: '1px solid #eee', borderRadius: 6, background: '#fafafa' },
+    fileName: { fontSize: 13, color: '#333', wordBreak: 'break-all' },
+    downloadLink: { color: '#4a6cf7', fontSize: 12, whiteSpace: 'nowrap', textDecoration: 'none', fontWeight: 'bold' },
     // W3: 轮询指示器
     pollingBar: {
         display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
@@ -36,6 +40,7 @@ const styles = {
 
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336' };
 const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败' };
+const analysisNames = { 0: '待分析', 1: '分析中', 2: '分析完成', 3: '分析失败' };
 
 // W3: 状态步骤定义
 const statusSteps = [
@@ -58,6 +63,17 @@ export default function TaskResultPage() {
     const [bpfSvgUrl, setBpfSvgUrl] = useState('');        // eBPF 直方图 SVG URL
     const [analysisPolling, setAnalysisPolling] = useState(false);  // 是否在等分析结果
 
+    const applyFiles = useCallback((files = []) => {
+        const safeFiles = Array.isArray(files) ? files : [];
+        setFlameFiles(safeFiles);
+
+        const flameFile = safeFiles.find(isFlamegraphFile);
+        const bpfFile = safeFiles.find(isBpfHistogramFile);
+
+        setFlameSvgUrl(flameFile?.download_url || '');
+        setBpfSvgUrl(bpfFile?.download_url || '');
+    }, []);
+
     // W4: 加载任务详情 + 产物文件
     const loadTask = useCallback(async (isPoll = false) => {
         if (!isPoll) setLoading(true);
@@ -67,7 +83,7 @@ export default function TaskResultPage() {
             const res = await tasks.detail(tid);
             if (res.code === 0) {
                 // apiserver 返回 { data: { task: {...}, files: [...], top_functions: [...] } }
-                const taskData = res.data?.task || res.data;
+                const taskData = { ...(res.data?.task || res.data || {}) };
                 // 合并 TopN 数据（API 返回到 data.top_functions）
                 const topFuncs = res.data?.top_functions || [];
                 if (topFuncs.length > 0) {
@@ -76,22 +92,7 @@ export default function TaskResultPage() {
                 setTask(taskData);
                 setError('');
 
-                // W4: 提取产物文件列表，查找火焰图 SVG
-                const files = res.data?.files || [];
-                setFlameFiles(files);
-                const svgFile = files.find(f =>
-                    f.name && (f.name.endsWith('.svg') || f.name.includes('flamegraph'))
-                );
-                if (svgFile?.download_url) {
-                    setFlameSvgUrl(svgFile.download_url);
-                }
-                // eBPF: 检测直方图 SVG
-                const bpfFile = files.find(f =>
-                    f.name && f.name.includes('bpf_histogram') || f.name.includes('bpf_data')
-                );
-                if (bpfFile?.download_url) {
-                    setBpfSvgUrl(bpfFile.download_url);
-                }
+                applyFiles(res.data?.files || []);
             } else {
                 if (!isPoll) setError(res.message || '任务不存在');
             }
@@ -101,7 +102,7 @@ export default function TaskResultPage() {
             setLoading(false);
             setPolling(false);
         }
-    }, [tid]);
+    }, [tid, applyFiles]);
 
     // W4: 单独加载产物文件列表（用于分析完成后轮询）
     const loadFiles = useCallback(async () => {
@@ -109,28 +110,14 @@ export default function TaskResultPage() {
         try {
             const res = await cosfiles.list(tid);
             if (res.code === 0) {
-                const files = res.data?.files || [];
-                setFlameFiles(files);
-                const svgFile = files.find(f =>
-                    f.name && (f.name.endsWith('.svg') || f.name.includes('flamegraph'))
-                );
-                if (svgFile?.download_url) {
-                    setFlameSvgUrl(svgFile.download_url);
-                }
-                // eBPF: 检测直方图 SVG
-                const bpfFile = files.find(f =>
-                    f.name && f.name.includes('bpf_histogram') || f.name.includes('bpf_data')
-                );
-                if (bpfFile?.download_url) {
-                    setBpfSvgUrl(bpfFile.download_url);
-                }
+                applyFiles(res.data?.files || []);
             }
         } catch (err) {
             console.error('加载文件列表失败:', err);
         } finally {
             setAnalysisPolling(false);
         }
-    }, [tid]);
+    }, [tid, applyFiles]);
 
     // 初始加载
     useEffect(() => {
@@ -163,7 +150,7 @@ export default function TaskResultPage() {
         }, 5000);
 
         return () => clearInterval(interval);
-    }, [task?.status, flameSvgUrl, loadFiles]);
+    }, [task?.status, flameSvgUrl, bpfSvgUrl, loadFiles]);
 
     if (loading) return <div style={styles.container}><p style={styles.loading}>⏳ 加载中...</p></div>;
     if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
@@ -171,7 +158,12 @@ export default function TaskResultPage() {
 
     const statusColor = statusColors[task.status] || '#999';
     const statusName = statusNames[task.status] || '未知';
+    const analysisName = analysisNames[task.analysis_status] || '未知';
     const isRunning = task.status < 2;
+    const isBpfHistogramTask = Number(task.type) === 5;
+    const waitingArtifactText = isBpfHistogramTask
+        ? '任务采集已完成，正在等待分析引擎生成 eBPF 直方图...'
+        : '任务采集已完成，正在等待分析引擎生成火焰图...';
 
     return (
         <div style={styles.container}>
@@ -218,6 +210,10 @@ export default function TaskResultPage() {
                             </td>
                         </tr>
                         <tr>
+                            <td style={{ ...styles.td, fontWeight: 'bold' }}>分析状态</td>
+                            <td style={styles.td}>{analysisName}</td>
+                        </tr>
+                        <tr>
                             <td style={{ ...styles.td, fontWeight: 'bold' }}>目标 IP</td>
                             <td style={styles.td}>{task.target_ip || '-'}</td>
                         </tr>
@@ -243,44 +239,37 @@ export default function TaskResultPage() {
                 </table>
             </div>
 
-            {/* ===== 火焰图 ===== */}
-            <h3>🔥 火焰图</h3>
+            {/* ===== 可视化结果 ===== */}
+            <h3>{isBpfHistogramTask ? '📊 eBPF 内核探针' : '🔥 火焰图'}</h3>
             <div style={styles.flameBox}>
-                {flameSvgUrl ? (
+                {bpfSvgUrl ? (
+                    <div>
+                        <iframe
+                            src={bpfSvgUrl}
+                            title="eBPF Histogram"
+                            style={{
+                                width: '100%', height: 420, border: '1px solid #e0e0e0',
+                                borderRadius: 4, background: '#fff',
+                            }}
+                        />
+                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>
+                            eBPF 延迟分布直方图
+                        </p>
+                    </div>
+                ) : flameSvgUrl ? (
                     <div>
                         <iframe src={flameSvgUrl} title="火焰图"
                             style={{ width: '100%', height: 500, border: '1px solid #e0e0e0', borderRadius: 4, background: '#fff' }} />
-                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>💡 点击函数框可放大，右键可缩小</p>
-                    </div>
-                ) : bpfSvgUrl ? (
-                    // eBPF IO/调度模式：直方图已生成，不需要火焰图
-                    <div>
-                        <p style={{ fontSize: 14, color: '#4caf50' }}>✅ eBPF 直方图已生成，请查看下方「📊 eBPF 内核探针」区域</p>
+                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>点击函数框可放大，右键可缩小</p>
                     </div>
                 ) : task.status === 2 ? (
                     <div>
                         <p style={{ fontSize: 48, margin: '0 0 16px 0' }}>🔬</p>
-                        <p>任务采集已完成，正在等待分析引擎生成火焰图...</p>
+                        <p>{waitingArtifactText}</p>
                         {analysisPolling && (
                             <p style={{ fontSize: 13, color: '#1565c0', marginTop: 8 }}>
                                 🔄 每 5 秒检查分析结果...
                             </p>
-                        )}
-                        {flameFiles.length > 0 && (
-                            <div style={{ marginTop: 12, textAlign: 'left', maxWidth: 500, margin: '12px auto' }}>
-                                <p style={{ fontSize: 13, fontWeight: 'bold' }}>已有产物文件：</p>
-                                {flameFiles.map(f => (
-                                    <div key={f.name} style={{ fontSize: 12, padding: '4px 0', color: '#666' }}>
-                                        📄 {f.name} ({formatSize(f.size)})
-                                        {f.download_url && (
-                                            <a href={f.download_url} target="_blank" rel="noreferrer"
-                                                style={{ marginLeft: 8, color: '#4a6cf7', fontSize: 11 }}>
-                                                下载
-                                            </a>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
                         )}
                         {flameFiles.length === 0 && !analysisPolling && (
                             <p style={{ fontSize: 12, color: '#999', marginTop: 8 }}>
@@ -302,25 +291,36 @@ export default function TaskResultPage() {
                 )}
             </div>
 
-            {/* ===== eBPF IO 直方图 (profilerType=3) ===== */}
-            {bpfSvgUrl && (
-                <>
-                    <h3>📊 eBPF 内核探针</h3>
-                    <div style={{ ...styles.card, textAlign: 'center' }}>
-                        <iframe
-                            src={bpfSvgUrl}
-                            title="eBPF Histogram"
-                            style={{
-                                width: '100%', height: 380, border: '1px solid #e0e0e0',
-                                borderRadius: 4, background: '#f5f5fa',
-                            }}
-                        />
-                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>
-                            💡 IO 延迟分布直方图（绿色=&lt;10us, 橙色=10-100us, 红色=&gt;100us）
-                        </p>
+            {/* ===== 产物文件下载 ===== */}
+            <h3>产物文件</h3>
+            <div style={styles.card}>
+                {flameFiles.length > 0 ? (
+                    <div style={styles.fileList}>
+                        {flameFiles.map((f, i) => (
+                            <div key={f.name || f.download_url || i} style={styles.fileItem}>
+                                <div>
+                                    <div style={styles.fileName}>{displayFileName(f.name)}</div>
+                                    <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>
+                                        {f.content_type || 'application/octet-stream'} · {formatSize(f.size)}
+                                        {f.source && ` · ${f.source}`}
+                                    </div>
+                                </div>
+                                {f.download_url ? (
+                                    <a href={f.download_url} target="_blank" rel="noreferrer" style={styles.downloadLink}>
+                                        下载
+                                    </a>
+                                ) : (
+                                    <span style={{ fontSize: 12, color: '#aaa', whiteSpace: 'nowrap' }}>无链接</span>
+                                )}
+                            </div>
+                        ))}
                     </div>
-                </>
-            )}
+                ) : (
+                    <p style={{ textAlign: 'center', padding: 24, color: '#999' }}>
+                        暂无产物文件
+                    </p>
+                )}
+            </div>
 
             {/* ===== 热点 TopN ===== */}
             <h3>🔥 热点 TopN</h3>
@@ -354,6 +354,32 @@ export default function TaskResultPage() {
             </div>
         </div>
     );
+}
+
+function normalizeFileName(file) {
+    return (file?.name || '').toString();
+}
+
+function displayFileName(name) {
+    if (!name) return '未知文件';
+    const parts = name.split('/');
+    return parts[parts.length - 1] || name;
+}
+
+function isBpfHistogramFile(file) {
+    const name = normalizeFileName(file).toLowerCase();
+    return name.endsWith('.svg') && (
+        name.includes('bpf_histogram') ||
+        name.includes('bpf-latency') ||
+        name.includes('bpf_latency')
+    );
+}
+
+function isFlamegraphFile(file) {
+    const name = normalizeFileName(file).toLowerCase();
+    return name.endsWith('.svg') &&
+        name.includes('flamegraph') &&
+        !name.includes('bpf_histogram');
 }
 
 // W4: 文件大小格式化工具

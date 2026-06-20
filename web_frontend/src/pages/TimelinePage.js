@@ -80,10 +80,7 @@ export default function TimelinePage() {
     const toggleSchedule = async (sid, e) => {
         e.stopPropagation();  // 阻止触发行点击
         try {
-            await fetch('/api/v1/schedule/' + sid + '/toggle', {
-                method: 'POST',
-                headers: { 'Drop_user_uid': 'demo', 'Drop_user_name': 'demo' }
-            });
+            await schedules.toggle(sid);
             refreshSchedules();
         } catch (err) { alert('操作失败: ' + err.message); }
     };
@@ -92,10 +89,7 @@ export default function TimelinePage() {
         e.stopPropagation();
         if (!window.confirm('确定删除此定时任务？相关采集记录保留。')) return;
         try {
-            await fetch('/api/v1/schedule/' + sid, {
-                method: 'DELETE',
-                headers: { 'Drop_user_uid': 'demo', 'Drop_user_name': 'demo' }
-            });
+            await schedules.delete(sid);
             refreshSchedules();
             if (masterTid === sid) { setMasterTid(''); setPoints([]); }
         } catch (err) { alert('删除失败: ' + err.message); }

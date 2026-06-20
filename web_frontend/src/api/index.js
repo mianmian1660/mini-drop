@@ -52,6 +52,7 @@ export const schedules = {
     create: (data) => client.post('/api/v1/schedule/task', data),
     list: () => client.get('/api/v1/schedule/tasks'),
     delete: (sid) => client.delete(`/api/v1/schedule/${sid}`),
+    toggle: (sid) => client.post(`/api/v1/schedule/${sid}/toggle`),
 };
 
 // ---------- 文件（W4: 火焰图等产物） ----------

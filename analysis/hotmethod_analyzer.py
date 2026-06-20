@@ -746,24 +746,25 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
         svg = bpf_histogram_to_svg(hist_data, title=f"eBPF {hist_data.get('type', '')}")
         top_json = hist_data
 
-    # 保存产物
-    out_dir = local_dir if local_dir else f"/tmp/{tid}_output"
+    # 保存产物。MinIO 不可用时使用 apiserver 的本地降级约定：/tmp/drop-output/{tid}_*
+    out_dir = local_dir if local_dir else "/tmp/drop-output"
     os.makedirs(out_dir, exist_ok=True)
+    local_prefix = "" if local_dir else f"{tid}_"
 
-    svg_name = "bpf_histogram.svg"
+    svg_name = f"{local_prefix}bpf_histogram.svg"
     svg_path = os.path.join(out_dir, svg_name)
     if svg:
         with open(svg_path, 'w') as f:
             f.write(svg)
         local_files.append({"name": svg_name, "path": svg_path})
 
-    json_name = "bpf_data.json"
+    json_name = f"{local_prefix}bpf_data.json"
     json_path = os.path.join(out_dir, json_name)
     with open(json_path, 'w') as f:
         json.dump(top_json, f, ensure_ascii=False, indent=2)
     local_files.append({"name": json_name, "path": json_path})
 
-    raw_name = "bpf_raw.txt"
+    raw_name = f"{local_prefix}bpf_raw.txt"
     raw_path = os.path.join(out_dir, raw_name)
     with open(raw_path, 'w') as f:
         f.write(bpf_text)
@@ -772,14 +773,24 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
     # 上传 MinIO
     if storage_ok:
         for lf in local_files:
-            key = f"{tid}/{lf['name']}"
+            object_name = lf["name"]
+            if object_name.startswith(f"{tid}_"):
+                object_name = object_name[len(tid) + 1:]
+            key = f"{tid}/{object_name}"
+            content_type = "application/octet-stream"
+            if object_name.endswith(".svg"):
+                content_type = "image/svg+xml"
+            elif object_name.endswith(".json"):
+                content_type = "application/json"
+            elif object_name.endswith(".txt"):
+                content_type = "text/plain"
             try:
                 with open(lf["path"], 'rb') as f:
                     file_data = f.read()
-                storage.put_object(bucket, key, file_data)
+                storage.put_object(bucket, key, file_data, content_type)
                 url = storage.presigned_get_url(bucket, key)
                 if url:
-                    presigned_urls[lf["name"]] = url
+                    presigned_urls[object_name] = url
                 outputs.append(key)
             except Exception as e:
                 print(f"[analysis] MinIO 上传 {lf['name']} 失败: {e}", file=sys.stderr)

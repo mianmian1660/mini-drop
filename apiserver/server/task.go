@@ -34,10 +34,10 @@ type CreateTaskReq struct {
 	ProfilerType  uint32 `json:"profiler_type"` // 0=perf 1=async-profiler 2=pprof
 	TargetIP      string `json:"target_ip" binding:"required"`
 	TargetPID     int32  `json:"target_pid"`
-	Duration      uint64 `json:"duration"`      // 采集秒数
-	Frequency     uint32 `json:"frequency"`     // 采样频率 Hz
-	Callgraph     string `json:"callgraph"`     // fp / dwarf / lbr
-	Event         string `json:"event"`         // cpu-cycles / cache-misses
+	Duration      uint64 `json:"duration"`  // 采集秒数
+	Frequency     uint32 `json:"frequency"` // 采样频率 Hz
+	Callgraph     string `json:"callgraph"` // fp / dwarf / lbr
+	Event         string `json:"event"`     // cpu-cycles / cache-misses
 	Subprocess    bool   `json:"subprocess"`
 	ContainerName string `json:"container_name"`
 }
@@ -106,18 +106,18 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 	now := time.Now()
 
 	task := &model.HotmethodTask{
-		TID:           tid,
-		Name:          req.Name,
-		Type:          req.TaskType,
-		ProfilerType:  req.ProfilerType,
-		TargetIP:      req.TargetIP,
-		RequestParams: paramsJSON,
-		Status:        0,      // 新建
-		StatusInfo:    "任务已创建，等待下发",
-		AnalysisStatus: 0,     // 待分析
-		UID:           uid,
-		UserName:      userName,
-		CreateTime:    now,
+		TID:            tid,
+		Name:           req.Name,
+		Type:           req.TaskType,
+		ProfilerType:   req.ProfilerType,
+		TargetIP:       req.TargetIP,
+		RequestParams:  paramsJSON,
+		Status:         0, // 新建
+		StatusInfo:     "任务已创建，等待下发",
+		AnalysisStatus: 0, // 待分析
+		UID:            uid,
+		UserName:       userName,
+		CreateTime:     now,
 	}
 
 	if err := s.DB.Create(task).Error; err != nil {
@@ -309,14 +309,16 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		return
 	}
 
-	// W4: 如果存储已连接，列出该任务下的产物文件并生成下载链接
 	result := gin.H{"task": task}
+	files := []map[string]interface{}{}
+
+	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
-		files, err := s.listTaskFiles(tid)
+		storageFiles, err := s.listTaskFiles(tid)
 		if err != nil {
 			s.Logger.Warn("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
 		} else {
-			result["files"] = files
+			files = storageFiles
 
 			// 尝试从 MinIO 读取 top.json → TopN 热点数据
 			topFuncs := s.fetchTopFunctions(tid)
@@ -325,11 +327,47 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 			}
 		}
 	}
+	if len(files) == 0 {
+		files = s.listLocalFiles(tid)
+		if _, ok := result["top_functions"]; !ok {
+			topFuncs := s.fetchLocalTopFunctions(tid)
+			if len(topFuncs) > 0 {
+				result["top_functions"] = topFuncs
+			}
+		}
+	}
+	result["files"] = files
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": result,
 	})
+}
+
+// fetchLocalTopFunctions 从 /tmp/drop-output/{tid}_top.json 读取 TopN
+func (s *APIServer) fetchLocalTopFunctions(tid string) []map[string]interface{} {
+	localPath := filepath.Join("/tmp/drop-output", tid+"_top.json")
+	f, err := os.Open(localPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var topData map[string]interface{}
+	if err := json.NewDecoder(f).Decode(&topData); err != nil {
+		return nil
+	}
+
+	if selfTop, ok := topData["self_time_top"].([]interface{}); ok {
+		funcs := make([]map[string]interface{}, 0, len(selfTop))
+		for _, item := range selfTop {
+			if m, ok := item.(map[string]interface{}); ok {
+				funcs = append(funcs, m)
+			}
+		}
+		return funcs
+	}
+	return nil
 }
 
 // fetchTopFunctions 从 MinIO 读取 {tid}/top.json 并解析 TopN
@@ -778,14 +816,14 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 
 	// 构建时间轴数据
 	type TimelinePoint struct {
-		TID         string    `json:"tid"`
-		Name        string    `json:"name"`
-		Status      int    `json:"status"`
-		CreateTime  time.Time `json:"create_time"`
-		BeginTime   *time.Time `json:"begin_time,omitempty"`
-		EndTime     *time.Time `json:"end_time,omitempty"`
-		HasResult   bool      `json:"has_result"`   // 是否有火焰图/SVG产物
-		AnalysisStatus int `json:"analysis_status"`
+		TID            string     `json:"tid"`
+		Name           string     `json:"name"`
+		Status         int        `json:"status"`
+		CreateTime     time.Time  `json:"create_time"`
+		BeginTime      *time.Time `json:"begin_time,omitempty"`
+		EndTime        *time.Time `json:"end_time,omitempty"`
+		HasResult      bool       `json:"has_result"` // 是否有火焰图/SVG产物
+		AnalysisStatus int        `json:"analysis_status"`
 	}
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
