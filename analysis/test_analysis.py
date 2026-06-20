@@ -37,6 +37,14 @@ def t_parse_bpf_histogram_sched():
     r = parse_bpf_histogram("# Mini-Drop eBPF Scheduler\n@sched_lat_us:\n[0, 10) 500\n[10, 50) 200\n[50, 100) 50\n")
     assert r["type"]=="sched_latency" and r["total_events"]==750
 
+def t_parse_bpf_histogram_suffix_buckets():
+    from bpf_analyzer import parse_bpf_histogram
+    text = "@io_lat_us:\n[0] 5 |@@@@@\n[1K, 2K) 3 |@@@\n[2K, 4K) 2 |@@\n"
+    r = parse_bpf_histogram(text)
+    assert r["type"]=="io_latency" and len(r["buckets"])==3
+    assert r["buckets"][1]["low"]==1024 and r["buckets"][1]["high"]==2048
+    assert r["total_events"]==10
+
 def t_parse_bpf_histogram_empty():
     from bpf_analyzer import parse_bpf_histogram
     r = parse_bpf_histogram("")

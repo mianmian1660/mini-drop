@@ -32,10 +32,10 @@ type APIServer struct {
 	Logger     *zap.Logger
 	Config     *config.Config
 	Router     *gin.Engine
-	GRPCConn   *grpc.ClientConn       // gRPC 连接（到 drop_server）
-	ControlCli pb.ControlClient       // Control 服务客户端
-	Storage    storage.Storage        // 对象存储（MinIO）
-	Cron       *cron.Cron             // 定时任务调度器（W5）
+	GRPCConn   *grpc.ClientConn        // gRPC 连接（到 drop_server）
+	ControlCli pb.ControlClient        // Control 服务客户端
+	Storage    storage.Storage         // 对象存储（MinIO）
+	Cron       *cron.Cron              // 定时任务调度器（W5）
 	CronJobs   map[string]cron.EntryID // SID → cron EntryID 映射（支持动态停止/删除）
 }
 
@@ -339,8 +339,9 @@ func (s *APIServer) registerRoutes() {
 
 		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)
+		api.GET("/cosfiles/view", s.ViewCOSFile)
 		api.POST("/cosfiles/upload", s.UploadTestFile)
-		api.GET("/files/:filename", s.ServeLocalFile)  // W4: 本地文件服务
+		api.GET("/files/:filename", s.ServeLocalFile) // W4: 本地文件服务
 
 		// 用户组管理（W5）
 		api.POST("/groups", s.CreateGroup)
@@ -359,6 +360,6 @@ func (s *APIServer) registerRoutes() {
 	}
 
 	s.Logger.Info("路由注册完成",
-		zap.Int("api_count", 21),
+		zap.Int("api_count", 22),
 	)
 }

@@ -21,7 +21,7 @@ const styles = {
     fileList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 },
     fileItem: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '10px 12px', border: '1px solid #eee', borderRadius: 6, background: '#fafafa' },
     fileName: { fontSize: 13, color: '#333', wordBreak: 'break-all' },
-    downloadLink: { color: '#4a6cf7', fontSize: 12, whiteSpace: 'nowrap', textDecoration: 'none', fontWeight: 'bold' },
+    downloadLink: { background: '#4a6cf7', color: '#fff', fontSize: 12, whiteSpace: 'nowrap', textDecoration: 'none', fontWeight: 'bold', borderRadius: 4, padding: '6px 10px' },
     // W3: 轮询指示器
     pollingBar: {
         display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
@@ -64,14 +64,20 @@ export default function TaskResultPage() {
     const [analysisPolling, setAnalysisPolling] = useState(false);  // 是否在等分析结果
 
     const applyFiles = useCallback((files = []) => {
-        const safeFiles = Array.isArray(files) ? files : [];
+        const safeFiles = Array.isArray(files)
+            ? files.map(f => ({
+                ...f,
+                download_url: resolveDownloadUrl(f?.download_url),
+                view_url: resolveDownloadUrl(f?.view_url),
+            }))
+            : [];
         setFlameFiles(safeFiles);
 
         const flameFile = safeFiles.find(isFlamegraphFile);
         const bpfFile = safeFiles.find(isBpfHistogramFile);
 
-        setFlameSvgUrl(flameFile?.download_url || '');
-        setBpfSvgUrl(bpfFile?.download_url || '');
+        setFlameSvgUrl(flameFile?.view_url || flameFile?.download_url || '');
+        setBpfSvgUrl(bpfFile?.view_url || bpfFile?.download_url || '');
     }, []);
 
     // W4: 加载任务详情 + 产物文件
@@ -306,8 +312,8 @@ export default function TaskResultPage() {
                                     </div>
                                 </div>
                                 {f.download_url ? (
-                                    <a href={f.download_url} target="_blank" rel="noreferrer" style={styles.downloadLink}>
-                                        下载
+                                    <a href={f.download_url} target="_blank" rel="noreferrer" download={displayFileName(f.name)} style={styles.downloadLink}>
+                                        下载文件
                                     </a>
                                 ) : (
                                     <span style={{ fontSize: 12, color: '#aaa', whiteSpace: 'nowrap' }}>无链接</span>
@@ -364,6 +370,16 @@ function displayFileName(name) {
     if (!name) return '未知文件';
     const parts = name.split('/');
     return parts[parts.length - 1] || name;
+}
+
+function resolveDownloadUrl(url) {
+    if (!url) return '';
+    if (/^https?:\/\//i.test(url)) return url;
+    if (!url.startsWith('/')) return url;
+
+    const hostUrl = window.config?.HOST_URL || '';
+    if (!hostUrl) return url;
+    return hostUrl.replace(/\/$/, '') + url;
 }
 
 function isBpfHistogramFile(file) {

@@ -31,7 +31,7 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 # W5: Docker 健康检查（每 30 秒探测 /health 端点）
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost/health || exit 1
+    CMD wget -qO- http://127.0.0.1/health || exit 1
 
 EXPOSE 80
 

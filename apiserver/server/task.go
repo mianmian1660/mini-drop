@@ -10,7 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -598,14 +600,18 @@ func (s *APIServer) listLocalFiles(tid string) []map[string]interface{} {
 		// 生成本地下载 URL
 		downloadURL := fmt.Sprintf("/api/v1/files/%s", filename)
 
-		files = append(files, map[string]interface{}{
+		fileInfo := map[string]interface{}{
 			"name":          filename,
 			"size":          info.Size(),
 			"last_modified": info.ModTime(),
 			"content_type":  mimeType(filename),
 			"download_url":  downloadURL,
 			"source":        "local",
-		})
+		}
+		if filepath.Ext(filename) == ".svg" {
+			fileInfo["view_url"] = downloadURL
+		}
+		files = append(files, fileInfo)
 	}
 
 	return files
@@ -646,6 +652,46 @@ func (s *APIServer) ServeLocalFile(c *gin.Context) {
 	c.File(localPath)
 }
 
+// ViewCOSFile 通过 apiserver 代理查看对象存储中的小型可视化产物。
+// 主要用于修正历史 SVG 对象的 Content-Type，避免浏览器因 nosniff 拒绝渲染。
+// GET /api/v1/cosfiles/view?key=tid/flamegraph.svg
+func (s *APIServer) ViewCOSFile(c *gin.Context) {
+	key := c.Query("key")
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 key 参数"})
+		return
+	}
+	if strings.Contains(key, "..") || strings.Contains(key, "\\") || strings.HasPrefix(key, "/") {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "非法对象路径"})
+		return
+	}
+	if filepath.Ext(key) != ".svg" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "仅支持查看 SVG 可视化产物"})
+		return
+	}
+	if !s.StorageConnected() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"code": 503, "message": "对象存储未连接"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, key)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "文件不存在: " + key})
+		return
+	}
+	defer reader.Close()
+
+	c.Header("Content-Type", mimeType(key))
+	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filepath.Base(key)))
+	c.Status(http.StatusOK)
+	if _, err := io.Copy(c.Writer, reader); err != nil {
+		s.Logger.Warn("代理输出对象存储文件失败", zap.String("key", key), zap.Error(err))
+	}
+}
+
 // mimeType 根据文件扩展名返回 MIME 类型
 func mimeType(filename string) string {
 	ext := filepath.Ext(filename)
@@ -684,11 +730,15 @@ func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) 
 
 	var files []map[string]interface{}
 	for _, obj := range objects {
+		contentType := obj.ContentType
+		if contentType == "" || contentType == "application/octet-stream" {
+			contentType = mimeType(obj.Name)
+		}
 		fileInfo := map[string]interface{}{
 			"name":          obj.Name,
 			"size":          obj.Size,
 			"last_modified": obj.LastModified,
-			"content_type":  obj.ContentType,
+			"content_type":  contentType,
 		}
 
 		// 生成预签名下载 URL
@@ -702,6 +752,9 @@ func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) 
 			fileInfo["url_error"] = err.Error()
 		} else {
 			fileInfo["download_url"] = presignedURL
+		}
+		if filepath.Ext(obj.Name) == ".svg" {
+			fileInfo["view_url"] = "/api/v1/cosfiles/view?key=" + url.QueryEscape(obj.Name)
 		}
 		files = append(files, fileInfo)
 	}

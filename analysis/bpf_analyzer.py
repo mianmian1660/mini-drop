@@ -59,23 +59,31 @@ def parse_bpf_histogram(text: str) -> dict:
             result["type"] = "cpu"
             break
     
-    # 解析直方图行
-    # 格式: [min, max)    count |@@@@@
-    hist_pattern = re.compile(r'\[\s*(\d+[.]?\d*)\s*,\s*(\d+[.]?\d*)\s*\)\s+(\d+)\s*\|?(.*)')
+    # 解析直方图行。bpftrace 不同版本可能输出:
+    #   [1, 2)        42 |@@@@@
+    #   [1K, 2K)       3 |@@
+    #   [0]            7 |@@@@
+    #   (..., 0)       1 |@
+    number = r'-?\d+(?:\.\d+)?(?:[KMGTP])?'
+    range_pattern = re.compile(
+        rf'[\[\(]\s*({number}|-inf|\.\.\.)\s*(?:,\s*({number}|inf|\.\.\.)\s*)?[\]\)]\s+(\d+)\s*\|?(.*)',
+        re.IGNORECASE,
+    )
     
     buckets = []
     total_count = 0
     
     for line in lines:
         # 匹配直方图行
-        m = hist_pattern.match(line.strip())
+        m = range_pattern.match(line.strip())
         if m:
-            low = float(m.group(1))
-            high = float(m.group(2))
+            low = parse_hist_value(m.group(1), default=0.0)
+            high_raw = m.group(2)
+            high = parse_hist_value(high_raw, default=low) if high_raw else low
             count = int(m.group(3))
             bar = m.group(4).strip() if m.group(4) else ""
             buckets.append({
-                "range": f"[{int(low) if low == int(low) else low}, {int(high) if high == int(high) else high})",
+                "range": format_range_label(m.group(1), high_raw),
                 "low": low,
                 "high": high,
                 "count": count,
@@ -114,6 +122,41 @@ def parse_bpf_histogram(text: str) -> dict:
             }
     
     return result
+
+
+def parse_hist_value(value: str, default: float = 0.0) -> float:
+    """把 bpftrace 桶边界中的 K/M/G 后缀转成数值。"""
+    if value is None:
+        return default
+    value = value.strip()
+    if value in ("", "-inf", "inf", "..."):
+        return default
+
+    multiplier = 1
+    suffix = value[-1].upper()
+    if suffix in {"K", "M", "G", "T", "P"}:
+        value = value[:-1]
+        multiplier = {
+            "K": 1024,
+            "M": 1024 ** 2,
+            "G": 1024 ** 3,
+            "T": 1024 ** 4,
+            "P": 1024 ** 5,
+        }[suffix]
+
+    try:
+        return float(value) * multiplier
+    except ValueError:
+        return default
+
+
+def format_range_label(low_raw: str, high_raw: str = None) -> str:
+    """保留 bpftrace 原始桶标签，便于前端和报告对照原始输出。"""
+    low = (low_raw or "").strip()
+    high = (high_raw or "").strip() if high_raw else ""
+    if high:
+        return f"[{low}, {high})"
+    return f"[{low}]"
 
 
 def parse_bpf_collapsed(text: str) -> dict:
