@@ -44,6 +44,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   libgrpc++1      = gRPC C++ 运行时库
 #   libprotobuf23   = protobuf 运行时库
 #   linux-tools-generic = perf 工具（采集性能需要）
+#   bpftrace        = eBPF 内核态探针（profilerType=3）
 #   perl            = 火焰图脚本需要
 #   curl            = 健康检查 + MinIO API 调用
 #   wget            = 下载 mc (MinIO Client)
@@ -51,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgrpc++1 \
     libprotobuf23 \
     linux-tools-generic \
+    bpftrace \
     perl \
     curl \
     wget \

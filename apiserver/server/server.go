@@ -333,6 +333,9 @@ func (s *APIServer) registerRoutes() {
 		api.DELETE("/tasks/:tid", s.DeleteTask)
 		api.POST("/tasks/:tid/retry", s.RetryTask)
 
+		// Continuous Profiling 时间轴 (W6)
+		api.GET("/tasks/timeline", s.GetTimeline)
+
 		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)
 		api.POST("/cosfiles/upload", s.UploadTestFile)

@@ -55,6 +55,7 @@ export default function TaskResultPage() {
     // W4: 火焰图文件状态
     const [flameFiles, setFlameFiles] = useState([]);      // 所有产物文件
     const [flameSvgUrl, setFlameSvgUrl] = useState('');    // 火焰图 SVG 的预签名 URL
+    const [bpfSvgUrl, setBpfSvgUrl] = useState('');        // eBPF 直方图 SVG URL
     const [analysisPolling, setAnalysisPolling] = useState(false);  // 是否在等分析结果
 
     // W4: 加载任务详情 + 产物文件
@@ -65,8 +66,13 @@ export default function TaskResultPage() {
         try {
             const res = await tasks.detail(tid);
             if (res.code === 0) {
-                // apiserver 返回 { data: { task: {...}, files: [...] } }
+                // apiserver 返回 { data: { task: {...}, files: [...], top_functions: [...] } }
                 const taskData = res.data?.task || res.data;
+                // 合并 TopN 数据（API 返回到 data.top_functions）
+                const topFuncs = res.data?.top_functions || [];
+                if (topFuncs.length > 0) {
+                    taskData.top_functions = topFuncs;
+                }
                 setTask(taskData);
                 setError('');
 
@@ -78,6 +84,13 @@ export default function TaskResultPage() {
                 );
                 if (svgFile?.download_url) {
                     setFlameSvgUrl(svgFile.download_url);
+                }
+                // eBPF: 检测直方图 SVG
+                const bpfFile = files.find(f =>
+                    f.name && f.name.includes('bpf_histogram')
+                );
+                if (bpfFile?.download_url) {
+                    setBpfSvgUrl(bpfFile.download_url);
                 }
             } else {
                 if (!isPoll) setError(res.message || '任务不存在');
@@ -103,6 +116,13 @@ export default function TaskResultPage() {
                 );
                 if (svgFile?.download_url) {
                     setFlameSvgUrl(svgFile.download_url);
+                }
+                // eBPF: 检测直方图 SVG
+                const bpfFile = files.find(f =>
+                    f.name && f.name.includes('bpf_histogram')
+                );
+                if (bpfFile?.download_url) {
+                    setBpfSvgUrl(bpfFile.download_url);
                 }
             }
         } catch (err) {
@@ -287,6 +307,26 @@ export default function TaskResultPage() {
                 )}
             </div>
 
+            {/* ===== eBPF IO 直方图 (profilerType=3) ===== */}
+            {bpfSvgUrl && (
+                <>
+                    <h3>📊 eBPF 内核探针</h3>
+                    <div style={{ ...styles.card, textAlign: 'center' }}>
+                        <iframe
+                            src={bpfSvgUrl}
+                            title="eBPF Histogram"
+                            style={{
+                                width: '100%', height: 380, border: '1px solid #e0e0e0',
+                                borderRadius: 4, background: '#f5f5fa',
+                            }}
+                        />
+                        <p style={{ fontSize: 12, color: '#888', marginTop: 8 }}>
+                            💡 IO 延迟分布直方图（绿色=&lt;10us, 橙色=10-100us, 红色=&gt;100us）
+                        </p>
+                    </div>
+                </>
+            )}
+
             {/* ===== 热点 TopN ===== */}
             <h3>🔥 热点 TopN</h3>
             <div style={styles.card}>
@@ -303,10 +343,10 @@ export default function TaskResultPage() {
                         <tbody>
                             {task.top_functions.map((f, i) => (
                                 <tr key={i}>
-                                    <td style={styles.td}>{i + 1}</td>
-                                    <td style={styles.td}>{f.name}</td>
-                                    <td style={styles.td}>{f.samples}</td>
-                                    <td style={styles.td}>{f.percent}%</td>
+                                    <td style={styles.td}>{f.rank || i + 1}</td>
+                                    <td style={styles.td}>{f.function || f.name || '-'}</td>
+                                    <td style={styles.td}>{f.samples || 0}</td>
+                                    <td style={styles.td}>{f.percentage || f.percent || 0}%</td>
                                 </tr>
                             ))}
                         </tbody>

@@ -36,6 +36,7 @@ from flamegraph import generate_flamegraph, get_folded_stacks
 from collapsed_data_parser import analyze_collapsed
 from analysis_advisor import generate_suggestions as advisor_generate_suggestions
 from memleak_analyzer import analyze_memtrace, generate_mock_memtrace
+from bpf_analyzer import analyze_bpf_output, bpf_histogram_to_svg
 
 
 # ============================================================
@@ -45,6 +46,7 @@ TASK_TYPE_GENERIC   = 0   # 通用 CPU 采样
 TASK_TYPE_JAVA      = 1   # Java 分析
 TASK_TYPE_TRACING   = 2   # Tracing
 TASK_TYPE_MEMCHECK  = 4   # 内存泄漏
+TASK_TYPE_BPF       = 5   # eBPF 内核探针 (IO/调度延迟)
 TASK_TYPE_JAVA_HEAP = 6   # Java 堆 dump
 
 
@@ -689,6 +691,98 @@ def _analyze_memleak(conn, storage_cfg: dict, task: dict,
     }
 
 
+def _analyze_bpf(conn, storage_cfg: dict, task: dict,
+                 bucket: str, tid: str, local_dir: str = "") -> dict:
+    """
+    eBPF 内核探针分析（task_type=5）
+    支持 IO 延迟直方图 / 调度延迟 / CPU 火焰图
+    """
+    outputs = []
+    presigned_urls = {}
+    local_files = []
+
+    storage, storage_ok = _connect_storage(storage_cfg)
+
+    local_bpf = f"/tmp/{tid}_bpf.txt"
+    has_data = False
+
+    if storage_ok:
+        try:
+            key = f"{tid}/perf.data"
+            storage.get_object(bucket, key, local_bpf)
+            if os.path.exists(local_bpf) and os.path.getsize(local_bpf) > 0:
+                has_data = True
+        except Exception as e:
+            print(f"[analysis] MinIO 下载 bpf 数据失败: {e}", file=sys.stderr)
+
+    if not has_data:
+        print(f"[analysis] 错误: 找不到 eBPF 数据文件", file=sys.stderr)
+        return {"outputs": [], "presigned_urls": {}, "local_files": []}
+
+    with open(local_bpf, 'r') as f:
+        bpf_text = f.read()
+
+    if not bpf_text.strip():
+        return {"outputs": [], "presigned_urls": {}, "local_files": []}
+
+    # 检测格式：折叠栈 → 火焰图；直方图 → SVG 柱状图
+    if ";" in bpf_text and "@" not in bpf_text:
+        print(f"[analysis] eBPF CPU 折叠栈 → 火焰图", file=sys.stderr)
+        try:
+            svg = generate_flamegraph(local_bpf, title=f"eBPF CPU: {task.get('name', tid)}")
+        except:
+            svg = ""
+        folded = get_folded_stacks(local_bpf) if False else bpf_text
+        try:
+            top_json = analyze_collapsed(bpf_text, top_n=20)
+        except:
+            top_json = {}
+    else:
+        print(f"[analysis] eBPF 直方图 → SVG 柱状图", file=sys.stderr)
+        hist_data = analyze_bpf_output(bpf_text)
+        svg = bpf_histogram_to_svg(hist_data, title=f"eBPF {hist_data.get('type', '')}")
+        top_json = hist_data
+
+    # 保存产物
+    out_dir = local_dir if local_dir else f"/tmp/{tid}_output"
+    os.makedirs(out_dir, exist_ok=True)
+
+    svg_name = "bpf_histogram.svg"
+    svg_path = os.path.join(out_dir, svg_name)
+    if svg:
+        with open(svg_path, 'w') as f:
+            f.write(svg)
+        local_files.append({"name": svg_name, "path": svg_path})
+
+    json_name = "bpf_data.json"
+    json_path = os.path.join(out_dir, json_name)
+    with open(json_path, 'w') as f:
+        json.dump(top_json, f, ensure_ascii=False, indent=2)
+    local_files.append({"name": json_name, "path": json_path})
+
+    raw_name = "bpf_raw.txt"
+    raw_path = os.path.join(out_dir, raw_name)
+    with open(raw_path, 'w') as f:
+        f.write(bpf_text)
+    local_files.append({"name": raw_name, "path": raw_path})
+
+    # 上传 MinIO
+    if storage_ok:
+        for lf in local_files:
+            key = f"{tid}/{lf['name']}"
+            try:
+                storage.put_object(bucket, key, lf["path"])
+                url = storage.presigned_get_url(bucket, key)
+                if url:
+                    presigned_urls[lf["name"]] = url
+                outputs.append(key)
+            except Exception as e:
+                print(f"[analysis] MinIO 上传 {lf['name']} 失败: {e}", file=sys.stderr)
+
+    print(f"[analysis] eBPF 分析完成: {len(outputs)} 个产物", file=sys.stderr)
+    return {"outputs": outputs, "presigned_urls": presigned_urls, "local_files": local_files}
+
+
 def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
                           bucket: str, tid: str, task_type: int,
                           local_dir: str = "") -> dict:
@@ -714,6 +808,11 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
             # 内存泄漏检测：alloc/free 配对分析 → 责任人定位
             result = _analyze_memleak(conn, storage_cfg, task,
                                       bucket, tid, local_dir)
+
+        elif task_type == TASK_TYPE_BPF:
+            # eBPF 内核探针分析：IO延迟直方图 / 调度延迟
+            result = _analyze_bpf(conn, storage_cfg, task,
+                                  bucket, tid, local_dir)
 
         elif task_type == TASK_TYPE_JAVA_HEAP:
             # W5 将实现: Java 堆 dump 分析

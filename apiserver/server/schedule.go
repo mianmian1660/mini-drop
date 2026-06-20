@@ -98,6 +98,7 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 		AnalysisStatus: 0,
 		UID:           sch.UID,
 		UserName:      sch.UserName,
+		MasterTaskTID: sch.SID,
 		CreateTime:    now,
 	}
 

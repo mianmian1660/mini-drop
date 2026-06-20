@@ -8,6 +8,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -294,7 +295,7 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 	})
 }
 
-// GetTaskDetail 获取任务详情（含产物下载链接）
+// GetTaskDetail 获取任务详情（含产物下载链接 + TopN 热点数据）
 // GET /api/v1/tasks/:tid
 func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	tid := c.Param("tid")
@@ -316,6 +317,12 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 			s.Logger.Warn("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
 		} else {
 			result["files"] = files
+
+			// 尝试从 MinIO 读取 top.json → TopN 热点数据
+			topFuncs := s.fetchTopFunctions(tid)
+			if len(topFuncs) > 0 {
+				result["top_functions"] = topFuncs
+			}
 		}
 	}
 
@@ -323,6 +330,39 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		"code": 0,
 		"data": result,
 	})
+}
+
+// fetchTopFunctions 从 MinIO 读取 {tid}/top.json 并解析 TopN
+func (s *APIServer) fetchTopFunctions(tid string) []map[string]interface{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	bucket := s.Config.Storage.Bucket
+	key := tid + "/top.json"
+
+	// 尝试读取文件内容
+	reader, err := s.Storage.GetObject(ctx, bucket, key)
+	if err != nil {
+		return nil
+	}
+	defer reader.Close()
+
+	var topData map[string]interface{}
+	if err := json.NewDecoder(reader).Decode(&topData); err != nil {
+		return nil
+	}
+
+	// 提取 self_time_top
+	if selfTop, ok := topData["self_time_top"].([]interface{}); ok {
+		funcs := make([]map[string]interface{}, 0, len(selfTop))
+		for _, item := range selfTop {
+			if m, ok := item.(map[string]interface{}); ok {
+				funcs = append(funcs, m)
+			}
+		}
+		return funcs
+	}
+	return nil
 }
 
 // DeleteTask 软删除任务
@@ -710,6 +750,70 @@ func (s *APIServer) UploadTestFile(c *gin.Context) {
 			"key":          objectKey,
 			"size":         header.Size,
 			"download_url": downloadURL,
+		},
+	})
+}
+
+// ============================================================
+// GetTimeline — Continuous Profiling 时间轴
+// GET /api/v1/tasks/timeline?master_tid=xxx
+// 返回某个 master_task（定时任务）下所有子任务的时间序列
+// ============================================================
+func (s *APIServer) GetTimeline(c *gin.Context) {
+	masterTID := c.Query("master_tid")
+	if masterTID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 master_tid 参数"})
+		return
+	}
+
+	var tasks []model.HotmethodTask
+	err := s.DB.Where("master_task_tid = ? AND deleted_at IS NULL", masterTID).
+		Order("create_time ASC").
+		Find(&tasks).Error
+	if err != nil {
+		s.Logger.Error("查询时间轴失败", zap.String("master_tid", masterTID), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询失败"})
+		return
+	}
+
+	// 构建时间轴数据
+	type TimelinePoint struct {
+		TID         string    `json:"tid"`
+		Name        string    `json:"name"`
+		Status      int    `json:"status"`
+		CreateTime  time.Time `json:"create_time"`
+		BeginTime   *time.Time `json:"begin_time,omitempty"`
+		EndTime     *time.Time `json:"end_time,omitempty"`
+		HasResult   bool      `json:"has_result"`   // 是否有火焰图/SVG产物
+		AnalysisStatus int `json:"analysis_status"`
+	}
+
+	timeline := make([]TimelinePoint, 0, len(tasks))
+	for _, t := range tasks {
+		tp := TimelinePoint{
+			TID:            t.TID,
+			Name:           t.Name,
+			Status:         t.Status,
+			CreateTime:     t.CreateTime,
+			AnalysisStatus: t.AnalysisStatus,
+		}
+		if t.BeginTime != nil {
+			tp.BeginTime = t.BeginTime
+		}
+		if t.EndTime != nil {
+			tp.EndTime = t.EndTime
+		}
+		// 状态 >= 2 (完成) 且 analysis_status >= 2 (分析完成) 视为有结果
+		tp.HasResult = t.Status >= 2 && t.AnalysisStatus >= 2
+		timeline = append(timeline, tp)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"data": gin.H{
+			"master_tid": masterTID,
+			"total":      len(timeline),
+			"points":     timeline,
 		},
 	})
 }

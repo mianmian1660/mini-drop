@@ -19,6 +19,7 @@ import { auth, users } from './api';
 import HomePage from './pages/HomePage';
 import TaskListPage from './pages/TaskListPage';
 import TaskResultPage from './pages/TaskResultPage';
+import TimelinePage from './pages/TimelinePage';
 import LoginPage from './pages/LoginPage';
 
 // ============================================================
@@ -122,6 +123,7 @@ export default function App() {
                 <nav style={styles.nav}>
                     <Link to="/" style={styles.navLink}>主页</Link>
                     <Link to="/tasks" style={styles.navLink}>任务列表</Link>
+                    <Link to="/timeline" style={styles.navLink}>时间轴</Link>
                     <span style={{ color: '#555' }}>|</span>
                     <span style={styles.userInfo}>
                         👤 {userName}
@@ -135,6 +137,7 @@ export default function App() {
                 <Route path="/" element={<HomePage />} />
                 <Route path="/tasks" element={<TaskListPage />} />
                 <Route path="/task/result" element={<TaskResultPage />} />
+                <Route path="/timeline" element={<TimelinePage />} />
                 <Route path="/login" element={<LoginPage onLoginSuccess={handleLoginSuccess} />} />
             </Routes>
         </div>

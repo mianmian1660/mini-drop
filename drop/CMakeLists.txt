@@ -62,6 +62,7 @@ set(COMMON_SRCS
     common/Perf.cpp
     common/AsyncProfilerProfiler.cpp
     common/PprofProfiler.cpp
+    common/BpfProfiler.cpp
     common/Process.cpp
     common/COSClient.cpp
     common/Utils.cpp

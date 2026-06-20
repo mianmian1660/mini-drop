@@ -18,6 +18,7 @@
 #include "common/Perf.h"                  // drop::run_perf (profilerType=0)
 #include "common/AsyncProfilerProfiler.h" // drop::run_async_profiler (profilerType=1)
 #include "common/PprofProfiler.h"         // drop::run_pprof (profilerType=2)
+#include "common/BpfProfiler.h"           // drop::run_bpf (profilerType=3, eBPF)
 #include "common/Process.h"               // drop::collect_self_pidstats, collect_children_pidstats
 #include "common/COSClient.h"             // drop::upload_to_minio
 #include "common/Utils.h"                 // drop::read_file_content
@@ -216,6 +217,37 @@ static pair<int, string> run_profiler(
             return {0, "pprof(mock)"};
         }
         return {result, "pprof"};
+    }
+    case 3: // eBPF (bpftrace)
+    {
+        path = outputPath + ".bpf";
+        cout << "[agent] 选择采集器: eBPF/bpftrace (profilerType=3)" << endl;
+        int result = drop::run_bpf(task, path);
+        if (result != 0)
+        {
+            cout << "[agent] eBPF 不可用，启用 mock 模式" << endl;
+            // eBPF IO 模式生成模拟 IO 直方图
+            if (task.sampleargv().event() == "io" || task.sampleargv().event() == "blk")
+            {
+                ofstream mockIO(path);
+                mockIO << "# eBPF IO Latency Histogram (mock)\n";
+                mockIO << "@io_lat_us:\n";
+                mockIO << "[1, 2)        42 |@@@@@@@@@\n";
+                mockIO << "[2, 4)        88 |@@@@@@@@@@@@@@@@@@@\n";
+                mockIO << "[4, 8)       156 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
+                mockIO << "[8, 16)      230 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
+                mockIO << "[16, 32)      89 |@@@@@@@@@@@@@@@@@@@@\n";
+                mockIO << "[32, 64)      45 |@@@@@@@@@@\n";
+                mockIO << "[64, 128)     12 |@@\n";
+                mockIO << "[128, 256)     3 |@\n";
+                mockIO << "# Total IO: 665\n";
+                mockIO.close();
+                return {0, "eBPF(mock-io)"};
+            }
+            generate_mock_collapsed_stacks(outputPath);
+            return {0, "eBPF(mock)"};
+        }
+        return {result, "eBPF"};
     }
     default:
         cerr << "[agent] 未知的 profilerType=" << profilerType << "，回退到 perf" << endl;

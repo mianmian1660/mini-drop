@@ -43,11 +43,18 @@ export const tasks = {
     delete: (tid) => client.delete(`/api/v1/tasks/${tid}`),
     // 重试任务（POST /api/v1/tasks/:tid/retry）
     retry: (tid) => client.post(`/api/v1/tasks/${tid}/retry`),
+    // Continuous Profiling 时间轴（GET /api/v1/tasks/timeline?master_tid=xxx）
+    timeline: (masterTid) => client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid } }),
+};
+
+// ---------- 定时任务 / Continuous Profiling ----------
+export const schedules = {
+    create: (data) => client.post('/api/v1/schedule/task', data),
+    list: () => client.get('/api/v1/schedule/tasks'),
+    delete: (sid) => client.delete(`/api/v1/schedule/${sid}`),
 };
 
 // ---------- 文件（W4: 火焰图等产物） ----------
 export const cosfiles = {
-    // 列出任务产物文件（GET /api/v1/cosfiles?tid=xxx）
-    // 返回每个文件的 name / size / download_url（预签名）
     list: (tid) => client.get('/api/v1/cosfiles', { params: { tid } }),
 };

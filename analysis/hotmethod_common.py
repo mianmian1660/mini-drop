@@ -57,6 +57,14 @@ from error import (
     exit_error,
 )
 
+# eBPF 分析
+from bpf_analyzer import (
+    parse_bpf_histogram,
+    parse_bpf_collapsed,
+    analyze_bpf_output,
+    bpf_histogram_to_svg,
+)
+
 
 # ----------------------------------------------------------
 # 额外工具函数
