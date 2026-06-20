@@ -47,6 +47,12 @@ const styles = {
     paramLabel: { color: '#667085', fontSize: 12, whiteSpace: 'nowrap' },
     paramValue: { color: '#202124', fontSize: 13, fontWeight: 700, textAlign: 'right', wordBreak: 'break-word' },
     paramHint: { margin: '12px 0 0 0', color: '#667085', fontSize: 12, lineHeight: 1.55 },
+    suggestionList: { display: 'grid', gap: 12 },
+    suggestionItem: { border: '1px solid #e5e7eb', borderRadius: 8, padding: 14, background: '#fbfcfe' },
+    suggestionHead: { display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start', marginBottom: 8 },
+    suggestionTitle: { fontSize: 14, fontWeight: 700, color: '#202124', wordBreak: 'break-word' },
+    suggestionMeta: { fontSize: 12, color: '#667085', whiteSpace: 'nowrap' },
+    suggestionBody: { margin: 0, color: '#344054', fontSize: 13, lineHeight: 1.65, whiteSpace: 'pre-wrap' },
     fileList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(290px, 1fr))', gap: 10 },
     fileItem: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '11px 12px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fbfcfe' },
     fileName: { fontSize: 13, color: '#202124', wordBreak: 'break-all', fontWeight: 600 },
@@ -68,6 +74,7 @@ export default function TaskResultPage() {
     const [files, setFiles] = useState([]);
     const [topFunctions, setTopFunctions] = useState([]);
     const [bpfHistogram, setBpfHistogram] = useState(null);
+    const [suggestions, setSuggestions] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [polling, setPolling] = useState(false);
@@ -98,6 +105,7 @@ export default function TaskResultPage() {
             setTask(data.task || {});
             setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
             setBpfHistogram(data.bpf_histogram || null);
+            setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
             applyFiles(data.files || []);
             setError('');
         } catch (err) {
@@ -221,6 +229,13 @@ export default function TaskResultPage() {
             {isBpfTask && topFunctions.length > 0 && (
                 <TopFunctionsPanel topFunctions={topFunctions} status={status} title="热点 TopN" />
             )}
+
+            <SuggestionsPanel
+                suggestions={suggestions}
+                bpfHistogram={bpfHistogram}
+                isBpfTask={isBpfTask}
+                status={status}
+            />
 
             <ArtifactsPanel files={files} />
         </div>
@@ -408,6 +423,39 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN' }) {
     );
 }
 
+function SuggestionsPanel({ suggestions, bpfHistogram, isBpfTask, status }) {
+    const items = suggestions.length > 0
+        ? suggestions
+        : (isBpfTask ? deriveBpfSuggestions(bpfHistogram) : []);
+
+    return (
+        <div style={styles.card}>
+            <h3 style={styles.sectionTitle}>优化建议</h3>
+            {items.length > 0 ? (
+                <div style={styles.suggestionList}>
+                    {items.slice(0, 8).map((item, index) => (
+                        <div key={`${item.function || item.title || 'suggestion'}-${index}`} style={styles.suggestionItem}>
+                            <div style={styles.suggestionHead}>
+                                <div style={styles.suggestionTitle}>
+                                    {item.function || item.title || `建议 ${index + 1}`}
+                                </div>
+                                <div style={styles.suggestionMeta}>
+                                    {formatSuggestionMeta(item)}
+                                </div>
+                            </div>
+                            <p style={styles.suggestionBody}>{item.advice || item.suggestion || '-'}</p>
+                        </div>
+                    ))}
+                </div>
+            ) : (
+                <p style={{ textAlign: 'center', padding: 28, color: '#667085', margin: 0 }}>
+                    {status >= 2 ? '暂无建议。CPU 任务需要 suggestions.json，eBPF 任务需要有效直方图摘要。' : '任务完成后将自动生成分析建议。'}
+                </p>
+            )}
+        </div>
+    );
+}
+
 function ArtifactsPanel({ files }) {
     return (
         <div style={styles.card}>
@@ -523,6 +571,57 @@ function profilerLabel(profilerType, taskType, event) {
     if (pt === 2) return 'pprof';
     if (pt === 3) return 'eBPF CPU';
     return 'perf CPU';
+}
+
+function deriveBpfSuggestions(histogram) {
+    if (!histogram || !Array.isArray(histogram.buckets) || histogram.buckets.length === 0) {
+        return [];
+    }
+
+    const summary = histogram.summary || {};
+    const p95 = Number(summary.p95 || 0);
+    const p99 = Number(summary.p99 || 0);
+    const type = histogram.type || '';
+    const unit = histogram.unit || 'us';
+    const suggestions = [];
+
+    if (type === 'io_latency') {
+        suggestions.push({
+            title: 'IO 延迟分布检查',
+            percentage: p95,
+            advice: `当前 IO 延迟 P95=${formatNumber(p95)}${unit}，P99=${formatNumber(p99)}${unit}。如果高延迟桶占比上升，建议检查磁盘队列深度、同步写入、页缓存命中率和是否存在大量小 I/O；演示时可用 dd/fio 对比采集前后的分布变化。`,
+        });
+    } else if (type === 'sched_latency') {
+        suggestions.push({
+            title: '调度延迟分布检查',
+            percentage: p95,
+            advice: `当前调度延迟 P95=${formatNumber(p95)}${unit}，P99=${formatNumber(p99)}${unit}。如果尾部延迟明显，建议检查 CPU 抢占、run queue 长度、线程数是否过多、容器 CPU quota 和高优先级任务竞争。`,
+        });
+    }
+
+    const hottestBucket = histogram.buckets.reduce((best, bucket) => {
+        if (!best || Number(bucket.count || 0) > Number(best.count || 0)) return bucket;
+        return best;
+    }, null);
+    if (hottestBucket) {
+        suggestions.push({
+            title: '最高频延迟桶',
+            percentage: hottestBucket.count,
+            advice: `样本最多的区间是 ${hottestBucket.range}，共 ${hottestBucket.count} 次。建议把该区间作为 baseline，后续制造 IO 或 CPU 压力时观察高延迟桶是否右移。`,
+        });
+    }
+
+    return suggestions;
+}
+
+function formatSuggestionMeta(item) {
+    if (item.percentage !== undefined && item.percentage !== null && item.samples !== undefined) {
+        return `${formatPercent(item.percentage)} · ${item.samples} samples`;
+    }
+    if (item.percentage !== undefined && item.percentage !== null) {
+        return `指标 ${formatNumber(item.percentage)}`;
+    }
+    return '';
 }
 
 function eventLabel(event) {

@@ -315,6 +315,7 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	files := []map[string]interface{}{}
 	var topFuncs []map[string]interface{}
 	var bpfData map[string]interface{}
+	var suggestions []map[string]interface{}
 
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
@@ -327,6 +328,7 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 			// 尝试从 MinIO 读取 top.json → TopN 热点数据
 			topFuncs = s.fetchTopFunctions(tid)
 			bpfData = s.fetchBPFData(tid)
+			suggestions = s.fetchSuggestions(tid)
 		}
 	}
 	if len(files) == 0 {
@@ -338,11 +340,20 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 			bpfData = s.fetchLocalBPFData(tid)
 		}
 	}
+	if len(suggestions) == 0 {
+		suggestions = s.fetchLocalSuggestions(tid)
+	}
+	if len(suggestions) == 0 {
+		suggestions = s.fetchDBSuggestions(tid)
+	}
 	if len(topFuncs) > 0 {
 		result["top_functions"] = topFuncs
 	}
 	if bpfData != nil {
 		result["bpf_histogram"] = bpfData
+	}
+	if len(suggestions) > 0 {
+		result["suggestions"] = suggestions
 	}
 	result["files"] = files
 
@@ -468,6 +479,75 @@ func (s *APIServer) fetchLocalBPFData(tid string) map[string]interface{} {
 		return nil
 	}
 	return data
+}
+
+// fetchSuggestions 从 MinIO 读取 {tid}/suggestions.json 并返回规则建议列表。
+func (s *APIServer) fetchSuggestions(tid string) []map[string]interface{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, tid+"/suggestions.json")
+	if err != nil {
+		return nil
+	}
+	defer reader.Close()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(reader).Decode(&data); err != nil {
+		return nil
+	}
+	return normalizeSuggestions(data)
+}
+
+func (s *APIServer) fetchLocalSuggestions(tid string) []map[string]interface{} {
+	localPath := filepath.Join("/tmp/drop-output", tid+"_suggestions.json")
+	f, err := os.Open(localPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(f).Decode(&data); err != nil {
+		return nil
+	}
+	return normalizeSuggestions(data)
+}
+
+func (s *APIServer) fetchDBSuggestions(tid string) []map[string]interface{} {
+	var rows []model.AnalysisSuggestion
+	if err := s.DB.Where("tid = ?", tid).Order("id ASC").Find(&rows).Error; err != nil {
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	suggestions := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		suggestions = append(suggestions, map[string]interface{}{
+			"function":      row.Func,
+			"advice":        row.Suggestion,
+			"ai_suggestion": row.AISuggestion,
+			"status":        row.Status,
+		})
+	}
+	return suggestions
+}
+
+func normalizeSuggestions(data map[string]interface{}) []map[string]interface{} {
+	items, ok := data["suggestions"].([]interface{})
+	if !ok {
+		return nil
+	}
+
+	suggestions := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		if m, ok := item.(map[string]interface{}); ok {
+			suggestions = append(suggestions, m)
+		}
+	}
+	return suggestions
 }
 
 // DeleteTask 软删除任务
