@@ -217,9 +217,18 @@ schedule_task -> cron trigger -> child hotmethod_task -> normal task flow
 
 drop_server 能收到 Agent 的 NotifyResult，但 apiserver 与 analysis 之间仍使用轮询推进。这个设计简单、稳定、便于演示，代价是实时性不如消息队列。复刻项目更关注端到端可跑通和状态可解释，因此优先选择轮询。
 
-### 8.4 eBPF 提供 mock fallback，但演示必须真跑
+### 8.4 采集器受虚拟化能力影响
 
-在 WSL、macOS Docker Desktop 或权限不足的 Linux 上，bpftrace/perf 可能无法正常工作。为了让开发者仍能看到页面效果，Agent 保留 mock fallback。但评分要求里 eBPF 必须真跑，所以正式演示需要在 Ubuntu 22.04 或类似 Linux VM 上，确认容器具备 `privileged`、`pid: host`、`SYS_ADMIN`、`SYS_PTRACE`、`PERFMON` 等权限。
+perf 和 eBPF 都依赖宿主机内核能力。尤其是 `perf record` 的真实 CPU 采样依赖 perf_event 和硬件 PMU/性能计数器；部分 VMware/VirtualBox/WSL 环境无法开启“虚拟化 CPU 性能计数器”，这种情况下即使容器使用 `privileged`、`pid: host`、`SYS_ADMIN`、`SYS_PTRACE`、`PERFMON`，perf 硬件采样仍可能无法真跑。
+
+因此正式演示的环境要求不是“任意 Linux 虚拟机”，而是：
+
+- Linux 内核支持 perf_event 和 tracepoint。
+- 容器能访问必要的内核调试/追踪接口。
+- 虚拟机或宿主机能暴露 CPU PMU/性能计数器。
+- eBPF 演示环境中 bpftrace 可用，并具备足够权限。
+
+为了让开发者在权限不足的环境里仍能看到页面链路，Agent 保留 mock fallback。但评分要求里 eBPF 必须真跑，perf 火焰图也应尽量使用真实 perf 产物；如果当前 VMware 无法勾选 CPU 性能计数器，需要在演示说明里明确这是虚拟化环境限制，并优先更换到可开启 PMU 的 Linux 裸机、云主机或其他虚拟化环境。
 
 ### 8.5 UI 优先展示可验证结果
 
@@ -288,7 +297,7 @@ Mini-Drop 的性能自证主要从三个角度做：
    Agent 上报 CPU、内存、读写吞吐。Web Agent 详情页能直接看到 Agent 自身资源开销，避免采集探针对业务造成不可见影响。
 
 3. Demo 可制造可见变化  
-   `make demo-ebpf-io` 用 `dd` 制造 IO 写入，`make demo-ebpf-sched` 用短 CPU 忙等制造调度样本。eBPF 直方图应能在真实 Linux 权限环境下看到分布变化，作为采集器有效性的自证。
+   `make demo-ebpf-io` 用 `dd` 制造 IO 写入，`make demo-ebpf-sched` 用短 CPU 忙等制造调度样本。eBPF 直方图应能在真实 Linux 权限环境下看到分布变化，作为采集器有效性的自证。CPU perf 火焰图需要额外确认演示环境暴露 PMU/性能计数器；如果 VMware 无法开启该能力，则应在报告和演示中说明环境限制，并将真实 perf 采样放到可用 Linux 环境中验证。
 
 ## 11. AI 协作说明
 
@@ -319,7 +328,7 @@ Mini-Drop 的性能自证主要从三个角度做：
    为火焰图、直方图、TopN 增加筛选、排序、复制函数名、下载全部产物、异常桶高亮和 baseline 对比。
 
 3. 做更完整的真实采集演示环境  
-   准备一个 Go pprof demo 服务、一个 Java async-profiler demo 进程和一个稳定的 eBPF Linux VM 环境，确保评审现场不依赖 mock fallback。
+   准备一个 Go pprof demo 服务、一个 Java async-profiler demo 进程和一个稳定的 Linux 演示环境。该环境需要能暴露 CPU PMU/性能计数器，并能运行 bpftrace，避免评审现场依赖 mock fallback 或受 VMware 性能计数器限制影响。
 
 4. 强化 Continuous Profiling  
    支持任意 5 分钟窗口聚合、跨窗口趋势对比、异常窗口自动标注，以及从时间轴直接比较两次采样差异。
@@ -332,5 +341,4 @@ Mini-Drop 的性能自证主要从三个角度做：
 
 7. 加强安全与权限模型  
    增加用户/组权限、Agent 归属、任务访问控制、下载链接权限和审计导出能力，使系统更接近生产平台。
-
 
