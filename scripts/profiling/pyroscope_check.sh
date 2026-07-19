@@ -28,7 +28,15 @@ wait_ready() {
 echo "[pyroscope-check] compose file: ${COMPOSE_FILE}"
 test -f "${COMPOSE_FILE}"
 
-echo "[pyroscope-check] kernel: $(uname -r)"
+KERNEL_RELEASE="$(uname -r)"
+echo "[pyroscope-check] kernel: ${KERNEL_RELEASE}"
+if printf '%s' "${KERNEL_RELEASE}" | grep -Eqi 'microsoft|wsl'; then
+  cat <<'EOF'
+[pyroscope-check] warning: WSL/WSL2 kernel detected.
+[pyroscope-check] Alloy may become ready but fail to forward useful eBPF container profiles.
+[pyroscope-check] Use a real Linux host, cloud VM, or eBPF-capable VM for acceptance.
+EOF
+fi
 
 if command -v docker >/dev/null 2>&1; then
   docker info --format '[pyroscope-check] docker kernel: {{.KernelVersion}}' 2>/dev/null || true
@@ -49,9 +57,19 @@ wait_ready "alloy" "${ALLOY_URL}/-/ready"
 echo "[pyroscope-check] discovered profile series:"
 END_MS="$(date +%s%3N)"
 START_MS="$((END_MS - 7200000))"
-curl -fsS -X POST "${PYROSCOPE_URL}/querier.v1.QuerierService/Series" \
+SERIES_BODY="$(curl -fsS -X POST "${PYROSCOPE_URL}/querier.v1.QuerierService/Series" \
   -H "Content-Type: application/json" \
-  -d "{\"matchers\":[],\"labelNames\":[\"service_name\",\"container\",\"compose_project\",\"project\",\"profiler\",\"__profile_type__\"],\"start\":${START_MS},\"end\":${END_MS}}"
+  -d "{\"matchers\":[],\"labelNames\":[\"service_name\",\"container\",\"compose_project\",\"project\",\"profiler\",\"__profile_type__\"],\"start\":${START_MS},\"end\":${END_MS}}")"
+echo "${SERIES_BODY}"
+
+if ! printf '%s' "${SERIES_BODY}" | grep -Eq '"project","value":"mini-drop"|"compose_project"|"container"'; then
+  cat <<'EOF'
+[pyroscope-check] warning: only Pyroscope self-profiles may be visible right now.
+[pyroscope-check] Start Mini-Drop first and keep it busy, for example:
+  docker compose up -d --build
+  make demo
+EOF
+fi
 echo
 
 cat <<EOF

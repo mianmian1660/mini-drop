@@ -7,7 +7,9 @@ TARGET_IP ?= 127.0.0.1
 DURATION ?= 15
 FREQUENCY ?= 99
 
-.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health test coverage e2e verify
+PYROSCOPE_COMPOSE ?= deploy/profiling/pyroscope/docker-compose.yml
+
+.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health profiling-pyroscope-up profiling-pyroscope-check profiling-pyroscope-down test coverage e2e verify
 
 health:
 	@echo "[health] API: $(API)"
@@ -53,6 +55,18 @@ demo-ebpf-sched:
 		echo "$$RESP"; \
 		TID=$$(printf '%s' "$$RESP" | sed -n 's/.*"tid":"\([^"]*\)".*/\1/p'); \
 		if [[ -n "$$TID" ]]; then echo "[demo-ebpf-sched] result: http://localhost/task/result?tid=$$TID"; fi
+
+profiling-pyroscope-up:
+	@echo "[profiling] 启动 Pyroscope + Grafana Alloy eBPF 持续 profiling"
+	docker compose -f "$(PYROSCOPE_COMPOSE)" up -d
+	@echo "[profiling] Pyroscope UI: http://localhost:4040"
+	@echo "[profiling] Alloy UI:     http://localhost:12345"
+
+profiling-pyroscope-check:
+	bash scripts/profiling/pyroscope_check.sh
+
+profiling-pyroscope-down:
+	docker compose -f "$(PYROSCOPE_COMPOSE)" down
 
 test:
 	$(MAKE) -C drop/build

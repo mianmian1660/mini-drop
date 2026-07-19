@@ -47,6 +47,9 @@ const styles = {
     paramLabel: { color: '#667085', fontSize: 12, whiteSpace: 'nowrap' },
     paramValue: { color: '#202124', fontSize: 13, fontWeight: 700, textAlign: 'right', wordBreak: 'break-word' },
     paramHint: { margin: '12px 0 0 0', color: '#667085', fontSize: 12, lineHeight: 1.55 },
+    labelWrap: { display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 },
+    labelChip: { display: 'inline-flex', alignItems: 'center', gap: 4, border: '1px solid #d0d7de', background: '#f8fafc', color: '#344054', borderRadius: 6, padding: '6px 8px', fontSize: 12 },
+    codeText: { fontFamily: 'Menlo, Consolas, monospace', fontSize: 12, wordBreak: 'break-all' },
     suggestionList: { display: 'grid', gap: 12 },
     suggestionItem: { border: '1px solid #e5e7eb', borderRadius: 8, padding: 14, background: '#fbfcfe' },
     suggestionHead: { display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start', marginBottom: 8 },
@@ -76,6 +79,7 @@ export default function TaskResultPage() {
     const [bpfHistogram, setBpfHistogram] = useState(null);
     const [suggestions, setSuggestions] = useState([]);
     const [statusEvents, setStatusEvents] = useState([]);
+    const [profilingBackend, setProfilingBackend] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [polling, setPolling] = useState(false);
@@ -108,6 +112,7 @@ export default function TaskResultPage() {
             setBpfHistogram(data.bpf_histogram || null);
             setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
             setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
+            setProfilingBackend(data.profiling_backend || null);
             applyFiles(data.files || []);
             setError('');
         } catch (err) {
@@ -209,6 +214,8 @@ export default function TaskResultPage() {
                     <Metric label="状态 reason" value={task.status_info || '-'} />
                 </div>
             </div>
+
+            <ProfilingBackendPanel profiling={profilingBackend} />
 
             <StatusEventsPanel events={statusEvents} />
 
@@ -338,6 +345,55 @@ function ParameterPanel({ task }) {
             <p style={styles.paramHint}>
                 这些参数来自任务创建请求，分析产物会在采集完成后自动关联到当前任务。
             </p>
+        </div>
+    );
+}
+
+function ProfilingBackendPanel({ profiling }) {
+    if (!profiling) return null;
+    const labels = profiling.labels && typeof profiling.labels === 'object' ? profiling.labels : {};
+    const status = String(profiling.status || 'unknown');
+    const isWarning = status.includes('warning');
+    const statusColor = isWarning ? '#d97706' : '#16a34a';
+
+    return (
+        <div style={styles.card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start', marginBottom: 12 }}>
+                <h3 style={styles.sectionTitle}>持续 Profiling 后端</h3>
+                {profiling.query_url && (
+                    <a href={profiling.query_url} target="_blank" rel="noreferrer" style={{ ...styles.button, ...styles.primaryButton }}>
+                        打开 Pyroscope
+                    </a>
+                )}
+            </div>
+            <div style={styles.grid}>
+                <Metric label="profiling backend" value={profiling.backend || '-'} />
+                <Metric label="collector" value={profiling.collector || '-'} />
+                <Metric label="profile 类型" value={profiling.profile_type || '-'} />
+                <Metric label="运行模式" value={profiling.mode || '-'} />
+                <Metric label="运行状态" value={<span style={{ ...styles.badge, background: statusColor }}>{status}</span>} />
+                <Metric label="profile 时间范围" value={`${formatTime(profiling.start_time) || '-'} ~ ${formatTime(profiling.end_time) || '-'}`} />
+            </div>
+            {profiling.query && (
+                <div style={{ marginTop: 12 }}>
+                    <div style={styles.metricLabel}>profile 查询</div>
+                    <div style={{ ...styles.codeText, border: '1px solid #edf0f3', background: '#fbfcfe', borderRadius: 6, padding: 10 }}>
+                        {profiling.query}
+                    </div>
+                </div>
+            )}
+            {profiling.status_info && (
+                <p style={styles.paramHint}>{profiling.status_info}</p>
+            )}
+            <div style={styles.labelWrap}>
+                {Object.entries(labels).map(([key, value]) => (
+                    <span key={key} style={styles.labelChip}>
+                        <strong>{key}</strong>
+                        <span>=</span>
+                        <span>{String(value)}</span>
+                    </span>
+                ))}
+            </div>
         </div>
     );
 }
@@ -621,6 +677,7 @@ function isFlamegraphFile(file) {
 
 function profilerLabel(profilerType, taskType, event) {
     const pt = Number(profilerType);
+    if (Number(taskType) === 7 || pt === 4) return 'continuous_cpu (Pyroscope/Alloy)';
     if (Number(taskType) === 5) {
         if (event === 'sched') return 'eBPF 调度延迟';
         if (event === 'io' || event === 'blk') return 'eBPF IO 延迟';

@@ -30,6 +30,7 @@ const S = {
 };
 
 function deriveTaskType(pt, ev) {
+    if (pt === 4) return 7;
     if (pt === 3 && (ev === 'io' || ev === 'blk' || ev === 'sched')) return 5;
     return 0;
 }
@@ -44,7 +45,8 @@ const CRON_PRESETS = [
 export default function CreateTaskModal({ onClose, onSuccess }) {
     const [f, setF] = useState({
         name: '', target_ip: '', target_pid: '', duration: 10, frequency: 99,
-        profiler_type: 0, callgraph: 'fp', event: '',
+        profiler_type: 0, callgraph: 'fp', event: '', container_name: '',
+        backend_type: 'pyroscope', labels: 'project=mini-drop',
         continuous: false, cron_expr: '*/5 * * * *',
     });
     const [sub, setSub] = useState(false);
@@ -70,6 +72,12 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
     const up = (k, v) => setF(p => {
         const n = { ...p, [k]: v };
         if (k === 'profiler_type' && v === 3 && !p.event) n.event = 'cpu';
+        if (k === 'profiler_type' && v === 4) {
+            n.event = 'process_cpu';
+            n.backend_type = n.backend_type || 'pyroscope';
+            n.labels = n.labels || 'project=mini-drop';
+            n.continuous = false;
+        }
         return n;
     });
 
@@ -80,13 +88,28 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
         const dur = parseInt(f.duration) || 10;
         const hz = parseInt(f.frequency) || 99;
         if (dur < 1 || dur > 3600) { setErr('时长需为 1-3600s'); return; }
-        if (f.continuous && !f.cron_expr) { setErr('请输入 cron 表达式'); return; }
+        if (f.continuous && f.profiler_type !== 4 && !f.cron_expr) { setErr('请输入 cron 表达式'); return; }
 
         setSub(true); setErr(''); setOk('');
         const tt = deriveTaskType(f.profiler_type, f.event);
 
         try {
-            if (f.continuous) {
+            if (f.profiler_type === 4) {
+                const r = await tasks.create({
+                    name: f.name.trim(), target_ip: f.target_ip, target_pid: pid,
+                    duration: dur, frequency: hz, task_type: tt,
+                    profiler_type: f.profiler_type, callgraph: f.callgraph,
+                    event: f.event || 'process_cpu',
+                    container_name: f.container_name,
+                    backend_type: f.backend_type,
+                    labels: f.labels,
+                });
+                if (r.code === 0) {
+                    setCid(r.data?.tid || ''); setIsSch(false); setOk('continuous_cpu 任务创建成功！');
+                    setTimeout(() => onSuccess?.(), 2000);
+                }
+                else setErr(r.message || '创建失败');
+            } else if (f.continuous) {
                 const r = await schedules.create({
                     name: f.name.trim(), cron_expr: f.cron_expr, task_type: tt,
                     profiler_type: f.profiler_type, target_ip: f.target_ip,
@@ -114,7 +137,9 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
         finally { setSub(false); }
     };
 
-    const modeLabel = f.profiler_type === 3
+    const modeLabel = f.profiler_type === 4
+        ? 'Pyroscope continuous_cpu 查询窗口'
+        : f.profiler_type === 3
         ? (f.event === 'io' ? 'IO延迟直方图' : f.event === 'sched' ? '调度延迟直方图' : 'eBPF CPU火焰图')
         : f.profiler_type === 1 ? 'Java async-profiler'
             : f.profiler_type === 2 ? 'Go pprof'
@@ -153,11 +178,16 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                         <option value={1}>async-profiler (Java)</option>
                         <option value={2}>pprof (Go)</option>
                         <option value={3}>eBPF (内核探针)</option>
+                        <option value={4}>continuous_cpu (Pyroscope/Alloy)</option>
                     </select>
                 </div>
                 <div>
-                    <label style={S.label}>{f.profiler_type === 3 ? 'eBPF 追踪模式' : '调用图模式'}</label>
-                    {f.profiler_type === 3 ? (
+                    <label style={S.label}>{f.profiler_type === 4 ? 'Backend 类型' : f.profiler_type === 3 ? 'eBPF 追踪模式' : '调用图模式'}</label>
+                    {f.profiler_type === 4 ? (
+                        <select style={S.select} value={f.backend_type} onChange={e => up('backend_type', e.target.value)}>
+                            <option value="pyroscope">Pyroscope + Grafana Alloy</option>
+                        </select>
+                    ) : f.profiler_type === 3 ? (
                         <select style={S.select} value={f.event} onChange={e => up('event', e.target.value)}>
                             <option value="cpu">CPU 性能分析 (火焰图)</option>
                             <option value="io">IO 延迟分布 (直方图)</option>
@@ -173,10 +203,28 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 </div>
             </div>
 
+            {f.profiler_type === 4 && (
+                <div style={{ ...S.section, background: '#f8fafc', border: '1px solid #d0d7de' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                        <div>
+                            <label style={S.label}>目标容器（可选）</label>
+                            <input style={S.input} placeholder="mini-drop-project-analysis-1" value={f.container_name} onChange={e => up('container_name', e.target.value)} />
+                        </div>
+                        <div>
+                            <label style={S.label}>Profile 类型</label>
+                            <input style={S.input} value="process_cpu" disabled />
+                        </div>
+                    </div>
+                    <label style={S.label}>Labels</label>
+                    <input style={S.input} placeholder="project=mini-drop,service_name=analysis" value={f.labels} onChange={e => up('labels', e.target.value)} />
+                    <p style={S.hint}>创建后任务详情页会展示 backend 状态、时间范围、labels 和 Pyroscope 查询链接；真实 profile 仍取决于宿主机 eBPF 环境。</p>
+                </div>
+            )}
+
             <p style={S.hint}>📌 将生成: {modeLabel}</p>
 
             {/* 持续采集 */}
-            <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
+            {f.profiler_type !== 4 && <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
                 <label style={S.chk}>
                     <input type="checkbox" checked={f.continuous} onChange={e => up('continuous', e.target.checked)} />
                     <span style={{ fontWeight: 'bold', fontSize: 14 }}>🔄 持续采集 (Continuous Profiling)</span>
@@ -194,7 +242,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                         <input style={S.input} value={f.cron_expr} onChange={e => up('cron_expr', e.target.value)} placeholder="*/5 * * * *" />
                     </div>
                 )}
-            </div>
+            </div>}
 
             {err && <p style={S.err}>❌ {err}</p>}
             {ok && <div style={S.ok}>✅ {ok} {cid && (isSch
@@ -204,7 +252,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
 
             <div style={{ marginTop: 16, display: 'flex', gap: 10 }}>
                 <button style={{ ...S.btn, opacity: sub ? 0.6 : 1 }} onClick={submit} disabled={sub}>
-                    {sub ? '提交中...' : f.continuous ? '创建持续采集' : '提交任务'}
+                    {sub ? '提交中...' : f.profiler_type === 4 ? '创建 continuous_cpu' : f.continuous ? '创建持续采集' : '提交任务'}
                 </button>
                 <button style={{ ...S.btn, background: '#999' }} onClick={onClose} disabled={sub}>取消</button>
             </div>

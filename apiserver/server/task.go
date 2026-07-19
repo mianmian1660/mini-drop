@@ -29,11 +29,16 @@ import (
 	"github.com/mini-drop/apiserver/util"
 )
 
+const (
+	TaskTypeContinuousCPU      uint32 = 7
+	ProfilerTypePyroscopeAlloy uint32 = 4
+)
+
 // CreateTaskReq 创建任务请求体
 type CreateTaskReq struct {
 	Name          string `json:"name" binding:"required"`
-	TaskType      uint32 `json:"task_type"`     // 0=通用 1=Java 2=Tracing
-	ProfilerType  uint32 `json:"profiler_type"` // 0=perf 1=async-profiler 2=pprof
+	TaskType      uint32 `json:"task_type"`     // 0=通用 1=Java 2=Tracing 7=continuous_cpu
+	ProfilerType  uint32 `json:"profiler_type"` // 0=perf 1=async-profiler 2=pprof 3=eBPF 4=Pyroscope/Alloy
 	TargetIP      string `json:"target_ip" binding:"required"`
 	TargetPID     int32  `json:"target_pid"`
 	Duration      uint64 `json:"duration"`  // 采集秒数
@@ -42,16 +47,22 @@ type CreateTaskReq struct {
 	Event         string `json:"event"`     // cpu-cycles / cache-misses
 	Subprocess    bool   `json:"subprocess"`
 	ContainerName string `json:"container_name"`
+	BackendType   string `json:"backend_type"` // pyroscope
+	Labels        string `json:"labels"`       // k=v,k2=v2
 }
 
 // PerfParams 性能采集参数，会被序列化为 JSONB 存入 request_params 字段
 type PerfParams struct {
-	TargetPID  int32  `json:"target_pid"`
-	Duration   uint64 `json:"duration"`
-	Frequency  uint32 `json:"frequency"`
-	Callgraph  string `json:"callgraph"`
-	Event      string `json:"event"`
-	Subprocess bool   `json:"subprocess"`
+	TargetPID     int32             `json:"target_pid"`
+	Duration      uint64            `json:"duration"`
+	Frequency     uint32            `json:"frequency"`
+	Callgraph     string            `json:"callgraph"`
+	Event         string            `json:"event"`
+	Subprocess    bool              `json:"subprocess"`
+	ContainerName string            `json:"container_name,omitempty"`
+	BackendType   string            `json:"backend_type,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	ProfileType   string            `json:"profile_type,omitempty"`
 }
 
 // CreateTask 创建性能采集任务
@@ -76,6 +87,15 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 	if req.Callgraph == "" {
 		req.Callgraph = "fp"
 	}
+	if req.TaskType == TaskTypeContinuousCPU && req.ProfilerType == 0 {
+		req.ProfilerType = ProfilerTypePyroscopeAlloy
+	}
+	if req.TaskType == TaskTypeContinuousCPU && req.Event == "" {
+		req.Event = "process_cpu"
+	}
+	if req.BackendType == "" && req.TaskType == TaskTypeContinuousCPU {
+		req.BackendType = "pyroscope"
+	}
 
 	tid := util.GenTID()
 	uid := c.GetHeader("Drop_user_uid")
@@ -89,12 +109,16 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 
 	// 将性能采集参数序列化为 JSONB（只存采参，不存 Name/TargetIP 等已落列的字段）
 	paramsJSON, err := util.MarshalJSONB(PerfParams{
-		TargetPID:  req.TargetPID,
-		Duration:   req.Duration,
-		Frequency:  req.Frequency,
-		Callgraph:  req.Callgraph,
-		Event:      req.Event,
-		Subprocess: req.Subprocess,
+		TargetPID:     req.TargetPID,
+		Duration:      req.Duration,
+		Frequency:     req.Frequency,
+		Callgraph:     req.Callgraph,
+		Event:         req.Event,
+		Subprocess:    req.Subprocess,
+		ContainerName: req.ContainerName,
+		BackendType:   req.BackendType,
+		Labels:        parseLabelString(req.Labels),
+		ProfileType:   profileTypeForRequest(req),
 	})
 	if err != nil {
 		s.Logger.Error("序列化任务参数失败", zap.Error(err))
@@ -131,6 +155,23 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		return
 	}
 	s.recordTaskStatusEvent(task.TID, -1, TaskStatusCreated, "任务已创建，等待下发", "apiserver")
+
+	if req.TaskType == TaskTypeContinuousCPU {
+		s.activateContinuousProfilingTask(task, req)
+		s.Logger.Info("持续 profiling 任务创建成功",
+			zap.String("tid", tid),
+			zap.String("backend", req.BackendType),
+			zap.String("target_ip", req.TargetIP),
+			zap.String("container", req.ContainerName),
+		)
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{
+				"tid": tid,
+			},
+		})
+		return
+	}
 
 	// W3: 通过 gRPC 下发任务到 drop_server
 	if s.GrpcConnected() {
@@ -226,6 +267,119 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
 		"apiserver",
 		map[string]interface{}{"begin_time": &now},
 	)
+}
+
+func (s *APIServer) activateContinuousProfilingTask(task *model.HotmethodTask, req CreateTaskReq) {
+	now := time.Now()
+	backendStatus, backendInfo := s.checkPyroscopeBackend()
+	status := TaskStatusDone
+	analysisStatus := 2
+	reason := "continuous_cpu 查询窗口已创建，Pyroscope/Alloy backend ready"
+	if backendStatus != "ready" {
+		status = TaskStatusFailed
+		analysisStatus = 3
+		reason = "continuous_cpu 查询窗口已创建，但 Pyroscope/Alloy backend 未就绪: " + backendInfo
+	}
+
+	_ = s.transitionTaskStatus(task, status, reason, "apiserver",
+		map[string]interface{}{
+			"begin_time":      &now,
+			"end_time":        ptrTime(now.Add(time.Duration(req.Duration) * time.Second)),
+			"analysis_status": analysisStatus,
+		},
+	)
+}
+
+func (s *APIServer) checkPyroscopeBackend() (string, string) {
+	pyroscopeReady := checkHTTPReady(pyroscopeAPIURL() + "/ready")
+	alloyURL := strings.TrimRight(os.Getenv("ALLOY_API_URL"), "/")
+	if alloyURL == "" {
+		alloyURL = "http://localhost:12345"
+	}
+	alloyReady := checkHTTPReady(alloyURL + "/-/ready")
+
+	if pyroscopeReady == "" && alloyReady == "" {
+		return "ready", "Pyroscope and Alloy are ready"
+	}
+	parts := []string{}
+	if pyroscopeReady != "" {
+		parts = append(parts, "pyroscope="+pyroscopeReady)
+	}
+	if alloyReady != "" {
+		parts = append(parts, "alloy="+alloyReady)
+	}
+	return "unreachable", strings.Join(parts, "; ")
+}
+
+func checkHTTPReady(rawURL string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err.Error()
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return ""
+	}
+	return resp.Status
+}
+
+func ptrTime(t time.Time) *time.Time {
+	return &t
+}
+
+func parseLabelString(raw string) map[string]string {
+	labels := map[string]string{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			labels[key] = value
+		}
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	return labels
+}
+
+func profileTypeForRequest(req CreateTaskReq) string {
+	if req.TaskType == TaskTypeContinuousCPU {
+		return "process_cpu"
+	}
+	if req.Event != "" {
+		return req.Event
+	}
+	return "cpu"
+}
+
+func pyroscopePublicURL() string {
+	publicURL := strings.TrimRight(os.Getenv("PYROSCOPE_PUBLIC_URL"), "/")
+	if publicURL == "" {
+		return "http://localhost:4040"
+	}
+	return publicURL
+}
+
+func pyroscopeAPIURL() string {
+	apiURL := strings.TrimRight(os.Getenv("PYROSCOPE_API_URL"), "/")
+	if apiURL != "" {
+		return apiURL
+	}
+	return pyroscopePublicURL()
 }
 
 // ListTasks 获取任务列表（支持分页、搜索、状态筛选）
@@ -351,6 +505,7 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	if len(suggestions) > 0 {
 		result["suggestions"] = suggestions
 	}
+	result["profiling_backend"] = s.buildProfilingBackend(task)
 	result["status_events"] = statusEvents
 	result["files"] = files
 
@@ -383,6 +538,131 @@ func taskDetailResponse(task model.HotmethodTask) gin.H {
 		"begin_time":      task.BeginTime,
 		"end_time":        task.EndTime,
 		"master_task_tid": task.MasterTaskTID,
+	}
+}
+
+func (s *APIServer) buildProfilingBackend(task model.HotmethodTask) gin.H {
+	var params map[string]interface{}
+	if len(task.RequestParams) > 0 {
+		_ = json.Unmarshal(task.RequestParams, &params)
+	}
+	if params == nil {
+		params = map[string]interface{}{}
+	}
+
+	publicURL := pyroscopePublicURL()
+
+	start := task.CreateTime
+	if task.BeginTime != nil {
+		start = *task.BeginTime
+	}
+	end := time.Now()
+	if task.EndTime != nil {
+		end = *task.EndTime
+	} else if dur := numericParam(params, "duration"); dur > 0 {
+		end = start.Add(time.Duration(dur) * time.Second)
+		if end.Before(time.Now().Add(-2 * time.Minute)) {
+			end = time.Now()
+		}
+	}
+	if !end.After(start) {
+		end = start.Add(10 * time.Minute)
+	}
+
+	labels := gin.H{
+		"project":        "mini-drop",
+		"profiler":       "pyroscope.ebpf",
+		"target_ip":      task.TargetIP,
+		"task_tid":       task.TID,
+		"profiler_type":  task.ProfilerType,
+		"drop_task_type": task.Type,
+	}
+	if event, ok := params["event"].(string); ok && event != "" {
+		labels["event"] = event
+	}
+	if pid := numericParam(params, "target_pid"); pid > 0 {
+		labels["target_pid"] = pid
+	}
+	if containerName, ok := params["container_name"].(string); ok && containerName != "" {
+		labels["container"] = containerName
+	}
+	if extraLabels, ok := params["labels"].(map[string]interface{}); ok {
+		for k, v := range extraLabels {
+			if k != "" && v != nil {
+				labels[k] = fmt.Sprintf("%v", v)
+			}
+		}
+	}
+
+	query := pyroscopeQuery(labels, task.Type)
+	queryURL := publicURL + "/?" + url.Values{
+		"query": []string{query},
+		"from":  []string{strconv.FormatInt(start.UnixMilli(), 10)},
+		"until": []string{strconv.FormatInt(end.UnixMilli(), 10)},
+	}.Encode()
+
+	status := "configured"
+	statusInfo := "Pyroscope/Grafana Alloy runs as a sidecar continuous profiling backend. The link opens this task's time window; actual profiles depend on the host eBPF environment."
+	if strings.Contains(strings.ToLower(os.Getenv("WSL_DISTRO_NAME")+" "+os.Getenv("WSL_INTEROP")), "wsl") {
+		status = "environment_warning"
+		statusInfo = "WSL2 detected. Alloy may be ready but fail to forward useful eBPF container profiles; use a real Linux host for acceptance."
+	}
+
+	return gin.H{
+		"backend":       "pyroscope",
+		"collector":     "grafana-alloy",
+		"profile_type":  "process_cpu",
+		"mode":          "sidecar-ebpf",
+		"status":        status,
+		"status_info":   statusInfo,
+		"start_time":    start,
+		"end_time":      end,
+		"time_range_ms": gin.H{"from": start.UnixMilli(), "until": end.UnixMilli()},
+		"query":         query,
+		"query_url":     queryURL,
+		"labels":        labels,
+	}
+}
+
+func pyroscopeQuery(labels gin.H, taskType uint32) string {
+	queryLabels := map[string]string{"project": "mini-drop"}
+	if taskType == TaskTypeContinuousCPU {
+		if container, ok := labels["container"].(string); ok && container != "" {
+			queryLabels["container"] = container
+		}
+		if serviceName, ok := labels["service_name"].(string); ok && serviceName != "" {
+			queryLabels["service_name"] = serviceName
+		}
+	}
+	parts := make([]string, 0, len(queryLabels))
+	for k, v := range queryLabels {
+		parts = append(parts, fmt.Sprintf(`%s="%s"`, k, strings.ReplaceAll(v, `"`, `\"`)))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+func numericParam(params map[string]interface{}, key string) int64 {
+	v, ok := params[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int32:
+		return int64(n)
+	case int64:
+		return n
+	case uint64:
+		return int64(n)
+	case float64:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	default:
+		i, _ := strconv.ParseInt(fmt.Sprintf("%v", v), 10, 64)
+		return i
 	}
 }
 

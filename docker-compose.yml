@@ -132,8 +132,12 @@ services:
       S3_PUBLIC_ENDPOINT: "localhost:9000" # 浏览器访问地址（预签名 URL 用）
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"
+      PYROSCOPE_PUBLIC_URL: "http://localhost:4040"
+      PYROSCOPE_API_URL: "http://host.docker.internal:4040"
+      ALLOY_API_URL: "http://host.docker.internal:12345"
     extra_hosts:
       - "localhost:host-gateway" # 让容器内也能通过 localhost 访问宿主机上的 MinIO 端口
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
