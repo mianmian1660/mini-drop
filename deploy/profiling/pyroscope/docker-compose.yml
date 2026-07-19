@@ -1,0 +1,33 @@
+services:
+  pyroscope:
+    image: ${PYROSCOPE_IMAGE:-grafana/pyroscope:latest}
+    container_name: mini-drop-pyroscope
+    ports:
+      - "${PYROSCOPE_PORT:-4040}:4040"
+    volumes:
+      - pyroscope-data:/var/lib/pyroscope
+    restart: unless-stopped
+
+  alloy:
+    image: ${ALLOY_IMAGE:-grafana/alloy:latest}
+    container_name: mini-drop-pyroscope-alloy
+    user: root
+    privileged: true
+    pid: host
+    ports:
+      - "${ALLOY_PORT:-12345}:12345"
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/alloy.config
+    volumes:
+      - ./alloy.config:/etc/alloy/alloy.config:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-symb-cache:/tmp/symb-cache
+    depends_on:
+      - pyroscope
+    restart: unless-stopped
+
+volumes:
+  pyroscope-data:
+  alloy-symb-cache:
