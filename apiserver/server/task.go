@@ -1033,7 +1033,11 @@ func (s *APIServer) UploadTestFile(c *gin.Context) {
 // ============================================================
 // GetTimeline — Continuous Profiling 时间轴
 // GET /api/v1/tasks/timeline?master_tid=xxx
-// 返回某个 master_task（定时任务）下所有子任务的时间序列
+// GET /api/v1/tasks/timeline?master_tid=xxx&from=<RFC3339>&to=<RFC3339>  区间筛选
+// GET /api/v1/tasks/timeline?master_tid=xxx&at=<RFC3339>                回溯到某一时刻生效的窗口
+//
+// 窗口语义：一次 cron 触发 = 一个采集窗口 [create_time, create_time+duration)。
+// at 语义：返回 create_time <= at 的最近一个窗口（即 at 时刻正在生效/最近生效的窗口）。
 // ============================================================
 func (s *APIServer) GetTimeline(c *gin.Context) {
 	masterTID := c.Query("master_tid")
@@ -1042,11 +1046,44 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		return
 	}
 
+	query := s.DB.Where("master_task_tid = ? AND deleted_at IS NULL", masterTID)
+
+	atRaw := c.Query("at")
+	fromRaw := c.Query("from")
+	toRaw := c.Query("to")
+
+	switch {
+	case atRaw != "":
+		at, err := time.Parse(time.RFC3339, atRaw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "at 参数格式错误，需为 RFC3339: " + err.Error()})
+			return
+		}
+		query = query.Where("create_time <= ?", at).Order("create_time DESC").Limit(1)
+	case fromRaw != "" || toRaw != "":
+		if fromRaw != "" {
+			from, err := time.Parse(time.RFC3339, fromRaw)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "from 参数格式错误，需为 RFC3339: " + err.Error()})
+				return
+			}
+			query = query.Where("create_time >= ?", from)
+		}
+		if toRaw != "" {
+			to, err := time.Parse(time.RFC3339, toRaw)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "to 参数格式错误，需为 RFC3339: " + err.Error()})
+				return
+			}
+			query = query.Where("create_time <= ?", to)
+		}
+		query = query.Order("create_time ASC")
+	default:
+		query = query.Order("create_time ASC")
+	}
+
 	var tasks []model.HotmethodTask
-	err := s.DB.Where("master_task_tid = ? AND deleted_at IS NULL", masterTID).
-		Order("create_time ASC").
-		Find(&tasks).Error
-	if err != nil {
+	if err := query.Find(&tasks).Error; err != nil {
 		s.Logger.Error("查询时间轴失败", zap.String("master_tid", masterTID), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询失败"})
 		return
@@ -1062,6 +1099,9 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		EndTime        *time.Time `json:"end_time,omitempty"`
 		HasResult      bool       `json:"has_result"` // 是否有火焰图/SVG产物
 		AnalysisStatus int        `json:"analysis_status"`
+		WindowStart    time.Time  `json:"window_start"` // = CreateTime，窗口生效起点
+		WindowEnd      time.Time  `json:"window_end"`   // = CreateTime + duration，从任务自身采集参数推导
+		FrequencyHz    uint32     `json:"frequency_hz"` // 该窗口的采样频率
 	}
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
@@ -1072,6 +1112,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			Status:         t.Status,
 			CreateTime:     t.CreateTime,
 			AnalysisStatus: t.AnalysisStatus,
+			WindowStart:    t.CreateTime,
 		}
 		if t.BeginTime != nil {
 			tp.BeginTime = t.BeginTime
@@ -1081,6 +1122,14 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		}
 		// DONE 且 analysis_status >= 2 (分析完成) 视为有结果，UPLOADING 仍需继续轮询。
 		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus >= 2
+
+		// 窗口结束时间 = 触发时刻 + 该任务自身的采集时长（每条任务参数独立，不依赖 schedule 当前配置）
+		var params PerfParams
+		if err := util.UnmarshalJSONB(t.RequestParams, &params); err == nil && params.Duration > 0 {
+			tp.WindowEnd = t.CreateTime.Add(time.Duration(params.Duration) * time.Second)
+			tp.FrequencyHz = params.Frequency
+		}
+
 		timeline = append(timeline, tp)
 	}
 

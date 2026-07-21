@@ -34,18 +34,21 @@ function deriveTaskType(pt, ev) {
     return 0;
 }
 
-const CRON_PRESETS = [
-    { label: '每1分钟', value: '*/1 * * * *' },
-    { label: '每5分钟', value: '*/5 * * * *' },
-    { label: '每10分钟', value: '*/10 * * * *' },
-    { label: '每30分钟', value: '*/30 * * * *' },
+// 窗口预设：cron 周期 + 采样时长(留 buffer 防止相邻窗口重叠) + 低频采样率。
+// 频率取质数，参考 parca-agent 19Hz 的设计——低频满足常驻开销要求，
+// 质数避免和应用自身周期性行为（定时器/GC）产生拍频共振。
+const WINDOW_PRESETS = [
+    { label: '5 分钟窗口(默认)', cron: '*/5 * * * *', windowSeconds: 300, duration: 290, frequency: 19 },
+    { label: '1 分钟窗口', cron: '*/1 * * * *', windowSeconds: 60, duration: 50, frequency: 19 },
+    { label: '10 分钟窗口', cron: '*/10 * * * *', windowSeconds: 600, duration: 580, frequency: 19 },
+    { label: '30 分钟窗口', cron: '*/30 * * * *', windowSeconds: 1800, duration: 1740, frequency: 19 },
 ];
 
 export default function CreateTaskModal({ onClose, onSuccess }) {
     const [f, setF] = useState({
         name: '', target_ip: '', target_pid: '', duration: 10, frequency: 99,
         profiler_type: 0, callgraph: 'fp', event: '',
-        continuous: false, cron_expr: '*/5 * * * *',
+        continuous: false, cron_expr: '*/5 * * * *', window_seconds: 300,
     });
     const [sub, setSub] = useState(false);
     const [err, setErr] = useState('');
@@ -70,8 +73,25 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
     const up = (k, v) => setF(p => {
         const n = { ...p, [k]: v };
         if (k === 'profiler_type' && v === 3 && !p.event) n.event = 'cpu';
+        // 首次勾选持续采集时，自动套用默认窗口预设（低频常驻），避免沿用一次性任务的 99Hz/10s
+        if (k === 'continuous' && v === true && !p.continuous) {
+            const preset = WINDOW_PRESETS[0];
+            n.cron_expr = preset.cron;
+            n.duration = preset.duration;
+            n.frequency = preset.frequency;
+            n.window_seconds = preset.windowSeconds;
+        }
         return n;
     });
+
+    // 应用一个窗口预设：同时设定 cron 周期、采样时长、采样频率，保证"时长 < 周期"恒成立
+    const applyWindowPreset = (preset) => setF(p => ({
+        ...p,
+        cron_expr: preset.cron,
+        duration: preset.duration,
+        frequency: preset.frequency,
+        window_seconds: preset.windowSeconds,
+    }));
 
     const submit = async () => {
         if (!f.name.trim()) { setErr('请输入任务名称'); return; }
@@ -81,6 +101,10 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
         const hz = parseInt(f.frequency) || 99;
         if (dur < 1 || dur > 3600) { setErr('时长需为 1-3600s'); return; }
         if (f.continuous && !f.cron_expr) { setErr('请输入 cron 表达式'); return; }
+        if (f.continuous && f.window_seconds && dur >= f.window_seconds) {
+            setErr(`采样时长(${dur}s)需小于窗口周期(${f.window_seconds}s)，否则相邻窗口会重叠`);
+            return;
+        }
 
         setSub(true); setErr(''); setOk('');
         const tt = deriveTaskType(f.profiler_type, f.event);
@@ -92,6 +116,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                     profiler_type: f.profiler_type, target_ip: f.target_ip,
                     target_pid: pid, duration: dur, frequency: hz,
                     callgraph: f.callgraph, event: f.event,
+                    window_seconds: f.window_seconds,
                 });
                 if (r.code === 0) {
                     setCid(r.data?.sid || ''); setIsSch(true); setOk('持续采集已创建！');
@@ -184,14 +209,19 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 <p style={S.hint}>自动定时采集，可在"时间轴"页面回溯历史</p>
                 {f.continuous && (
                     <div>
-                        <label style={S.label}>Cron 周期</label>
+                        <label style={S.label}>持续采集窗口预设</label>
                         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-                            {CRON_PRESETS.map(p => (
-                                <button key={p.value} style={S.presetBtn(f.cron_expr === p.value)}
-                                    onClick={() => up('cron_expr', p.value)}>{p.label}</button>
+                            {WINDOW_PRESETS.map(p => (
+                                <button key={p.cron} style={S.presetBtn(f.cron_expr === p.cron && f.window_seconds === p.windowSeconds)}
+                                    onClick={() => applyWindowPreset(p)}>{p.label}</button>
                             ))}
                         </div>
+                        <label style={S.label}>Cron 周期</label>
                         <input style={S.input} value={f.cron_expr} onChange={e => up('cron_expr', e.target.value)} placeholder="*/5 * * * *" />
+                        <p style={S.hint}>
+                            窗口时长 {f.duration}s / 采样频率 {f.frequency}Hz（低频常驻，参考 parca-agent 设计）。
+                            自定义 cron 时请自行保证「采样时长 &lt; 窗口周期」，否则相邻窗口会重叠，后端也会拒绝创建。
+                        </p>
                     </div>
                 )}
             </div>

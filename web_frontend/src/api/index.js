@@ -47,8 +47,13 @@ export const tasks = {
     delete: (tid) => client.delete(`/api/v1/tasks/${tid}`),
     // 重试任务（POST /api/v1/tasks/:tid/retry）
     retry: (tid) => client.post(`/api/v1/tasks/${tid}/retry`),
-    // Continuous Profiling 时间轴（GET /api/v1/tasks/timeline?master_tid=xxx）
-    timeline: (masterTid) => client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid } }),
+    // Continuous Profiling 时间轴
+    // 全部窗口:      tasks.timeline(masterTid)
+    // 区间筛选:      tasks.timeline(masterTid, { from, to })   （RFC3339 字符串）
+    // 按时刻回溯:    tasks.timeline(masterTid, { at })         （RFC3339 字符串）
+    // GET /api/v1/tasks/timeline?master_tid=xxx&from=&to=&at=
+    timeline: (masterTid, { from, to, at } = {}) =>
+        client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid, from, to, at } }),
 };
 
 // ---------- 定时任务 / Continuous Profiling ----------

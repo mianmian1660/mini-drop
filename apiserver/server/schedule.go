@@ -6,6 +6,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -30,6 +31,9 @@ type CreateScheduleReq struct {
 	Callgraph    string `json:"callgraph"`
 	Event        string `json:"event"`
 	Subprocess   bool   `json:"subprocess"`
+	// WindowSeconds 可选：前端按"窗口预设"下发时携带的窗口周期（秒），用于校验
+	// Duration 不会超出窗口本身，避免相邻窗口重叠。不下发则跳过该校验（自定义 cron 场景）。
+	WindowSeconds uint64 `json:"window_seconds"`
 }
 
 // ----------------------------------------------------------
@@ -103,19 +107,19 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 	now := time.Now()
 
 	task := &model.HotmethodTask{
-		TID:           tid,
-		Name:          sch.Name + " (定时)",
-		Type:          sch.TaskType,
-		ProfilerType:  sch.ProfilerType,
-		TargetIP:      sch.TargetIP,
-		RequestParams: sch.RequestParams,
-		Status:        0,
-		StatusInfo:    "定时任务触发",
+		TID:            tid,
+		Name:           sch.Name + " (定时)",
+		Type:           sch.TaskType,
+		ProfilerType:   sch.ProfilerType,
+		TargetIP:       sch.TargetIP,
+		RequestParams:  sch.RequestParams,
+		Status:         0,
+		StatusInfo:     "定时任务触发",
 		AnalysisStatus: 0,
-		UID:           sch.UID,
-		UserName:      sch.UserName,
-		MasterTaskTID: sch.SID,
-		CreateTime:    now,
+		UID:            sch.UID,
+		UserName:       sch.UserName,
+		MasterTaskTID:  sch.SID,
+		CreateTime:     now,
 	}
 
 	if err := s.DB.Create(task).Error; err != nil {
@@ -178,6 +182,19 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 		req.Callgraph = "fp"
 	}
 
+	// 窗口校验：持续采集的每次采样必须在窗口周期内结束，否则相邻窗口会重叠，
+	// "回溯任意窗口"的语义就不成立了。
+	if req.WindowSeconds > 0 && req.Duration >= req.WindowSeconds {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code": 400,
+			"message": fmt.Sprintf(
+				"采样时长(%ds)需小于窗口周期(%ds)，否则相邻窗口会重叠",
+				req.Duration, req.WindowSeconds,
+			),
+		})
+		return
+	}
+
 	sid := "sch-" + util.GenTID()[4:]
 	uid := c.GetHeader("Drop_user_uid")
 	if uid == "" {
@@ -200,18 +217,18 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 
 	now := time.Now()
 	sch := &model.ScheduleTask{
-		SID:          sid,
-		Name:         req.Name,
-		CronExpr:     req.CronExpr,
-		TaskType:     req.TaskType,
-		ProfilerType: req.ProfilerType,
-		TargetIP:     req.TargetIP,
+		SID:           sid,
+		Name:          req.Name,
+		CronExpr:      req.CronExpr,
+		TaskType:      req.TaskType,
+		ProfilerType:  req.ProfilerType,
+		TargetIP:      req.TargetIP,
 		RequestParams: paramsJSON,
-		Enabled:      true,
-		UID:          uid,
-		UserName:     userName,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		Enabled:       true,
+		UID:           uid,
+		UserName:      userName,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 
 	if err := s.DB.Create(sch).Error; err != nil {

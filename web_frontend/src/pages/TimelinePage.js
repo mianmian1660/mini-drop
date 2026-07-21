@@ -50,6 +50,8 @@ export default function TimelinePage() {
     const [loading, setLoading] = useState(false);
     const [schLoading, setSchLoading] = useState(true);
     const [error, setError] = useState('');
+    const [atInput, setAtInput] = useState('');       // datetime-local 输入值
+    const [queryMode, setQueryMode] = useState('list'); // 'list' 全部窗口 | 'at' 按时刻回溯
 
     // 加载定时任务列表
     useEffect(() => {
@@ -61,6 +63,7 @@ export default function TimelinePage() {
     const loadTimeline = useCallback(async (sid) => {
         if (!sid) return;
         setMasterTid(sid);
+        setQueryMode('list');
         setLoading(true); setError('');
         try {
             const r = await tasks.timeline(sid);
@@ -70,13 +73,29 @@ export default function TimelinePage() {
         finally { setLoading(false); }
     }, []);
 
-    // 自动轮询
+    // 按时刻回溯：返回 create_time <= at 的最近一个窗口（即 at 时刻正在生效的窗口）
+    const loadAt = useCallback(async () => {
+        if (!masterTid || !atInput) return;
+        setQueryMode('at');
+        setLoading(true); setError('');
+        try {
+            const atISO = new Date(atInput).toISOString();
+            const r = await tasks.timeline(masterTid, { at: atISO });
+            if (r.code === 0) setPoints(r.data?.points || []);
+            else setError(r.message || '查询失败');
+        } catch (e) { setError('请求失败: ' + (e.message || '')); }
+        finally { setLoading(false); }
+    }, [masterTid, atInput]);
+
+    // 自动轮询：沿用当前查询模式（全部窗口 / 按时刻回溯）重新拉取
     useEffect(() => {
         const hasRunning = points.some(p => isActiveTask(p.status));
         if (!hasRunning || !masterTid) return;
-        const iv = setInterval(() => loadTimeline(masterTid), 5000);
+        const iv = setInterval(() => {
+            if (queryMode === 'at') loadAt(); else loadTimeline(masterTid);
+        }, 5000);
         return () => clearInterval(iv);
-    }, [points, masterTid, loadTimeline]);
+    }, [points, masterTid, queryMode, loadTimeline, loadAt]);
 
     const refreshSchedules = () => {
         setSchLoading(true);
@@ -151,13 +170,36 @@ export default function TimelinePage() {
                     )}
             </div>
 
+            {/* 按时刻回溯 */}
+            {masterTid && (
+                <div style={S.card}>
+                    <h3 style={{ marginTop: 0 }}>🕐 按时刻回溯窗口</h3>
+                    <p style={S.hint}>
+                        选择一个历史时刻，查看当时正在生效（即该时刻之前最近一次触发）的采集窗口，
+                        而不是只能看调度器实际建过的离散任务点。
+                    </p>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <input
+                            type="datetime-local"
+                            style={{ ...S.input, width: 240, marginBottom: 0 }}
+                            value={atInput}
+                            onChange={e => setAtInput(e.target.value)}
+                        />
+                        <button style={S.btn} onClick={loadAt} disabled={!atInput}>回溯到该时刻</button>
+                        <button style={S.btnSm} onClick={() => loadTimeline(masterTid)}>查看全部窗口</button>
+                    </div>
+                </div>
+            )}
+
             {/* 时间轴 */}
             {loading && <div style={S.loading}>⏳ 加载时间轴...</div>}
             {error && <div style={{ ...S.loading, color: '#f44' }}>❌ {error}</div>}
 
             {!loading && points.length > 0 && (
                 <div style={S.card}>
-                    <h3>历史采集 ({points.length} 个窗口) — {masterTid}</h3>
+                    <h3>
+                        {queryMode === 'at' ? `回溯结果 (1 个窗口)` : `历史采集 (${points.length} 个窗口)`} — {masterTid}
+                    </h3>
                     <div style={S.timeline}>
                         {points.map((p, i) => (
                             <div key={p.tid} style={S.point(p.status)}>
@@ -178,8 +220,12 @@ export default function TimelinePage() {
                                     </Link>
                                 </div>
                                 <div style={{ fontSize: 11, color: '#999', marginTop: 4 }}>
-                                    {new Date(p.create_time).toLocaleString('zh-CN')}
-                                    {p.end_time && ` → ${new Date(p.end_time).toLocaleString('zh-CN')}`}
+                                    窗口 {new Date(p.window_start || p.create_time).toLocaleString('zh-CN')}
+                                    {' → '}
+                                    {p.window_end
+                                        ? new Date(p.window_end).toLocaleString('zh-CN')
+                                        : (p.end_time ? new Date(p.end_time).toLocaleString('zh-CN') : '进行中')}
+                                    {p.frequency_hz ? ` · ${p.frequency_hz}Hz` : ''}
                                 </div>
                             </div>
                         ))}
