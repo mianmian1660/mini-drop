@@ -165,9 +165,11 @@ type ScheduleTask struct {
 // ----------------------------------------------------------
 // AutoMigrate：一键创建/更新所有表
 // 调用这个方法，GORM 会检查每张表是否存在：
-//   不存在 → 创建
-//   存在但字段不同 → 自动加列
-//   不会删除已有的列（安全）
+//
+//	不存在 → 创建
+//	存在但字段不同 → 自动加列
+//	不会删除已有的列（安全）
+//
 // ----------------------------------------------------------
 func AutoMigrate(db *gorm.DB) error {
 	return db.AutoMigrate(
@@ -181,5 +183,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&GroupMember{},
 		&AnalysisSuggestion{},
 		&ScheduleTask{},
+		&TaskAttempt{},
+		&Artifact{},
+		&AnalysisJob{},
 	)
 }
