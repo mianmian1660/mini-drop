@@ -119,6 +119,92 @@ make demo
 
 第一条命令启动平台，第二条命令创建演示任务。然后打开 http://localhost/ 查看任务列表和结果页。
 
+## 关闭和结束流程
+
+演示或开发结束后，需要区分“停止当前运行的服务”和“彻底清理本次运行产生的数据”。通常建议先用普通停止方式保留数据，确认不再需要历史任务和产物后，再执行彻底清理。
+
+### 1. 确认演示任务已经结束
+
+`make demo` 创建任务后，CPU/eBPF 采集会按照任务的 `duration` 自动结束；`demo-ebpf-io` 和 `demo-ebpf-sched` 为了制造现场负载而启动的临时进程也使用 `timeout` 控制，默认会在采样窗口结束后自动退出。
+
+关闭平台前，建议先在 Web UI 的任务列表或任务详情页确认任务状态已经进入 `DONE` 或 `FAILED`。也可以通过下面命令查看容器和服务状态：
+
+```bash
+docker compose ps
+docker compose logs apiserver --tail=100
+docker compose logs analysis --tail=100
+```
+
+如果任务仍处于 `RUNNING`、`UPLOADING` 或分析中，直接关闭不会破坏 Docker 本身，但可能导致该任务本轮采集、上传或分析没有完整完成。演示录屏时建议等结果页产物可见后再关闭。
+
+### 2. 普通停止：保留数据库和 MinIO 产物
+
+如果只是结束本次运行，并希望下次启动后仍能看到历史任务、Agent 记录和已经上传的火焰图/eBPF 产物，请执行：
+
+```bash
+docker compose down
+```
+
+这会停止并删除本项目启动的容器和默认网络，但不会删除 Docker volume。PostgreSQL 的任务数据和 MinIO 的对象文件会继续保留在 `pgdata`、`miniodata` 两个数据卷中。下次重新执行：
+
+```bash
+docker compose up -d --build
+```
+
+平台会复用这些数据卷，历史任务和产物仍然可以查看。
+
+### 3. 彻底清理：删除容器、网络和持久化数据
+
+如果需要把环境恢复到“第一次启动前”的干净状态，或者演示数据已经不再需要，可以执行：
+
+```bash
+docker compose down -v
+```
+
+`-v` 会同时删除 Compose 创建的数据卷，因此会清空：
+
+- PostgreSQL 中的用户、任务、Agent、状态流转记录
+- MinIO 中保存的 `perf.data`、`flamegraph.svg`、`top.json`、`bpf_histogram.svg`、`bpf_data.json` 等采集和分析产物
+
+这一步不可恢复。执行前请确认不需要保留页面上的历史任务结果，也不需要继续下载本次演示生成的文件。
+
+### 4. 可选清理镜像和本地临时文件
+
+如果还想释放本项目构建出来的镜像空间，可以在 `docker compose down` 或 `docker compose down -v` 之后查看镜像：
+
+```bash
+docker images
+```
+
+确认镜像不再需要后，再按镜像名或镜像 ID 删除。不要在不了解镜像用途时批量清理，以免影响其他 Docker 项目。
+
+`make demo-ebpf-io` 会在宿主机 `/tmp` 下临时写入 `/tmp/mini-drop-demo-io.dat`，正常情况下脚本会自动删除；日志可能保留在 `/tmp/mini-drop-demo-io.log`。如需手动清理，可以执行：
+
+```bash
+rm -f /tmp/mini-drop-demo-io.dat /tmp/mini-drop-demo-io.log
+```
+
+### 5. 确认端口已经释放
+
+关闭后如果想确认 Web、API、MinIO 和 gRPC 端口已经不再被本项目占用，可以查看：
+
+```bash
+docker compose ps
+ss -ltnp | grep -E ':(80|8191|9000|9001|50051)\b' || true
+```
+
+普通结束流程可以概括为：
+
+```bash
+docker compose down
+```
+
+彻底清空环境则使用：
+
+```bash
+docker compose down -v
+```
+
 ## 端到端验证
 
 按《drop系统复刻指南.md》的端到端链路验证：
