@@ -175,6 +175,13 @@ export default function TaskResultPage() {
     }, [task, files, loadTask, loadFiles]);
 
     const artifact = useMemo(() => pickVisualArtifact(files), [files]);
+    const stageStatus = Number(task?.status);
+    const stageAnalysisStatus = Number(task?.analysis_status);
+    const stages = useMemo(
+        () => buildStages(task || {}, statusEvents, stageStatus, stageAnalysisStatus, artifact, files),
+        [task, statusEvents, stageStatus, stageAnalysisStatus, artifact, files],
+    );
+    const failure = stageStatus === 3 ? describeFailure(task || {}, statusEvents) : null;
 
     if (loading) return <div style={styles.container}><p style={styles.loading}>加载中...</p></div>;
     if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
@@ -187,11 +194,6 @@ export default function TaskResultPage() {
     const statusName = statusNames[status] || 'UNKNOWN';
     const statusColor = statusColors[status] || '#667085';
     const shouldPoll = isActiveTaskStatus(status) || (status === 2 && analysisStatus < 2 && !artifact);
-    const stages = useMemo(
-        () => buildStages(task, statusEvents, status, analysisStatus, artifact, files),
-        [task, statusEvents, status, analysisStatus, artifact, files],
-    );
-    const failure = status === 3 ? describeFailure(task, statusEvents) : null;
 
     const retryTask = async () => {
         setRetrying(true);

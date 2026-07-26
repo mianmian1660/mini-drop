@@ -123,6 +123,8 @@ Web ──HTTP──> API ──gRPC──> drop_server <──gRPC── drop_a
 
 **完成记录（B4）**：前端新增 `analysisResults.suggestions` 与 `analysisResults.attribution` 封装，复用现有任务详情接口中的建议、归因和产物数据，不依赖尚未提供的独立后端路由。任务结果页已由五段进度条升级为七阶段时间线，结合状态迁移审计、任务状态、分析状态与产物可用性展示当前进度。失败时会从 `status_info` 和最近审计事件提取错误码及原因，判断是否适合重试；可重试任务可直接调用已有重试接口创建新的采集任务。
 
+**补充修复（B4）**：修复任务详情页在加载态与数据返回态调用 Hook 顺序不一致导致的 React 渲染错误。开发环境取消全路径代理，新增 `setupProxy.js` 仅转发 `/api` 到后端，保证直接访问 `/task/result?tid=...` 时由 React 路由返回页面，而非被 API 误处理为 404。
+
 **验证（B4）**：`cd web_frontend && npm run build`（构建成功）；`python3 analysis/test_analysis.py`（27 项通过）。
 
 ---
