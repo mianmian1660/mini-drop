@@ -24,17 +24,11 @@ const styles = {
     metricLabel: { fontSize: 12, color: '#667085', marginBottom: 6 },
     metricValue: { fontSize: 14, color: '#202124', wordBreak: 'break-word' },
     badge: { display: 'inline-flex', alignItems: 'center', borderRadius: 999, padding: '4px 10px', fontSize: 12, fontWeight: 700, color: '#fff' },
-    progressBar: { display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 6, marginBottom: 16 },
-    progressStep: (active, done, failed) => ({
-        textAlign: 'center',
-        padding: '8px 6px',
-        fontSize: 12,
-        borderRadius: 6,
-        background: failed ? '#fee4e2' : done ? '#dcfce7' : active ? '#dbeafe' : '#f1f5f9',
-        color: failed ? '#b42318' : done ? '#166534' : active ? '#1d4ed8' : '#64748b',
-        border: failed ? '1px solid #fda29b' : active ? '1px solid #93c5fd' : '1px solid transparent',
-        fontWeight: active || done || failed ? 700 : 500,
-    }),
+    stageTimeline: { display: 'grid', gridTemplateColumns: 'repeat(7, minmax(112px, 1fr))', gap: 8, overflowX: 'auto', paddingBottom: 4, marginBottom: 16 },
+    stage: (state) => ({ minHeight: 74, borderRadius: 6, border: `1px solid ${state === 'failed' ? '#fda29b' : state === 'done' ? '#86efac' : state === 'active' ? '#93c5fd' : '#e2e8f0'}`, background: state === 'failed' ? '#fee4e2' : state === 'done' ? '#f0fdf4' : state === 'active' ? '#eff6ff' : '#f8fafc', padding: '10px 11px' }),
+    stageTitle: (state) => ({ margin: 0, fontSize: 13, fontWeight: 700, color: state === 'failed' ? '#b42318' : state === 'done' ? '#166534' : state === 'active' ? '#1d4ed8' : '#64748b', whiteSpace: 'nowrap' }),
+    stageMeta: { margin: '6px 0 0 0', fontSize: 11, lineHeight: 1.35, color: '#667085', wordBreak: 'break-word' },
+    failure: { border: '1px solid #fda29b', background: '#fff6f5', borderRadius: 6, padding: 14, marginBottom: 16, display: 'flex', gap: 14, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' },
     notice: { display: 'flex', gap: 8, alignItems: 'center', background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 13 },
     flameFrame: { width: '100%', height: 560, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
     histogramStage: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 420, border: '1px solid #d0d7de', borderRadius: 6, background: '#fbfcfe', padding: 16, overflow: 'hidden' },
@@ -66,7 +60,15 @@ const styles = {
 const statusColors = { 0: '#d97706', 1: '#2563eb', 2: '#16a34a', 3: '#dc2626', 4: '#7c3aed' };
 const statusNames = { 0: 'PENDING', 1: 'RUNNING', 2: 'DONE', 3: 'FAILED', 4: 'UPLOADING' };
 const analysisNames = { 0: '待分析', 1: '分析中', 2: '分析完成', 3: '分析失败' };
-const progressSteps = ['PENDING', 'RUNNING', 'UPLOADING', 'ANALYZING', 'DONE'];
+const stageDefinitions = [
+    { id: 'created', label: '已创建' },
+    { id: 'dispatch', label: '等待下发' },
+    { id: 'accepted', label: 'Agent 已接收' },
+    { id: 'collecting', label: '采集中' },
+    { id: 'raw_saved', label: '原始数据已保存' },
+    { id: 'analyzing', label: '分析中' },
+    { id: 'available', label: '结果可用' },
+];
 
 export default function TaskResultPage() {
     const params = new URLSearchParams(window.location.search);
@@ -82,6 +84,8 @@ export default function TaskResultPage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [polling, setPolling] = useState(false);
+    const [retrying, setRetrying] = useState(false);
+    const [retryNotice, setRetryNotice] = useState('');
 
     const applyFiles = useCallback((inputFiles = []) => {
         const safeFiles = Array.isArray(inputFiles)
@@ -183,6 +187,30 @@ export default function TaskResultPage() {
     const statusName = statusNames[status] || 'UNKNOWN';
     const statusColor = statusColors[status] || '#667085';
     const shouldPoll = isActiveTaskStatus(status) || (status === 2 && analysisStatus < 2 && !artifact);
+    const stages = useMemo(
+        () => buildStages(task, statusEvents, status, analysisStatus, artifact, files),
+        [task, statusEvents, status, analysisStatus, artifact, files],
+    );
+    const failure = status === 3 ? describeFailure(task, statusEvents) : null;
+
+    const retryTask = async () => {
+        setRetrying(true);
+        setRetryNotice('');
+        try {
+            const response = await tasks.retry(tid);
+            if (response.code !== 0) throw new Error(response.message || '重试请求失败');
+            const nextTid = response.data?.task?.tid || response.data?.tid || response.data?.task_id;
+            if (nextTid) {
+                window.location.assign(`/task/result?tid=${encodeURIComponent(nextTid)}`);
+                return;
+            }
+            setRetryNotice('已创建重试任务，任务列表会显示新的采集记录。');
+        } catch (err) {
+            setRetryNotice(`无法重试：${err.message || '未知错误'}`);
+        } finally {
+            setRetrying(false);
+        }
+    };
 
     return (
         <div style={styles.container}>
@@ -202,17 +230,9 @@ export default function TaskResultPage() {
                 </div>
             )}
 
-            <div style={styles.progressBar}>
-                {progressSteps.map((label, index) => {
-                    const done = isStepDone(index, status, analysisStatus, artifact);
-                    const active = isStepActive(index, status, analysisStatus, artifact);
-                    return (
-                        <div key={label} style={styles.progressStep(active, done, status === 3)}>
-                            {status === 3 && index === 4 ? 'FAILED' : label}
-                        </div>
-                    );
-                })}
-            </div>
+            <StageTimeline stages={stages} />
+
+            {failure && <FailurePanel failure={failure} retrying={retrying} onRetry={retryTask} notice={retryNotice} />}
 
             <div style={styles.card}>
                 <h3 style={styles.sectionTitle}>任务概览</h3>
@@ -580,6 +600,101 @@ function ArtifactsPanel({ files }) {
     );
 }
 
+function StageTimeline({ stages }) {
+    return (
+        <div style={styles.stageTimeline} aria-label="任务阶段时间线">
+            {stages.map(stage => (
+                <div key={stage.id} style={styles.stage(stage.state)}>
+                    <p style={styles.stageTitle(stage.state)}>{stage.label}</p>
+                    <p style={styles.stageMeta}>{stage.detail}</p>
+                </div>
+            ))}
+        </div>
+    );
+}
+
+function FailurePanel({ failure, retrying, onRetry, notice }) {
+    return (
+        <div style={styles.failure} role="alert">
+            <div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: '#b42318' }}>任务失败</div>
+                <div style={{ marginTop: 5, fontSize: 13, color: '#475467', wordBreak: 'break-word' }}>
+                    错误码：{failure.code} · {failure.message}
+                </div>
+                <div style={{ marginTop: 4, fontSize: 12, color: '#667085' }}>
+                    {failure.retryable ? '该错误可重试，将使用原参数创建新的任务。' : '该错误通常不可通过直接重试恢复，请先修正任务参数或运行环境。'}
+                </div>
+                {notice && <div style={{ marginTop: 6, fontSize: 12, color: '#b42318' }}>{notice}</div>}
+            </div>
+            {failure.retryable && (
+                <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onRetry} disabled={retrying}>
+                    {retrying ? '正在创建重试任务...' : '重试任务'}
+                </button>
+            )}
+        </div>
+    );
+}
+
+function buildStages(task, events, status, analysisStatus, artifact, files) {
+    const hasEvent = (patterns) => events.some(event => patterns.some(pattern =>
+        pattern.test(`${event?.reason || ''} ${event?.source || ''}`),
+    ));
+    const rawArtifact = files.some(file => /(?:perf\.data|folded\.txt|bpf_raw|java_folded)/i.test(String(file?.name || '')));
+    const dispatched = status !== 0 || events.length > 1 || hasEvent([/下发|dispatch|deliver/i]);
+    const accepted = status === 1 || status === 4 || status === 2 || analysisStatus > 0 || hasEvent([/接收|accepted|runner.started|agent/i]);
+    const collecting = status === 4 || status === 2 || analysisStatus > 0 || hasEvent([/采集|collect|runner.started/i]);
+    const rawSaved = status === 4 || status === 2 || analysisStatus > 0 || rawArtifact || hasEvent([/原始.*保存|上传|raw.*artifact/i]);
+    const analyzing = analysisStatus >= 2 || Boolean(artifact) || hasEvent([/分析|analysis/i]);
+    const available = (status === 2 && analysisStatus >= 2) || Boolean(artifact);
+    const complete = [true, dispatched, accepted, collecting, rawSaved, analyzing, available];
+    const current = available ? 6 : analyzing ? 5 : rawSaved ? 4 : collecting ? 3 : accepted ? 2 : dispatched ? 1 : 0;
+    const failedAt = status === 3 ? current : -1;
+
+    return stageDefinitions.map((definition, index) => {
+        const state = index === failedAt ? 'failed' : complete[index] ? 'done' : index === current ? 'active' : 'pending';
+        const source = events.find(event => eventMatchesStage(event, definition.id));
+        return {
+            ...definition,
+            state,
+            detail: source?.reason || stageDetail(definition.id, task, status, analysisStatus, available),
+        };
+    });
+}
+
+function eventMatchesStage(event, stageId) {
+    const text = `${event?.reason || ''} ${event?.source || ''}`.toLowerCase();
+    const patterns = {
+        created: /创建|created/,
+        dispatch: /下发|dispatch|deliver/,
+        accepted: /接收|accepted|agent|runner.started/,
+        collecting: /采集|collect|runner.started/,
+        raw_saved: /原始.*保存|上传|raw.*artifact/,
+        analyzing: /分析|analysis/,
+        available: /完成|succeeded|result/,
+    };
+    return patterns[stageId]?.test(text);
+}
+
+function stageDetail(stageId, task, status, analysisStatus, available) {
+    if (stageId === 'created') return formatTime(task.create_time) || '任务已记录';
+    if (stageId === 'dispatch') return status === 0 ? '等待 Server 下发' : '下发流程已推进';
+    if (stageId === 'accepted') return status >= 1 ? '已进入执行链路' : '等待 Agent 接收';
+    if (stageId === 'collecting') return status === 1 ? '采集器正在运行' : '等待采集开始';
+    if (stageId === 'raw_saved') return status === 4 ? '正在上传原始数据' : '等待原始数据保存';
+    if (stageId === 'analyzing') return analysisStatus === 1 ? '分析器正在处理' : analysisStatus >= 2 ? '分析已完成' : '等待分析器领取';
+    if (stageId === 'available') return available ? '结果与产物已可查看' : '等待分析产物';
+    return '';
+}
+
+function describeFailure(task, events) {
+    const last = [...events].reverse().find(event => event?.reason) || {};
+    const message = task.status_info || last.reason || '任务执行失败，服务端未提供详细原因。';
+    const match = String(message).match(/\b[A-Z][A-Z0-9_]{2,}\b/);
+    const code = match ? match[0] : 'TASK_FAILED';
+    const nonRetryable = new Set(['AUTH_FORBIDDEN', 'TASK_INVALID_ARGUMENT', 'TARGET_NOT_FOUND', 'AGENT_INCOMPATIBLE']);
+    return { code, message, retryable: !nonRetryable.has(code) };
+}
+
 function pickVisualArtifact(files) {
     const bpf = files.find(isBpfHistogramFile);
     const java = files.find(isJavaFlamegraphFile);
@@ -596,26 +711,6 @@ function pickVisualArtifact(files) {
 
 function hasVisual(files) {
     return Boolean(pickVisualArtifact(files));
-}
-
-function isStepDone(index, status, analysisStatus, artifact) {
-    if (status === 3) return false;
-    if (index === 0) return status > 0;
-    if (index === 1) return status === 4 || status === 2;
-    if (index === 2) return status === 2;
-    if (index === 3) return analysisStatus >= 2 || Boolean(artifact);
-    if (index === 4) return status === 2 && (analysisStatus >= 2 || Boolean(artifact));
-    return false;
-}
-
-function isStepActive(index, status, analysisStatus, artifact) {
-    if (status === 3) return index === 4;
-    if (index === 0) return status === 0;
-    if (index === 1) return status === 1;
-    if (index === 2) return status === 4;
-    if (index === 3) return status === 2 && analysisStatus === 1 && !artifact;
-    if (index === 4) return status === 2 && (analysisStatus >= 2 || Boolean(artifact));
-    return false;
 }
 
 function isActiveTaskStatus(status) {

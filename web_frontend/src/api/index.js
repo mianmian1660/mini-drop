@@ -56,6 +56,26 @@ export const tasks = {
         client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid, from, to, at } }),
 };
 
+// ---------- 分析结果 ----------
+// 当前后端将建议、归因和产物汇总在任务详情中；在这里收敛为结果页可复用的数据接口。
+export const analysisResults = {
+    suggestions: async (tid) => {
+        const response = await tasks.detail(tid);
+        return { code: response.code, message: response.message, data: response.data?.suggestions || [] };
+    },
+    attribution: async (tid) => {
+        const response = await tasks.detail(tid);
+        return {
+            code: response.code,
+            message: response.message,
+            data: {
+                suggestions: response.data?.suggestions || [],
+                files: response.data?.files || [],
+            },
+        };
+    },
+};
+
 // ---------- 定时任务 / Continuous Profiling ----------
 export const schedules = {
     create: (data) => client.post('/api/v1/schedule/task', data),

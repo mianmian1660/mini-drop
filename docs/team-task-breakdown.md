@@ -113,6 +113,10 @@ Web ──HTTP──> API ──gRPC──> drop_server <──gRPC── drop_a
 | `web_frontend/src/api/index.js` | 修改 | 新增 `suggestions`/`attribution` 相关 API 封装函数 |
 | `web_frontend/src/pages/TaskResultPage.js` | 修改 | 状态展示从当前的简单进度条，扩展为 8.6 节"阶段时间线"（已创建→等待下发→Agent已接收→采集中→原始数据已保存→分析中→结果可用），失败态显示错误码+是否可重试 |
 
+**完成记录（B4）**：前端新增 `analysisResults.suggestions` 与 `analysisResults.attribution` 封装，复用现有任务详情接口中的建议、归因和产物数据，不依赖尚未提供的独立后端路由。任务结果页已由五段进度条升级为七阶段时间线，结合状态迁移审计、任务状态、分析状态与产物可用性展示当前进度。失败时会从 `status_info` 和最近审计事件提取错误码及原因，判断是否适合重试；可重试任务可直接调用已有重试接口创建新的采集任务。
+
+**验证（B4）**：`cd web_frontend && npm run build`（构建成功）；`python3 analysis/test_analysis.py`（27 项通过）。
+
 ---
 
 ## 共同部分
