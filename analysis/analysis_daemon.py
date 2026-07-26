@@ -2,64 +2,53 @@
 # ============================================================
 # analysis_daemon.py — 分析守护进程
 # ============================================================
-# 轮询 PostgreSQL，找到 status=2(已完成) 且 analysis_status=0(待分析) 的任务，
-# 调用 hotmethod_analyzer.py 进行分析，并更新 analysis_status。
-#
-# 用于 docker-compose 中替代直接运行 hotmethod_analyzer.py，
-# 使 analysis 容器作为常驻服务运行。
+# 从 analysis_jobs 表领取租约，调用注册表中的分析器，并更新 AnalysisJob
+# 与 hotmethod_tasks.analysis_status。
 # ============================================================
 
+import argparse
 import os
 import sys
+import threading
 import time
-import subprocess
-import argparse
 
-# 轮询间隔（秒）
+from analyzer_registry import build_default_registry
+from lease import AnalysisLeaseClient
+
+
 POLL_INTERVAL = 5
-
-# 数据库连接（从环境变量或默认值）
+LEASE_SECONDS = 300
+ANALYZER_VERSION = os.environ.get("ANALYZER_VERSION", "b1-lease")
 PG_DSN = os.environ.get(
     "PG_DSN", "host=localhost user=postgres password=dev dbname=drop sslmode=disable"
 )
 
 
-def get_pending_tasks():
-    """查询所有待分析的任务 (status=2, analysis_status=0)"""
+def update_analysis_status(dsn: str, tid: str, status: int, status_info: str = ""):
+    """兼容旧前端/旧接口：同步更新 hotmethod_tasks.analysis_status。"""
     try:
         import psycopg2
-    except ImportError:
-        print("[analysis_daemon] psycopg2 未安装，尝试 pip install psycopg2-binary",
-              file=sys.stderr)
-        return []
 
-    try:
-        conn = psycopg2.connect(PG_DSN)
+        conn = psycopg2.connect(dsn)
         cur = conn.cursor()
-        cur.execute(
-            "SELECT tid, type FROM hotmethod_tasks "
-            "WHERE status = 2 AND analysis_status = 0 AND deleted_at IS NULL "
-            "ORDER BY create_time ASC LIMIT 5"
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
-    except Exception as e:
-        print(f"[analysis_daemon] 数据库查询失败: {e}", file=sys.stderr)
-        return []
-
-
-def update_analysis_status(tid: str, status: int):
-    """更新任务的 analysis_status"""
-    try:
-        import psycopg2
-        conn = psycopg2.connect(PG_DSN)
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE hotmethod_tasks SET analysis_status = %s WHERE tid = %s",
-            (status, tid),
-        )
+        if status_info:
+            cur.execute(
+                """
+                UPDATE hotmethod_tasks
+                SET analysis_status = %s,
+                    status_info = CASE
+                        WHEN status_info = '' THEN %s
+                        ELSE status_info || '; ' || %s
+                    END
+                WHERE tid = %s
+                """,
+                (status, status_info, status_info, tid),
+            )
+        else:
+            cur.execute(
+                "UPDATE hotmethod_tasks SET analysis_status = %s WHERE tid = %s",
+                (status, tid),
+            )
         conn.commit()
         cur.close()
         conn.close()
@@ -67,65 +56,130 @@ def update_analysis_status(tid: str, status: int):
         print(f"[analysis_daemon] 更新 analysis_status 失败: {e}", file=sys.stderr)
 
 
-def run_analysis(tid: str, task_type: int) -> bool:
-    """调用 hotmethod_analyzer.py 分析单个任务"""
-    print(f"[analysis_daemon] 开始分析: tid={tid} type={task_type}", file=sys.stderr)
+def _start_heartbeat(lease_client: AnalysisLeaseClient, job_id: int,
+                     stop_event: threading.Event):
+    def run():
+        while not stop_event.wait(max(1, lease_client.lease_seconds // 3)):
+            try:
+                if not lease_client.heartbeat(job_id):
+                    print(f"[analysis_daemon] 续租失败: job_id={job_id}", file=sys.stderr)
+            except Exception as e:
+                print(f"[analysis_daemon] 续租异常: job_id={job_id} error={e}",
+                      file=sys.stderr)
 
-    # 标记为分析中
-    update_analysis_status(tid, 1)
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    analyzer = os.path.join(script_dir, "hotmethod_analyzer.py")
-    config = os.environ.get("ANALYSIS_CONFIG", os.path.join(script_dir, "config.ini"))
 
-    cmd = [
-        sys.executable, analyzer,
-        "--task-id", tid,
-        "--task-type", str(task_type),
-    ]
-    if os.path.exists(config):
-        cmd.extend(["--config", config])
+def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
+            local_output_dir: str, registry) -> bool:
+    """执行一个已领取的 AnalysisJob。"""
+    import hotmethod_analyzer as hm
 
+    tid = job.task_tid
+    print(f"[analysis_daemon] 开始分析: job_id={job.id} tid={tid} "
+          f"pipeline={job.pipeline} attempt={job.attempt}", file=sys.stderr)
+
+    stop_heartbeat = threading.Event()
+    heartbeat_thread = _start_heartbeat(lease_client, job.id, stop_heartbeat)
+
+    conn = None
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            print(f"[analysis_daemon] ✅ 分析成功: tid={tid}", file=sys.stderr)
-            update_analysis_status(tid, 2)  # 分析成功
-            return True
+        config = hm.load_config(config_path)
+        db_cfg = config["database"]
+        storage_cfg = config["storage"]
+        bucket = storage_cfg["bucket"]
+
+        conn = hm.connect_db(db_cfg["dsn"])
+        task = hm.get_task(conn, tid)
+        task_type = int(task.get("type", 0))
+        analyzer = registry.require(task_type)
+
+        hm.update_analysis_status(conn, tid, 1, "分析中")
+        result = analyzer(
+            conn, storage_cfg, task, bucket, tid, local_dir=local_output_dir
+        )
+        hm.update_analysis_status(conn, tid, 2, "分析完成")
+
+        if not lease_client.complete(job.id, ANALYZER_VERSION):
+            print(f"[analysis_daemon] 完成标记未生效: job_id={job.id}", file=sys.stderr)
+
+        print(f"[analysis_daemon] ✅ 分析成功: tid={tid} "
+              f"outputs={len(result.get('outputs', []))}", file=sys.stderr)
+        return True
+
+    except KeyError as e:
+        update_analysis_status(dsn, tid, 3, f"未注册分析器: {e}")
+        lease_client.fail(job.id, retry=False, analyzer_version=ANALYZER_VERSION)
+        print(f"[analysis_daemon] ❌ 不可重试失败: tid={tid} error={e}",
+              file=sys.stderr)
+        return False
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+        ok = code == 0
+        if ok:
+            lease_client.complete(job.id, ANALYZER_VERSION)
         else:
-            print(f"[analysis_daemon] ❌ 分析失败: tid={tid} rc={result.returncode}",
-                  file=sys.stderr)
-            print(f"[analysis_daemon]   stderr: {result.stderr[:500]}", file=sys.stderr)
-            update_analysis_status(tid, 3)  # 分析失败
-            return False
-    except subprocess.TimeoutExpired:
-        print(f"[analysis_daemon] ⏰ 分析超时: tid={tid}", file=sys.stderr)
-        update_analysis_status(tid, 3)
-        return False
+            update_analysis_status(dsn, tid, 3, f"分析失败: exit={code}")
+            lease_client.fail(job.id, retry=True, analyzer_version=ANALYZER_VERSION)
+        return ok
     except Exception as e:
+        update_analysis_status(dsn, tid, 3, f"分析异常: {e}")
+        lease_client.fail(job.id, retry=True, analyzer_version=ANALYZER_VERSION)
         print(f"[analysis_daemon] ❌ 分析异常: tid={tid} error={e}", file=sys.stderr)
-        update_analysis_status(tid, 3)
         return False
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=1)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analysis Daemon - 轮询并分析已完成任务")
+    parser = argparse.ArgumentParser(description="Analysis Daemon - 租约领取并分析任务")
     parser.add_argument("--interval", type=int, default=POLL_INTERVAL,
                         help=f"轮询间隔秒数 (默认: {POLL_INTERVAL})")
     parser.add_argument("--once", action="store_true",
-                        help="只运行一次，处理完所有待分析任务后退出")
+                        help="只尝试领取一次，处理完已领取任务后退出")
+    parser.add_argument("--lease-seconds", type=int, default=LEASE_SECONDS,
+                        help=f"租约有效期秒数 (默认: {LEASE_SECONDS})")
+    parser.add_argument("--worker-id", default=os.environ.get("ANALYSIS_WORKER_ID", ""),
+                        help="当前 worker 标识，默认自动生成")
+    parser.add_argument("--config", default=os.environ.get("ANALYSIS_CONFIG", ""),
+                        help="配置文件路径")
+    parser.add_argument("--local-output-dir", default=os.environ.get("LOCAL_OUTPUT_DIR", ""),
+                        help="MinIO 不可用时的本地产物目录")
     args = parser.parse_args()
 
-    print(f"[analysis_daemon] 启动 (间隔={args.interval}s, dsn={PG_DSN[:50]}...)",
-          file=sys.stderr)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = args.config or os.path.join(script_dir, "config.ini")
+    lease_client = AnalysisLeaseClient(
+        PG_DSN,
+        worker_id=args.worker_id or None,
+        lease_seconds=args.lease_seconds,
+    )
+    registry = build_default_registry()
+
+    print(f"[analysis_daemon] 启动 (interval={args.interval}s, "
+          f"worker={lease_client.worker_id}, lease={args.lease_seconds}s, "
+          f"task_types={registry.task_types()})", file=sys.stderr)
 
     while True:
-        tasks = get_pending_tasks()
+        try:
+            job = lease_client.claim_one()
+        except Exception as e:
+            print(f"[analysis_daemon] 领取 AnalysisJob 失败: {e}", file=sys.stderr)
+            job = None
 
-        if tasks:
-            print(f"[analysis_daemon] 发现 {len(tasks)} 个待分析任务", file=sys.stderr)
-            for tid, task_type in tasks:
-                run_analysis(tid, task_type)
+        if job is not None:
+            run_job(PG_DSN, lease_client, job, config_path, args.local_output_dir, registry)
+        elif args.once:
+            print("[analysis_daemon] --once 模式，没有可领取任务，退出", file=sys.stderr)
+            break
 
         if args.once:
             print("[analysis_daemon] --once 模式，退出", file=sys.stderr)

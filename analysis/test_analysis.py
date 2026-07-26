@@ -128,6 +128,23 @@ def t_error_info():
     d = ErrorInfo(ErrorCode.OK, "一切正常").to_dict()
     assert d["code"]==0 and d["message"]=="一切正常"
 
+def t_analyzer_registry_defaults():
+    from analyzer_registry import build_default_registry
+    r = build_default_registry()
+    for task_type in [0, 1, 2, 4, 5, 6]:
+        assert r.get(task_type) is not None
+    try:
+        r.require(999)
+        assert False, "未知 task_type 应该抛错"
+    except KeyError:
+        pass
+
+def t_lease_job_dataclass():
+    from lease import AnalysisJob, STATUS_PENDING, STATUS_RUNNING
+    job = AnalysisJob(id=1, task_tid="tid-test", pipeline="perf", status=STATUS_PENDING, attempt=0)
+    assert job.task_tid == "tid-test"
+    assert STATUS_RUNNING == "running"
+
 if __name__ == "__main__":
     tests = [v for k,v in list(globals().items()) if k.startswith("t_") and callable(v)]
     passed = failed = 0
