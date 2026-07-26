@@ -40,6 +40,7 @@ from analysis_advisor import generate_suggestions as advisor_generate_suggestion
 from memleak_analyzer import analyze_memtrace, generate_mock_memtrace
 from bpf_analyzer import analyze_bpf_output, bpf_histogram_to_svg
 from java_analyzer import analyze_java_profile, generate_java_suggestions
+from attribution import run_attribution
 
 
 # ============================================================
@@ -237,6 +238,46 @@ def insert_suggestion(conn, tid: str, func_name: str,
         print(f"[analysis] 插入建议: {func_name}", file=sys.stderr)
     except Exception as e:
         print(f"[analysis] 插入建议失败: {e}", file=sys.stderr)
+
+
+def persist_attribution(conn, tid: str, attribution: dict):
+    """将一份可验证的归因 JSON 附加到该任务已有建议上。"""
+    try:
+        value = json.dumps(attribution, ensure_ascii=False)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE analysis_suggestions SET ai_suggestion = %s "
+            "WHERE tid = %s AND (ai_suggestion = '' OR ai_suggestion IS NULL)",
+            (value, tid),
+        )
+        if cur.rowcount == 0:
+            cur.execute(
+                "INSERT INTO analysis_suggestions (tid, func, suggestion, ai_suggestion, status) "
+                "VALUES (%s, %s, %s, %s, 0)",
+                (tid, "智能归因", attribution.get("suggestion", ""), value),
+            )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[analysis] 写入智能归因失败: {e}", file=sys.stderr)
+
+
+def _save_attribution(conn, storage, bucket: str, tid: str, task: dict,
+                      top_json: dict, folded_text: str, local_dir: str,
+                      outputs: list, presigned_urls: dict, local_files: list):
+    """归因失败不影响主分析；其状态同样保留给前端展示。"""
+    attribution = run_attribution(conn, task, top_json, folded_text)
+    persist_attribution(conn, tid, attribution)
+    key = _upload_output(storage, bucket, tid, "attribution.json", attribution, "application/json")
+    if key:
+        outputs.append(key)
+        presigned_urls["attribution.json"] = _get_presigned_url(storage, bucket, key)
+    else:
+        local_path = _save_local_output(local_dir, f"{tid}_attribution.json", attribution)
+        if local_path:
+            local_files.append(local_path)
+            outputs.append(local_path)
+    return attribution
 
 
 def _connect_storage(storage_cfg: dict):
@@ -557,6 +598,9 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                           f"建议人工审查是否存在优化空间")
             insert_suggestion(conn, tid, func_name, suggestion)
 
+    _save_attribution(conn, storage, bucket, tid, task, top_json, folded_text,
+                      local_dir, outputs, presigned_urls, local_files)
+
     print(f"[analysis] CPU 火焰图分析完成: {len(outputs)} 个产物 "
           f"(MinIO: {len(presigned_urls)}, 本地: {len(local_files)})",
           file=sys.stderr)
@@ -704,6 +748,9 @@ def _analyze_java_async_profiler(conn, storage_cfg: dict, task: dict,
                 item["function"],
                 f"Java 方法 '{item['function']}' 占 CPU {item['percentage']}%，建议检查锁竞争、对象分配、JIT 内联和业务热点路径。",
             )
+
+    _save_attribution(conn, storage, bucket, tid, task, top_json, folded_text,
+                      local_dir, outputs, presigned_urls, local_files)
 
     print(f"[analysis] Java async-profiler 分析完成: {len(outputs)} 个产物",
           file=sys.stderr)

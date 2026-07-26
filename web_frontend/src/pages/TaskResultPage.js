@@ -7,6 +7,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { tasks, cosfiles } from '../api';
 import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
+import AICard from '../components/AICard';
 
 const styles = {
     container: { maxWidth: 1280, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif', color: '#202124' },
@@ -76,6 +77,7 @@ export default function TaskResultPage() {
     const [topFunctions, setTopFunctions] = useState([]);
     const [bpfHistogram, setBpfHistogram] = useState(null);
     const [suggestions, setSuggestions] = useState([]);
+    const [attribution, setAttribution] = useState(null);
     const [statusEvents, setStatusEvents] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -108,6 +110,7 @@ export default function TaskResultPage() {
             setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
             setBpfHistogram(data.bpf_histogram || null);
             setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
+            setAttribution(readEmbeddedAttribution(data.suggestions));
             setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
             applyFiles(data.files || []);
             setError('');
@@ -118,6 +121,19 @@ export default function TaskResultPage() {
             setPolling(false);
         }
     }, [tid, applyFiles]);
+
+    useEffect(() => {
+        if (attribution) return;
+        const file = files.find(item => String(item?.name || '').endsWith('attribution.json'));
+        const url = file?.view_url || file?.download_url;
+        if (!url) return;
+        let cancelled = false;
+        fetch(url)
+            .then(response => response.ok ? response.json() : null)
+            .then(data => { if (!cancelled && data && typeof data === 'object') setAttribution(data); })
+            .catch(() => {});
+        return () => { cancelled = true; };
+    }, [files, attribution]);
 
     const loadFiles = useCallback(async () => {
         if (!tid) return;
@@ -245,6 +261,8 @@ export default function TaskResultPage() {
                 <TopFunctionsPanel topFunctions={topFunctions} status={status} title="热点 TopN" />
             )}
 
+            <AICard attribution={attribution} />
+
             <SuggestionsPanel
                 suggestions={suggestions}
                 bpfHistogram={bpfHistogram}
@@ -255,6 +273,22 @@ export default function TaskResultPage() {
             <ArtifactsPanel files={files} />
         </div>
     );
+}
+
+function readEmbeddedAttribution(items) {
+    if (!Array.isArray(items)) return null;
+    for (const item of items) {
+        const value = item?.ai_suggestion;
+        if (!value) continue;
+        if (typeof value === 'object') return value;
+        try {
+            const parsed = JSON.parse(value);
+            if (parsed && typeof parsed === 'object') return parsed;
+        } catch (_) {
+            // Historical rows can contain prose rather than structured B3 output.
+        }
+    }
+    return null;
 }
 
 function Metric({ label, value }) {

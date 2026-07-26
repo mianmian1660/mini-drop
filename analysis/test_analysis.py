@@ -167,6 +167,50 @@ def t_java_analyze_profile_topn():
     assert result["top_json"]["self_time_top"][0]["function"] == "com.example.Foo.work"
     assert "<svg" in result["svg"]
 
+def t_attribution_tool_call_and_evidence_validation():
+    from attribution import run_attribution
+
+    class FakeLLM:
+        enabled = True
+        model = "fake-model"
+        def __init__(self):
+            self.calls = 0
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {"tool_calls": [{
+                    "id": "tool-1",
+                    "function": {"name": "read_stack_context", "arguments": '{"function":"hot.work"}'},
+                }]}
+            return {"content": json.dumps({
+                "reasoning_summary": "hot.work 是当前采样中的主要热点。",
+                "suggestion": "优先检查 hot.work 的循环与锁竞争。",
+                "evidence": [{"function": "hot.work", "detail": "占 CPU 70%", "source": "topn"}],
+            })}
+
+    result = run_attribution(
+        None,
+        {"tid": "t1", "name": "test", "type": 0, "request_params": {}},
+        {"total_samples": 10, "self_time_top": [{"function": "hot.work", "samples": 7, "percentage": 70.0}]},
+        "main;hot.work 7\n",
+        llm_client=FakeLLM(),
+    )
+    assert result["status"] == "completed"
+    assert result["done"] is True
+    assert result["evidence"][0]["function"] == "hot.work"
+
+def t_attribution_disabled_is_non_blocking():
+    from attribution import run_attribution
+    class DisabledLLM:
+        enabled = False
+        model = "disabled"
+    result = run_attribution(
+        None, {"tid": "t1", "type": 0},
+        {"self_time_top": [{"function": "work", "samples": 1, "percentage": 100.0}]},
+        llm_client=DisabledLLM(),
+    )
+    assert result["status"] == "skipped" and result["done"] is True
+
 if __name__ == "__main__":
     tests = [v for k,v in list(globals().items()) if k.startswith("t_") and callable(v)]
     passed = failed = 0

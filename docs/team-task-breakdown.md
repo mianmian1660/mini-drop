@@ -102,6 +102,10 @@ Web ──HTTP──> API ──gRPC──> drop_server <──gRPC── drop_a
 | `web_frontend/src/components/AICard.js` | 新建 | 归因结果展示卡片：区分 `status`/`reasoning_summary`/`suggestion`/`evidence`/`done`/`error` 几类内容（8.9 节事件分类），Markdown 经清洗后渲染 |
 | `web_frontend/src/pages/TaskResultPage.js` | 修改 | 接入 `AICard`，展示归因结论 + 支撑证据 |
 
+**完成记录（B3）**：分析器在 CPU 与 Java 火焰图产出 TopN 后执行受限工具调用式归因，支持查询历史任务、比较采样和读取折叠调用栈。归因结论必须包含当前热点函数的证据；LLM 未配置、请求失败或结论不可验证时，会保存明确状态并继续完成原有分析。结果同步写入 `analysis_suggestions.ai_suggestion`，并生成 `attribution.json`，结果页优先读取数据库字段，必要时读取该产物展示归因摘要、建议和支撑证据。
+
+**验证（B3）**：`python3 analysis/test_analysis.py`（27 项通过）；`cd web_frontend && npm run build`（构建成功）。
+
 ### B4. Web 展示模块补强（对应第 8 章）
 
 | 文件 | 状态 | 实现的功能 |
