@@ -26,6 +26,8 @@ import argparse
 import configparser
 import json
 import os
+import shutil
+import subprocess
 import sys
 import traceback
 
@@ -37,6 +39,7 @@ from collapsed_data_parser import analyze_collapsed
 from analysis_advisor import generate_suggestions as advisor_generate_suggestions
 from memleak_analyzer import analyze_memtrace, generate_mock_memtrace
 from bpf_analyzer import analyze_bpf_output, bpf_histogram_to_svg
+from java_analyzer import analyze_java_profile, generate_java_suggestions
 
 
 # ============================================================
@@ -565,6 +568,152 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     }
 
 
+def _analyze_java_async_profiler(conn, storage_cfg: dict, task: dict,
+                                 bucket: str, tid: str,
+                                 local_dir: str = "") -> dict:
+    """
+    Java async-profiler 分析（task_type=1）
+
+    支持 async-profiler collapsed 输出；文本化 JFR 会做保守解析；二进制 JFR
+    会提示采集侧输出 collapsed 或先用 jfr print 转文本。
+    """
+    outputs = []
+    presigned_urls = {}
+    local_files = []
+
+    storage, storage_ok = _connect_storage(storage_cfg)
+    local_profile = f"/tmp/{tid}_java_profile.data"
+    has_profile = False
+
+    if storage_ok:
+        has_profile = _download_perf_data(storage, bucket, tid, local_profile)
+
+    if not has_profile:
+        test_files = [
+            f"/tmp/{tid}_java_profile.txt",
+            f"/tmp/{tid}_perf.data",
+            "/tmp/test_java_collapsed.txt",
+        ]
+        for tf in test_files:
+            if os.path.exists(tf) and os.path.getsize(tf) > 0:
+                local_profile = tf
+                has_profile = True
+                print(f"[analysis] 使用本地 Java profile: {local_profile}", file=sys.stderr)
+                break
+
+    if not has_profile:
+        print("[analysis] 错误: 找不到 Java profile，无法生成 Java 火焰图", file=sys.stderr)
+        return {"outputs": outputs, "presigned_urls": presigned_urls, "local_files": local_files}
+
+    with open(local_profile, "rb") as f:
+        profile_data = f.read()
+
+    if profile_data.startswith(b"FLR\x00") and shutil.which("jfr"):
+        try:
+            printed = subprocess.run(
+                ["jfr", "print", "--events", "jdk.ExecutionSample", local_profile],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if printed.returncode == 0 and printed.stdout.strip():
+                profile_data = printed.stdout.encode("utf-8")
+                print("[analysis] 已用 jfr print 转换二进制 JFR", file=sys.stderr)
+            else:
+                print(f"[analysis] jfr print 未产出可解析文本: {printed.stderr[:300]}",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"[analysis] jfr print 转换失败: {e}", file=sys.stderr)
+
+    task_name = task.get("name", tid)
+    try:
+        java_result = analyze_java_profile(profile_data, task_name=task_name, top_n=20)
+    except Exception as e:
+        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
+                   f"Java profile 解析失败: {e}",
+                   traceback.format_exc())
+
+    svg_content = java_result["svg"]
+    folded_text = java_result["folded"]
+    top_json = java_result["top_json"]
+
+    artifacts = [
+        ("java_flamegraph.svg", svg_content, "image/svg+xml"),
+        ("java_folded.txt", folded_text, "text/plain"),
+        ("java_top.json", top_json, "application/json"),
+        # 兼容现有 apiserver: fetchTopFunctions 只读取 top.json。
+        ("top.json", top_json, "application/json"),
+    ]
+
+    for filename, content, content_type in artifacts:
+        key = _upload_output(storage, bucket, tid, filename, content, content_type)
+        if key:
+            outputs.append(key)
+            presigned_urls[filename] = _get_presigned_url(storage, bucket, key)
+        else:
+            local_name = f"{tid}_{filename}"
+            local_path = _save_local_output(local_dir, local_name, content)
+            if local_path:
+                local_files.append(local_path)
+                outputs.append(local_path)
+
+    suggestions_result = generate_java_suggestions(top_json, task_name=task_name)
+    if suggestions_result.get("suggestions_md"):
+        md_key = _upload_output(storage, bucket, tid,
+                                "java_suggestions.md",
+                                suggestions_result["suggestions_md"],
+                                "text/markdown")
+        if md_key:
+            outputs.append(md_key)
+            presigned_urls["java_suggestions.md"] = _get_presigned_url(storage, bucket, md_key)
+        else:
+            local_path = _save_local_output(
+                local_dir, f"{tid}_java_suggestions.md",
+                suggestions_result["suggestions_md"],
+            )
+            if local_path:
+                local_files.append(local_path)
+                outputs.append(local_path)
+
+    suggestions_json = {
+        "suggestions": suggestions_result.get("suggestions", []),
+        "rules_loaded": suggestions_result.get("rules_loaded", 0),
+        "language": "java",
+        "source_format": top_json.get("source_format", ""),
+    }
+    for filename in ("java_suggestions.json", "suggestions.json"):
+        key = _upload_output(storage, bucket, tid, filename, suggestions_json, "application/json")
+        if key:
+            outputs.append(key)
+            presigned_urls[filename] = _get_presigned_url(storage, bucket, key)
+        else:
+            local_path = _save_local_output(local_dir, f"{tid}_{filename}", suggestions_json)
+            if local_path:
+                local_files.append(local_path)
+                outputs.append(local_path)
+
+    matched = suggestions_result.get("suggestions", [])
+    if matched:
+        for item in matched[:5]:
+            insert_suggestion(conn, tid, item["function"], item["advice"])
+    elif top_json.get("self_time_top"):
+        for item in top_json["self_time_top"][:5]:
+            insert_suggestion(
+                conn,
+                tid,
+                item["function"],
+                f"Java 方法 '{item['function']}' 占 CPU {item['percentage']}%，建议检查锁竞争、对象分配、JIT 内联和业务热点路径。",
+            )
+
+    print(f"[analysis] Java async-profiler 分析完成: {len(outputs)} 个产物",
+          file=sys.stderr)
+    return {
+        "outputs": outputs,
+        "presigned_urls": presigned_urls,
+        "local_files": local_files,
+    }
+
+
 def _analyze_memleak(conn, storage_cfg: dict, task: dict,
                      bucket: str, tid: str,
                      local_dir: str = "") -> dict:
@@ -817,8 +966,9 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
                                              bucket, tid, local_dir)
 
         elif task_type == TASK_TYPE_JAVA:
-            # W5 将实现: async-profiler 折叠栈解析
-            print(f"[analysis] Java 分析 (W5 实现)", file=sys.stderr)
+            # Java async-profiler：collapsed/JFR 文本 → Java 火焰图 + TopN
+            result = _analyze_java_async_profiler(conn, storage_cfg, task,
+                                                  bucket, tid, local_dir)
 
         elif task_type == TASK_TYPE_MEMCHECK:
             # 内存泄漏检测：alloc/free 配对分析 → 责任人定位

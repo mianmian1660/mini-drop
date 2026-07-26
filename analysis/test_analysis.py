@@ -145,6 +145,28 @@ def t_lease_job_dataclass():
     assert job.task_tid == "tid-test"
     assert STATUS_RUNNING == "running"
 
+def t_java_normalize_collapsed():
+    from java_analyzer import normalize_java_profile
+    folded, fmt = normalize_java_profile(
+        b"java.lang.Thread.run;com.example.App.handle;com.example.Foo.work 7\n"
+        b"java.lang.Thread.run;com.example.App.handle;com.example.Bar.query 3\n"
+    )
+    assert fmt == "collapsed"
+    assert "com.example.Foo.work 7" in folded
+
+def t_java_analyze_profile_topn():
+    from java_analyzer import analyze_java_profile
+    result = analyze_java_profile(
+        b"java.lang.Thread.run;com.example.App.handle;com.example.Foo.work 7\n"
+        b"java.lang.Thread.run;com.example.App.handle;com.example.Bar.query 3\n",
+        task_name="java-test",
+        top_n=2,
+    )
+    assert result["source_format"] == "collapsed"
+    assert result["top_json"]["language"] == "java"
+    assert result["top_json"]["self_time_top"][0]["function"] == "com.example.Foo.work"
+    assert "<svg" in result["svg"]
+
 if __name__ == "__main__":
     tests = [v for k,v in list(globals().items()) if k.startswith("t_") and callable(v)]
     passed = failed = 0

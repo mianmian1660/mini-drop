@@ -6,6 +6,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { tasks, cosfiles } from '../api';
+import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
 
 const styles = {
     container: { maxWidth: 1280, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif', color: '#202124' },
@@ -160,6 +161,7 @@ export default function TaskResultPage() {
     if (!task) return <div style={styles.container}><p style={styles.error}>任务不存在</p></div>;
 
     const isBpfTask = Number(task.type) === 5 || Boolean(bpfHistogram);
+    const isJavaTask = Number(task.type) === 1 || Number(task.profiler_type) === 1;
     const status = Number(task.status);
     const analysisStatus = Number(task.analysis_status);
     const statusName = statusNames[status] || 'UNKNOWN';
@@ -214,7 +216,7 @@ export default function TaskResultPage() {
 
             <div style={styles.split}>
                 <div style={styles.card}>
-                    <h3 style={styles.sectionTitle}>{isBpfTask ? 'eBPF 直方图' : '火焰图'}</h3>
+                    <h3 style={styles.sectionTitle}>{isBpfTask ? 'eBPF 直方图' : isJavaTask ? 'Java 火焰图' : '火焰图'}</h3>
                     <VisualResult artifact={artifact} task={task} isBpfTask={isBpfTask} />
                 </div>
 
@@ -224,9 +226,18 @@ export default function TaskResultPage() {
                 </div>
             </div>
 
+            {isJavaTask && (
+                <JavaFlamegraphPanel
+                    task={task}
+                    topFunctions={topFunctions}
+                    files={files}
+                    artifact={artifact}
+                />
+            )}
+
             {isBpfTask ? (
                 <BPFHistogramPanel histogram={bpfHistogram} />
-            ) : (
+            ) : isJavaTask ? null : (
                 <TopFunctionsPanel topFunctions={topFunctions} status={status} />
             )}
 
@@ -537,14 +548,15 @@ function ArtifactsPanel({ files }) {
 
 function pickVisualArtifact(files) {
     const bpf = files.find(isBpfHistogramFile);
+    const java = files.find(isJavaFlamegraphFile);
     const flame = files.find(isFlamegraphFile);
-    const picked = bpf || flame;
+    const picked = bpf || java || flame;
     if (!picked) return null;
     return {
         name: picked.name,
         url: picked.view_url || picked.download_url || '',
         downloadUrl: picked.download_url || picked.view_url || '',
-        type: bpf ? 'bpf' : 'flamegraph',
+        type: bpf ? 'bpf' : java ? 'java' : 'flamegraph',
     };
 }
 
@@ -617,6 +629,14 @@ function isBpfHistogramFile(file) {
 function isFlamegraphFile(file) {
     const name = String(file?.name || '').toLowerCase();
     return name.endsWith('.svg') && name.includes('flamegraph') && !name.includes('bpf_histogram');
+}
+
+function isJavaFlamegraphFile(file) {
+    const name = String(file?.name || '').toLowerCase();
+    return name.endsWith('.svg') && (
+        name.includes('java_flamegraph') ||
+        name.includes('java-flamegraph')
+    );
 }
 
 function profilerLabel(profilerType, taskType, event) {
