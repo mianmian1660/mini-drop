@@ -84,6 +84,10 @@ Web ──HTTP──> API ──gRPC──> drop_server <──gRPC── drop_a
 | `analysis/analysis_daemon.py` | 修改 | 主循环从"直接轮询 `hotmethod_tasks.analysis_status`"改为"通过 `lease.py` 领取 `AnalysisJob`"，对接 A1 新建的 `analysis_job` 表 |
 | `analysis/analyzer_registry.py` | 新建 | 把 `task_type → analyzer 函数` 的映射抽成注册表（7.4 节），替代 `hotmethod_analyzer.py` 里现在的 `if/elif` 分发 |
 
+**完成记录（B1，提交 `30df930`）**：新增 `AnalysisLeaseClient` 与 `AnalysisJob`，使用 `FOR UPDATE SKIP LOCKED` 领取待处理作业，并实现续租、成功完成、失败重试和租约归属校验。分析守护进程已改为从 `analysis_jobs` 领取作业，处理期间启动心跳续租线程，并在执行结束后同步更新 `hotmethod_tasks.analysis_status`。新增注册表统一处理任务类型到分析函数的分发。
+
+**验证（B1）**：`python3 -m py_compile analysis/analysis_daemon.py analysis/analyzer_registry.py analysis/lease.py` 通过；当时 `python3 analysis/test_analysis.py` 为 23 项通过。
+
 ### B2. 用户态语言级采集器补全（对应第 5.9、7.7 章 + 题目扩展硬性要求）
 
 | 文件 | 状态 | 实现的功能 |
@@ -91,6 +95,10 @@ Web ──HTTP──> API ──gRPC──> drop_server <──gRPC── drop_a
 | `analysis/hotmethod_analyzer.py` | 修改 | `task_type==1`（Java）分支从"打印占位"接上真实解析逻辑 |
 | `analysis/java_analyzer.py` | 新建 | 解析 async-profiler 折叠栈/JFR 输出，产出火焰图 SVG + TopN（7.7 节 pprof 流水线的姊妹实现） |
 | `web_frontend/src/components/JavaFlamegraphPanel.js` | 新建 | Java 采集器专属的可视化面板（题目要求"用户态采集器必须在 Web 有自己的可视化形态"，参照现有 `BPFHistogramPanel` 的写法） |
+
+**完成记录（B2，提交 `a0253e1`）**：新增 Java async-profiler 分析器，支持 collapsed 折叠栈与文本 JFR 解析；二进制 JFR 在本机存在 `jfr` 工具时先转换为文本。Java 任务会生成火焰图、folded stacks、TopN 与建议产物，并保留 `top.json`、`suggestions.json` 以兼容已有结果接口。结果页新增 Java 专属面板，展示 async-profiler 采集信息、热点方法和 Java 产物入口。
+
+**验证（B2）**：`python3 -m py_compile analysis/java_analyzer.py analysis/hotmethod_analyzer.py` 通过；当时 `python3 analysis/test_analysis.py` 为 25 项通过；`cd web_frontend && npm run build` 构建成功。
 
 ### B3. 智能归因（对应第 3.10、8.9 章 + 题目加分项）
 
