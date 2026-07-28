@@ -29,9 +29,24 @@ using namespace drop_server;
 
 static atomic<bool> server_running{true};
 
+// A3: 任务队列快照路径，可用 DROP_TASK_QUEUE_SNAPSHOT 覆盖。
+// 注意：默认写在容器内 /tmp，只在"进程重启、容器不重建"时生效；
+// 要跨 `docker compose down/up` 持久化，需要给这个路径挂一个 volume（docker-compose.yml 未改动，留给后续统一调整）。
+static string task_queue_snapshot_path()
+{
+    const char *v = getenv("DROP_TASK_QUEUE_SNAPSHOT");
+    if (v && *v)
+        return string(v);
+    return "/tmp/drop_server_task_queue.bin";
+}
+
 int main(int argc, char **argv)
 {
     string server_address("0.0.0.0:50051");
+
+    // A3: 启动时从磁盘快照恢复未派发的任务队列（新复刻指南 5.13 节验收项）
+    string snapshotPath = task_queue_snapshot_path();
+    restore_tasks_from_disk(snapshotPath);
 
     HealthCheckServiceImpl healthcheck_service;
     HotmethodServiceImpl hotmethod_service;
@@ -75,6 +90,14 @@ int main(int argc, char **argv)
             }
         } });
 
+    // A3: 定期把任务队列快照落盘（每 5 秒），供 Server 重启后恢复
+    thread snapshot_thread([snapshotPath]()
+                           {
+        while (server_running) {
+            this_thread::sleep_for(chrono::seconds(5));
+            snapshot_tasks_to_disk(snapshotPath);
+        } });
+
     // W2 自测模式
     if (getenv("W2_TEST"))
     {
@@ -110,6 +133,8 @@ int main(int argc, char **argv)
 
     cout << "[server] 收到退出信号，正在关闭..." << endl;
     offline_checker.join();
+    snapshot_thread.join();
+    snapshot_tasks_to_disk(snapshotPath); // 退出前做最后一次快照，避免丢失最近 5 秒内的变化
     server->Shutdown();
     cout << "[server] 已关闭" << endl;
     return 0;

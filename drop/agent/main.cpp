@@ -197,13 +197,21 @@ static pair<int, string> run_profiler(
         cout << "[agent] 选择采集器: perf (profilerType=0)" << endl;
         int result = drop::run_perf(task, path);
 
-        // WSL2 / 容器环境 fallback：perf 失败时生成模拟数据
         if (result != 0)
         {
+            // A3: 不再无条件 mock。默认显式返回失败，和 eBPF 走同一套门控，
+            // 避免演示/评审现场把"采集失败"悄悄伪装成"采集成功"。
+            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
+            {
+                cout << "[agent] perf 采集失败(result=" << result
+                     << ")，默认不生成 mock。如仅本地开发要看页面链路，"
+                     << "可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
+                return {result, "perf"};
+            }
             cout << "[agent] perf 失败(result=" << result
-                 << ")，启用 WSL2 mock 模式" << endl;
+                 << ")，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
             generate_mock_collapsed_stacks(path);
-            return {0, "perf(mock)"}; // 返回成功，后续正常上传
+            return {0, "perf(mock)"};
         }
         return {result, "perf"};
     }
@@ -214,7 +222,14 @@ static pair<int, string> run_profiler(
         int result = drop::run_async_profiler(task, path);
         if (result != 0)
         {
-            cout << "[agent] async-profiler 不可用，启用 mock 模式" << endl;
+            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
+            {
+                cout << "[agent] async-profiler 采集失败(result=" << result
+                     << ")，默认不生成 mock。如仅本地开发要看页面链路，"
+                     << "可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
+                return {result, "async-profiler"};
+            }
+            cout << "[agent] async-profiler 不可用，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
             generate_mock_collapsed_stacks(outputPath);
             return {0, "async-profiler(mock)"};
         }
@@ -227,7 +242,14 @@ static pair<int, string> run_profiler(
         int result = drop::run_pprof(task, path);
         if (result != 0)
         {
-            cout << "[agent] pprof 不可用，启用 mock 模式" << endl;
+            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
+            {
+                cout << "[agent] pprof 采集失败(result=" << result
+                     << ")，默认不生成 mock。如仅本地开发要看页面链路，"
+                     << "可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
+                return {result, "pprof"};
+            }
+            cout << "[agent] pprof 不可用，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
             generate_mock_collapsed_stacks(outputPath);
             return {0, "pprof(mock)"};
         }
@@ -292,6 +314,10 @@ static pair<int, string> run_profiler(
         int result = drop::run_perf(task, path);
         if (result != 0)
         {
+            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
+            {
+                return {result, "perf(回退)"};
+            }
             generate_mock_collapsed_stacks(path);
             return {0, "perf(mock,回退)"};
         }

@@ -73,6 +73,7 @@ set(SERVER_SRCS
     server/main.cpp
     server/AgentInfo.cpp
     server/TaskQueue.cpp
+    server/ResultNotifier.cpp
     server/HealthCheckService.cpp
     server/HotmethodService.cpp
     server/ControlService.cpp

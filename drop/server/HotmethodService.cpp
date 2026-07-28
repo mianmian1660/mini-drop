@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "server/HotmethodService.h"
+#include "server/ResultNotifier.h"
 
 #include <iostream>
 
@@ -41,6 +42,10 @@ namespace drop_server
                  << " IO_r=" << ps.readkbpers() << "KB/s"
                  << " IO_w=" << ps.writekbpers() << "KB/s" << endl;
         }
+
+        // A3: 主动通知 apiserver（"锦上添花"，失败不影响本 RPC 返回成功）
+        notify_apiserver_task_result(*request);
+
         return grpc::Status::OK;
     }
 
