@@ -8,11 +8,39 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
+// RequestID 请求 ID 中间件（A4，6.4 节推荐的中间件顺序里贯穿全链路的 request_id）
+// 优先复用客户端传入的 X-Request-ID（方便前端/上游把一次操作串联起来排障），
+// 没有则生成一个；写回响应头，并存进 gin.Context 供后续 handler/日志取用。
+// 必须排在其他中间件最前面，这样 AccessLog 等才能拿到同一个 request_id。
+func RequestID() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		rid := c.GetHeader("X-Request-ID")
+		if rid == "" {
+			rid = uuid.New().String()
+		}
+		c.Set("request_id", rid)
+		c.Header("X-Request-ID", rid)
+		c.Next()
+	}
+}
+
+// requestIDFromContext 取出 RequestID 中间件写入的 request_id；
+// 理论上不会缺失（RequestID 应排在最前面），缺失时返回空字符串而不是 panic。
+func requestIDFromContext(c *gin.Context) string {
+	if v, ok := c.Get("request_id"); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 // AccessLog 访问日志中间件
-// 记录每个 HTTP 请求的：方法、路径、状态码、耗时、客户端 IP
+// 记录每个 HTTP 请求的：request_id、方法、路径、状态码、耗时、客户端 IP
 func AccessLog(logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -23,6 +51,7 @@ func AccessLog(logger *zap.Logger) gin.HandlerFunc {
 		// 记录日志
 		latency := time.Since(start)
 		logger.Info("HTTP 请求",
+			zap.String("request_id", requestIDFromContext(c)),
 			zap.String("method", c.Request.Method),
 			zap.String("path", c.Request.URL.Path),
 			zap.Int("status", c.Writer.Status()),
@@ -64,6 +93,7 @@ func Recovery(logger *zap.Logger) gin.HandlerFunc {
 		defer func() {
 			if err := recover(); err != nil {
 				logger.Error("服务 panic 恢复",
+					zap.String("request_id", requestIDFromContext(c)),
 					zap.Any("error", err),
 					zap.String("path", c.Request.URL.Path),
 				)

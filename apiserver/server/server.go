@@ -46,7 +46,9 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 
 	router := gin.New()
 
-	// 全局中间件：Recovery → CORS → AccessLog
+	// 全局中间件：RequestID → Recovery → CORS → AccessLog（6.4 节推荐顺序）
+	// RequestID 必须排最前面，这样 Recovery/AccessLog 才能拿到同一个 request_id。
+	router.Use(middleware.RequestID())
 	router.Use(middleware.Recovery(logger))
 	router.Use(middleware.CORS())
 	router.Use(middleware.AccessLog(logger))
@@ -401,16 +403,22 @@ func (s *APIServer) startAgentDiscoverer() {
 }
 
 // registerRoutes 注册所有 API 路由
+//
+// A4: /api/v1 下除 /auth/check 外的所有路由都挂 CheckLogin 中间件，
+// 缺失 Drop_user_uid 时统一 401，不再无条件放通。
+// /auth/check 必须留在鉴权组之外——它自己就是用来告诉前端"有没有登录"的，
+// 如果也被拦住，前端永远拿不到"未登录"这个明确信号。
 func (s *APIServer) registerRoutes() {
 	// 健康检查（不需要鉴权）
 	s.Router.GET("/healthz", s.Healthz)
 
-	// API v1 路由组
-	api := s.Router.Group("/api/v1")
-	{
-		// 鉴权回调（不需要登录中间件）
-		api.GET("/auth/check", s.AuthCheck)
+	// 鉴权回调（不挂 CheckLogin，这是唯一的例外）
+	s.Router.GET("/api/v1/auth/check", s.AuthCheck)
 
+	// 其余 /api/v1 路由：统一要求带身份信息
+	api := s.Router.Group("/api/v1")
+	api.Use(s.CheckLogin)
+	{
 		// 用户信息
 		api.GET("/users", s.GetCurrentUser)
 
@@ -454,6 +462,6 @@ func (s *APIServer) registerRoutes() {
 	}
 
 	s.Logger.Info("路由注册完成",
-		zap.Int("api_count", 22),
+		zap.Int("api_count", 23),
 	)
 }

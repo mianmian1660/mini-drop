@@ -341,11 +341,16 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 
 // GetTaskDetail 获取任务详情（含产物下载链接 + TopN 热点数据）
 // GET /api/v1/tasks/:tid
+//
+// A4: 加 uid 过滤，防止越权访问他人任务。CheckLogin 中间件保证 uid 非空。
+// 查不到时统一返回"任务不存在"（不区分"确实不存在"和"存在但不是你的"），
+// 避免向未授权用户泄露 tid 是否存在。
 func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	tid := c.Param("tid")
+	uid := c.GetHeader("Drop_user_uid")
 
 	var task model.HotmethodTask
-	if err := s.DB.Where("tid = ?", tid).First(&task).Error; err != nil {
+	if err := s.DB.Where("tid = ? AND uid = ?", tid, uid).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"code":    404,
 			"message": "任务不存在: " + tid,
@@ -607,11 +612,13 @@ func (s *APIServer) fetchTaskStatusEvents(tid string) []model.TaskStatusEvent {
 
 // DeleteTask 软删除任务
 // DELETE /api/v1/tasks/:tid
+// A4: 加 uid 过滤，防止越权删除他人任务。
 func (s *APIServer) DeleteTask(c *gin.Context) {
 	tid := c.Param("tid")
+	uid := c.GetHeader("Drop_user_uid")
 
 	// 使用 GORM 软删除
-	result := s.DB.Where("tid = ?", tid).Delete(&model.HotmethodTask{})
+	result := s.DB.Where("tid = ? AND uid = ?", tid, uid).Delete(&model.HotmethodTask{})
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code":    500,
@@ -637,12 +644,16 @@ func (s *APIServer) DeleteTask(c *gin.Context) {
 
 // RetryTask 重试失败的任务（用同参数重新创建）
 // POST /api/v1/tasks/:tid/retry
+// A4: 加 uid 过滤，防止用他人任务的 tid 发起重试（越权发起新的采集）。
+// 这个函数没有在 A4 原定文件清单里被单独点名，但和 GetTaskDetail/DeleteTask
+// 是同一类"按 tid 直查，不校验 uid"的漏洞，放着不管等于没修完，顺手一起补上。
 func (s *APIServer) RetryTask(c *gin.Context) {
 	tid := c.Param("tid")
+	uid := c.GetHeader("Drop_user_uid")
 
 	// 查找原任务
 	var oldTask model.HotmethodTask
-	if err := s.DB.Unscoped().Where("tid = ?", tid).First(&oldTask).Error; err != nil {
+	if err := s.DB.Unscoped().Where("tid = ? AND uid = ?", tid, uid).First(&oldTask).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"code":    404,
 			"message": "原任务不存在: " + tid,
