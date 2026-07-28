@@ -21,6 +21,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 
 	"github.com/mini-drop/apiserver/model"
 	pb_common "github.com/mini-drop/apiserver/proto/common"
@@ -77,7 +78,6 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		req.Callgraph = "fp"
 	}
 
-	tid := util.GenTID()
 	uid := c.GetHeader("Drop_user_uid")
 	if uid == "" {
 		uid = "default-user"
@@ -86,6 +86,36 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 	if userName == "" {
 		userName = "默认用户"
 	}
+
+	// A2: Idempotency-Key 去重（4.2 节）。同一用户携带相同幂等键重复提交，
+	// 直接返回已存在的任务，不重复创建、不重复下发。
+	var idempotencyKey *string
+	if raw := strings.TrimSpace(c.GetHeader("Idempotency-Key")); raw != "" {
+		idempotencyKey = &raw
+
+		var existing model.HotmethodTask
+		err := s.DB.Where("uid = ? AND idempotency_key = ?", uid, raw).First(&existing).Error
+		if err == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"code": 0,
+				"data": gin.H{
+					"tid":      existing.TID,
+					"replayed": true,
+				},
+			})
+			return
+		}
+		if err != gorm.ErrRecordNotFound {
+			s.Logger.Error("查询幂等键失败", zap.String("idempotency_key", raw), zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code":    500,
+				"message": "服务器内部错误",
+			})
+			return
+		}
+	}
+
+	tid := util.GenTID()
 
 	// 将性能采集参数序列化为 JSONB（只存采参，不存 Name/TargetIP 等已落列的字段）
 	paramsJSON, err := util.MarshalJSONB(PerfParams{
@@ -119,10 +149,27 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		AnalysisStatus: 0, // 待分析
 		UID:            uid,
 		UserName:       userName,
+		IdempotencyKey: idempotencyKey,
 		CreateTime:     now,
 	}
 
 	if err := s.DB.Create(task).Error; err != nil {
+		// A2: 并发下两个携带相同幂等键的请求可能都通过了前面的查重，
+		// 只有一个能真正插入成功；另一个会撞在 (uid, idempotency_key) 唯一索引上。
+		// 这种情况下不报错，改为查出已创建成功的那条任务返回，保证"只有一个 Task"。
+		if idempotencyKey != nil && isUniqueViolation(err) {
+			var existing model.HotmethodTask
+			if lookupErr := s.DB.Where("uid = ? AND idempotency_key = ?", uid, *idempotencyKey).First(&existing).Error; lookupErr == nil {
+				c.JSON(http.StatusOK, gin.H{
+					"code": 0,
+					"data": gin.H{
+						"tid":      existing.TID,
+						"replayed": true,
+					},
+				})
+				return
+			}
+		}
 		s.Logger.Error("创建任务失败", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code":    500,
@@ -140,7 +187,7 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 			zap.String("tid", tid),
 		)
 		// 标记为失败，等待后续手动重试或 cron 重发
-		_ = s.transitionTaskStatus(task, TaskStatusFailed, "gRPC 未连接，任务无法下发到 drop_server", "apiserver", nil)
+		_ = s.transitionTaskStatus(task, TaskStatusFailed, formatErrorReason(ErrCodeDependencyUnavailable, "gRPC 未连接，任务无法下发到 drop_server"), "apiserver", nil)
 	}
 
 	s.Logger.Info("任务创建成功",

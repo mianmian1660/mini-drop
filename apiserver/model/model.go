@@ -63,18 +63,22 @@ type AgentAuditLog struct {
 // HotmethodTask — 任务表（最核心的表！）
 // ----------------------------------------------------------
 type HotmethodTask struct {
-	ID             uint           `gorm:"primaryKey" json:"id"`
-	TID            string         `gorm:"column:tid;uniqueIndex;size:64" json:"tid"`
-	Name           string         `gorm:"column:name;size:256" json:"name"`
-	Type           uint32         `gorm:"column:type;default:0" json:"type"`
-	ProfilerType   uint32         `gorm:"column:profiler_type;default:0" json:"profiler_type"`
-	TargetIP       string         `gorm:"column:target_ip;size:45" json:"target_ip"`
-	RequestParams  []byte         `gorm:"column:request_params;type:jsonb" json:"request_params"`
-	Status         int            `gorm:"column:status;default:0;index" json:"status"`
-	StatusInfo     string         `gorm:"column:status_info;size:1024" json:"status_info"`
-	AnalysisStatus int            `gorm:"column:analysis_status;default:0" json:"analysis_status"`
-	UID            string         `gorm:"column:uid;size:64" json:"uid"`
-	UserName       string         `gorm:"column:user_name;size:128" json:"user_name"`
+	ID             uint   `gorm:"primaryKey" json:"id"`
+	TID            string `gorm:"column:tid;uniqueIndex;size:64" json:"tid"`
+	Name           string `gorm:"column:name;size:256" json:"name"`
+	Type           uint32 `gorm:"column:type;default:0" json:"type"`
+	ProfilerType   uint32 `gorm:"column:profiler_type;default:0" json:"profiler_type"`
+	TargetIP       string `gorm:"column:target_ip;size:45" json:"target_ip"`
+	RequestParams  []byte `gorm:"column:request_params;type:jsonb" json:"request_params"`
+	Status         int    `gorm:"column:status;default:0;index" json:"status"`
+	StatusInfo     string `gorm:"column:status_info;size:1024" json:"status_info"`
+	AnalysisStatus int    `gorm:"column:analysis_status;default:0" json:"analysis_status"`
+	UID            string `gorm:"column:uid;size:64;uniqueIndex:idx_task_uid_idempotency" json:"uid"`
+	UserName       string `gorm:"column:user_name;size:128" json:"user_name"`
+	// IdempotencyKey 幂等键（A2）：和 UID 组成联合唯一索引。
+	// 未提供时为 nil（SQL NULL），多条 NULL 之间不冲突；提供了就必须在同一用户下唯一，
+	// 重复请求会命中已有任务而不是新建一条（新复刻指南 4.2 节）。
+	IdempotencyKey *string        `gorm:"column:idempotency_key;size:128;uniqueIndex:idx_task_uid_idempotency" json:"idempotency_key,omitempty"`
 	CreateTime     time.Time      `gorm:"column:create_time" json:"create_time"`
 	BeginTime      *time.Time     `gorm:"column:begin_time" json:"begin_time"`
 	EndTime        *time.Time     `gorm:"column:end_time" json:"end_time"`

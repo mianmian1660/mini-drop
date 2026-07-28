@@ -70,6 +70,13 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 初始化 gRPC 连接（连接失败不阻止启动，后续 CreateTask 会回退到仅写库模式）
 	s.initGRPC()
 
+	// A2: 启动一次性对账（4.6 节：Server 重启后从 DB 恢复待调度工作）
+	// 等待一段时间让 gRPC 有机会连接上，再扫描"卡在 Created 状态"的孤儿任务。
+	go func() {
+		time.Sleep(10 * time.Second)
+		s.reconcileOrphanedTasks()
+	}()
+
 	// 启动任务状态轮询器（W3：定期检查 Running 任务是否应标记为完成）
 	go s.startTaskPoller()
 
@@ -255,6 +262,53 @@ func (s *APIServer) pollRunningTasks() {
 					zap.Bool("has_artifacts", hasArtifacts),
 				)
 			}
+		}
+	}
+}
+
+// reconcileOrphanedTasks 启动时执行一次性对账（A2，新复刻指南 4.6 节）。
+//
+// CreateTask 的实现是"写库 -> 同步调 gRPC 下发"，如果进程恰好在写库成功、
+// 下发完成之前崩溃/重启，任务会永久停留在 Created(0) 状态，没有任何机制
+// 让它继续往前走。这里扫描这类"孤儿任务"，重新尝试下发；gRPC 仍不可用
+// 就显式标记失败，不允许任务无声无息地卡住。
+func (s *APIServer) reconcileOrphanedTasks() {
+	cutoff := time.Now().Add(-30 * time.Second)
+
+	var tasks []model.HotmethodTask
+	if err := s.DB.Where("status = ? AND create_time < ?", TaskStatusCreated, cutoff).Find(&tasks).Error; err != nil {
+		s.Logger.Error("启动对账查询失败", zap.Error(err))
+		return
+	}
+	if len(tasks) == 0 {
+		s.Logger.Info("启动对账：没有发现停留在 Created 状态的孤儿任务")
+		return
+	}
+
+	s.Logger.Info("启动对账：发现停留在 Created 状态的孤儿任务", zap.Int("count", len(tasks)))
+
+	for i := range tasks {
+		task := &tasks[i]
+
+		var params PerfParams
+		if err := util.UnmarshalJSONB(task.RequestParams, &params); err != nil {
+			s.Logger.Warn("启动对账：解析任务参数失败", zap.String("tid", task.TID), zap.Error(err))
+			_ = s.transitionTaskStatus(task, TaskStatusFailed, formatErrorReason(ErrCodeTaskInvalidArgument, "Server 重启对账：任务参数无法解析"), "startup_reconciler", nil)
+			continue
+		}
+
+		req := CreateTaskReq{
+			Name: task.Name, TaskType: task.Type, ProfilerType: task.ProfilerType,
+			TargetIP: task.TargetIP, TargetPID: params.TargetPID, Duration: params.Duration,
+			Frequency: params.Frequency, Callgraph: params.Callgraph, Event: params.Event,
+			Subprocess: params.Subprocess,
+		}
+
+		if s.GrpcConnected() {
+			s.Logger.Info("启动对账：重新下发孤儿任务", zap.String("tid", task.TID))
+			s.dispatchTask(task, req)
+		} else {
+			_ = s.transitionTaskStatus(task, TaskStatusFailed, formatErrorReason(ErrCodeDependencyUnavailable, "Server 重启对账：gRPC 仍未连接，任务无法下发"), "startup_reconciler", nil)
 		}
 	}
 }
