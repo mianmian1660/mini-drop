@@ -29,10 +29,12 @@ const (
 
 // Artifact — 一份任务产物的元数据
 type Artifact struct {
-	ID          uint      `gorm:"primaryKey" json:"id"`
-	TaskTID     string    `gorm:"column:task_tid;size:64;index" json:"task_tid"`
+	ID uint `gorm:"primaryKey" json:"id"`
+	// TaskTID 原有单列 index 保留，再加入 A5 新增的 idx_artifacts_task_kind 联合索引
+	// （task_tid, kind），对应新复刻指南 9.4 节原文列出的同名索引。
+	TaskTID     string    `gorm:"column:task_tid;size:64;index;index:idx_artifacts_task_kind,priority:1" json:"task_tid"`
 	AttemptID   uint      `gorm:"column:attempt_id;index" json:"attempt_id"` // 关联 TaskAttempt.ID，0 表示尚未关联到具体尝试
-	Kind        string    `gorm:"column:kind;size:32" json:"kind"`
+	Kind        string    `gorm:"column:kind;size:32;index:idx_artifacts_task_kind,priority:2" json:"kind"`
 	ObjectKey   string    `gorm:"column:object_key;size:512" json:"object_key"` // 如 "tid/perf.data"
 	Size        int64     `gorm:"column:size" json:"size"`
 	SHA256      string    `gorm:"column:sha256;size:64" json:"sha256"`

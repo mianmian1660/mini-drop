@@ -63,40 +63,49 @@ type AgentAuditLog struct {
 // HotmethodTask — 任务表（最核心的表！）
 // ----------------------------------------------------------
 type HotmethodTask struct {
-	ID             uint   `gorm:"primaryKey" json:"id"`
-	TID            string `gorm:"column:tid;uniqueIndex;size:64" json:"tid"`
-	Name           string `gorm:"column:name;size:256" json:"name"`
-	Type           uint32 `gorm:"column:type;default:0" json:"type"`
-	ProfilerType   uint32 `gorm:"column:profiler_type;default:0" json:"profiler_type"`
-	TargetIP       string `gorm:"column:target_ip;size:45" json:"target_ip"`
-	RequestParams  []byte `gorm:"column:request_params;type:jsonb" json:"request_params"`
-	Status         int    `gorm:"column:status;default:0;index" json:"status"`
+	ID           uint   `gorm:"primaryKey" json:"id"`
+	TID          string `gorm:"column:tid;uniqueIndex;size:64" json:"tid"`
+	Name         string `gorm:"column:name;size:256" json:"name"`
+	Type         uint32 `gorm:"column:type;default:0" json:"type"`
+	ProfilerType uint32 `gorm:"column:profiler_type;default:0" json:"profiler_type"`
+	// TargetIP 参与 A5 新增的 idx_tasks_target_status 联合索引（target_ip, status, create_time），
+	// 支持"某目标机器下特定状态任务"这类查询（新复刻指南 9.4 节）。
+	TargetIP      string `gorm:"column:target_ip;size:45;index:idx_tasks_target_status,priority:1" json:"target_ip"`
+	RequestParams []byte `gorm:"column:request_params;type:jsonb" json:"request_params"`
+	// Status 原有的单列 index 保留（现有查询很多按 status 单独过滤），
+	// 再加入 idx_tasks_target_status 联合索引的第二列。
+	Status         int    `gorm:"column:status;default:0;index;index:idx_tasks_target_status,priority:2" json:"status"`
 	StatusInfo     string `gorm:"column:status_info;size:1024" json:"status_info"`
 	AnalysisStatus int    `gorm:"column:analysis_status;default:0" json:"analysis_status"`
-	UID            string `gorm:"column:uid;size:64;uniqueIndex:idx_task_uid_idempotency" json:"uid"`
-	UserName       string `gorm:"column:user_name;size:128" json:"user_name"`
+	// UID 同时属于两个联合索引：A2 的幂等键唯一索引、A5 新增的 idx_tasks_uid_created
+	// （uid, create_time），支持 ListTasks 里"按 uid 过滤 + 按创建时间排序"的查询模式。
+	UID      string `gorm:"column:uid;size:64;uniqueIndex:idx_task_uid_idempotency;index:idx_tasks_uid_created,priority:1" json:"uid"`
+	UserName string `gorm:"column:user_name;size:128" json:"user_name"`
 	// IdempotencyKey 幂等键（A2）：和 UID 组成联合唯一索引。
 	// 未提供时为 nil（SQL NULL），多条 NULL 之间不冲突；提供了就必须在同一用户下唯一，
 	// 重复请求会命中已有任务而不是新建一条（新复刻指南 4.2 节）。
-	IdempotencyKey *string        `gorm:"column:idempotency_key;size:128;uniqueIndex:idx_task_uid_idempotency" json:"idempotency_key,omitempty"`
-	CreateTime     time.Time      `gorm:"column:create_time" json:"create_time"`
-	BeginTime      *time.Time     `gorm:"column:begin_time" json:"begin_time"`
-	EndTime        *time.Time     `gorm:"column:end_time" json:"end_time"`
-	MasterTaskTID  string         `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
-	DeletedAt      gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	IdempotencyKey *string `gorm:"column:idempotency_key;size:128;uniqueIndex:idx_task_uid_idempotency" json:"idempotency_key,omitempty"`
+	// CreateTime 同时是 idx_tasks_uid_created 和 idx_tasks_target_status 两个联合索引的最后一列。
+	CreateTime    time.Time      `gorm:"column:create_time;index:idx_tasks_uid_created,priority:2;index:idx_tasks_target_status,priority:3" json:"create_time"`
+	BeginTime     *time.Time     `gorm:"column:begin_time" json:"begin_time"`
+	EndTime       *time.Time     `gorm:"column:end_time" json:"end_time"`
+	MasterTaskTID string         `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
+	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
 }
 
 // ----------------------------------------------------------
 // TaskStatusEvent — 任务状态迁移审计表
 // ----------------------------------------------------------
 type TaskStatusEvent struct {
-	ID         uint      `gorm:"primaryKey" json:"id"`
-	TID        string    `gorm:"column:tid;size:64;index" json:"tid"`
+	ID uint `gorm:"primaryKey" json:"id"`
+	// TID 原有单列 index 保留，再加入 A5 新增的 idx_task_events_tid_created 联合索引，
+	// 支持 fetchTaskStatusEvents 里"按 tid 过滤 + 按时间排序"的查询模式（9.4 节）。
+	TID        string    `gorm:"column:tid;size:64;index;index:idx_task_events_tid_created,priority:1" json:"tid"`
 	FromStatus int       `gorm:"column:from_status" json:"from_status"`
 	ToStatus   int       `gorm:"column:to_status" json:"to_status"`
 	Reason     string    `gorm:"column:reason;size:1024" json:"reason"`
 	Source     string    `gorm:"column:source;size:64" json:"source"`
-	CreatedAt  time.Time `gorm:"column:created_at" json:"created_at"`
+	CreatedAt  time.Time `gorm:"column:created_at;index:idx_task_events_tid_created,priority:2" json:"created_at"`
 }
 
 // ----------------------------------------------------------
@@ -190,5 +199,6 @@ func AutoMigrate(db *gorm.DB) error {
 		&TaskAttempt{},
 		&Artifact{},
 		&AnalysisJob{},
+		&Outbox{},
 	)
 }

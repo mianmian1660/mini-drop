@@ -79,6 +79,11 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 		s.reconcileOrphanedTasks()
 	}()
 
+	// A5: 启动 Outbox 分发器（9.6 节 Transactional Outbox）
+	// CreateTask/RetryTask/executeScheduledTask 只负责把"需要下发"这件事和任务记录
+	// 一起原子落库，真正的 gRPC 下发在这里异步执行。
+	go s.dispatchOutboxLoop()
+
 	// 启动任务状态轮询器（W3：定期检查 Running 任务是否应标记为完成）
 	go s.startTaskPoller()
 
@@ -265,6 +270,79 @@ func (s *APIServer) pollRunningTasks() {
 				)
 			}
 		}
+	}
+}
+
+// dispatchOutboxLoop 后台 Outbox 分发器（A5，新复刻指南 9.6 节）。
+// 每 2 秒领取一批未发布的 outbox 记录，执行真正的 gRPC 下发。
+// 这个间隔比同步下发多了最多 2 秒的延迟，换来的是"任务落库"和"下发意图落库"
+// 的原子性——进程崩溃发生在两者之间不会再产生需要靠时间猜的孤儿任务
+// （A2 的 reconcileOrphanedTasks 仍然保留作为兜底：outbox 记录本身发布失败、
+// 或者更极端的场景下，两套机制不冲突，互相独立）。
+func (s *APIServer) dispatchOutboxLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.drainOutbox()
+	}
+}
+
+// drainOutbox 领取一批未发布的 outbox 记录并逐条处理。
+func (s *APIServer) drainOutbox() {
+	var entries []model.Outbox
+	if err := s.DB.Where("published_at IS NULL").
+		Order("created_at ASC").
+		Limit(20).
+		Find(&entries).Error; err != nil {
+		s.Logger.Error("查询 outbox 失败", zap.Error(err))
+		return
+	}
+
+	for i := range entries {
+		s.processOutboxEntry(&entries[i])
+	}
+}
+
+// processOutboxEntry 处理单条 outbox 记录：解析 payload → 真正调 gRPC 下发 →
+// 无论下发成功与否都标记为已发布（"已发布"表示"已经尝试过下发"，
+// 下发本身成功与否体现在任务自身的状态机 status/status_info 里）。
+func (s *APIServer) processOutboxEntry(entry *model.Outbox) {
+	defer func() {
+		now := time.Now()
+		if err := s.DB.Model(entry).Update("published_at", &now).Error; err != nil {
+			s.Logger.Error("标记 outbox 已发布失败", zap.Uint("id", entry.ID), zap.Error(err))
+		}
+	}()
+
+	if entry.Event != model.OutboxEventDispatchTask {
+		s.Logger.Warn("未知的 outbox 事件类型，跳过", zap.Uint("id", entry.ID), zap.String("event", entry.Event))
+		return
+	}
+
+	var req CreateTaskReq
+	if err := util.UnmarshalJSONB(entry.Payload, &req); err != nil {
+		s.Logger.Error("解析 outbox payload 失败", zap.Uint("id", entry.ID), zap.Error(err))
+		return
+	}
+
+	var task model.HotmethodTask
+	if err := s.DB.Where("tid = ?", entry.AggregateID).First(&task).Error; err != nil {
+		s.Logger.Warn("outbox 对应的任务不存在，跳过", zap.String("tid", entry.AggregateID))
+		return
+	}
+
+	// 任务已经被别的机制（比如 A2 的启动对账）推进过，不重复下发
+	if task.Status != TaskStatusCreated {
+		return
+	}
+
+	if s.GrpcConnected() {
+		s.dispatchTask(&task, req)
+	} else {
+		_ = s.transitionTaskStatus(&task, TaskStatusFailed,
+			formatErrorReason(ErrCodeDependencyUnavailable, "gRPC 未连接，任务无法下发到 drop_server"),
+			"outbox_dispatcher", nil)
 	}
 }
 

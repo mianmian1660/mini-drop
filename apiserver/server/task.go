@@ -153,7 +153,10 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		CreateTime:     now,
 	}
 
-	if err := s.DB.Create(task).Error; err != nil {
+	// A5: Task 和"需要下发"这件事在同一事务里落地（新复刻指南 9.6 节 Transactional
+	// Outbox），替代之前"写库后立刻在本次请求里同步调 gRPC"的非事务模式。
+	// 真正的 gRPC 下发交给后台 dispatchOutboxLoop 异步执行，HTTP 响应不用等 gRPC 往返。
+	if err := s.createTaskWithOutbox(task, req); err != nil {
 		// A2: 并发下两个携带相同幂等键的请求可能都通过了前面的查重，
 		// 只有一个能真正插入成功；另一个会撞在 (uid, idempotency_key) 唯一索引上。
 		// 这种情况下不报错，改为查出已创建成功的那条任务返回，保证"只有一个 Task"。
@@ -179,17 +182,6 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 	}
 	s.recordTaskStatusEvent(task.TID, -1, TaskStatusCreated, "任务已创建，等待下发", "apiserver")
 
-	// W3: 通过 gRPC 下发任务到 drop_server
-	if s.GrpcConnected() {
-		s.dispatchTask(task, req)
-	} else {
-		s.Logger.Warn("gRPC 未连接，任务仅写库未下发",
-			zap.String("tid", tid),
-		)
-		// 标记为失败，等待后续手动重试或 cron 重发
-		_ = s.transitionTaskStatus(task, TaskStatusFailed, formatErrorReason(ErrCodeDependencyUnavailable, "gRPC 未连接，任务无法下发到 drop_server"), "apiserver", nil)
-	}
-
 	s.Logger.Info("任务创建成功",
 		zap.String("tid", tid),
 		zap.String("target_ip", req.TargetIP),
@@ -201,6 +193,29 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		"data": gin.H{
 			"tid": tid,
 		},
+	})
+}
+
+// createTaskWithOutbox 在同一事务内写入 HotmethodTask 和对应的 Outbox 下发记录（A5，
+// 新复刻指南 9.6 节 Transactional Outbox）。task/req 必须已经填好全部字段。
+// 真正的 gRPC 下发不在这里做，交给后台 dispatchOutboxLoop 异步领取执行。
+func (s *APIServer) createTaskWithOutbox(task *model.HotmethodTask, req CreateTaskReq) error {
+	payload, err := util.MarshalJSONB(req)
+	if err != nil {
+		return err
+	}
+	outboxEntry := &model.Outbox{
+		Aggregate:   model.OutboxAggregateTask,
+		AggregateID: task.TID,
+		Event:       model.OutboxEventDispatchTask,
+		Payload:     payload,
+		CreatedAt:   time.Now(),
+	}
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(task).Error; err != nil {
+			return err
+		}
+		return tx.Create(outboxEntry).Error
 	})
 }
 
@@ -681,7 +696,26 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 		MasterTaskTID:  tid, // 记录父任务
 	}
 
-	if err := s.DB.Create(&newTask).Error; err != nil {
+	// 从原任务的 request_params 重建采集参数，构造下发用的请求体
+	var oldParams PerfParams
+	if err := util.UnmarshalJSONB(oldTask.RequestParams, &oldParams); err != nil {
+		s.Logger.Warn("解析原任务参数失败，使用默认值", zap.Error(err))
+	}
+	req := CreateTaskReq{
+		Name:         newTask.Name,
+		TaskType:     newTask.Type,
+		ProfilerType: newTask.ProfilerType,
+		TargetIP:     newTask.TargetIP,
+		TargetPID:    oldParams.TargetPID,
+		Duration:     oldParams.Duration,
+		Frequency:    oldParams.Frequency,
+		Callgraph:    oldParams.Callgraph,
+		Event:        oldParams.Event,
+		Subprocess:   oldParams.Subprocess,
+	}
+
+	// A5: 同事务写 Task + Outbox，下发交给后台 dispatchOutboxLoop 异步执行
+	if err := s.createTaskWithOutbox(&newTask, req); err != nil {
 		s.Logger.Error("重试任务创建失败", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code":    500,
@@ -690,30 +724,6 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 		return
 	}
 	s.recordTaskStatusEvent(newTask.TID, -1, TaskStatusCreated, "重试任务已创建，等待下发", "apiserver")
-
-	// W3: 重试任务也通过 gRPC 下发
-	if s.GrpcConnected() {
-		// 从原任务的 request_params 重建采集参数
-		var oldParams PerfParams
-		if err := util.UnmarshalJSONB(oldTask.RequestParams, &oldParams); err != nil {
-			s.Logger.Warn("解析原任务参数失败，使用默认值", zap.Error(err))
-		}
-		req := CreateTaskReq{
-			Name:         newTask.Name,
-			TaskType:     newTask.Type,
-			ProfilerType: newTask.ProfilerType,
-			TargetIP:     newTask.TargetIP,
-			TargetPID:    oldParams.TargetPID,
-			Duration:     oldParams.Duration,
-			Frequency:    oldParams.Frequency,
-			Callgraph:    oldParams.Callgraph,
-			Event:        oldParams.Event,
-			Subprocess:   oldParams.Subprocess,
-		}
-		s.dispatchTask(&newTask, req)
-	} else {
-		_ = s.transitionTaskStatus(&newTask, TaskStatusFailed, "gRPC 未连接，重试任务无法下发", "apiserver", nil)
-	}
 
 	s.Logger.Info("任务重试成功",
 		zap.String("old_tid", tid),

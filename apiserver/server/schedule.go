@@ -122,26 +122,23 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 		CreateTime:     now,
 	}
 
-	if err := s.DB.Create(task).Error; err != nil {
-		s.Logger.Error("定时任务创建失败", zap.String("sid", sch.SID), zap.Error(err))
-		return
+	req := CreateTaskReq{
+		Name:         task.Name,
+		TaskType:     sch.TaskType,
+		ProfilerType: sch.ProfilerType,
+		TargetIP:     sch.TargetIP,
+		TargetPID:    params.TargetPID,
+		Duration:     params.Duration,
+		Frequency:    params.Frequency,
+		Callgraph:    params.Callgraph,
+		Event:        params.Event,
+		Subprocess:   params.Subprocess,
 	}
 
-	// 通过 gRPC 下发（如果已连接）
-	if s.GrpcConnected() {
-		req := CreateTaskReq{
-			Name:         task.Name,
-			TaskType:     sch.TaskType,
-			ProfilerType: sch.ProfilerType,
-			TargetIP:     sch.TargetIP,
-			TargetPID:    params.TargetPID,
-			Duration:     params.Duration,
-			Frequency:    params.Frequency,
-			Callgraph:    params.Callgraph,
-			Event:        params.Event,
-			Subprocess:   params.Subprocess,
-		}
-		s.dispatchTask(task, req)
+	// A5: 同事务写 Task + Outbox，下发交给后台 dispatchOutboxLoop 异步执行
+	if err := s.createTaskWithOutbox(task, req); err != nil {
+		s.Logger.Error("定时任务创建失败", zap.String("sid", sch.SID), zap.Error(err))
+		return
 	}
 
 	// 更新最后运行时间
