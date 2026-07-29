@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+from datetime import datetime, timezone
 
 # 引入同目录下的模块
 from storage import MinIOStorage, create_storage
@@ -41,6 +42,7 @@ from memleak_analyzer import analyze_memtrace, generate_mock_memtrace
 from bpf_analyzer import analyze_bpf_output, bpf_histogram_to_svg
 from java_analyzer import analyze_java_profile, generate_java_suggestions
 from attribution import run_attribution
+from observability import elapsed_seconds, log_event, now_seconds
 
 
 # ============================================================
@@ -266,7 +268,28 @@ def _save_attribution(conn, storage, bucket: str, tid: str, task: dict,
                       top_json: dict, folded_text: str, local_dir: str,
                       outputs: list, presigned_urls: dict, local_files: list):
     """归因失败不影响主分析；其状态同样保留给前端展示。"""
-    attribution = run_attribution(conn, task, top_json, folded_text)
+    started_at = now_seconds()
+    try:
+        attribution = run_attribution(conn, task, top_json, folded_text)
+    except Exception as e:
+        attribution = {
+            "status": "error",
+            "reasoning_summary": f"智能归因异常但主分析已继续: {e}",
+            "suggestion": "",
+            "evidence": [],
+            "done": False,
+            "engine": "",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    log_event(
+        "attribution_succeeded" if attribution.get("status") == "completed"
+        else "attribution_skipped" if attribution.get("status") == "skipped"
+        else "attribution_failed",
+        task_tid=tid,
+        status=attribution.get("status"),
+        duration_seconds=elapsed_seconds(started_at),
+        error=attribution.get("reasoning_summary") if attribution.get("status") == "error" else None,
+    )
     persist_attribution(conn, tid, attribution)
     key = _upload_output(storage, bucket, tid, "attribution.json", attribution, "application/json")
     if key:
@@ -337,9 +360,12 @@ def _upload_output(storage, bucket: str, tid: str,
     返回: MinIO key，失败返回空字符串
     """
     if storage is None:
+        log_event("artifact_upload_skipped", task_tid=tid, filename=filename,
+                  reason="storage_unavailable")
         return ""
 
     key = f"{tid}/{filename}"
+    started_at = now_seconds()
     try:
         if isinstance(content, str):
             data = content.encode("utf-8")
@@ -350,9 +376,18 @@ def _upload_output(storage, bucket: str, tid: str,
             data = json.dumps(content, ensure_ascii=False).encode("utf-8")
 
         if storage.put_object(bucket, key, data, content_type):
+            log_event("artifact_upload_succeeded", task_tid=tid, filename=filename,
+                      object_key=key, size_bytes=len(data),
+                      duration_seconds=elapsed_seconds(started_at))
             return key
+        log_event("artifact_upload_failed", task_tid=tid, filename=filename,
+                  object_key=key, duration_seconds=elapsed_seconds(started_at),
+                  error="put_object returned false")
         return ""
     except Exception as e:
+        log_event("artifact_upload_failed", task_tid=tid, filename=filename,
+                  object_key=key, duration_seconds=elapsed_seconds(started_at),
+                  error=str(e))
         print(f"[analysis] 上传 {filename} 失败: {e}", file=sys.stderr)
         return ""
 

@@ -14,6 +14,7 @@ import time
 
 from analyzer_registry import build_default_registry
 from lease import AnalysisLeaseClient
+from observability import elapsed_seconds, log_event, now_seconds
 
 
 POLL_INTERVAL = 5
@@ -78,8 +79,17 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
     import hotmethod_analyzer as hm
 
     tid = job.task_tid
+    started_at = now_seconds()
+    common = {
+        "task_tid": tid,
+        "job_id": job.id,
+        "pipeline": job.pipeline,
+        "attempt": job.attempt,
+        "worker_id": lease_client.worker_id,
+    }
     print(f"[analysis_daemon] 开始分析: job_id={job.id} tid={tid} "
           f"pipeline={job.pipeline} attempt={job.attempt}", file=sys.stderr)
+    log_event("analysis_started", **common)
 
     stop_heartbeat = threading.Event()
     heartbeat_thread = _start_heartbeat(lease_client, job.id, stop_heartbeat)
@@ -105,6 +115,10 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         if not lease_client.complete(job.id, ANALYZER_VERSION):
             print(f"[analysis_daemon] 完成标记未生效: job_id={job.id}", file=sys.stderr)
 
+        log_event("analysis_succeeded", **common,
+                  analysis_duration_seconds=elapsed_seconds(started_at),
+                  duration_seconds=elapsed_seconds(started_at),
+                  outputs_count=len(result.get("outputs", [])))
         print(f"[analysis_daemon] ✅ 分析成功: tid={tid} "
               f"outputs={len(result.get('outputs', []))}", file=sys.stderr)
         return True
@@ -112,6 +126,10 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
     except KeyError as e:
         update_analysis_status(dsn, tid, 3, f"未注册分析器: {e}")
         lease_client.fail(job.id, retry=False, analyzer_version=ANALYZER_VERSION)
+        log_event("analysis_failed", **common,
+                  analysis_duration_seconds=elapsed_seconds(started_at),
+                  duration_seconds=elapsed_seconds(started_at),
+                  error=str(e), retryable=False)
         print(f"[analysis_daemon] ❌ 不可重试失败: tid={tid} error={e}",
               file=sys.stderr)
         return False
@@ -120,13 +138,25 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         ok = code == 0
         if ok:
             lease_client.complete(job.id, ANALYZER_VERSION)
+            log_event("analysis_succeeded", **common,
+                      analysis_duration_seconds=elapsed_seconds(started_at),
+                      duration_seconds=elapsed_seconds(started_at),
+                      exit_code=code)
         else:
             update_analysis_status(dsn, tid, 3, f"分析失败: exit={code}")
             lease_client.fail(job.id, retry=True, analyzer_version=ANALYZER_VERSION)
+            log_event("analysis_failed", **common,
+                      analysis_duration_seconds=elapsed_seconds(started_at),
+                      duration_seconds=elapsed_seconds(started_at),
+                      exit_code=code, retryable=True)
         return ok
     except Exception as e:
         update_analysis_status(dsn, tid, 3, f"分析异常: {e}")
         lease_client.fail(job.id, retry=True, analyzer_version=ANALYZER_VERSION)
+        log_event("analysis_failed", **common,
+                  analysis_duration_seconds=elapsed_seconds(started_at),
+                  duration_seconds=elapsed_seconds(started_at),
+                  error=str(e), retryable=True)
         print(f"[analysis_daemon] ❌ 分析异常: tid={tid} error={e}", file=sys.stderr)
         return False
     finally:
@@ -169,9 +199,23 @@ def main():
           f"task_types={registry.task_types()})", file=sys.stderr)
 
     while True:
+        claim_started_at = now_seconds()
         try:
             job = lease_client.claim_one()
+            log_event("analysis_claimed" if job is not None else "analysis_claim_empty",
+                      worker_id=lease_client.worker_id,
+                      job_id=getattr(job, "id", None),
+                      task_tid=getattr(job, "task_tid", None),
+                      pipeline=getattr(job, "pipeline", None),
+                      attempt=getattr(job, "attempt", None),
+                      analysis_claim_latency_seconds=elapsed_seconds(claim_started_at),
+                      duration_seconds=elapsed_seconds(claim_started_at))
         except Exception as e:
+            log_event("analysis_claim_failed",
+                      worker_id=lease_client.worker_id,
+                      analysis_claim_latency_seconds=elapsed_seconds(claim_started_at),
+                      duration_seconds=elapsed_seconds(claim_started_at),
+                      error=str(e))
             print(f"[analysis_daemon] 领取 AnalysisJob 失败: {e}", file=sys.stderr)
             job = None
 

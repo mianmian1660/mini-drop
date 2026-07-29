@@ -4,6 +4,24 @@
 import json, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+def t_observability_json_log_fields():
+    import contextlib
+    import io
+    from observability import log_event
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        log_event("analysis_started", task_tid="tid-1",
+                  analysis_duration_seconds=1.25, ignored_none=None)
+    line = buf.getvalue().strip()
+    assert line.startswith("[analysis_observe] ")
+    payload = json.loads(line.replace("[analysis_observe] ", "", 1))
+    assert payload["component"] == "analysis"
+    assert payload["stage"] == "analysis_started"
+    assert payload["task_tid"] == "tid-1"
+    assert payload["analysis_duration_seconds"] == 1.25
+    assert "ignored_none" not in payload
+
 def t_parse_collapsed_basic():
     from collapsed_data_parser import parse_collapsed
     folded = "func1;func2;func3 10\nfunc1;func2;func4 5\nfunc1;func5 3\n"
@@ -25,6 +43,19 @@ def t_analyze_collapsed():
     from collapsed_data_parser import analyze_collapsed
     result = analyze_collapsed("main;worker;process 200\nmain;worker;io_wait 100\nmain;gc 50\n", top_n=10)
     assert result["total_samples"] == 350
+
+def t_analyze_collapsed_minimal_schema():
+    from collapsed_data_parser import analyze_collapsed
+    result = analyze_collapsed("main;hot 1\n", top_n=5)
+    assert result["total_samples"] == 1
+    assert "self_time_top" in result and isinstance(result["self_time_top"], list)
+    assert result["self_time_top"][0]["function"] == "hot"
+    assert {"function", "samples", "percentage"}.issubset(result["self_time_top"][0].keys())
+
+def t_parse_collapsed_truncated_lines_are_ignored():
+    from collapsed_data_parser import parse_collapsed
+    parsed = parse_collapsed("main;ok 3\nbroken-without-count\nmain;bad nope\n")
+    assert parsed == {"ok": 3}
 
 def t_parse_bpf_histogram():
     from bpf_analyzer import parse_bpf_histogram
@@ -166,6 +197,62 @@ def t_java_analyze_profile_topn():
     assert result["top_json"]["language"] == "java"
     assert result["top_json"]["self_time_top"][0]["function"] == "com.example.Foo.work"
     assert "<svg" in result["svg"]
+
+def t_java_unknown_profile_rejected():
+    from java_analyzer import analyze_java_profile
+    try:
+        analyze_java_profile(b"\x00\x01not a collapsed profile", task_name="bad")
+        assert False, "损坏 Java profile 应该被拒绝"
+    except ValueError as e:
+        assert "无法识别" in str(e)
+
+def t_java_collapsed_topn_schema():
+    from java_analyzer import analyze_java_profile
+    result = analyze_java_profile(
+        b"root;com.example.A.run 2\nroot;com.example.B.wait 1\n",
+        task_name="java-minimal",
+        top_n=10,
+    )
+    top = result["top_json"]["self_time_top"]
+    assert result["top_json"]["total_samples"] == 3
+    assert top[0]["function"] == "com.example.A.run"
+    assert {"function", "samples", "percentage"}.issubset(top[0].keys())
+
+def t_lease_owner_guard_sql():
+    from lease import AnalysisLeaseClient
+
+    class FakeCursor:
+        def __init__(self):
+            self.rowcount = 0
+            self.params = None
+        def execute(self, query, params):
+            self.query = query
+            self.params = params
+            self.rowcount = 1 if params[-1] == "owner-a" else 0
+        def close(self):
+            pass
+
+    class FakeConn:
+        def __init__(self):
+            self.cursor_obj = FakeCursor()
+        def cursor(self):
+            return self.cursor_obj
+        def commit(self):
+            pass
+        def close(self):
+            pass
+
+    conn = FakeConn()
+    client = AnalysisLeaseClient("fake", worker_id="owner-a")
+    client.connect = lambda: conn
+    assert client.heartbeat(7) is True
+    assert conn.cursor_obj.params[-1] == "owner-a"
+
+    late = FakeConn()
+    late_client = AnalysisLeaseClient("fake", worker_id="late-owner")
+    late_client.connect = lambda: late
+    assert late_client.complete(7, "v-test") is False
+    assert late.cursor_obj.params[-1] == "late-owner"
 
 def t_attribution_tool_call_and_evidence_validation():
     from attribution import run_attribution
