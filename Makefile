@@ -23,8 +23,8 @@ demo-cpu:
 	@echo "[demo-cpu] 创建 perf CPU 火焰图任务"
 	@RESP=$$(curl -fsS -X POST "$(API)/api/v1/tasks" \
 		-H "Content-Type: application/json" \
-		-H "Drop_user_uid: $(USER_UID)" \
-		-H "Drop_user_name: $(USER_NAME)" \
+		-H "Drop-User-Uid: $(USER_UID)" \
+		-H "Drop-User-Name: $(USER_NAME)" \
 		-d '{"name":"make demo - CPU flamegraph","task_type":0,"profiler_type":0,"target_ip":"$(TARGET_IP)","target_pid":0,"duration":$(DURATION),"frequency":$(FREQUENCY),"callgraph":"fp","event":"cpu-cycles"}'); \
 		echo "$$RESP"; \
 		TID=$$(printf '%s' "$$RESP" | sed -n 's/.*"tid":"\([^"]*\)".*/\1/p'); \
@@ -35,8 +35,8 @@ demo-ebpf-io:
 	@timeout $$(( $(DURATION) + 8 ))s bash -c 'while true; do dd if=/dev/zero of=/tmp/mini-drop-demo-io.dat bs=1M count=256 conv=fsync; rm -f /tmp/mini-drop-demo-io.dat; done' >/tmp/mini-drop-demo-io.log 2>&1 &
 	@RESP=$$(curl -fsS -X POST "$(API)/api/v1/tasks" \
 		-H "Content-Type: application/json" \
-		-H "Drop_user_uid: $(USER_UID)" \
-		-H "Drop_user_name: $(USER_NAME)" \
+		-H "Drop-User-Uid: $(USER_UID)" \
+		-H "Drop-User-Name: $(USER_NAME)" \
 		-d '{"name":"make demo - eBPF IO histogram","task_type":5,"profiler_type":3,"target_ip":"$(TARGET_IP)","target_pid":0,"duration":$(DURATION),"frequency":1,"callgraph":"fp","event":"io"}'); \
 		echo "$$RESP"; \
 		TID=$$(printf '%s' "$$RESP" | sed -n 's/.*"tid":"\([^"]*\)".*/\1/p'); \
@@ -47,8 +47,8 @@ demo-ebpf-sched:
 	@timeout $$(( $(DURATION) + 8 ))s bash -c 'for i in $$(seq 1 4); do while :; do :; done & done; wait' >/dev/null 2>&1 &
 	@RESP=$$(curl -fsS -X POST "$(API)/api/v1/tasks" \
 		-H "Content-Type: application/json" \
-		-H "Drop_user_uid: $(USER_UID)" \
-		-H "Drop_user_name: $(USER_NAME)" \
+		-H "Drop-User-Uid: $(USER_UID)" \
+		-H "Drop-User-Name: $(USER_NAME)" \
 		-d '{"name":"make demo - eBPF sched histogram","task_type":5,"profiler_type":3,"target_ip":"$(TARGET_IP)","target_pid":0,"duration":$(DURATION),"frequency":1,"callgraph":"fp","event":"sched"}'); \
 		echo "$$RESP"; \
 		TID=$$(printf '%s' "$$RESP" | sed -n 's/.*"tid":"\([^"]*\)".*/\1/p'); \

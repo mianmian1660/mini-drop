@@ -59,6 +59,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     ca-certificates \
+    && perf_real="$(find /usr/lib -type f -path '*/linux-tools*/perf' | sort -V | tail -n 1)" \
+    && test -n "$perf_real" \
+    && ln -sf "$perf_real" /usr/local/bin/perf-real \
     && rm -rf /var/lib/apt-lists/*
 
 # 安装 MinIO Client (mc)，用于上传采集结果到 MinIO

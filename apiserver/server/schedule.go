@@ -193,14 +193,8 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 	}
 
 	sid := "sch-" + util.GenTID()[4:]
-	uid := c.GetHeader("Drop_user_uid")
-	if uid == "" {
-		uid = "default-user"
-	}
-	userName := c.GetHeader("Drop_user_name")
-	if userName == "" {
-		userName = "默认用户"
-	}
+	uid := getRequestUIDOrDefault(c)
+	userName := getRequestUserName(c)
 
 	// 序列化采集参数
 	paramsJSON, _ := util.MarshalJSONB(PerfParams{

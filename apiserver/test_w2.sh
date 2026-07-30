@@ -42,14 +42,14 @@ check "返回 service=apiserver" '"service":"apiserver"' "$R"
 
 # ---- 2. 鉴权回调 ----
 echo "2. GET /api/v1/auth/check"
-R=$(curl -s -H "Drop_user_uid: user-001" -H "Drop_user_name: Alice" "$BASE/api/v1/auth/check")
+R=$(curl -s -H "Drop-User-Uid: user-001" -H "Drop-User-Name: Alice" "$BASE/api/v1/auth/check")
 check "返回 code=0" '"code":0' "$R"
 check "返回 uid" '"uid":"user-001"' "$R"
 check "返回 user_name" 'Alice' "$R"
 
 # ---- 3. 用户信息 ----
 echo "3. GET /api/v1/users"
-R=$(curl -s -H "Drop_user_uid: user-001" -H "Drop_user_name: Alice" "$BASE/api/v1/users")
+R=$(curl -s -H "Drop-User-Uid: user-001" -H "Drop-User-Name: Alice" "$BASE/api/v1/users")
 check "返回 code=0" '"code":0' "$R"
 check "返回 groups 数组" 'groups' "$R"
 
@@ -73,12 +73,12 @@ check "返回 400" '"code":400' "$R"
 # ---- 7. 创建任务 ----
 echo "7. POST /api/v1/tasks"
 # 先记录创建前的任务总数
-BEFORE_COUNT=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['total'])" 2>/dev/null || echo 0)
+BEFORE_COUNT=$(curl -s -H "Drop-User-Uid: user-001" "$BASE/api/v1/tasks" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['total'])" 2>/dev/null || echo 0)
 
 R=$(curl -s -X POST "$BASE/api/v1/tasks" \
   -H "Content-Type: application/json" \
-  -H "Drop_user_uid: user-001" \
-  -H "Drop_user_name: Alice" \
+  -H "Drop-User-Uid: user-001" \
+  -H "Drop-User-Name: Alice" \
   -d '{"name":"CPU采样","task_type":0,"profiler_type":0,"target_ip":"10.0.0.1","target_pid":1234,"duration":10,"frequency":99}')
 check "返回 code=0" '"code":0' "$R"
 TID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['tid'])")
@@ -86,7 +86,7 @@ check "返回 tid" "tid-" "$TID"
 
 # ---- 8. 任务列表 ----
 echo "8. GET /api/v1/tasks"
-R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks")
+R=$(curl -s -H "Drop-User-Uid: user-001" "$BASE/api/v1/tasks")
 check "返回 code=0" '"code":0' "$R"
 check "返回 tasks 数组" '"tasks"' "$R"
 AFTER_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['total'])")
@@ -103,7 +103,7 @@ check "status 有效 (0/1/3)" "status" "status=$STATUS"
 
 # ---- 10. 按状态过滤 ----
 echo "10. GET /api/v1/tasks?status=0"
-R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks?status=0")
+R=$(curl -s -H "Drop-User-Uid: user-001" "$BASE/api/v1/tasks?status=0")
 check "返回 code=0" '"code":0' "$R"
 # 验证所有返回任务 status 都是 0
 ALL_ZERO=$(echo "$R" | python3 -c "
@@ -115,7 +115,7 @@ print('OK' if ok else 'FAIL')
 check "过滤结果全部 status=0" "OK" "$ALL_ZERO"
 
 echo "11. GET /api/v1/tasks?status=2"
-R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/tasks?status=2")
+R=$(curl -s -H "Drop-User-Uid: user-001" "$BASE/api/v1/tasks?status=2")
 check "返回 code=0" '"code":0' "$R"
 # 验证所有返回任务 status 都是 2
 ALL_TWO=$(echo "$R" | python3 -c "
@@ -129,8 +129,8 @@ check "过滤结果全部 status=2" "OK" "$ALL_TWO"
 # ---- 12. 重试任务 ----
 echo "12. POST /api/v1/tasks/:tid/retry"
 R=$(curl -s -X POST "$BASE/api/v1/tasks/$TID/retry" \
-  -H "Drop_user_uid: user-001" \
-  -H "Drop_user_name: Alice")
+  -H "Drop-User-Uid: user-001" \
+  -H "Drop-User-Name: Alice")
 check "返回 code=0" '"code":0' "$R"
 RETRY_TID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['tid'])")
 check "返回新 tid" "tid-" "$RETRY_TID"
@@ -179,8 +179,8 @@ check "返回 400" '"code":400' "$R"
 echo "20. POST /api/v1/tasks (完整参数)"
 R=$(curl -s -X POST "$BASE/api/v1/tasks" \
   -H "Content-Type: application/json" \
-  -H "Drop_user_uid: user-001" \
-  -H "Drop_user_name: Alice" \
+  -H "Drop-User-Uid: user-001" \
+  -H "Drop-User-Name: Alice" \
   -d '{"name":"Java堆分析","task_type":6,"profiler_type":1,"target_ip":"10.0.0.2","target_pid":5678,"duration":30,"frequency":0,"callgraph":"dwarf","event":"cpu-cycles","subprocess":true,"container_name":"pod-abc"}')
 check "返回 code=0" '"code":0' "$R"
 

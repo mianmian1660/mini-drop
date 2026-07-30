@@ -22,8 +22,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/mini-drop/apiserver/model"
+	"github.com/mini-drop/apiserver/pkg/storage"
 	pb_common "github.com/mini-drop/apiserver/proto/common"
 	pb_control "github.com/mini-drop/apiserver/proto/control"
 	pb_hotmethod "github.com/mini-drop/apiserver/proto/hotmethod"
@@ -55,6 +57,13 @@ type PerfParams struct {
 	Subprocess bool   `json:"subprocess"`
 }
 
+// TaskResultNotifyReq 是 drop_server 完成采集后回调 apiserver 的内部请求体。
+type TaskResultNotifyReq struct {
+	TaskID       string `json:"task_id" binding:"required"`
+	ErrorMessage string `json:"error_message"`
+	CosKey       string `json:"cos_key"`
+}
+
 // CreateTask 创建性能采集任务
 // POST /api/v1/tasks
 func (s *APIServer) CreateTask(c *gin.Context) {
@@ -78,14 +87,8 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		req.Callgraph = "fp"
 	}
 
-	uid := c.GetHeader("Drop_user_uid")
-	if uid == "" {
-		uid = "default-user"
-	}
-	userName := c.GetHeader("Drop_user_name")
-	if userName == "" {
-		userName = "默认用户"
-	}
+	uid := getRequestUIDOrDefault(c)
+	userName := getRequestUserName(c)
 
 	// A2: Idempotency-Key 去重（4.2 节）。同一用户携带相同幂等键重复提交，
 	// 直接返回已存在的任务，不重复创建、不重复下发。
@@ -290,6 +293,240 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
 	)
 }
 
+// NotifyTaskResult 接收 drop_server 的采集完成通知。
+// POST /api/v1/internal/task-notify
+func (s *APIServer) NotifyTaskResult(c *gin.Context) {
+	var req TaskResultNotifyReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "请求参数错误: " + err.Error(),
+		})
+		return
+	}
+
+	var task model.HotmethodTask
+	if err := s.DB.Where("tid = ?", req.TaskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"code":    404,
+			"message": "任务不存在: " + req.TaskID,
+		})
+		return
+	}
+
+	if strings.TrimSpace(req.ErrorMessage) != "" {
+		endTime := time.Now()
+		if task.Status != TaskStatusFailed {
+			_ = s.transitionTaskStatus(
+				&task,
+				TaskStatusFailed,
+				formatErrorReason(ErrCodeTaskExecutionFailed, req.ErrorMessage),
+				"drop_server_notify",
+				map[string]interface{}{"end_time": &endTime, "analysis_status": 3},
+			)
+		} else {
+			_ = s.DB.Model(&model.HotmethodTask{}).
+				Where("tid = ?", task.TID).
+				Update("analysis_status", 3).Error
+		}
+		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"tid": task.TID}})
+		return
+	}
+
+	if strings.TrimSpace(req.CosKey) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": "采集成功通知缺少 cos_key",
+		})
+		return
+	}
+
+	endTime := time.Now()
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		if task.Status != TaskStatusDone {
+			fromStatus := task.Status
+			if err := tx.Model(&model.HotmethodTask{}).
+				Where("tid = ?", task.TID).
+				Updates(map[string]interface{}{
+					"status":      TaskStatusDone,
+					"status_info": "采集产物已上传，任务完成",
+					"end_time":    &endTime,
+				}).Error; err != nil {
+				return err
+			}
+			if err := tx.Create(&model.TaskStatusEvent{
+				TID:        task.TID,
+				FromStatus: fromStatus,
+				ToStatus:   TaskStatusDone,
+				Reason:     "采集产物已上传，任务完成",
+				Source:     "drop_server_notify",
+				CreatedAt:  endTime,
+			}).Error; err != nil {
+				return err
+			}
+		}
+		return s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, 0)
+	})
+	if err != nil {
+		s.Logger.Error("处理采集结果通知失败",
+			zap.String("tid", task.TID),
+			zap.String("cos_key", req.CosKey),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":    500,
+			"message": "处理采集结果通知失败: " + err.Error(),
+		})
+		return
+	}
+
+	s.Logger.Info("采集结果已登记并进入分析队列",
+		zap.String("tid", task.TID),
+		zap.String("cos_key", req.CosKey),
+		zap.String("source", "drop_server_notify"),
+	)
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"tid": task.TID}})
+}
+
+func (s *APIServer) ensureAnalysisQueued(tid string, objectKey string, size int64) error {
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		return s.ensureAnalysisQueuedTx(tx, tid, objectKey, size)
+	})
+}
+
+func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey string, size int64) error {
+	objectKey = strings.TrimSpace(objectKey)
+	if tid == "" || objectKey == "" {
+		return nil
+	}
+
+	artifact := model.Artifact{
+		TaskTID:     tid,
+		Kind:        model.ArtifactKindRaw,
+		ObjectKey:   objectKey,
+		Size:        size,
+		ContentType: mimeType(objectKey),
+		Status:      model.ArtifactStatusReady,
+		CreatedAt:   time.Now(),
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "task_tid"},
+			{Name: "kind"},
+			{Name: "object_key"},
+		},
+		DoNothing: true,
+	}).Create(&artifact).Error; err != nil {
+		return err
+	}
+
+	job := model.AnalysisJob{
+		TaskTID:   tid,
+		Pipeline:  analysisPipelineForObject(objectKey),
+		Status:    model.AnalysisJobStatusPending,
+		Attempt:   0,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "task_tid"}},
+		DoNothing: true,
+	}).Create(&job).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+func analysisPipelineForObject(objectKey string) string {
+	switch {
+	case strings.HasSuffix(objectKey, ".bpf"):
+		return "bpf_histogram"
+	default:
+		return "perf_flamegraph"
+	}
+}
+
+func (s *APIServer) findRawCollectionArtifact(tid string) (string, int64, bool) {
+	if tid == "" {
+		return "", 0, false
+	}
+	if s.StorageConnected() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		objects, err := s.Storage.ListObjects(ctx, s.Config.Storage.Bucket, tid+"/")
+		if err != nil {
+			s.Logger.Warn("检查任务产物失败", zap.String("tid", tid), zap.Error(err))
+		} else if key, size, ok := pickRawCollectionObject(objects); ok {
+			return key, size, true
+		}
+	}
+	return pickRawCollectionLocalFile(s.listLocalFiles(tid))
+}
+
+func pickRawCollectionObject(files []storage.FileInfo) (string, int64, bool) {
+	for _, file := range files {
+		if filepath.Base(file.Name) == "perf.data" {
+			return file.Name, file.Size, true
+		}
+	}
+	for _, file := range files {
+		if isRawCollectionName(file.Name) {
+			return file.Name, file.Size, true
+		}
+	}
+	return "", 0, false
+}
+
+func pickRawCollectionLocalFile(files []map[string]interface{}) (string, int64, bool) {
+	for _, file := range files {
+		name, _ := file["name"].(string)
+		if name == "" {
+			continue
+		}
+		size := int64(0)
+		switch v := file["size"].(type) {
+		case int64:
+			size = v
+		case int:
+			size = int64(v)
+		case float64:
+			size = int64(v)
+		}
+		if strings.HasSuffix(name, "_perf.data") || filepath.Base(name) == "perf.data" {
+			return name, size, true
+		}
+	}
+	for _, file := range files {
+		name, _ := file["name"].(string)
+		if name == "" || !isRawCollectionName(name) {
+			continue
+		}
+		size := int64(0)
+		switch v := file["size"].(type) {
+		case int64:
+			size = v
+		case int:
+			size = int64(v)
+		case float64:
+			size = int64(v)
+		}
+		return name, size, true
+	}
+	return "", 0, false
+}
+
+func isRawCollectionName(name string) bool {
+	base := filepath.Base(strings.ToLower(name))
+	switch filepath.Ext(base) {
+	case ".svg", ".json", ".md", ".txt", ".html":
+		return false
+	}
+	return strings.Contains(base, "perf") ||
+		strings.HasSuffix(base, ".data") ||
+		strings.HasSuffix(base, ".bpf") ||
+		strings.HasSuffix(base, ".collapsed")
+}
+
 // ListTasks 获取任务列表（支持分页、搜索、状态筛选）
 // GET /api/v1/tasks?page=1&pageSize=20&status=0&keyword=xxx
 func (s *APIServer) ListTasks(c *gin.Context) {
@@ -320,7 +557,7 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 	}
 
 	// 按用户筛选（权限控制）
-	if uid := c.GetHeader("Drop_user_uid"); uid != "" {
+	if uid := getRequestUID(c); uid != "" {
 		query = query.Where("uid = ?", uid)
 	}
 
@@ -362,7 +599,7 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 // 避免向未授权用户泄露 tid 是否存在。
 func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	tid := c.Param("tid")
-	uid := c.GetHeader("Drop_user_uid")
+	uid := getRequestUID(c)
 
 	var task model.HotmethodTask
 	if err := s.DB.Where("tid = ? AND uid = ?", tid, uid).First(&task).Error; err != nil {
@@ -630,7 +867,7 @@ func (s *APIServer) fetchTaskStatusEvents(tid string) []model.TaskStatusEvent {
 // A4: 加 uid 过滤，防止越权删除他人任务。
 func (s *APIServer) DeleteTask(c *gin.Context) {
 	tid := c.Param("tid")
-	uid := c.GetHeader("Drop_user_uid")
+	uid := getRequestUID(c)
 
 	// 使用 GORM 软删除
 	result := s.DB.Where("tid = ? AND uid = ?", tid, uid).Delete(&model.HotmethodTask{})
@@ -664,7 +901,7 @@ func (s *APIServer) DeleteTask(c *gin.Context) {
 // 是同一类"按 tid 直查，不校验 uid"的漏洞，放着不管等于没修完，顺手一起补上。
 func (s *APIServer) RetryTask(c *gin.Context) {
 	tid := c.Param("tid")
-	uid := c.GetHeader("Drop_user_uid")
+	uid := getRequestUID(c)
 
 	// 查找原任务
 	var oldTask model.HotmethodTask

@@ -10,9 +10,11 @@ FROM python:3.10-slim
 # 安装系统级工具：
 #   perl            = 火焰图生成脚本 flamegraph.pl 是 Perl 写的
 #   procps          = ps 等进程工具
+#   linux-perf      = perf script 解析 perf.data，生成 CPU 火焰图
 RUN apt-get update && apt-get install -y --no-install-recommends \
     perl \
     procps \
+    linux-perf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

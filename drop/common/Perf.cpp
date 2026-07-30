@@ -15,12 +15,20 @@
 #include <signal.h>   // kill, SIGTERM, SIGKILL
 #include <cstring>    // strerror
 #include <cerrno>     // errno
+#include <cstdlib>    // getenv
 
 using namespace std;
 using namespace std::chrono;
 
 namespace drop
 {
+    static string resolve_perf_bin()
+    {
+        const char *configured = getenv("DROP_PERF_BIN");
+        if (configured && configured[0] != '\0')
+            return string(configured);
+        return "perf";
+    }
 
     int run_perf(const hotmethod::TaskDesc &taskDesc, const string &outputPath)
     {
@@ -47,7 +55,8 @@ namespace drop
             vector<string> args_storage;
             args_storage.reserve(16);
 
-            args_storage.push_back("perf");
+            string perfBin = resolve_perf_bin();
+            args_storage.push_back(perfBin);
             args_storage.push_back("record");
             args_storage.push_back("-F");
             args_storage.push_back(to_string(taskDesc.sampleargv().hz()));
@@ -66,6 +75,10 @@ namespace drop
             {
                 args_storage.push_back("-p");
                 args_storage.push_back(to_string(targetPid));
+            }
+            else
+            {
+                args_storage.push_back("-a");
             }
 
             args_storage.push_back("--");
@@ -87,8 +100,8 @@ namespace drop
                 cout << args[i] << " ";
             cout << endl;
 
-            execvp("perf", const_cast<char *const *>(args.data()));
-            cerr << "[perf] execvp 失败!" << endl;
+            execvp(perfBin.c_str(), const_cast<char *const *>(args.data()));
+            cerr << "[perf] execvp 失败: " << perfBin << endl;
             _exit(127);
         }
 

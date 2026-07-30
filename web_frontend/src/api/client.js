@@ -36,8 +36,8 @@ client.interceptors.request.use(
     (config) => {
         const uid = getCookie('drop_user_uid');
         const name = getCookie('drop_user_name');
-        if (uid) config.headers['Drop_user_uid'] = uid;
-        if (name) config.headers['Drop_user_name'] = name;
+        if (uid) config.headers['Drop-User-Uid'] = uid;
+        if (name) config.headers['Drop-User-Name'] = name;
         return config;
     },
     (error) => Promise.reject(error)
@@ -54,7 +54,7 @@ client.interceptors.response.use(
     },
     (error) => {
         // 401 鉴权失败 → 跳转登录
-        if (error.response?.status === 401) {
+        if (error.response?.status === 401 && window.location.pathname !== '/login') {
             const redirect = encodeURIComponent(window.location.href);
             window.location.href = '/login?redirect=' + redirect;
         }

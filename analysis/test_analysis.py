@@ -57,6 +57,22 @@ def t_parse_collapsed_truncated_lines_are_ignored():
     parsed = parse_collapsed("main;ok 3\nbroken-without-count\nmain;bad nope\n")
     assert parsed == {"ok": 3}
 
+def t_flamegraph_detects_single_frame_folded_stacks():
+    from flamegraph import _looks_like_folded_stacks
+    assert _looks_like_folded_stacks([
+        "0x769d56fbf527 1",
+        "main;worker;hot 3",
+        "0x5bbf4625fb6a 1",
+    ])
+
+def t_flamegraph_does_not_treat_perf_script_as_folded():
+    from flamegraph import _looks_like_folded_stacks
+    assert not _looks_like_folded_stacks([
+        "python 1234 123.456: cycles:",
+        "        ffffffff81000000 native_write_msr ([kernel.kallsyms])",
+        "        7f0000000000 PyEval_EvalFrame (/usr/bin/python)",
+    ])
+
 def t_parse_bpf_histogram():
     from bpf_analyzer import parse_bpf_histogram
     text = "@io_lat_us:\n[1, 2)        42 |@@@@@\n[2, 4)        88 |@@@@@@@@@@\n[4, 8)       156 |@@@@@@@@@@@@\n# Total IO: 286\n"

@@ -42,10 +42,7 @@ func (s *APIServer) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	uid := c.GetHeader("Drop_user_uid")
-	if uid == "" {
-		uid = "default-user"
-	}
+	uid := getRequestUIDOrDefault(c)
 
 	gid := "grp-" + util.GenTID()[4:] // grp-20260619-a1b2c3d4
 

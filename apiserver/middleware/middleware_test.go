@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -30,6 +31,12 @@ func TestCORSAddsHeaders(t *testing.T) {
 	}
 	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 		t.Fatalf("allow credentials = %q", got)
+	}
+	allowHeaders := w.Header().Get("Access-Control-Allow-Headers")
+	for _, header := range []string{"Drop-User-Uid", "Drop-User-Name", "Drop_user_uid", "Drop_user_name"} {
+		if !strings.Contains(allowHeaders, header) {
+			t.Fatalf("allow headers %q does not contain %q", allowHeaders, header)
+		}
 	}
 }
 

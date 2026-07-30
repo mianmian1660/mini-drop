@@ -45,26 +45,23 @@ func (s *APIServer) Healthz(c *gin.Context) {
 
 // AuthCheck 鉴权回调
 // GET /api/v1/auth/check
-// 检查请求是否携带身份信息（Drop_user_uid 头）。这个接口本身必须留在
+// 检查请求是否携带身份信息（Drop-User-Uid 头）。这个接口本身必须留在
 // CheckLogin 中间件之外——它的职责就是让前端知道"我现在算不算登录"，
 // 如果也被拦在中间件里，前端就永远拿不到"未登录"这个明确信号了。
 //
 // A4：不再无条件放通、默认造一个 "default-user"。没带身份信息就如实
 // 返回 401，前端 axios 拦截器已经在处理 401 自动跳转登录页。
 func (s *APIServer) AuthCheck(c *gin.Context) {
-	uid := strings.TrimSpace(c.GetHeader("Drop_user_uid"))
+	uid := getRequestUID(c)
 	if uid == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"code":    401,
-			"message": "未登录：请求未携带 Drop_user_uid",
+			"message": "未登录：请求未携带 Drop-User-Uid",
 		})
 		return
 	}
 
-	userName := c.GetHeader("Drop_user_name")
-	if userName == "" {
-		userName = "默认用户"
-	}
+	userName := getRequestUserName(c)
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
@@ -79,7 +76,7 @@ func (s *APIServer) AuthCheck(c *gin.Context) {
 // CheckLogin 简化版鉴权中间件（A4，新复刻指南 6.9 节）
 //
 // 当前系统没有真正的登录态/session/OIDC，身份完全靠客户端自己带的
-// Drop_user_uid 头声明。这里能做到的"鉴权"边界很明确：校验请求确实
+// Drop-User-Uid 头声明。这里能做到的"鉴权"边界很明确：校验请求确实
 // 携带了身份信息，不再对空身份默认造一个 "default-user" 蒙混过关；
 // 校验"这个身份是否被伪造"超出本次改动范围，需要接入真实登录态才能做到。
 //
@@ -89,11 +86,11 @@ func (s *APIServer) AuthCheck(c *gin.Context) {
 //
 // 必须挂在 /auth/check 之外的所有 /api/v1 路由上。
 func (s *APIServer) CheckLogin(c *gin.Context) {
-	uid := strings.TrimSpace(c.GetHeader("Drop_user_uid"))
+	uid := getRequestUID(c)
 	if uid == "" {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 			"code":    401,
-			"message": "未登录：请求未携带 Drop_user_uid",
+			"message": "未登录：请求未携带 Drop-User-Uid",
 		})
 		return
 	}
@@ -103,14 +100,8 @@ func (s *APIServer) CheckLogin(c *gin.Context) {
 // GetCurrentUser 获取当前用户信息
 // GET /api/v1/users
 func (s *APIServer) GetCurrentUser(c *gin.Context) {
-	uid := c.GetHeader("Drop_user_uid")
-	if uid == "" {
-		uid = "default-user"
-	}
-	userName := c.GetHeader("Drop_user_name")
-	if userName == "" {
-		userName = "默认用户"
-	}
+	uid := getRequestUIDOrDefault(c)
+	userName := getRequestUserName(c)
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
@@ -121,4 +112,42 @@ func (s *APIServer) GetCurrentUser(c *gin.Context) {
 			"groups":    []string{},
 		},
 	})
+}
+
+func getRequestUID(c *gin.Context) string {
+	uid := strings.TrimSpace(c.GetHeader("Drop-User-Uid"))
+	if uid != "" {
+		return uid
+	}
+	uid = strings.TrimSpace(c.GetHeader("Drop_user_uid"))
+	if uid != "" {
+		return uid
+	}
+	if cookieUID, err := c.Cookie("drop_user_uid"); err == nil {
+		return strings.TrimSpace(cookieUID)
+	}
+	return ""
+}
+
+func getRequestUIDOrDefault(c *gin.Context) string {
+	if uid := getRequestUID(c); uid != "" {
+		return uid
+	}
+	return "default-user"
+}
+
+func getRequestUserName(c *gin.Context) string {
+	userName := strings.TrimSpace(c.GetHeader("Drop-User-Name"))
+	if userName == "" {
+		userName = strings.TrimSpace(c.GetHeader("Drop_user_name"))
+	}
+	if userName == "" {
+		if cookieName, err := c.Cookie("drop_user_name"); err == nil {
+			userName = strings.TrimSpace(cookieName)
+		}
+	}
+	if userName == "" {
+		return "默认用户"
+	}
+	return userName
 }

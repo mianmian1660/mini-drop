@@ -87,6 +87,12 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 启动任务状态轮询器（W3：定期检查 Running 任务是否应标记为完成）
 	go s.startTaskPoller()
 
+	// B: 启动时补偿历史已完成但未入分析队列的任务，修复回调缺失期间留下的卡住记录。
+	go func() {
+		time.Sleep(12 * time.Second)
+		s.backfillAnalysisQueueForCompletedTasks()
+	}()
+
 	// W3: 启动 Agent 自动发现（每 30 秒同步一次）
 	go s.startAgentDiscoverer()
 
@@ -255,7 +261,7 @@ func (s *APIServer) pollRunningTasks() {
 		}
 
 		if task.Status == TaskStatusUploading {
-			hasArtifacts := s.taskHasArtifacts(task.TID)
+			rawKey, rawSize, hasArtifacts := s.findRawCollectionArtifact(task.TID)
 			if hasArtifacts || now.After(deadline) {
 				reason := "采集产物已上传，任务完成"
 				if !hasArtifacts {
@@ -263,6 +269,15 @@ func (s *APIServer) pollRunningTasks() {
 				}
 				endTime := now
 				_ = s.transitionTaskStatus(&task, TaskStatusDone, reason, "task_poller", map[string]interface{}{"end_time": &endTime})
+				if hasArtifacts {
+					if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {
+						s.Logger.Warn("轮询补建分析任务失败",
+							zap.String("tid", task.TID),
+							zap.String("raw_key", rawKey),
+							zap.Error(err),
+						)
+					}
+				}
 				s.Logger.Info("任务自动标记为完成",
 					zap.String("tid", task.TID),
 					zap.String("name", task.Name),
@@ -270,6 +285,36 @@ func (s *APIServer) pollRunningTasks() {
 				)
 			}
 		}
+	}
+}
+
+func (s *APIServer) backfillAnalysisQueueForCompletedTasks() {
+	var tasks []model.HotmethodTask
+	if err := s.DB.Where("status = ? AND analysis_status = ?", TaskStatusDone, 0).
+		Order("create_time ASC").
+		Limit(100).
+		Find(&tasks).Error; err != nil {
+		s.Logger.Warn("补偿分析队列查询失败", zap.Error(err))
+		return
+	}
+
+	for _, task := range tasks {
+		rawKey, rawSize, ok := s.findRawCollectionArtifact(task.TID)
+		if !ok {
+			continue
+		}
+		if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {
+			s.Logger.Warn("补偿分析队列失败",
+				zap.String("tid", task.TID),
+				zap.String("raw_key", rawKey),
+				zap.Error(err),
+			)
+			continue
+		}
+		s.Logger.Info("已补偿历史任务进入分析队列",
+			zap.String("tid", task.TID),
+			zap.String("raw_key", rawKey),
+		)
 	}
 }
 
@@ -483,7 +528,7 @@ func (s *APIServer) startAgentDiscoverer() {
 // registerRoutes 注册所有 API 路由
 //
 // A4: /api/v1 下除 /auth/check 外的所有路由都挂 CheckLogin 中间件，
-// 缺失 Drop_user_uid 时统一 401，不再无条件放通。
+// 缺失 Drop-User-Uid 时统一 401，不再无条件放通。
 // /auth/check 必须留在鉴权组之外——它自己就是用来告诉前端"有没有登录"的，
 // 如果也被拦住，前端永远拿不到"未登录"这个明确信号。
 func (s *APIServer) registerRoutes() {
@@ -492,6 +537,7 @@ func (s *APIServer) registerRoutes() {
 
 	// 鉴权回调（不挂 CheckLogin，这是唯一的例外）
 	s.Router.GET("/api/v1/auth/check", s.AuthCheck)
+	s.Router.POST("/api/v1/internal/task-notify", s.NotifyTaskResult)
 
 	// 其余 /api/v1 路由：统一要求带身份信息
 	api := s.Router.Group("/api/v1")
@@ -540,6 +586,6 @@ func (s *APIServer) registerRoutes() {
 	}
 
 	s.Logger.Info("路由注册完成",
-		zap.Int("api_count", 23),
+		zap.Int("api_count", 24),
 	)
 }

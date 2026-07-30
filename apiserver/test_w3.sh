@@ -89,8 +89,8 @@ fi
 blue "4. 创建任务 (duration=3s)..."
 R=$(curl -s -X POST "$BASE/api/v1/tasks" \
   -H "Content-Type: application/json" \
-  -H "Drop_user_uid: user-001" \
-  -H "Drop_user_name: Alice" \
+  -H "Drop-User-Uid: user-001" \
+  -H "Drop-User-Name: Alice" \
   -d '{"name":"W3验收测试","task_type":0,"profiler_type":0,"target_ip":"127.0.0.1","target_pid":1,"duration":3,"frequency":99}')
 check "创建任务 code=0" '"code":0' "$R"
 TID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['tid'])" 2>/dev/null)
@@ -176,7 +176,7 @@ blue "10. 回归测试：W2 基础 API 仍然正常..."
 R=$(curl -s "$BASE/healthz")
 check "healthz ok" '"status":"ok"' "$R"
 
-R=$(curl -s -H "Drop_user_uid: user-001" -H "Drop_user_name: Alice" "$BASE/api/v1/auth/check")
+R=$(curl -s -H "Drop-User-Uid: user-001" -H "Drop-User-Name: Alice" "$BASE/api/v1/auth/check")
 check "auth/check ok" '"code":0' "$R"
 
 R=$(curl -s "$BASE/api/v1/agents")

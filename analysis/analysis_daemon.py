@@ -19,6 +19,7 @@ from observability import elapsed_seconds, log_event, now_seconds
 
 POLL_INTERVAL = 5
 LEASE_SECONDS = 300
+MAX_ANALYSIS_ATTEMPTS = int(os.environ.get("MAX_ANALYSIS_ATTEMPTS", "3"))
 ANALYZER_VERSION = os.environ.get("ANALYZER_VERSION", "b1-lease")
 PG_DSN = os.environ.get(
     "PG_DSN", "host=localhost user=postgres password=dev dbname=drop sslmode=disable"
@@ -71,6 +72,10 @@ def _start_heartbeat(lease_client: AnalysisLeaseClient, job_id: int,
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     return thread
+
+
+def should_retry(job) -> bool:
+    return int(getattr(job, "attempt", 0) or 0) < MAX_ANALYSIS_ATTEMPTS
 
 
 def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
@@ -143,20 +148,22 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
                       duration_seconds=elapsed_seconds(started_at),
                       exit_code=code)
         else:
+            retry = should_retry(job)
             update_analysis_status(dsn, tid, 3, f"分析失败: exit={code}")
-            lease_client.fail(job.id, retry=True, analyzer_version=ANALYZER_VERSION)
+            lease_client.fail(job.id, retry=retry, analyzer_version=ANALYZER_VERSION)
             log_event("analysis_failed", **common,
                       analysis_duration_seconds=elapsed_seconds(started_at),
                       duration_seconds=elapsed_seconds(started_at),
-                      exit_code=code, retryable=True)
+                      exit_code=code, retryable=retry)
         return ok
     except Exception as e:
+        retry = should_retry(job)
         update_analysis_status(dsn, tid, 3, f"分析异常: {e}")
-        lease_client.fail(job.id, retry=True, analyzer_version=ANALYZER_VERSION)
+        lease_client.fail(job.id, retry=retry, analyzer_version=ANALYZER_VERSION)
         log_event("analysis_failed", **common,
                   analysis_duration_seconds=elapsed_seconds(started_at),
                   duration_seconds=elapsed_seconds(started_at),
-                  error=str(e), retryable=True)
+                  error=str(e), retryable=retry)
         print(f"[analysis_daemon] ❌ 分析异常: tid={tid} error={e}", file=sys.stderr)
         return False
     finally:
@@ -196,6 +203,7 @@ def main():
 
     print(f"[analysis_daemon] 启动 (interval={args.interval}s, "
           f"worker={lease_client.worker_id}, lease={args.lease_seconds}s, "
+          f"max_attempts={MAX_ANALYSIS_ATTEMPTS}, "
           f"task_types={registry.task_types()})", file=sys.stderr)
 
     while True:

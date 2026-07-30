@@ -96,8 +96,8 @@ blue "6. 测试任务详情含产物文件..."
 # 创建任务
 R=$(curl -s -X POST "$BASE/api/v1/tasks" \
   -H "Content-Type: application/json" \
-  -H "Drop_user_uid: user-001" \
-  -H "Drop_user_name: Alice" \
+  -H "Drop-User-Uid: user-001" \
+  -H "Drop-User-Name: Alice" \
   -d '{"name":"W4测试","task_type":0,"profiler_type":0,"target_ip":"127.0.0.1","target_pid":1,"duration":5}')
 TID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['tid'])" 2>/dev/null)
 
@@ -130,7 +130,7 @@ blue "9. W2 回归测试..."
 R=$(curl -s "$BASE/healthz")
 check "healthz ok" '"status":"ok"' "$R"
 
-R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/agents")
+R=$(curl -s -H "Drop-User-Uid: user-001" "$BASE/api/v1/agents")
 check "agents ok" '"code":0' "$R"
 
 # ---- 结果汇总 ----

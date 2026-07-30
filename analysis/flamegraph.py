@@ -17,6 +17,7 @@
 # ============================================================
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ from typing import Optional
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STACKCOLLAPSE_SCRIPT = os.path.join(_SCRIPT_DIR, "stackcollapse-perf.pl")
 FLAMEGRAPH_SCRIPT = os.path.join(_SCRIPT_DIR, "flamegraph.pl")
+_FOLDED_STACK_LINE_RE = re.compile(r"^.+\s+\d+(?:\.\d+)?$")
 
 
 def _check_dependencies():
@@ -234,9 +236,16 @@ def _detect_and_fold(perf_data_path: str) -> str:
     """智能折叠：检测输入格式，自动选择处理方式"""
     try:
         with open(perf_data_path, 'r', errors='replace') as f:
-            first_line = f.readline().strip()
-            # 如果第一行包含分号，说明已经是 collapsed stacks 格式
-            if ';' in first_line and ' ' in first_line:
+            sample = []
+            for _ in range(30):
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    sample.append(line)
+            # folded stacks 允许单帧行（例如 "0xabc 1"），不能只靠分号判断。
+            if _looks_like_folded_stacks(sample):
                 f.seek(0)
                 folded = f.read()
                 print(f"[flamegraph] 检测到已折叠栈格式（{len(folded)} 字节），跳过 perf script",
@@ -248,6 +257,16 @@ def _detect_and_fold(perf_data_path: str) -> str:
     # 标准 perf.data 流程
     script_output = run_perf_script(perf_data_path)
     return run_stackcollapse(script_output)
+
+
+def _looks_like_folded_stacks(lines) -> bool:
+    if not lines:
+        return False
+    matches = 0
+    for line in lines:
+        if _FOLDED_STACK_LINE_RE.match(line):
+            matches += 1
+    return matches >= max(1, len(lines) // 2)
 
 
 # ----------------------------------------------------------

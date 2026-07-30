@@ -48,7 +48,7 @@ sleep 2
 blue "1. 创建用户组..."
 R=$(curl -s -X POST "$BASE/api/v1/groups" \
   -H "Content-Type: application/json" \
-  -H "Drop_user_uid: user-001" -H "Drop_user_name: Alice" \
+  -H "Drop-User-Uid: user-001" -H "Drop-User-Name: Alice" \
   -d '{"name":"测试组"}')
 check "创建组 code=0" '"code":0' "$R"
 GID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['gid'])" 2>/dev/null)
@@ -100,7 +100,7 @@ check "移除成员 code=0" '"code":0' "$R"
 blue "8. 创建定时任务..."
 R=$(curl -s -X POST "$BASE/api/v1/schedule/task" \
   -H "Content-Type: application/json" \
-  -H "Drop_user_uid: user-001" -H "Drop_user_name: Alice" \
+  -H "Drop-User-Uid: user-001" -H "Drop-User-Name: Alice" \
   -d '{"name":"定期采样","cron_expr":"*/10 * * * *","task_type":0,"profiler_type":0,"target_ip":"127.0.0.1","target_pid":1,"duration":5}')
 check "创建 schedule code=0" '"code":0' "$R"
 SID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['sid'])" 2>/dev/null)
@@ -127,7 +127,7 @@ check "重新启用" '"enabled":true' "$R"
 blue "11. Cron 表达式校验..."
 R=$(curl -s -X POST "$BASE/api/v1/schedule/task" \
   -H "Content-Type: application/json" \
-  -H "Drop_user_uid: user-001" \
+  -H "Drop-User-Uid: user-001" \
   -d '{"name":"bad","cron_expr":"invalid","target_ip":"127.0.0.1"}')
 check "无效 cron 返回 400" '"code":400' "$R"
 
@@ -152,7 +152,7 @@ blue "14. 回归测试..."
 R=$(curl -s "$BASE/healthz")
 check "healthz ok" '"status":"ok"' "$R"
 
-R=$(curl -s -H "Drop_user_uid: user-001" "$BASE/api/v1/agents")
+R=$(curl -s -H "Drop-User-Uid: user-001" "$BASE/api/v1/agents")
 check "agents ok" '"code":0' "$R"
 
 R=$(curl -s "$BASE/api/v1/cosfiles?tid=test")
