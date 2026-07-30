@@ -26,6 +26,38 @@ PG_DSN = os.environ.get(
 )
 
 
+def record_result_artifacts(conn, tid: str, outputs):
+    """Persist analyzer outputs as Artifact metadata without storing URLs."""
+    keys = [value for value in (outputs or []) if isinstance(value, str) and value.startswith(tid + "/")]
+    if not keys:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM task_attempts WHERE task_tid = %s ORDER BY attempt_seq DESC LIMIT 1", (tid,)
+        )
+        row = cur.fetchone()
+        attempt_id = row[0] if row else 0
+        for key in keys:
+            name = key.rsplit("/", 1)[-1]
+            kind = "RESULT" if name.endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE"
+            content_type = "application/json" if name.endswith(".json") else "image/svg+xml" if name.endswith(".svg") else "application/octet-stream"
+            cur.execute(
+                """
+                INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, 'ready', NOW())
+                ON CONFLICT (task_tid, kind, object_key) DO UPDATE
+                SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status
+                """,
+                (tid, attempt_id, kind, key, content_type),
+            )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        # Artifact registration improves traceability but must not make analysis fail.
+        log_event("artifact_registry_failed", task_tid=tid, error=str(e))
+
+
 def update_analysis_status(dsn: str, tid: str, status: int, status_info: str = ""):
     """兼容旧前端/旧接口：同步更新 hotmethod_tasks.analysis_status。"""
     try:
@@ -115,6 +147,7 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         result = analyzer(
             conn, storage_cfg, task, bucket, tid, local_dir=local_output_dir
         )
+        record_result_artifacts(conn, tid, result.get("outputs", []))
         hm.update_analysis_status(conn, tid, 2, "分析完成")
 
         if not lease_client.complete(job.id, ANALYZER_VERSION):

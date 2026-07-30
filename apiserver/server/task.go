@@ -224,7 +224,11 @@ func (s *APIServer) createTaskWithOutbox(task *model.HotmethodTask, req CreateTa
 
 // dispatchTask 通过 gRPC 将任务下发到 drop_server
 // 如果下发失败，更新数据库状态为失败
-func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
+func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq, trigger string) error {
+	attempt, err := s.startTaskAttempt(task, trigger)
+	if err != nil {
+		return fmt.Errorf("创建任务尝试记录: %w", err)
+	}
 	// 构建 CosConfig（使用配置中的 MinIO 凭证）
 	cosCfg := &pb_common.CosConfig{
 		Endpoint:        s.Config.Storage.Endpoint,
@@ -275,8 +279,13 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
 			zap.String("target_ip", req.TargetIP),
 			zap.Error(err),
 		)
-		_ = s.transitionTaskStatus(task, TaskStatusFailed, errMsg, "apiserver", nil)
-		return
+		s.finishTaskAttempt(attempt.ID, ErrCodeDependencyUnavailable, errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
+	if resp.GetCode() != 0 {
+		errMsg := fmt.Sprintf("drop_server 拒绝任务: code=%d msg=%s", resp.GetCode(), resp.GetMsg())
+		s.finishTaskAttempt(attempt.ID, ErrCodeTaskExecutionFailed, errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 下发成功，更新状态为"已下发"
@@ -291,6 +300,7 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq) {
 		"apiserver",
 		map[string]interface{}{"begin_time": &now},
 	)
+	return nil
 }
 
 // NotifyTaskResult 接收 drop_server 的采集完成通知。
@@ -316,6 +326,7 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 
 	if strings.TrimSpace(req.ErrorMessage) != "" {
 		endTime := time.Now()
+		s.finishLatestTaskAttempt(task.TID, ErrCodeTaskExecutionFailed, req.ErrorMessage, nil)
 		if task.Status != TaskStatusFailed {
 			_ = s.transitionTaskStatus(
 				&task,
@@ -365,7 +376,14 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 				return err
 			}
 		}
-		return s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, 0)
+		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, 0); err != nil {
+			return err
+		}
+		var artifact model.Artifact
+		if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ?", task.TID, model.ArtifactKindRaw, req.CosKey).First(&artifact).Error; err == nil {
+			return s.finishLatestTaskAttemptTx(tx, task.TID, "", "", []string{req.CosKey}, artifact.ID)
+		}
+		return s.finishLatestTaskAttemptTx(tx, task.TID, "", "", []string{req.CosKey}, 0)
 	})
 	if err != nil {
 		s.Logger.Error("处理采集结果通知失败",
@@ -616,6 +634,8 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	var bpfData map[string]interface{}
 	var suggestions []map[string]interface{}
 	statusEvents := s.fetchTaskStatusEvents(tid)
+	attempts := s.fetchTaskAttempts(tid)
+	artifacts := s.fetchArtifacts(tid)
 
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
@@ -656,6 +676,8 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		result["suggestions"] = suggestions
 	}
 	result["status_events"] = statusEvents
+	result["attempts"] = attempts
+	result["artifacts"] = artifacts
 	result["files"] = files
 
 	c.JSON(http.StatusOK, gin.H{
@@ -860,6 +882,22 @@ func (s *APIServer) fetchTaskStatusEvents(tid string) []model.TaskStatusEvent {
 		return []model.TaskStatusEvent{}
 	}
 	return events
+}
+
+func (s *APIServer) fetchTaskAttempts(tid string) []model.TaskAttempt {
+	var attempts []model.TaskAttempt
+	if err := s.DB.Where("task_tid = ?", tid).Order("attempt_seq ASC").Find(&attempts).Error; err != nil || attempts == nil {
+		return []model.TaskAttempt{}
+	}
+	return attempts
+}
+
+func (s *APIServer) fetchArtifacts(tid string) []model.Artifact {
+	var artifacts []model.Artifact
+	if err := s.DB.Where("task_tid = ?", tid).Order("created_at ASC, id ASC").Find(&artifacts).Error; err != nil || artifacts == nil {
+		return []model.Artifact{}
+	}
+	return artifacts
 }
 
 // DeleteTask 软删除任务

@@ -4,8 +4,8 @@
 // 用 fork+execvp 调用 curl，参数走 argv 数组，不经过 shell 解释，
 // 避免 taskID/errorMessage 里出现特殊字符导致命令注入（呼应老指南 1.7 节踩坑提醒）。
 // 目标地址可用 APISERVER_CALLBACK_URL 环境变量覆盖，默认指向 docker-compose 里的
-// apiserver 服务名。当前 apiserver 侧尚未提供对应的接收端点，通知会失败但不影响
-// 主流程——drop_server 只是把它当作"尽力而为"的加速通知。
+// apiserver 服务名。通知是尽力而为的加速路径；失败时 apiserver 的轮询补偿仍会
+// 发现已上传的原始产物。
 // ============================================================
 
 #include "server/ResultNotifier.h"

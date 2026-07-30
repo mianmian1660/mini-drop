@@ -22,11 +22,14 @@ const (
 
 // Outbox — 事务性发件箱记录
 type Outbox struct {
-	ID          uint       `gorm:"primaryKey" json:"id"`
-	Aggregate   string     `gorm:"column:aggregate;size:64" json:"aggregate"`                            // 聚合类型，如 "task"
-	AggregateID string     `gorm:"column:aggregate_id;size:64;index" json:"aggregate_id"`                // 关联的 HotmethodTask.TID
-	Event       string     `gorm:"column:event;size:64" json:"event"`                                    // 事件类型，如 "dispatch_task"
-	Payload     []byte     `gorm:"column:payload;type:jsonb" json:"payload"`                             // 下发所需的完整参数（序列化后的 CreateTaskReq）
-	PublishedAt *time.Time `gorm:"column:published_at;index:idx_outbox_unpublished" json:"published_at"` // NULL = 尚未发布（待处理）
-	CreatedAt   time.Time  `gorm:"column:created_at;index:idx_outbox_unpublished" json:"created_at"`
+	ID            uint       `gorm:"primaryKey" json:"id"`
+	Aggregate     string     `gorm:"column:aggregate;size:64" json:"aggregate"`             // 聚合类型，如 "task"
+	AggregateID   string     `gorm:"column:aggregate_id;size:64;index" json:"aggregate_id"` // 关联的 HotmethodTask.TID
+	Event         string     `gorm:"column:event;size:64" json:"event"`                     // 事件类型，如 "dispatch_task"
+	Payload       []byte     `gorm:"column:payload;type:jsonb" json:"payload"`              // 下发所需的完整参数（序列化后的 CreateTaskReq）
+	Attempt       int        `gorm:"column:attempt;default:0" json:"attempt"`
+	LastError     string     `gorm:"column:last_error;size:1024" json:"last_error"`
+	NextAttemptAt *time.Time `gorm:"column:next_attempt_at;index:idx_outbox_unpublished" json:"next_attempt_at"`
+	PublishedAt   *time.Time `gorm:"column:published_at;index:idx_outbox_unpublished" json:"published_at"` // NULL = 尚未发布（待处理）
+	CreatedAt     time.Time  `gorm:"column:created_at;index:idx_outbox_unpublished" json:"created_at"`
 }

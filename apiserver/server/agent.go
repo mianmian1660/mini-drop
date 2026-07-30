@@ -55,6 +55,13 @@ func (s *APIServer) ListAgents(c *gin.Context) {
 	if agents == nil {
 		agents = []model.AgentInfo{}
 	}
+	var online int
+	for _, agent := range agents {
+		if agent.Online {
+			online++
+		}
+	}
+	s.Logger.Info("Agent 指标", zap.String("stage", "agent_metrics"), zap.Int("drop_agents_online", online))
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,

@@ -26,7 +26,7 @@ namespace drop_server
         const hotmethod::TaskResult *request,
         google::protobuf::Empty * /*response*/)
     {
-        cout << "[server] 收到结果: taskID=" << request->taskid()
+        cout << "[server] stage=result_received task_tid=" << request->taskid()
              << " error=\"" << request->errormessage() << "\""
              << " fileSize=" << request->file().size()
              << " cosKey=" << request->coskey()
@@ -44,7 +44,10 @@ namespace drop_server
         }
 
         // A3: 主动通知 apiserver（"锦上添花"，失败不影响本 RPC 返回成功）
-        notify_apiserver_task_result(*request);
+        bool notified = notify_apiserver_task_result(*request);
+        cout << "[server] stage=result_callback task_tid=" << request->taskid()
+             << " callback_ok=" << (notified ? "true" : "false")
+             << " error_code=" << (notified ? "" : "CALLBACK_FAILED") << endl;
 
         return grpc::Status::OK;
     }

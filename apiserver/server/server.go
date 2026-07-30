@@ -336,7 +336,8 @@ func (s *APIServer) dispatchOutboxLoop() {
 // drainOutbox 领取一批未发布的 outbox 记录并逐条处理。
 func (s *APIServer) drainOutbox() {
 	var entries []model.Outbox
-	if err := s.DB.Where("published_at IS NULL").
+	now := time.Now()
+	if err := s.DB.Where("published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", now).
 		Order("created_at ASC").
 		Limit(20).
 		Find(&entries).Error; err != nil {
@@ -349,46 +350,75 @@ func (s *APIServer) drainOutbox() {
 	}
 }
 
-// processOutboxEntry 处理单条 outbox 记录：解析 payload → 真正调 gRPC 下发 →
-// 无论下发成功与否都标记为已发布（"已发布"表示"已经尝试过下发"，
-// 下发本身成功与否体现在任务自身的状态机 status/status_info 里）。
+// processOutboxEntry 处理单条 outbox 记录。只有成功下发、内容不可恢复损坏，或
+// 达到有限重试上限才标记已发布；短暂的 gRPC 故障保留记录供后续重试。
 func (s *APIServer) processOutboxEntry(entry *model.Outbox) {
-	defer func() {
-		now := time.Now()
-		if err := s.DB.Model(entry).Update("published_at", &now).Error; err != nil {
-			s.Logger.Error("标记 outbox 已发布失败", zap.Uint("id", entry.ID), zap.Error(err))
-		}
-	}()
-
 	if entry.Event != model.OutboxEventDispatchTask {
 		s.Logger.Warn("未知的 outbox 事件类型，跳过", zap.Uint("id", entry.ID), zap.String("event", entry.Event))
+		s.markOutboxPublished(entry)
 		return
 	}
 
 	var req CreateTaskReq
 	if err := util.UnmarshalJSONB(entry.Payload, &req); err != nil {
 		s.Logger.Error("解析 outbox payload 失败", zap.Uint("id", entry.ID), zap.Error(err))
+		s.markOutboxPublished(entry)
 		return
 	}
 
 	var task model.HotmethodTask
 	if err := s.DB.Where("tid = ?", entry.AggregateID).First(&task).Error; err != nil {
 		s.Logger.Warn("outbox 对应的任务不存在，跳过", zap.String("tid", entry.AggregateID))
+		s.markOutboxPublished(entry)
 		return
 	}
 
 	// 任务已经被别的机制（比如 A2 的启动对账）推进过，不重复下发
 	if task.Status != TaskStatusCreated {
+		s.markOutboxPublished(entry)
 		return
 	}
 
-	if s.GrpcConnected() {
-		s.dispatchTask(&task, req)
-	} else {
-		_ = s.transitionTaskStatus(&task, TaskStatusFailed,
-			formatErrorReason(ErrCodeDependencyUnavailable, "gRPC 未连接，任务无法下发到 drop_server"),
-			"outbox_dispatcher", nil)
+	trigger := model.AttemptTriggerInitial
+	if task.MasterTaskTID != "" {
+		trigger = model.AttemptTriggerRetry
 	}
+	if s.GrpcConnected() {
+		if err := s.dispatchTask(&task, req, trigger); err == nil {
+			s.markOutboxPublished(entry)
+		} else {
+			s.retryOrFailOutbox(entry, &task, err.Error())
+		}
+	} else {
+		s.recordTaskAttemptFailure(&task, trigger, ErrCodeDependencyUnavailable, "gRPC 未连接，任务无法下发到 drop_server")
+		s.retryOrFailOutbox(entry, &task, "gRPC 未连接，任务无法下发到 drop_server")
+	}
+}
+
+func (s *APIServer) markOutboxPublished(entry *model.Outbox) {
+	now := time.Now()
+	if err := s.DB.Model(entry).Updates(map[string]interface{}{"published_at": &now, "next_attempt_at": nil}).Error; err != nil {
+		s.Logger.Error("标记 outbox 已发布失败", zap.Uint("id", entry.ID), zap.Error(err))
+	}
+}
+
+func (s *APIServer) retryOrFailOutbox(entry *model.Outbox, task *model.HotmethodTask, reason string) {
+	const maxAttempts = 3
+	nextAttempt := entry.Attempt + 1
+	if nextAttempt >= maxAttempts {
+		s.finishLatestTaskAttempt(task.TID, ErrCodeDependencyUnavailable, reason, nil)
+		_ = s.transitionTaskStatus(task, TaskStatusFailed, formatErrorReason(ErrCodeDependencyUnavailable, reason), "outbox_dispatcher", nil)
+		s.markOutboxPublished(entry)
+		return
+	}
+	delay := time.Duration(1<<uint(entry.Attempt)) * 2 * time.Second
+	next := time.Now().Add(delay)
+	if err := s.DB.Model(entry).Updates(map[string]interface{}{
+		"attempt": nextAttempt, "last_error": reason, "next_attempt_at": &next,
+	}).Error; err != nil {
+		s.Logger.Error("更新 outbox 重试状态失败", zap.Uint("id", entry.ID), zap.Error(err))
+	}
+	s.Logger.Warn("outbox 下发失败，稍后重试", zap.Uint("id", entry.ID), zap.Int("attempt", nextAttempt), zap.String("error_code", ErrCodeDependencyUnavailable), zap.String("stage", "outbox_retry"))
 }
 
 // reconcileOrphanedTasks 启动时执行一次性对账（A2，新复刻指南 4.6 节）。
@@ -431,7 +461,7 @@ func (s *APIServer) reconcileOrphanedTasks() {
 
 		if s.GrpcConnected() {
 			s.Logger.Info("启动对账：重新下发孤儿任务", zap.String("tid", task.TID))
-			s.dispatchTask(task, req)
+			s.dispatchTask(task, req, model.AttemptTriggerRecovery)
 		} else {
 			_ = s.transitionTaskStatus(task, TaskStatusFailed, formatErrorReason(ErrCodeDependencyUnavailable, "Server 重启对账：gRPC 仍未连接，任务无法下发"), "startup_reconciler", nil)
 		}

@@ -51,6 +51,7 @@ func AccessLog(logger *zap.Logger) gin.HandlerFunc {
 		// 记录日志
 		latency := time.Since(start)
 		logger.Info("HTTP 请求",
+			zap.String("stage", "http_request"),
 			zap.String("request_id", requestIDFromContext(c)),
 			zap.String("method", c.Request.Method),
 			zap.String("path", c.Request.URL.Path),
@@ -74,7 +75,7 @@ func CORS() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Origin", origin)
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Drop-User-Uid, Drop-User-Name, Drop_user_uid, Drop_user_name")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID, Idempotency-Key, Drop-User-Uid, Drop-User-Name, Drop_user_uid, Drop_user_name")
 		c.Header("Access-Control-Max-Age", "86400")
 
 		// 预检请求直接返回

@@ -33,7 +33,7 @@ func TestCORSAddsHeaders(t *testing.T) {
 		t.Fatalf("allow credentials = %q", got)
 	}
 	allowHeaders := w.Header().Get("Access-Control-Allow-Headers")
-	for _, header := range []string{"Drop-User-Uid", "Drop-User-Name", "Drop_user_uid", "Drop_user_name"} {
+	for _, header := range []string{"X-Request-ID", "Idempotency-Key", "Drop-User-Uid", "Drop-User-Name", "Drop_user_uid", "Drop_user_name"} {
 		if !strings.Contains(allowHeaders, header) {
 			t.Fatalf("allow headers %q does not contain %q", allowHeaders, header)
 		}

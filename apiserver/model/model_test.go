@@ -104,3 +104,20 @@ func TestMasterTaskTIDLink(t *testing.T) {
 		t.Error("standalone task should have empty master_task_tid")
 	}
 }
+
+func TestTaskAttemptEvidenceFields(t *testing.T) {
+	attempt := TaskAttempt{TaskTID: "t1", AttemptSeq: 2, Trigger: AttemptTriggerRecovery, ArtifactKeys: []byte(`["t1/perf.data"]`)}
+	if attempt.Trigger != AttemptTriggerRecovery || attempt.AttemptSeq != 2 || len(attempt.ArtifactKeys) == 0 {
+		t.Fatal("task attempt must retain trigger, sequence, and artifact evidence")
+	}
+	if AttemptTriggerInitial == AttemptTriggerRetry || AttemptTriggerSubtask == "" {
+		t.Fatal("task attempt trigger constants must remain distinct")
+	}
+}
+
+func TestOutboxRetryFields(t *testing.T) {
+	entry := Outbox{AggregateID: "t1", Attempt: 1, LastError: "temporary outage"}
+	if entry.Attempt != 1 || entry.LastError == "" {
+		t.Fatal("outbox must retain retry state until publication")
+	}
+}

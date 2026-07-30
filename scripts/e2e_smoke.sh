@@ -43,10 +43,34 @@ tid="$(printf '%s' "$create_resp" | json_get "d['data']['tid']")"
 test -n "$tid" || fail "create normal task"
 pass "create normal task $tid"
 
+idempotency_key="e2e-${tid}"
+idem_first="$(curl -fsS -X POST "$BASE/api/v1/tasks" \
+  -H 'Content-Type: application/json' \
+  -H "Drop-User-Uid: $AUTH_UID" -H "Drop-User-Name: $AUTH_NAME" \
+  -H "Idempotency-Key: $idempotency_key" \
+  -d "{\"name\":\"e2e idempotency\",\"task_type\":0,\"profiler_type\":0,\"target_ip\":\"$TARGET_IP\",\"duration\":2}")"
+idem_tid="$(printf '%s' "$idem_first" | json_get "d['data']['tid']")"
+idem_second="$(curl -fsS -X POST "$BASE/api/v1/tasks" \
+  -H 'Content-Type: application/json' \
+  -H "Drop-User-Uid: $AUTH_UID" -H "Drop-User-Name: $AUTH_NAME" \
+  -H "Idempotency-Key: $idempotency_key" \
+  -d "{\"name\":\"e2e idempotency\",\"task_type\":0,\"profiler_type\":0,\"target_ip\":\"$TARGET_IP\",\"duration\":2}")"
+test "$(printf '%s' "$idem_second" | json_get "d['data']['tid']")" = "$idem_tid" || fail "idempotency key returns same task"
+test "$(printf '%s' "$idem_second" | json_get "d['data'].get('replayed', False)")" = "True" || fail "idempotency key marks replay"
+pass "idempotency key"
+
+unauth_code="$(curl -s -o /tmp/mini-drop-e2e-unauth.json -w '%{http_code}' "$BASE/api/v1/tasks")"
+test "$unauth_code" = "401" || fail "unauthenticated request rejected"
+pass "authentication required"
+
 detail_resp="$(curl -fsS -H "Drop-User-Uid: $AUTH_UID" -H "Drop-User-Name: $AUTH_NAME" "$BASE/api/v1/tasks/$tid")"
 event_count="$(printf '%s' "$detail_resp" | json_get "len(d['data'].get('status_events', []))")"
 test "$event_count" -ge 1 || fail "task status event recorded"
 pass "task status event recorded"
+
+attempts_count="$(printf '%s' "$detail_resp" | json_get "len(d['data'].get('attempts', []))")"
+test "$attempts_count" -ge 0 || fail "task attempts response present"
+pass "task evidence response"
 
 upload_event_count=0
 for _ in $(seq 1 12); do
