@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+import re
 from datetime import datetime, timezone
 
 # 引入同目录下的模块
@@ -647,6 +648,69 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     }
 
 
+def _parse_pprof_top(output: str) -> dict:
+    """Convert `go tool pprof -top` CPU-time rows to the existing TopN schema.
+
+    pprof's ``flat`` value is duration (for example ``41.33s``), not a count
+    of sampling events.  It remains in ``samples`` for backwards-compatible
+    JSON, while ``sample_unit`` tells the result page how to label it.
+    """
+    rows = []
+    total = 0
+    for line in output.splitlines():
+        # flat flat% sum% cum cum% function
+        m = re.match(r"^\s*([\d.]+)([a-zA-Zµ]+)?\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)([a-zA-Zµ]+)?\s+([\d.]+)%\s+(.+)$", line)
+        if not m:
+            continue
+        samples = float(m.group(1))
+        pct = float(m.group(3))
+        name = m.group(8).strip()
+        if not name or name.startswith("..."):
+            continue
+        total += samples
+        rows.append({"function": name, "samples": samples, "percentage": pct})
+    return {
+        "language": "go", "source_format": "pprof", "sample_unit": "seconds", "total_samples": total,
+        "self_time_top": [{**row, "rank": i + 1} for i, row in enumerate(rows[:20])],
+    }
+
+
+def _analyze_pprof(conn, storage_cfg: dict, task: dict, bucket: str, tid: str,
+                   local_dir: str = "") -> dict:
+    """Analyse a gzip protobuf CPU profile with the official Go pprof CLI."""
+    storage, storage_ok = _connect_storage(storage_cfg)
+    local_profile = f"/tmp/{tid}_pprof.pb.gz"
+    if not storage_ok or not _download_perf_data(storage, bucket, tid, local_profile):
+        raise ValueError("找不到 pprof 原始 profile")
+    if not shutil.which("go"):
+        raise RuntimeError("分析镜像缺少 go tool pprof")
+
+    svg_path = f"/tmp/{tid}_pprof.svg"
+    svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-output", svg_path, local_profile],
+                             text=True, capture_output=True)
+    if svg_run.returncode != 0 or not os.path.exists(svg_path):
+        raise RuntimeError("pprof SVG 生成失败: " + (svg_run.stderr.strip() or svg_run.stdout.strip()))
+    top_run = subprocess.run(["go", "tool", "pprof", "-top", local_profile],
+                             text=True, capture_output=True)
+    if top_run.returncode != 0:
+        raise RuntimeError("pprof TopN 生成失败: " + top_run.stderr.strip())
+    with open(svg_path, "rb") as f:
+        svg = f.read()
+    top_json = _parse_pprof_top(top_run.stdout)
+    top_json["task_name"] = task.get("name", tid)
+    outputs, urls, local_files = [], {}, []
+    for name, data, content_type in (("flamegraph.svg", svg, "image/svg+xml"), ("top.json", top_json, "application/json")):
+        key = _upload_output(storage, bucket, tid, name, data, content_type)
+        if key:
+            outputs.append(key)
+            urls[name] = _get_presigned_url(storage, bucket, key)
+        else:
+            path = _save_local_output(local_dir, f"{tid}_{name}", data)
+            if path:
+                outputs.append(path); local_files.append(path)
+    return {"outputs": outputs, "presigned_urls": urls, "local_files": local_files}
+
+
 def _analyze_java_async_profiler(conn, storage_cfg: dict, task: dict,
                                  bucket: str, tid: str,
                                  local_dir: str = "") -> dict:
@@ -959,8 +1023,14 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
     if not bpf_text.strip():
         return {"outputs": [], "presigned_urls": {}, "local_files": []}
 
-    # 检测格式：折叠栈 → 火焰图；直方图 → SVG 柱状图
-    if ";" in bpf_text and "@" not in bpf_text:
+    params = task.get("request_params") or {}
+    bpf_mode = str(params.get("event") or "").lower()
+    if bpf_mode not in ("cpu", "io", "sched"):
+        bpf_mode = "cpu" if (";" in bpf_text and "@" not in bpf_text) else "histogram"
+
+    # 检测格式：CPU 折叠栈 → 火焰图；IO/sched → SVG 直方图。
+    is_cpu_profile = bpf_mode == "cpu" or (";" in bpf_text and "@" not in bpf_text)
+    if is_cpu_profile:
         print(f"[analysis] eBPF CPU 折叠栈 → 火焰图", file=sys.stderr)
         try:
             svg = generate_flamegraph(local_bpf, title=f"eBPF CPU: {task.get('name', tid)}")
@@ -969,11 +1039,16 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
         folded = get_folded_stacks(local_bpf) if False else bpf_text
         try:
             top_json = analyze_collapsed(bpf_text, top_n=20)
+            top_json["language"] = "native"
+            top_json["source_format"] = "bpftrace_folded"
+            top_json["collector"] = "ebpf"
         except:
             top_json = {}
     else:
         print(f"[analysis] eBPF 直方图 → SVG 柱状图", file=sys.stderr)
         hist_data = analyze_bpf_output(bpf_text)
+        if not hist_data.get("buckets"):
+            raise ValueError("eBPF 直方图没有有效桶：请确认采集窗口内存在 IO/调度负载、tracepoint 可用且 Agent 具备 bpftrace/tracefs 权限；必要时加长 duration")
         svg = bpf_histogram_to_svg(hist_data, title=f"eBPF {hist_data.get('type', '')}")
         top_json = hist_data
 
@@ -982,14 +1057,14 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
     os.makedirs(out_dir, exist_ok=True)
     local_prefix = "" if local_dir else f"{tid}_"
 
-    svg_name = f"{local_prefix}bpf_histogram.svg"
+    svg_name = f"{local_prefix}{'flamegraph.svg' if is_cpu_profile else 'bpf_histogram.svg'}"
     svg_path = os.path.join(out_dir, svg_name)
     if svg:
         with open(svg_path, 'w') as f:
             f.write(svg)
         local_files.append({"name": svg_name, "path": svg_path})
 
-    json_name = f"{local_prefix}bpf_data.json"
+    json_name = f"{local_prefix}{'top.json' if is_cpu_profile else 'bpf_data.json'}"
     json_path = os.path.join(out_dir, json_name)
     with open(json_path, 'w') as f:
         json.dump(top_json, f, ensure_ascii=False, indent=2)
@@ -1051,6 +1126,10 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
             # Java async-profiler：collapsed/JFR 文本 → Java 火焰图 + TopN
             result = _analyze_java_async_profiler(conn, storage_cfg, task,
                                                   bucket, tid, local_dir)
+
+        elif task_type == TASK_TYPE_TRACING:
+            # task type 2 is the Go HTTP pprof collector, not generic tracing.
+            result = _analyze_pprof(conn, storage_cfg, task, bucket, tid, local_dir)
 
         elif task_type == TASK_TYPE_MEMCHECK:
             # 内存泄漏检测：alloc/free 配对分析 → 责任人定位

@@ -13,6 +13,18 @@
 
 services:
 
+  # 本地验收用 Go pprof 服务；生产任务可填写任意 Agent 可访问的 pprof_url。
+  pprof_demo:
+    build:
+      context: ./pprof_demo
+    ports:
+      - "6060:6060"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:6060/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   # ========================================================
   # PostgreSQL — 数据库
   # 存用户、任务、Agent 等所有业务数据

@@ -45,6 +45,7 @@ type CreateTaskReq struct {
 	Event         string `json:"event"`     // cpu-cycles / cache-misses
 	Subprocess    bool   `json:"subprocess"`
 	ContainerName string `json:"container_name"`
+	PprofURL      string `json:"pprof_url"`
 }
 
 // PerfParams 性能采集参数，会被序列化为 JSONB 存入 request_params 字段
@@ -55,6 +56,68 @@ type PerfParams struct {
 	Callgraph  string `json:"callgraph"`
 	Event      string `json:"event"`
 	Subprocess bool   `json:"subprocess"`
+	PprofURL   string `json:"pprof_url"`
+}
+
+const (
+	ProfilerPerf  uint32 = 0
+	ProfilerAsync uint32 = 1
+	ProfilerPprof uint32 = 2
+	ProfilerBPF   uint32 = 3
+
+	TaskTypeGeneric uint32 = 0
+	TaskTypeJava    uint32 = 1
+	TaskTypePprof   uint32 = 2
+	TaskTypeBPF     uint32 = 5
+)
+
+// normalizeAndValidateCollector keeps the public REST contract and the agent
+// contract aligned.  In particular it prevents pprof/Java jobs from silently
+// being persisted as generic perf jobs and analysed by the wrong pipeline.
+func normalizeAndValidateCollector(req *CreateTaskReq) error {
+	switch req.ProfilerType {
+	case ProfilerPerf:
+		req.TaskType = TaskTypeGeneric
+		if req.Event == "" {
+			req.Event = "cpu-clock"
+		}
+	case ProfilerAsync:
+		req.TaskType = TaskTypeJava
+		if req.TargetPID <= 0 {
+			return fmt.Errorf("async-profiler 必须指定 Java 目标 PID")
+		}
+		if req.Event == "" {
+			req.Event = "cpu"
+		}
+	case ProfilerPprof:
+		req.TaskType = TaskTypePprof
+		// Compatibility: old jobs stored a full endpoint in event.
+		if req.PprofURL == "" && (strings.HasPrefix(req.Event, "http://") || strings.HasPrefix(req.Event, "https://")) {
+			req.PprofURL = req.Event
+		}
+		parsed, err := url.ParseRequestURI(req.PprofURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return fmt.Errorf("pprof_url 必须是可访问的 http/https 完整 URL")
+		}
+		req.Event = ""
+	case ProfilerBPF:
+		req.TaskType = TaskTypeBPF
+		if req.Event == "" {
+			req.Event = "cpu"
+		}
+		if req.Event != "cpu" && req.Event != "io" && req.Event != "sched" {
+			return fmt.Errorf("eBPF event 仅支持 cpu、io 或 sched")
+		}
+	default:
+		return fmt.Errorf("不支持的 profiler_type=%d", req.ProfilerType)
+	}
+	if req.Duration == 0 || req.Duration > 3600 {
+		return fmt.Errorf("采样时长需为 1-3600 秒")
+	}
+	if req.Frequency == 0 || req.Frequency > 10000 {
+		return fmt.Errorf("采样频率需为 1-10000 Hz")
+	}
+	return nil
 }
 
 // TaskResultNotifyReq 是 drop_server 完成采集后回调 apiserver 的内部请求体。
@@ -85,6 +148,10 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 	}
 	if req.Callgraph == "" {
 		req.Callgraph = "fp"
+	}
+	if err := normalizeAndValidateCollector(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
 	}
 
 	uid := getRequestUIDOrDefault(c)
@@ -128,6 +195,7 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		Callgraph:  req.Callgraph,
 		Event:      req.Event,
 		Subprocess: req.Subprocess,
+		PprofURL:   req.PprofURL,
 	})
 	if err != nil {
 		s.Logger.Error("序列化任务参数失败", zap.Error(err))
@@ -255,6 +323,7 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq, t
 		ProfilerType:  req.ProfilerType,
 		SampleArgv:    recordArgv,
 		ContainerName: req.ContainerName,
+		PprofUrl:      req.PprofURL,
 		TimeoutSec:    uint32(req.Duration + 30), // 多给 30s 上传时间
 		CosConfig:     cosCfg,
 	}
@@ -753,6 +822,10 @@ func (s *APIServer) fetchTopFunctions(tid string) []map[string]interface{} {
 }
 
 func normalizeTopFunctions(topData map[string]interface{}) []map[string]interface{} {
+	sampleUnit, _ := topData["sample_unit"].(string)
+	sampleKind, _ := topData["sample_kind"].(string)
+	sourceFormat, _ := topData["source_format"].(string)
+	collector, _ := topData["collector"].(string)
 	for _, key := range []string{"self_time_top", "top_functions", "inclusive_time_top"} {
 		items, ok := topData[key].([]interface{})
 		if !ok {
@@ -761,6 +834,18 @@ func normalizeTopFunctions(topData map[string]interface{}) []map[string]interfac
 		funcs := make([]map[string]interface{}, 0, len(items))
 		for _, item := range items {
 			if m, ok := item.(map[string]interface{}); ok {
+				if sampleUnit != "" {
+					m["sample_unit"] = sampleUnit
+				}
+				if sampleKind != "" {
+					m["sample_kind"] = sampleKind
+				}
+				if sourceFormat != "" {
+					m["source_format"] = sourceFormat
+				}
+				if collector != "" {
+					m["collector"] = collector
+				}
 				funcs = append(funcs, m)
 			}
 		}
@@ -987,6 +1072,7 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 		Callgraph:    oldParams.Callgraph,
 		Event:        oldParams.Event,
 		Subprocess:   oldParams.Subprocess,
+		PprofURL:     oldParams.PprofURL,
 	}
 
 	// A5: 同事务写 Task + Outbox，下发交给后台 dispatchOutboxLoop 异步执行

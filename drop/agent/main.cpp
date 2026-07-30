@@ -217,7 +217,7 @@ static pair<int, string> run_profiler(
     }
     case 1: // async-profiler (Java)
     {
-        path = outputPath + ".jfr";
+        path = outputPath + ".collapsed";
         cout << "[agent] 选择采集器: async-profiler (profilerType=1)" << endl;
         int result = drop::run_async_profiler(task, path);
         if (result != 0)
@@ -336,13 +336,18 @@ static string get_error_message(int resultCode, const string &profilerName,
     case 0:
         return ""; // 成功
     case -4:
+        if (profilerName == "pprof")
+            return "无法连接 Go pprof：请确认 pprof_url 可从 Agent 访问并已启用 /debug/pprof/profile";
         return "目标 PID " + to_string(task.sampleargv().pid()) + " 不存在";
     case -3:
         return profilerName + " 采集超时（" + to_string(task.timeoutsec()) + "秒）";
+    case -6:
+        if (profilerName == "pprof")
+            return "pprof 返回的不是有效 gzip profile；请确认 /debug/pprof/profile 已启用且未被代理改写";
+        return profilerName + " 未生成有效采集文件";
     case -1:
     case -2:
     case -5:
-    case -6:
         if (profilerName == "eBPF")
             return "eBPF 采集失败：请确认 bpftrace/tracefs 权限可用，并在采集窗口内制造 IO 或调度负载，resultCode=" + to_string(resultCode);
         return profilerName + " 进程异常, resultCode=" + to_string(resultCode);
@@ -379,8 +384,8 @@ static hotmethod::TaskResult build_task_result(
         if (!file_exists(actualPath))
         {
             // 尝试带后缀的变体
-            if (file_exists(outputPath + ".jfr"))
-                actualPath = outputPath + ".jfr";
+            if (file_exists(outputPath + ".collapsed"))
+                actualPath = outputPath + ".collapsed";
             else if (file_exists(outputPath + ".pb.gz"))
                 actualPath = outputPath + ".pb.gz";
             else if (file_exists(outputPath + ".bpf"))

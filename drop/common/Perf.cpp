@@ -16,6 +16,7 @@
 #include <cstring>    // strerror
 #include <cerrno>     // errno
 #include <cstdlib>    // getenv
+#include <sys/stat.h>
 
 using namespace std;
 using namespace std::chrono;
@@ -58,6 +59,13 @@ namespace drop
             string perfBin = resolve_perf_bin();
             args_storage.push_back(perfBin);
             args_storage.push_back("record");
+
+            string event = taskDesc.sampleargv().event();
+            if (!event.empty())
+            {
+                args_storage.push_back("-e");
+                args_storage.push_back(event);
+            }
             args_storage.push_back("-F");
             args_storage.push_back(to_string(taskDesc.sampleargv().hz()));
 
@@ -141,8 +149,15 @@ namespace drop
 
         if (WIFEXITED(status))
         {
-            cout << "[perf] 子进程退出, exitCode=" << WEXITSTATUS(status) << endl;
-            return WEXITSTATUS(status);
+            int exitCode = WEXITSTATUS(status);
+            cout << "[perf] 子进程退出, exitCode=" << exitCode << endl;
+            struct stat st {};
+            if (exitCode == 0 && (stat(outputPath.c_str(), &st) != 0 || st.st_size == 0))
+            {
+                cerr << "[perf] perf 返回成功但未生成有效输出: " << outputPath << endl;
+                return -6;
+            }
+            return exitCode;
         }
         if (WIFSIGNALED(status))
         {

@@ -31,6 +31,7 @@ type CreateScheduleReq struct {
 	Callgraph    string `json:"callgraph"`
 	Event        string `json:"event"`
 	Subprocess   bool   `json:"subprocess"`
+	PprofURL     string `json:"pprof_url"`
 	// WindowSeconds 可选：前端按"窗口预设"下发时携带的窗口周期（秒），用于校验
 	// Duration 不会超出窗口本身，避免相邻窗口重叠。不下发则跳过该校验（自定义 cron 场景）。
 	WindowSeconds uint64 `json:"window_seconds"`
@@ -133,6 +134,7 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 		Callgraph:    params.Callgraph,
 		Event:        params.Event,
 		Subprocess:   params.Subprocess,
+		PprofURL:     params.PprofURL,
 	}
 
 	// A5: 同事务写 Task + Outbox，下发交给后台 dispatchOutboxLoop 异步执行
@@ -178,6 +180,15 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 	if req.Callgraph == "" {
 		req.Callgraph = "fp"
 	}
+	collectorReq := CreateTaskReq{
+		TaskType: req.TaskType, ProfilerType: req.ProfilerType, TargetPID: req.TargetPID,
+		Duration: req.Duration, Frequency: req.Frequency, Callgraph: req.Callgraph, Event: req.Event, PprofURL: req.PprofURL,
+	}
+	if err := normalizeAndValidateCollector(&collectorReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
+	}
+	req.TaskType, req.Event, req.PprofURL = collectorReq.TaskType, collectorReq.Event, collectorReq.PprofURL
 
 	// 窗口校验：持续采集的每次采样必须在窗口周期内结束，否则相邻窗口会重叠，
 	// "回溯任意窗口"的语义就不成立了。
@@ -204,6 +215,7 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 		Callgraph:  req.Callgraph,
 		Event:      req.Event,
 		Subprocess: req.Subprocess,
+		PprofURL:   req.PprofURL,
 	})
 
 	now := time.Now()

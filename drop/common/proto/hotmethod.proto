@@ -38,6 +38,7 @@ message TaskDesc {
   uint32  timeoutSec    = 7;  // 超时时间（秒），超过就认为失败
   common.CosConfig cosConfig = 8;  // 上传结果的存储配置
   string  scriptContent = 9;  // 脚本内容（ScriptExec 类型任务用）
+  string  pprofUrl      = 10; // Go pprof 完整 profile URL（profilerType=2）
 }
 
 // ----------------------------------------------------------

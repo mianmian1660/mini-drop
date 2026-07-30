@@ -187,8 +187,12 @@ export default function TaskResultPage() {
     if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
     if (!task) return <div style={styles.container}><p style={styles.error}>任务不存在</p></div>;
 
+    const bpfEvent = String(task.request_params?.event || '').toLowerCase();
     const isBpfTask = Number(task.type) === 5 || Boolean(bpfHistogram);
+    const isBpfHistogramTask = isBpfTask && (bpfEvent === 'io' || bpfEvent === 'sched' || Boolean(bpfHistogram?.buckets));
+    const isBpfCpuTask = isBpfTask && !isBpfHistogramTask;
     const isJavaTask = Number(task.type) === 1 || Number(task.profiler_type) === 1;
+    const isPprofTask = Number(task.type) === 2 || Number(task.profiler_type) === 2;
     const status = Number(task.status);
     const analysisStatus = Number(task.analysis_status);
     const statusName = statusNames[status] || 'UNKNOWN';
@@ -243,6 +247,7 @@ export default function TaskResultPage() {
                     <Metric label="分析状态" value={analysisNames[analysisStatus] || '未知'} />
                     <Metric label="采集器" value={profilerLabel(task.profiler_type, task.type, task.request_params?.event)} />
                     <Metric label="目标 Agent" value={task.target_ip || '-'} />
+                    {isPprofTask && <Metric label="pprof 来源" value={redactProfileUrl(task.request_params?.pprof_url) || '-'} />}
                     <Metric label="创建时间" value={formatTime(task.create_time)} />
                     <Metric label="开始时间" value={formatTime(task.begin_time) || '-'} />
                     <Metric label="结束时间" value={formatTime(task.end_time) || '-'} />
@@ -254,8 +259,8 @@ export default function TaskResultPage() {
 
             <div style={styles.split}>
                 <div style={styles.card}>
-                    <h3 style={styles.sectionTitle}>{isBpfTask ? 'eBPF 直方图' : isJavaTask ? 'Java 火焰图' : '火焰图'}</h3>
-                    <VisualResult artifact={artifact} task={task} isBpfTask={isBpfTask} />
+                    <h3 style={styles.sectionTitle}>{isBpfHistogramTask ? 'eBPF 直方图' : isBpfCpuTask ? 'eBPF CPU 火焰图' : isJavaTask ? 'Java 火焰图' : isPprofTask ? 'Go pprof 调用图' : '火焰图'}</h3>
+                    <VisualResult artifact={artifact} task={task} isBpfHistogramTask={isBpfHistogramTask} />
                 </div>
 
                 <div style={styles.card}>
@@ -273,13 +278,13 @@ export default function TaskResultPage() {
                 />
             )}
 
-            {isBpfTask ? (
+            {isBpfHistogramTask ? (
                 <BPFHistogramPanel histogram={bpfHistogram} />
             ) : isJavaTask ? null : (
-                <TopFunctionsPanel topFunctions={topFunctions} status={status} />
+                <TopFunctionsPanel topFunctions={topFunctions} status={status} isPprof={isPprofTask} />
             )}
 
-            {isBpfTask && topFunctions.length > 0 && (
+            {isBpfHistogramTask && topFunctions.length > 0 && (
                 <TopFunctionsPanel topFunctions={topFunctions} status={status} title="热点 TopN" />
             )}
 
@@ -288,7 +293,7 @@ export default function TaskResultPage() {
             <SuggestionsPanel
                 suggestions={suggestions}
                 bpfHistogram={bpfHistogram}
-                isBpfTask={isBpfTask}
+                isBpfHistogramTask={isBpfHistogramTask}
                 status={status}
             />
 
@@ -322,15 +327,15 @@ function Metric({ label, value }) {
     );
 }
 
-function VisualResult({ artifact, task, isBpfTask }) {
+function VisualResult({ artifact, task, isBpfHistogramTask }) {
     if (artifact?.url) {
-        if (artifact.type === 'bpf' || isBpfTask) {
+        if (artifact.type === 'bpf' || isBpfHistogramTask) {
             return (
                 <div>
                     <div style={styles.histogramStage}>
                         <img
                             src={artifact.url}
-                            alt={isBpfTask ? 'eBPF 直方图' : '可视化结果'}
+                            alt={isBpfHistogramTask ? 'eBPF 直方图' : '可视化结果'}
                             style={styles.histogramImage}
                         />
                     </div>
@@ -350,7 +355,7 @@ function VisualResult({ artifact, task, isBpfTask }) {
             <div>
                 <iframe
                     src={artifact.url}
-                    title={isBpfTask ? 'eBPF Histogram' : 'Flame Graph'}
+                    title={isBpfHistogramTask ? 'eBPF Histogram' : 'Flame Graph'}
                     style={styles.flameFrame}
                 />
                 <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
@@ -369,8 +374,8 @@ function VisualResult({ artifact, task, isBpfTask }) {
     const text = status === 3
         ? '任务失败，未生成可视化产物。'
         : status === 2
-            ? (isBpfTask ? '采集已完成，正在等待分析引擎生成直方图。' : '采集已完成，正在等待分析引擎生成火焰图。')
-            : (isBpfTask ? 'eBPF 采集中，直方图会在分析完成后显示。' : 'CPU 采集中，火焰图会在分析完成后显示。');
+            ? (isBpfHistogramTask ? '采集已完成，正在等待分析引擎生成直方图。' : '采集已完成，正在等待分析引擎生成火焰图。')
+            : (isBpfHistogramTask ? 'eBPF 采集中，直方图会在分析完成后显示。' : 'CPU 采集中，火焰图会在分析完成后显示。');
 
     return (
         <div style={styles.visualEmpty}>
@@ -494,7 +499,9 @@ function BPFHistogramPanel({ histogram }) {
     );
 }
 
-function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN' }) {
+function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN', isPprof = false }) {
+    const unit = topFunctions[0]?.sample_unit || (isPprof ? 'seconds' : 'samples');
+    const isSeconds = unit === 'seconds';
     return (
         <div style={styles.card}>
             <h3 style={styles.sectionTitle}>{title}</h3>
@@ -502,10 +509,10 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN' }) {
                 <div style={{ overflowX: 'auto' }}>
                     <table style={styles.table}>
                         <thead>
-                            <tr>
-                                <th style={styles.th}>#</th>
-                                <th style={styles.th}>函数名</th>
-                                <th style={styles.th}>采样次数</th>
+                                <tr>
+                                    <th style={styles.th}>#</th>
+                                    <th style={styles.th}>函数名</th>
+                                <th style={styles.th}>{isSeconds ? '自身 CPU 时间' : '采样次数'}</th>
                                 <th style={styles.th}>占比</th>
                             </tr>
                         </thead>
@@ -514,7 +521,7 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN' }) {
                                 <tr key={`${item.function || item.name || 'fn'}-${index}`}>
                                     <td style={styles.td}>{item.rank || index + 1}</td>
                                     <td style={styles.td}>{item.function || item.name || '-'}</td>
-                                    <td style={styles.td}>{item.samples || item.count || 0}</td>
+                                    <td style={styles.td}>{formatSampleValue(item.samples ?? item.count ?? 0, item.sample_unit || unit)}</td>
                                     <td style={styles.td}>{formatPercent(item.percentage ?? item.percent)}</td>
                                 </tr>
                             ))}
@@ -530,10 +537,10 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN' }) {
     );
 }
 
-function SuggestionsPanel({ suggestions, bpfHistogram, isBpfTask, status }) {
+function SuggestionsPanel({ suggestions, bpfHistogram, isBpfHistogramTask, status }) {
     const items = suggestions.length > 0
         ? suggestions
-        : (isBpfTask ? deriveBpfSuggestions(bpfHistogram) : []);
+        : (isBpfHistogramTask ? deriveBpfSuggestions(bpfHistogram) : []);
 
     return (
         <div style={styles.card}>
@@ -556,7 +563,9 @@ function SuggestionsPanel({ suggestions, bpfHistogram, isBpfTask, status }) {
                 </div>
             ) : (
                 <p style={{ textAlign: 'center', padding: 28, color: '#667085', margin: 0 }}>
-                    {isFinalTaskStatus(status) ? '暂无建议。CPU 任务需要 suggestions.json，eBPF 任务需要有效直方图摘要。' : '任务完成后将自动生成分析建议。'}
+                    {isFinalTaskStatus(status)
+                        ? (isBpfHistogramTask ? '暂无建议。eBPF IO/调度任务需要有效直方图摘要。' : '暂无建议。CPU 任务需要 suggestions.json 或热点 TopN。')
+                        : '任务完成后将自动生成分析建议。'}
                 </p>
             )}
         </div>
@@ -748,6 +757,14 @@ function displayFileName(name) {
     return parts[parts.length - 1] || name;
 }
 
+function redactProfileUrl(value) {
+    try {
+        const url = new URL(value);
+        if (url.username || url.password) { url.username = ''; url.password = ''; }
+        return url.toString();
+    } catch (_) { return ''; }
+}
+
 function isBpfHistogramFile(file) {
     const name = String(file?.name || '').toLowerCase();
     return name.endsWith('.svg') && (
@@ -826,7 +843,7 @@ function deriveBpfSuggestions(histogram) {
 
 function formatSuggestionMeta(item) {
     if (item.percentage !== undefined && item.percentage !== null && item.samples !== undefined) {
-        return `${formatPercent(item.percentage)} · ${item.samples} samples`;
+        return `${formatPercent(item.percentage)} · ${formatSampleValue(item.samples, item.sample_unit || 'samples')}`;
     }
     if (item.percentage !== undefined && item.percentage !== null) {
         return `指标 ${formatNumber(item.percentage)}`;
@@ -838,6 +855,7 @@ function eventLabel(event) {
     if (!event) return '-';
     if (event === 'sched') return '调度延迟';
     if (event === 'io' || event === 'blk') return 'IO 延迟';
+    if (event === 'cpu-clock') return 'CPU clock';
     if (event === 'cpu-cycles') return 'CPU cycles';
     if (event === 'cpu') return 'CPU profile';
     return event;
@@ -874,4 +892,12 @@ function formatNumber(value) {
     const n = Number(value);
     if (Number.isNaN(n)) return String(value);
     return n >= 100 ? n.toFixed(0) : n.toFixed(2);
+}
+
+function formatSampleValue(value, unit = 'samples') {
+    if (value === undefined || value === null || value === '') return '-';
+    const n = Number(value);
+    if (Number.isNaN(n)) return String(value);
+    if (unit === 'seconds') return `${formatNumber(n)}s`;
+    return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 0 }).format(n);
 }

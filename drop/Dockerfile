@@ -64,6 +64,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf "$perf_real" /usr/local/bin/perf-real \
     && rm -rf /var/lib/apt-lists/*
 
+# Pin async-profiler so Java collection is available in every Agent image.
+# The launcher is placed on PATH and emits collapsed stacks in the Agent code.
+ARG ASYNC_PROFILER_VERSION=4.4
+RUN curl -fsSL "https://github.com/async-profiler/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64.tar.gz" \
+    | tar -xz -C /opt \
+    && ln -s "/opt/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64/bin/asprof" /usr/local/bin/asprof \
+    && asprof --version
+
 # 安装 MinIO Client (mc)，用于上传采集结果到 MinIO
 RUN wget -q https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc \
     && chmod +x /usr/local/bin/mc

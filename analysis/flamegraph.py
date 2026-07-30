@@ -31,6 +31,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STACKCOLLAPSE_SCRIPT = os.path.join(_SCRIPT_DIR, "stackcollapse-perf.pl")
 FLAMEGRAPH_SCRIPT = os.path.join(_SCRIPT_DIR, "flamegraph.pl")
 _FOLDED_STACK_LINE_RE = re.compile(r"^.+\s+\d+(?:\.\d+)?$")
+PERF_SCRIPT_FIELDS = "comm,pid,tid,cpu,time,event,ip,sym,dso"
 
 
 def _check_dependencies():
@@ -79,16 +80,16 @@ def run_perf_script(perf_data_path: str) -> str:
         subprocess.CalledProcessError: perf 命令失败
         FileNotFoundError: perf 未安装
     """
-    print(f"[flamegraph] 执行 perf script -i {perf_data_path} ...", file=sys.stderr)
+    print(f"[flamegraph] 执行 perf script -F {PERF_SCRIPT_FIELDS} -i {perf_data_path} ...", file=sys.stderr)
     result = subprocess.run(
-        ["perf", "script", "-i", perf_data_path],
+        ["perf", "script", "-F", PERF_SCRIPT_FIELDS, "-i", perf_data_path],
         capture_output=True, text=True,
         timeout=120  # 大文件可能较慢
     )
     if result.returncode != 0:
         error_msg = result.stderr.strip() or "perf script 返回非零退出码"
         raise subprocess.CalledProcessError(
-            result.returncode, ["perf", "script", "-i", perf_data_path],
+            result.returncode, ["perf", "script", "-F", PERF_SCRIPT_FIELDS, "-i", perf_data_path],
             output=result.stdout, stderr=result.stderr
         )
 

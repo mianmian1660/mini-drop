@@ -14,9 +14,8 @@ namespace drop
 
     /// 执行 pprof 采集（profilerType=2）
     /// 从 Go 程序的 /debug/pprof/profile HTTP 端点拉取 CPU profile
-    /// @param taskDesc  任务描述（pprof 端点信息通过 event 字段传递）
-    ///                   event 格式: "http://host:port" 或 ":port"
-    ///                   pid 字段可用于端口号（当 event 为空时取 :pid 作为端口）
+    /// @param taskDesc 任务描述。pprofUrl 是完整的 HTTP profile URL；旧任务
+    ///                 可兼容使用 event 字段中的完整 URL。
     /// @param outputPath 输出文件路径（pprof 格式）
     /// @return 0=成功, -1=fork失败, -2=exec/wait异常, -3=超时, -4=连接失败, >0=退出码
     int run_pprof(const hotmethod::TaskDesc &taskDesc, const std::string &outputPath);

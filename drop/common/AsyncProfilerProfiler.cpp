@@ -27,6 +27,7 @@
 #include <signal.h>   // kill, SIGTERM, SIGKILL
 #include <cstring>    // strerror
 #include <cerrno>     // errno
+#include <sys/stat.h>
 
 using namespace std;
 using namespace std::chrono;
@@ -80,11 +81,9 @@ namespace drop
             args_storage.push_back("-d");
             args_storage.push_back(to_string(dur));
 
-            // 输出格式：默认 jfr，也可指定 collapsed
-            // 根据 outputPath 后缀决定格式
-            string fmt = "jfr";
-            if (outputPath.find(".collapsed") != string::npos)
-                fmt = "collapsed";
+            // Always emit collapsed stacks. This is portable to the analysis
+            // container and avoids requiring a matching JDK/jfr tool there.
+            string fmt = "collapsed";
             args_storage.push_back("-o");
             args_storage.push_back(fmt);
 
@@ -148,8 +147,12 @@ namespace drop
 
         if (WIFEXITED(status))
         {
-            cout << "[async-profiler] 子进程退出, exitCode=" << WEXITSTATUS(status) << endl;
-            return WEXITSTATUS(status);
+            int exitCode = WEXITSTATUS(status);
+            cout << "[async-profiler] 子进程退出, exitCode=" << exitCode << endl;
+            struct stat st {};
+            if (exitCode == 0 && (stat(outputPath.c_str(), &st) != 0 || st.st_size == 0))
+                return -6;
+            return exitCode;
         }
         if (WIFSIGNALED(status))
         {

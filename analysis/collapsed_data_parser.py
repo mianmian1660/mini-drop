@@ -215,6 +215,8 @@ def analyze_collapsed(collapsed_text: str, top_n: int = 20) -> dict:
     result = {
         "total_functions": len(self_counts),
         "total_samples": total_samples,
+        "sample_unit": "samples",
+        "sample_kind": "event_records",
         "self_time_top": self_top,
         "inclusive_time_top": inclusive_top,
     }

@@ -43,6 +43,8 @@ def t_analyze_collapsed():
     from collapsed_data_parser import analyze_collapsed
     result = analyze_collapsed("main;worker;process 200\nmain;worker;io_wait 100\nmain;gc 50\n", top_n=10)
     assert result["total_samples"] == 350
+    assert result["sample_unit"] == "samples"
+    assert result["sample_kind"] == "event_records"
 
 def t_analyze_collapsed_minimal_schema():
     from collapsed_data_parser import analyze_collapsed
@@ -72,6 +74,25 @@ def t_flamegraph_does_not_treat_perf_script_as_folded():
         "        ffffffff81000000 native_write_msr ([kernel.kallsyms])",
         "        7f0000000000 PyEval_EvalFrame (/usr/bin/python)",
     ])
+
+def t_perf_script_omits_period_field():
+    import subprocess
+    import flamegraph
+
+    captured = {}
+    original_run = flamegraph.subprocess.run
+    try:
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            return subprocess.CompletedProcess(args, 0, stdout="python 1/1 [000] 1.0: cpu-clock:\n", stderr="")
+        flamegraph.subprocess.run = fake_run
+        flamegraph.run_perf_script("/tmp/demo.perf")
+    finally:
+        flamegraph.subprocess.run = original_run
+
+    fields = captured["args"][captured["args"].index("-F") + 1]
+    assert "period" not in fields.split(",")
+    assert fields == flamegraph.PERF_SCRIPT_FIELDS
 
 def t_parse_bpf_histogram():
     from bpf_analyzer import parse_bpf_histogram
@@ -115,6 +136,12 @@ def t_analyze_bpf_output_auto():
     from bpf_analyzer import analyze_bpf_output
     r = analyze_bpf_output("@io_lat_us:\n[1, 2) 5\n[2, 4) 10\n")
     assert r["type"]=="io_latency"
+
+def t_analyze_bpf_output_cpu_schema():
+    from bpf_analyzer import analyze_bpf_output
+    r = analyze_bpf_output("bash;main;hot 2\nbash;main;cold 1\n", data_type="collapsed")
+    assert r["sample_unit"] == "samples"
+    assert r["self_time_top"][0]["function"] == "hot"
 
 def t_parse_memtrace():
     from memleak_analyzer import parse_memtrace
@@ -233,6 +260,17 @@ def t_java_collapsed_topn_schema():
     assert result["top_json"]["total_samples"] == 3
     assert top[0]["function"] == "com.example.A.run"
     assert {"function", "samples", "percentage"}.issubset(top[0].keys())
+
+def t_parse_pprof_top_schema():
+    from hotmethod_analyzer import _parse_pprof_top
+    result = _parse_pprof_top("Showing nodes accounting for 30ms, 100% of 30ms total\n"
+                               "      flat  flat%   sum%        cum   cum%\n"
+                               "     20ms 66.67% 66.67%      20ms 66.67%  main.work\n"
+                               "     10ms 33.33%   100%      10ms 33.33%  main.read\n")
+    assert result["language"] == "go"
+    assert result["sample_unit"] == "seconds"
+    assert result["self_time_top"][0]["function"] == "main.work"
+    assert result["self_time_top"][0]["percentage"] == 66.67
 
 def t_lease_owner_guard_sql():
     from lease import AnalysisLeaseClient

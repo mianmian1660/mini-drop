@@ -7,16 +7,16 @@ TARGET_IP ?= 127.0.0.1
 DURATION ?= 15
 FREQUENCY ?= 99
 
-.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched health test coverage e2e verify
+.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof health test coverage e2e verify
 
 health:
 	@echo "[health] API: $(API)"
 	@curl -fsS "$(API)/healthz" || curl -fsS "$(API)/health"
 	@echo
 
-demo: health demo-cpu demo-ebpf-io demo-ebpf-sched
+demo: health demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof
 	@echo
-	@echo "[demo] 已创建 CPU、eBPF IO、eBPF 调度三个演示任务。"
+	@echo "[demo] 已创建 CPU、eBPF IO、eBPF 调度和 Go pprof 演示任务。"
 	@echo "[demo] 打开 http://localhost/ 查看任务列表，或进入上面输出的 /task/result?tid=... 页面。"
 
 demo-cpu:
@@ -53,6 +53,18 @@ demo-ebpf-sched:
 		echo "$$RESP"; \
 		TID=$$(printf '%s' "$$RESP" | sed -n 's/.*"tid":"\([^"]*\)".*/\1/p'); \
 		if [[ -n "$$TID" ]]; then echo "[demo-ebpf-sched] result: http://localhost/task/result?tid=$$TID"; fi
+
+demo-pprof:
+	@echo "[demo-pprof] 启动 CPU 负载并创建 Go pprof 任务"
+	@curl -fsS http://127.0.0.1:6060/burn >/dev/null
+	@RESP=$$(curl -fsS -X POST "$(API)/api/v1/tasks" \
+		-H "Content-Type: application/json" \
+		-H "Drop-User-Uid: $(USER_UID)" \
+		-H "Drop-User-Name: $(USER_NAME)" \
+		-d '{"name":"make demo - Go pprof","profiler_type":2,"target_ip":"$(TARGET_IP)","duration":$(DURATION),"frequency":1,"pprof_url":"http://127.0.0.1:6060/debug/pprof/profile"}'); \
+		echo "$$RESP"; \
+		TID=$$(printf '%s' "$$RESP" | sed -n 's/.*"tid":"\([^"]*\)".*/\1/p'); \
+		if [[ -n "$$TID" ]]; then echo "[demo-pprof] result: http://localhost/task/result?tid=$$TID"; fi
 
 test:
 	$(MAKE) -C drop/build

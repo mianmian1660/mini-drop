@@ -22,6 +22,7 @@ const S = {
     err: { color: '#f44336', fontSize: 13, marginTop: 12 },
     ok: { color: '#4caf50', fontSize: 13, marginTop: 12 },
     hint: { fontSize: 11, color: '#888', marginTop: 2, marginBottom: 8 },
+    collectorGuide: { margin: '0 0 14px', padding: '10px 12px', border: '1px solid #cfe0ff', borderRadius: 6, background: '#f4f8ff', color: '#344054', fontSize: 12, lineHeight: 1.65 },
     chk: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
     presetBtn: (active) => ({
         padding: '4px 10px', fontSize: 12, borderRadius: 4, cursor: 'pointer',
@@ -30,7 +31,9 @@ const S = {
 };
 
 function deriveTaskType(pt, ev) {
-    if (pt === 3 && (ev === 'io' || ev === 'blk' || ev === 'sched')) return 5;
+    if (pt === 1) return 1;
+    if (pt === 2) return 2;
+    if (pt === 3) return 5;
     return 0;
 }
 
@@ -47,7 +50,7 @@ const WINDOW_PRESETS = [
 export default function CreateTaskModal({ onClose, onSuccess }) {
     const [f, setF] = useState({
         name: '', target_ip: '', target_pid: '', duration: 10, frequency: 99,
-        profiler_type: 0, callgraph: 'fp', event: '',
+        profiler_type: 0, callgraph: 'fp', event: 'cpu-clock', pprof_url: '',
         continuous: false, cron_expr: '*/5 * * * *', window_seconds: 300,
     });
     const [sub, setSub] = useState(false);
@@ -72,7 +75,12 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
 
     const up = (k, v) => setF(p => {
         const n = { ...p, [k]: v };
-        if (k === 'profiler_type' && v === 3 && !p.event) n.event = 'cpu';
+        if (k === 'profiler_type') {
+            if (v === 0) n.event = 'cpu-clock';
+            if (v === 3) n.event = p.event === 'io' || p.event === 'sched' ? p.event : 'cpu';
+            if (v === 1) n.event = 'cpu';
+            if (v === 2) n.event = '';
+        }
         // 首次勾选持续采集时，自动套用默认窗口预设（低频常驻），避免沿用一次性任务的 99Hz/10s
         if (k === 'continuous' && v === true && !p.continuous) {
             const preset = WINDOW_PRESETS[0];
@@ -105,6 +113,8 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
             setErr(`采样时长(${dur}s)需小于窗口周期(${f.window_seconds}s)，否则相邻窗口会重叠`);
             return;
         }
+        if (f.profiler_type === 1 && pid <= 0) { setErr('async-profiler 必须填写正在运行的 Java 进程 PID'); return; }
+        if (f.profiler_type === 2 && !/^https?:\/\/.+/.test(f.pprof_url.trim())) { setErr('请输入可访问的 http/https pprof Profile URL'); return; }
 
         setSub(true); setErr(''); setOk('');
         const tt = deriveTaskType(f.profiler_type, f.event);
@@ -115,7 +125,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                     name: f.name.trim(), cron_expr: f.cron_expr, task_type: tt,
                     profiler_type: f.profiler_type, target_ip: f.target_ip,
                     target_pid: pid, duration: dur, frequency: hz,
-                    callgraph: f.callgraph, event: f.event,
+                    callgraph: f.callgraph, event: f.event, pprof_url: f.pprof_url.trim(),
                     window_seconds: f.window_seconds,
                 });
                 if (r.code === 0) {
@@ -127,7 +137,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 const r = await tasks.create({
                     name: f.name.trim(), target_ip: f.target_ip, target_pid: pid,
                     duration: dur, frequency: hz, task_type: tt,
-                    profiler_type: f.profiler_type, callgraph: f.callgraph, event: f.event,
+                    profiler_type: f.profiler_type, callgraph: f.callgraph, event: f.event, pprof_url: f.pprof_url.trim(),
                 });
                 if (r.code === 0) {
                     setCid(r.data?.tid || ''); setIsSch(false); setOk('任务创建成功！');
@@ -156,6 +166,13 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                     <button style={S.close} onClick={onClose} disabled={sub} aria-label="关闭">×</button>
                 </div>
 
+            <div style={S.collectorGuide}>
+                <strong>采集器填写说明：</strong>
+                perf 采集 CPU 栈，PID 留空表示整机；async-profiler 仅用于 Java，必须填写 Java PID；
+                Go pprof 不需要 PID，必须填写 Agent 能访问的完整 <code>/debug/pprof/profile</code> URL；
+                eBPF 需要 Agent 的内核追踪权限。
+            </div>
+
             <div style={{ marginBottom: 16 }}>
                 <label style={S.label}>目标 Agent *</label>
                 {aload ? <p style={{ fontSize: 12, color: '#999' }}>加载中...</p>
@@ -168,7 +185,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
                 <div><label style={S.label}>任务名称 *</label><input style={S.input} placeholder="CPU采样-nginx" value={f.name} onChange={e => up('name', e.target.value)} /></div>
-                <div><label style={S.label}>目标 PID（留空=整机）</label><input style={S.input} type="number" placeholder="留空" value={f.target_pid} onChange={e => up('target_pid', e.target.value)} /></div>
+                <div><label style={S.label}>{f.profiler_type === 1 ? 'Java 目标 PID *' : f.profiler_type === 2 ? '目标 PID（pprof 不需要）' : '目标 PID（留空=整机）'}</label><input style={S.input} type="number" placeholder={f.profiler_type === 1 ? '必须填写 Java PID' : '留空'} value={f.target_pid} onChange={e => up('target_pid', e.target.value)} disabled={f.profiler_type === 2} /></div>
                 <div><label style={S.label}>采样时长（秒）</label><input style={S.input} type="number" value={f.duration} onChange={e => up('duration', e.target.value)} /></div>
                 <div><label style={S.label}>采样频率（Hz）</label><input style={S.input} type="number" value={f.frequency} onChange={e => up('frequency', e.target.value)} /></div>
                 <div>
@@ -181,13 +198,17 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                     </select>
                 </div>
                 <div>
-                    <label style={S.label}>{f.profiler_type === 3 ? 'eBPF 追踪模式' : '调用图模式'}</label>
+                    <label style={S.label}>{f.profiler_type === 3 ? 'eBPF 追踪模式' : f.profiler_type === 1 ? '采样事件' : f.profiler_type === 2 ? 'pprof Profile URL *' : '调用图模式'}</label>
                     {f.profiler_type === 3 ? (
                         <select style={S.select} value={f.event} onChange={e => up('event', e.target.value)}>
                             <option value="cpu">CPU 性能分析 (火焰图)</option>
                             <option value="io">IO 延迟分布 (直方图)</option>
                             <option value="sched">调度延迟分布 (直方图)</option>
                         </select>
+                    ) : f.profiler_type === 1 ? (
+                        <select style={S.select} value={f.event} onChange={e => up('event', e.target.value)}><option value="cpu">CPU</option><option value="wall">Wall clock</option><option value="alloc">Allocation</option></select>
+                    ) : f.profiler_type === 2 ? (
+                        <input style={S.input} type="url" placeholder="http://127.0.0.1:6060/debug/pprof/profile" value={f.pprof_url} onChange={e => up('pprof_url', e.target.value)} />
                     ) : (
                         <select style={S.select} value={f.callgraph} onChange={e => up('callgraph', e.target.value)}>
                             <option value="fp">fp (frame pointer)</option>
@@ -198,7 +219,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 </div>
             </div>
 
-            <p style={S.hint}>📌 将生成: {modeLabel}</p>
+            <p style={S.hint}>📌 将生成: {modeLabel}{f.profiler_type === 1 ? '。请填写与 Agent 共享 PID 命名空间、正在运行的 Java 进程 PID。' : f.profiler_type === 2 ? '。请填写 Agent 能访问的完整 /debug/pprof/profile URL；本地 demo 使用 http://127.0.0.1:6060/debug/pprof/profile。' : ''}</p>
 
             {/* 持续采集 */}
             <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>

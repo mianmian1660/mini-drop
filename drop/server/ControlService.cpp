@@ -47,7 +47,7 @@ namespace drop_server
             argv->set_duration(10);
             argv->set_pid(-1);
             argv->set_callgraph("fp");
-            argv->set_event("cpu-cycles");
+            argv->set_event("cpu-clock");
             cout << "[server]   生成默认 TID: " << taskID << endl;
         }
 

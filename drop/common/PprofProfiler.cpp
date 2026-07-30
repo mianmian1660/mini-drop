@@ -33,6 +33,7 @@
 #include <signal.h>   // kill, SIGTERM, SIGKILL
 #include <cstring>    // strerror
 #include <cerrno>     // errno
+#include <fstream>
 
 using namespace std;
 using namespace std::chrono;
@@ -47,47 +48,27 @@ namespace drop
         if (duration == 0)
             duration = 10;
 
-        string event = taskDesc.sampleargv().event();
-        int targetPid = taskDesc.sampleargv().pid();
-
-        string baseUrl;
-
-        // 优先使用 event 字段指定的地址
-        if (!event.empty())
-        {
-            // 如果 event 已经是完整 URL（以 http:// 或 https:// 开头）
-            if (event.find("http://") == 0 || event.find("https://") == 0)
-            {
-                baseUrl = event;
-            }
-            else
-            {
-                // 否则视为 host:port
-                baseUrl = "http://" + event;
-            }
-        }
-        else if (targetPid > 0)
-        {
-            // 使用 PID 作为端口号的默认约定
-            baseUrl = "http://localhost:" + to_string(targetPid);
-        }
-        else
-        {
-            // 默认 Go pprof 端口
-            baseUrl = "http://localhost:6060";
-        }
-
-        // 去掉末尾的 /
-        while (!baseUrl.empty() && baseUrl.back() == '/')
-            baseUrl.pop_back();
-
-        string fullUrl = baseUrl + "/debug/pprof/profile?seconds=" + to_string(duration);
+        string fullUrl = taskDesc.pprofurl();
+        // Compatibility with tasks created before pprofUrl existed.
+        if (fullUrl.empty())
+            fullUrl = taskDesc.sampleargv().event();
+        if (fullUrl.empty())
+            return "";
+        const string seconds = "seconds=";
+        if (fullUrl.find(seconds) == string::npos)
+            fullUrl += (fullUrl.find('?') == string::npos ? "?" : "&") + seconds + to_string(duration);
         return fullUrl;
     }
 
     int run_pprof(const hotmethod::TaskDesc &taskDesc, const string &outputPath)
     {
         string url = build_pprof_url(taskDesc);
+
+        if (url.empty())
+        {
+            cerr << "[pprof] 未提供 pprof URL" << endl;
+            return -4;
+        }
 
         cout << "[pprof] 目标 URL: " << url << endl;
 
@@ -114,6 +95,8 @@ namespace drop
             vector<string> args_storage;
             args_storage.push_back("curl");
             args_storage.push_back("-s"); // 静默模式
+            args_storage.push_back("--fail"); // reject HTTP error pages
+            args_storage.push_back("--show-error");
             args_storage.push_back("-o"); // 输出到文件
             args_storage.push_back(outputPath);
             args_storage.push_back("--connect-timeout");
@@ -190,7 +173,17 @@ namespace drop
                 cerr << "[pprof] curl 请求超时" << endl;
                 return -3;
             }
-            return exitCode;
+            if (exitCode != 0)
+                return exitCode;
+            std::ifstream profile(outputPath, std::ios::binary);
+            unsigned char magic[2]{};
+            profile.read(reinterpret_cast<char *>(magic), sizeof(magic));
+            if (!profile || magic[0] != 0x1f || magic[1] != 0x8b)
+            {
+                cerr << "[pprof] 返回内容不是 gzip pprof profile" << endl;
+                return -6;
+            }
+            return 0;
         }
         if (WIFSIGNALED(status))
         {

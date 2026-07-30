@@ -46,6 +46,16 @@ namespace drop
                              const hotmethod::TaskDesc &taskDesc, BpfMode mode);
     static bool has_histogram_bucket(const string &path);
 
+    static bool tracepoint_available(const string &name)
+    {
+        ifstream events("/sys/kernel/tracing/available_events");
+        string line;
+        while (getline(events, line))
+            if (line == name)
+                return true;
+        return false;
+    }
+
     // ---- 生成 bpftrace 脚本 ----
     static string make_script(BpfMode mode, const hotmethod::TaskDesc &taskDesc)
     {
@@ -350,6 +360,18 @@ namespace drop
     int run_bpf(const hotmethod::TaskDesc &taskDesc, const string &outputPath)
     {
         BpfMode mode = parse_bpf_mode(taskDesc.sampleargv().event());
+        if (mode == BpfMode::IO_LATENCY &&
+            (!tracepoint_available("block:block_rq_issue") || !tracepoint_available("block:block_rq_complete")))
+        {
+            cerr << "[bpf] 当前内核缺少 block_rq_issue/block_rq_complete tracepoint" << endl;
+            return -2;
+        }
+        if (mode == BpfMode::SCHED_LATENCY &&
+            (!tracepoint_available("sched:sched_wakeup") || !tracepoint_available("sched:sched_switch")))
+        {
+            cerr << "[bpf] 当前内核缺少 sched_wakeup/sched_switch tracepoint" << endl;
+            return -2;
+        }
         string script = make_script(mode, taskDesc);
 
         string tmp = "/tmp/bpf_script_" + to_string(getpid()) + ".bt";

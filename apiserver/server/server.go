@@ -456,7 +456,7 @@ func (s *APIServer) reconcileOrphanedTasks() {
 			Name: task.Name, TaskType: task.Type, ProfilerType: task.ProfilerType,
 			TargetIP: task.TargetIP, TargetPID: params.TargetPID, Duration: params.Duration,
 			Frequency: params.Frequency, Callgraph: params.Callgraph, Event: params.Event,
-			Subprocess: params.Subprocess,
+			Subprocess: params.Subprocess, PprofURL: params.PprofURL,
 		}
 
 		if s.GrpcConnected() {

@@ -68,3 +68,54 @@ func TestNotifyTaskResultRejectsMissingTaskID(t *testing.T) {
 		t.Fatalf("status=%d, want 400, body=%s", w.Code, w.Body.String())
 	}
 }
+
+func TestNormalizeCollectorContract(t *testing.T) {
+	tests := []struct {
+		profiler, wantType uint32
+		pid                int32
+		event              string
+		wantErr            bool
+	}{
+		{ProfilerPerf, TaskTypeGeneric, 0, "", false},
+		{ProfilerAsync, TaskTypeJava, 123, "cpu", false},
+		{ProfilerAsync, TaskTypeJava, 0, "", true},
+		{ProfilerPprof, TaskTypePprof, 0, "", false},
+		{ProfilerBPF, TaskTypeBPF, 0, "sched", false},
+		{ProfilerBPF, TaskTypeBPF, 0, "invalid", true},
+	}
+	for _, tt := range tests {
+		req := CreateTaskReq{ProfilerType: tt.profiler, TaskType: 99, TargetPID: tt.pid, Event: tt.event, Duration: 10, Frequency: 99}
+		if tt.profiler == ProfilerPprof {
+			req.PprofURL = "http://127.0.0.1:6060/debug/pprof/profile"
+		}
+		err := normalizeAndValidateCollector(&req)
+		if (err != nil) != tt.wantErr {
+			t.Fatalf("profiler=%d err=%v", tt.profiler, err)
+		}
+		if err == nil && req.TaskType != tt.wantType {
+			t.Fatalf("profiler=%d task_type=%d want=%d", tt.profiler, req.TaskType, tt.wantType)
+		}
+		if err == nil && tt.profiler == ProfilerPerf && req.Event != "cpu-clock" {
+			t.Fatalf("perf default event=%q want cpu-clock", req.Event)
+		}
+	}
+}
+
+func TestNormalizePprofURL(t *testing.T) {
+	base := CreateTaskReq{ProfilerType: ProfilerPprof, Duration: 10, Frequency: 1}
+	if err := normalizeAndValidateCollector(&base); err == nil {
+		t.Fatal("missing pprof_url must fail")
+	}
+	base.PprofURL = "ftp://example.invalid/profile"
+	if err := normalizeAndValidateCollector(&base); err == nil {
+		t.Fatal("non-http pprof_url must fail")
+	}
+	base.PprofURL = ""
+	base.Event = "http://127.0.0.1:6060/debug/pprof/profile"
+	if err := normalizeAndValidateCollector(&base); err != nil {
+		t.Fatalf("legacy event URL must work: %v", err)
+	}
+	if base.PprofURL == "" || base.Event != "" {
+		t.Fatalf("legacy URL was not normalized: %#v", base)
+	}
+}
