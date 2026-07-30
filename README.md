@@ -21,6 +21,22 @@ Mini-Drop 是一个按需性能采集与分析平台复刻项目，包含四个�
 
 特别说明：`perf record` 的真实 CPU 采样依赖 Linux perf_event 和硬件 PMU/性能计数器。部分 VMware/VirtualBox/WSL 环境无法开启“虚拟化 CPU 性能计数器”，即使容器权限正确，也可能无法真跑 perf 硬件采样。这属于虚拟化环境限制，不是系统链路错误。正式演示建议使用可开启 PMU 的 Linux 虚拟机、Linux 裸机或云主机。
 
+### WSL 的 `perf not found for kernel ...-microsoft` 告警
+
+这是 Ubuntu 的 `/usr/bin/perf` 包装器找不到微软定制 WSL 内核同版本工具包的提示；提示中的 `linux-tools-<WSL 内核版本>` 通常不在 Ubuntu 仓库，不能直接用 apt 修复。Mini-Drop Agent 使用镜像内的 `perf-real`，启动后可用以下命令确认真实采样能力：
+
+```bash
+docker compose exec drop_agent /usr/local/bin/perf-real stat -e task-clock true
+```
+
+如还需要让宿主 WSL 命令行的 `perf` 可用，执行：
+
+```bash
+bash scripts/setup_wsl_perf.sh
+```
+
+脚本会基于当前 WSL 6.6/6.1 内核线编译匹配的 perf，安装到 `/usr/local/bin/perf`，不会替换 `/usr/bin/perf` 或修改内核。完成后用 `perf stat -e task-clock true` 验收。即便该检查通过，WSL 的硬件 PMU 事件仍可能受 Hyper-V 限制；项目会报告真实失败，不会伪造采样成功。
+
 题目要求 eBPF 必须真跑：演示视频里需要现场触发一次 IO 或调度异常，并在 Web 上看到分布变化。因此 eBPF 任务默认不再静默降级成 mock；如果日志里出现 `eBPF 采集失败`，需要更换到能运行 `bpftrace` 的 Linux 环境或修复容器权限。只有本地开发想看页面链路时，才可以显式设置 `DROP_ALLOW_EBPF_MOCK=1`。
 
 如果 perf 或 eBPF 权限受限，请在宿主机上确认：
@@ -104,7 +120,10 @@ make demo
 make demo-cpu
 make demo-ebpf-io
 make demo-ebpf-sched
+make demo-pprof
 ```
+
+`demo-pprof` 使用 Compose 内置的开发示例服务，并采集 `http://127.0.0.1:6060/debug/pprof/profile`。生产环境创建 Go pprof 任务时，必须在页面填写 Agent 网络命名空间可访问的完整 Profile URL；它可以是任意主机、端口或容器地址，不能只填写 PID，也不会再自动猜测 Agent 的 6060 端口。
 
 `demo-ebpf-io` 会用 `dd` 在 `/tmp/mini-drop-demo-io.dat` 持续制造 IO 写入；`demo-ebpf-sched` 会用 4 个忙等循环制造 CPU 竞争/调度样本。
 
