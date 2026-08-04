@@ -1,6 +1,7 @@
 // ============================================================
 // pages/TimelinePage.js — Continuous Profiling 时间轴
 // 自动加载所有定时任务，点击即可查看历史采集窗口
+// 支持三种查询：全部窗口 / 时间区间（快捷或自定义）/ 按时刻回溯
 // ============================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -12,6 +13,12 @@ const S = {
     card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
     btn: { background: '#4a6cf7', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontSize: 13 },
     btnSm: { background: '#e0e0e0', color: '#333', border: 'none', padding: '4px 10px', borderRadius: 4, cursor: 'pointer', fontSize: 12, marginRight: 6 },
+    input: { padding: '7px 10px', border: '1px solid #ddd', borderRadius: 6, fontSize: 13, marginBottom: 12, boxSizing: 'border-box' },
+    rangeBtn: (active) => ({
+        background: active ? '#4a6cf7' : '#f0f2f8', color: active ? '#fff' : '#555',
+        border: active ? '1px solid #4a6cf7' : '1px solid #dde1ec',
+        padding: '6px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 13, marginRight: 8,
+    }),
     timeline: { position: 'relative', paddingLeft: 30, borderLeft: '3px solid #4a6cf7', marginLeft: 10 },
     point: (st) => ({
         position: 'relative', marginBottom: 20, padding: '10px 16px',
@@ -51,7 +58,14 @@ export default function TimelinePage() {
     const [schLoading, setSchLoading] = useState(true);
     const [error, setError] = useState('');
     const [atInput, setAtInput] = useState('');       // datetime-local 输入值
-    const [queryMode, setQueryMode] = useState('list'); // 'list' 全部窗口 | 'at' 按时刻回溯
+    const [queryMode, setQueryMode] = useState('list'); // 'list' 全部窗口 | 'at' 按时刻回溯 | 'range' 时间区间
+    const [fromInput, setFromInput] = useState('');   // 自定义区间起点（datetime-local）
+    const [toInput, setToInput] = useState('');       // 自定义区间终点（datetime-local）
+    const [showCustom, setShowCustom] = useState(false);  // 自定义区间输入是否展开
+    const [activeRange, setActiveRange] = useState(0);    // 选中的快捷区间小时数；-1 表示自定义；0 表示未选中
+    // 已生效区间保存为两个字符串而非对象，避免轮询 effect 因引用变化被反复重建
+    const [rangeFrom, setRangeFrom] = useState('');
+    const [rangeTo, setRangeTo] = useState('');
 
     // 加载定时任务列表
     useEffect(() => {
@@ -64,6 +78,7 @@ export default function TimelinePage() {
         if (!sid) return;
         setMasterTid(sid);
         setQueryMode('list');
+        setActiveRange(0);
         setLoading(true); setError('');
         try {
             const r = await tasks.timeline(sid);
@@ -77,6 +92,7 @@ export default function TimelinePage() {
     const loadAt = useCallback(async () => {
         if (!masterTid || !atInput) return;
         setQueryMode('at');
+        setActiveRange(0);
         setLoading(true); setError('');
         try {
             const atISO = new Date(atInput).toISOString();
@@ -87,15 +103,47 @@ export default function TimelinePage() {
         finally { setLoading(false); }
     }, [masterTid, atInput]);
 
-    // 自动轮询：沿用当前查询模式（全部窗口 / 按时刻回溯）重新拉取
+    // 区间查询：返回 [from, to] 内触发的全部采集窗口
+    const loadRange = useCallback(async (fromISO, toISO) => {
+        if (!masterTid) return;
+        setQueryMode('range');
+        setRangeFrom(fromISO); setRangeTo(toISO);
+        setLoading(true); setError('');
+        try {
+            const r = await tasks.timeline(masterTid, { from: fromISO, to: toISO });
+            if (r.code === 0) setPoints(r.data?.points || []);
+            else setError(r.message || '查询失败');
+        } catch (e) { setError('请求失败: ' + (e.message || '')); }
+        finally { setLoading(false); }
+    }, [masterTid]);
+
+    // 快捷区间：最近 N 小时（区间在点击时固定，不随轮询滑动）
+    const loadQuickRange = useCallback((hours) => {
+        const to = new Date();
+        const from = new Date(to.getTime() - hours * 3600 * 1000);
+        setActiveRange(hours);
+        setShowCustom(false);
+        loadRange(from.toISOString(), to.toISOString());
+    }, [loadRange]);
+
+    // 自定义区间：读取两个 datetime-local 输入（按浏览器本地时区解释）
+    const loadCustomRange = useCallback(() => {
+        if (!fromInput || !toInput) return;
+        setActiveRange(-1);
+        loadRange(new Date(fromInput).toISOString(), new Date(toInput).toISOString());
+    }, [fromInput, toInput, loadRange]);
+
+    // 自动轮询：沿用当前查询模式（全部窗口 / 时间区间 / 按时刻回溯）重新拉取
     useEffect(() => {
         const hasRunning = points.some(p => isActiveTask(p.status));
         if (!hasRunning || !masterTid) return;
         const iv = setInterval(() => {
-            if (queryMode === 'at') loadAt(); else loadTimeline(masterTid);
+            if (queryMode === 'at') loadAt();
+            else if (queryMode === 'range') { if (rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo); }
+            else loadTimeline(masterTid);
         }, 5000);
         return () => clearInterval(iv);
-    }, [points, masterTid, queryMode, loadTimeline, loadAt]);
+    }, [points, masterTid, queryMode, rangeFrom, rangeTo, loadTimeline, loadAt, loadRange]);
 
     const refreshSchedules = () => {
         setSchLoading(true);
@@ -170,23 +218,54 @@ export default function TimelinePage() {
                     )}
             </div>
 
-            {/* 按时刻回溯 */}
+            {/* 时间范围查询 */}
             {masterTid && (
                 <div style={S.card}>
-                    <h3 style={{ marginTop: 0 }}>🕐 按时刻回溯窗口</h3>
+                    <h3 style={{ marginTop: 0 }}>🔍 时间范围查询</h3>
                     <p style={S.hint}>
-                        选择一个历史时刻，查看当时正在生效（即该时刻之前最近一次触发）的采集窗口，
-                        而不是只能看调度器实际建过的离散任务点。
+                        选择一段时间，查看该区间内触发的全部采集窗口；时间按浏览器本地时区解释。
                     </p>
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+                        <button style={S.rangeBtn(activeRange === 1)} onClick={() => loadQuickRange(1)}>最近 1 小时</button>
+                        <button style={S.rangeBtn(activeRange === 24)} onClick={() => loadQuickRange(24)}>最近 24 小时</button>
+                        <button style={S.rangeBtn(activeRange === 168)} onClick={() => loadQuickRange(168)}>最近 7 天</button>
+                        <button style={S.rangeBtn(showCustom || activeRange === -1)} onClick={() => setShowCustom(v => !v)}>
+                            自定义区间 {showCustom ? '▲' : '▼'}
+                        </button>
+                        <button style={S.btnSm} onClick={() => loadTimeline(masterTid)}>查看全部窗口</button>
+                    </div>
+
+                    {showCustom && (
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+                            <input
+                                type="datetime-local"
+                                style={{ ...S.input, width: 220, marginBottom: 0 }}
+                                value={fromInput}
+                                onChange={e => setFromInput(e.target.value)}
+                            />
+                            <span style={{ color: '#888' }}>→</span>
+                            <input
+                                type="datetime-local"
+                                style={{ ...S.input, width: 220, marginBottom: 0 }}
+                                value={toInput}
+                                onChange={e => setToInput(e.target.value)}
+                            />
+                            <button style={S.btn} onClick={loadCustomRange} disabled={!fromInput || !toInput}>查询区间</button>
+                        </div>
+                    )}
+
+                    <div style={{ borderTop: '1px solid #eee', paddingTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <span style={{ ...S.label, marginBottom: 0 }}>🕐 按时刻回溯</span>
                         <input
                             type="datetime-local"
-                            style={{ ...S.input, width: 240, marginBottom: 0 }}
+                            style={{ ...S.input, width: 220, marginBottom: 0 }}
                             value={atInput}
                             onChange={e => setAtInput(e.target.value)}
                         />
                         <button style={S.btn} onClick={loadAt} disabled={!atInput}>回溯到该时刻</button>
-                        <button style={S.btnSm} onClick={() => loadTimeline(masterTid)}>查看全部窗口</button>
+                        <div style={{ ...S.hint, flexBasis: '100%' }}>
+                            返回该时刻之前最近一次触发的采集窗口，即当时正在生效的窗口。
+                        </div>
                     </div>
                 </div>
             )}
@@ -198,7 +277,9 @@ export default function TimelinePage() {
             {!loading && points.length > 0 && (
                 <div style={S.card}>
                     <h3>
-                        {queryMode === 'at' ? `回溯结果 (1 个窗口)` : `历史采集 (${points.length} 个窗口)`} — {masterTid}
+                        {queryMode === 'at' ? `回溯结果 (${points.length} 个窗口)`
+                            : queryMode === 'range' ? `区间结果 (${points.length} 个窗口)`
+                                : `历史采集 (${points.length} 个窗口)`} — {masterTid}
                     </h3>
                     <div style={S.timeline}>
                         {points.map((p, i) => (
@@ -234,7 +315,11 @@ export default function TimelinePage() {
             )}
 
             {!loading && masterTid && points.length === 0 && !error && (
-                <div style={{ ...S.loading, color: '#888' }}>该定时任务暂无子任务记录</div>
+                <div style={{ ...S.loading, color: '#888' }}>
+                    {queryMode === 'range' ? '该时间区间内没有采集窗口'
+                        : queryMode === 'at' ? '该时刻之前没有已触发的采集窗口'
+                            : '该定时任务暂无子任务记录'}
+                </div>
             )}
         </div>
     );
