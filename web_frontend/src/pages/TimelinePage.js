@@ -20,10 +20,10 @@ const S = {
         padding: '6px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 13, marginRight: 8,
     }),
     timeline: { position: 'relative', paddingLeft: 30, borderLeft: '3px solid #4a6cf7', marginLeft: 10 },
-    point: (st) => ({
+    point: (st, eff) => ({
         position: 'relative', marginBottom: 20, padding: '10px 16px',
         background: st === 2 ? '#e8f5e9' : st === 3 ? '#ffebee' : st === 4 ? '#f3e8ff' : st === 1 ? '#e3f2fd' : '#f5f5f5',
-        borderRadius: 6, border: '1px solid #eee',
+        borderRadius: 6, border: eff ? '2px solid #4a6cf7' : '1px solid #eee',
     }),
     dot: (st) => ({
         position: 'absolute', left: -39, top: 12, width: 14, height: 14, borderRadius: '50%',
@@ -58,6 +58,7 @@ export default function TimelinePage() {
     const [schLoading, setSchLoading] = useState(true);
     const [error, setError] = useState('');
     const [atInput, setAtInput] = useState('');       // datetime-local 输入值
+    const [spanInput, setSpanInput] = useState('30m'); // 回溯时刻前后取多长区间
     const [queryMode, setQueryMode] = useState('list'); // 'list' 全部窗口 | 'at' 按时刻回溯 | 'range' 时间区间
     const [fromInput, setFromInput] = useState('');   // 自定义区间起点（datetime-local）
     const [toInput, setToInput] = useState('');       // 自定义区间终点（datetime-local）
@@ -88,7 +89,7 @@ export default function TimelinePage() {
         finally { setLoading(false); }
     }, []);
 
-    // 按时刻回溯：返回 create_time <= at 的最近一个窗口（即 at 时刻正在生效的窗口）
+    // 按时刻回溯：返回 [at-span, at+span] 内的全部窗口，其中当时生效的一个带 is_effective
     const loadAt = useCallback(async () => {
         if (!masterTid || !atInput) return;
         setQueryMode('at');
@@ -96,12 +97,12 @@ export default function TimelinePage() {
         setLoading(true); setError('');
         try {
             const atISO = new Date(atInput).toISOString();
-            const r = await tasks.timeline(masterTid, { at: atISO });
+            const r = await tasks.timeline(masterTid, { at: atISO, span: spanInput });
             if (r.code === 0) setPoints(r.data?.points || []);
             else setError(r.message || '查询失败');
         } catch (e) { setError('请求失败: ' + (e.message || '')); }
         finally { setLoading(false); }
-    }, [masterTid, atInput]);
+    }, [masterTid, atInput, spanInput]);
 
     // 区间查询：返回 [from, to] 内触发的全部采集窗口
     const loadRange = useCallback(async (fromISO, toISO) => {
@@ -262,9 +263,18 @@ export default function TimelinePage() {
                             value={atInput}
                             onChange={e => setAtInput(e.target.value)}
                         />
+                        <select
+                            style={{ ...S.input, marginBottom: 0 }}
+                            value={spanInput}
+                            onChange={e => setSpanInput(e.target.value)}
+                        >
+                            <option value="10m">前后 ±10 分钟</option>
+                            <option value="30m">前后 ±30 分钟</option>
+                            <option value="2h">前后 ±2 小时</option>
+                        </select>
                         <button style={S.btn} onClick={loadAt} disabled={!atInput}>回溯到该时刻</button>
                         <div style={{ ...S.hint, flexBasis: '100%' }}>
-                            返回该时刻之前最近一次触发的采集窗口，即当时正在生效的窗口。
+                            返回该时刻前后区间内的全部采集窗口；当时正在生效的那个会加粗边框并标注「当时生效」。
                         </div>
                     </div>
                 </div>
@@ -283,7 +293,7 @@ export default function TimelinePage() {
                     </h3>
                     <div style={S.timeline}>
                         {points.map((p, i) => (
-                            <div key={p.tid} style={S.point(p.status)}>
+                            <div key={p.tid} style={S.point(p.status, p.is_effective)}>
                                 <div style={S.dot(p.status)} />
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <div>
@@ -293,6 +303,10 @@ export default function TimelinePage() {
                                             background: statusBadgeColor(p.status),
                                             color: '#fff'
                                         }}>{ST[p.status] || '未知'}</span>
+                                        {p.is_effective && <span style={{
+                                            marginLeft: 6, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 'bold',
+                                            background: '#4a6cf7', color: '#fff'
+                                        }}>当时生效</span>}
                                         {p.has_result && <span style={{ marginLeft: 6, fontSize: 11, color: '#4caf50' }}>✅ 有结果</span>}
                                     </div>
                                     <Link to={`/task/result?tid=${p.tid}`}

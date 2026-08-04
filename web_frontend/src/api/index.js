@@ -49,11 +49,12 @@ export const tasks = {
     retry: (tid) => client.post(`/api/v1/tasks/${tid}/retry`),
     // Continuous Profiling 时间轴
     // 全部窗口:      tasks.timeline(masterTid)
-    // 区间筛选:      tasks.timeline(masterTid, { from, to })   （RFC3339 字符串）
-    // 按时刻回溯:    tasks.timeline(masterTid, { at })         （RFC3339 字符串）
-    // GET /api/v1/tasks/timeline?master_tid=xxx&from=&to=&at=
-    timeline: (masterTid, { from, to, at } = {}) =>
-        client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid, from, to, at } }),
+    // 区间筛选:      tasks.timeline(masterTid, { from, to })    （RFC3339 字符串）
+    // 按时刻回溯:    tasks.timeline(masterTid, { at, span })    at 为 RFC3339，span 为时长如 '30m'/'2h'
+    //               返回 [at-span, at+span] 内的全部窗口，当时生效的那个 is_effective=true
+    // GET /api/v1/tasks/timeline?master_tid=xxx&from=&to=&at=&span=
+    timeline: (masterTid, { from, to, at, span } = {}) =>
+        client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid, from, to, at, span } }),
 };
 
 // ---------- 分析结果 ----------

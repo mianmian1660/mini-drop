@@ -9,6 +9,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1459,14 +1460,22 @@ func (s *APIServer) UploadTestFile(c *gin.Context) {
 	})
 }
 
+// at 回溯默认取前后各 30 分钟，可用 span 参数覆盖
+const defaultTimelineSpan = 30 * time.Minute
+
 // ============================================================
 // GetTimeline — Continuous Profiling 时间轴
 // GET /api/v1/tasks/timeline?master_tid=xxx
 // GET /api/v1/tasks/timeline?master_tid=xxx&from=<RFC3339>&to=<RFC3339>  区间筛选
-// GET /api/v1/tasks/timeline?master_tid=xxx&at=<RFC3339>                回溯到某一时刻生效的窗口
+// GET /api/v1/tasks/timeline?master_tid=xxx&at=<RFC3339>&span=30m        回溯某一时刻前后的窗口
 //
 // 窗口语义：一次 cron 触发 = 一个采集窗口 [create_time, create_time+duration)。
-// at 语义：返回 create_time <= at 的最近一个窗口（即 at 时刻正在生效/最近生效的窗口）。
+// at 语义：返回 [at-span, at+span] 内触发的全部窗口，span 缺省 30m。
+//
+//	其中 create_time <= at 的最近一个窗口标记 is_effective=true，即 at 时刻正在生效
+//	（或最近一次生效）的窗口；该窗口若早于 at-span 也会被补入结果，
+//	保证回溯任意时刻都能知道当时在跑什么。
+//
 // ============================================================
 func (s *APIServer) GetTimeline(c *gin.Context) {
 	masterTID := c.Query("master_tid")
@@ -1475,11 +1484,18 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		return
 	}
 
-	query := s.DB.Where("master_task_tid = ? AND deleted_at IS NULL", masterTID)
+	// 生效窗口需要独立查询，不能共用已加过滤条件的 query，因此把基础条件封成构造函数
+	baseQuery := func() *gorm.DB {
+		return s.DB.Where("master_task_tid = ? AND deleted_at IS NULL", masterTID)
+	}
+	query := baseQuery()
 
 	atRaw := c.Query("at")
 	fromRaw := c.Query("from")
 	toRaw := c.Query("to")
+
+	// effective 仅在 at 模式下非空：at 时刻正在生效（最近一次触发）的窗口
+	var effective *model.HotmethodTask
 
 	switch {
 	case atRaw != "":
@@ -1488,7 +1504,33 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "at 参数格式错误，需为 RFC3339: " + err.Error()})
 			return
 		}
-		query = query.Where("create_time <= ?", at).Order("create_time DESC").Limit(1)
+
+		span := defaultTimelineSpan
+		if spanRaw := c.Query("span"); spanRaw != "" {
+			span, err = time.ParseDuration(spanRaw)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "span 参数格式错误，需为时长如 30m/2h: " + err.Error()})
+				return
+			}
+			if span <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "span 必须为正时长"})
+				return
+			}
+		}
+
+		// 单独查一次生效窗口：它可能早于 at-span，落在区间外
+		var eff model.HotmethodTask
+		errEff := baseQuery().Where("create_time <= ?", at).Order("create_time DESC").First(&eff).Error
+		if errEff == nil {
+			effective = &eff
+		} else if !errors.Is(errEff, gorm.ErrRecordNotFound) {
+			s.Logger.Error("查询生效窗口失败", zap.String("master_tid", masterTID), zap.Error(errEff))
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询失败"})
+			return
+		}
+
+		query = query.Where("create_time >= ? AND create_time <= ?", at.Add(-span), at.Add(span)).
+			Order("create_time ASC")
 	case fromRaw != "" || toRaw != "":
 		if fromRaw != "" {
 			from, err := time.Parse(time.RFC3339, fromRaw)
@@ -1518,6 +1560,20 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		return
 	}
 
+	// 生效窗口若早于 at-span 就不在区间结果里，补到最前面（其 create_time 必然最小，升序不变）
+	if effective != nil {
+		inRange := false
+		for _, t := range tasks {
+			if t.TID == effective.TID {
+				inRange = true
+				break
+			}
+		}
+		if !inRange {
+			tasks = append([]model.HotmethodTask{*effective}, tasks...)
+		}
+	}
+
 	// 构建时间轴数据
 	type TimelinePoint struct {
 		TID            string     `json:"tid"`
@@ -1531,6 +1587,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		WindowStart    time.Time  `json:"window_start"` // = CreateTime，窗口生效起点
 		WindowEnd      time.Time  `json:"window_end"`   // = CreateTime + duration，从任务自身采集参数推导
 		FrequencyHz    uint32     `json:"frequency_hz"` // 该窗口的采样频率
+		IsEffective    bool       `json:"is_effective"` // at 模式下：该窗口是 at 时刻正在生效的那一个
 	}
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
@@ -1542,6 +1599,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			CreateTime:     t.CreateTime,
 			AnalysisStatus: t.AnalysisStatus,
 			WindowStart:    t.CreateTime,
+			IsEffective:    effective != nil && t.TID == effective.TID,
 		}
 		if t.BeginTime != nil {
 			tp.BeginTime = t.BeginTime
