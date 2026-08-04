@@ -1585,9 +1585,13 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		HasResult      bool       `json:"has_result"` // 是否有火焰图/SVG产物
 		AnalysisStatus int        `json:"analysis_status"`
 		WindowStart    time.Time  `json:"window_start"` // = CreateTime，窗口生效起点
-		WindowEnd      time.Time  `json:"window_end"`   // = CreateTime + duration，从任务自身采集参数推导
-		FrequencyHz    uint32     `json:"frequency_hz"` // 该窗口的采样频率
-		IsEffective    bool       `json:"is_effective"` // at 模式下：该窗口是 at 时刻正在生效的那一个
+		// = CreateTime + duration，从任务自身采集参数推导。
+		// 用指针 + omitempty：采集参数缺 duration 时该字段直接不出现在 JSON 里，
+		// 而不是回一个零值时间（0001-01-01）——零值时间在前端是真值，会骗过
+		// `window_end ? ... : ...` 这类判断，把公元 1 年的日期当成合法窗口终点。
+		WindowEnd   *time.Time `json:"window_end,omitempty"`
+		FrequencyHz uint32     `json:"frequency_hz"` // 该窗口的采样频率
+		IsEffective bool       `json:"is_effective"` // at 模式下：该窗口是 at 时刻正在生效的那一个
 	}
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
@@ -1611,9 +1615,11 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus >= 2
 
 		// 窗口结束时间 = 触发时刻 + 该任务自身的采集时长（每条任务参数独立，不依赖 schedule 当前配置）
+		// 解析失败或 duration 缺失时保持 WindowEnd 为 nil，让它从 JSON 里消失
 		var params PerfParams
 		if err := util.UnmarshalJSONB(t.RequestParams, &params); err == nil && params.Duration > 0 {
-			tp.WindowEnd = t.CreateTime.Add(time.Duration(params.Duration) * time.Second)
+			windowEnd := t.CreateTime.Add(time.Duration(params.Duration) * time.Second)
+			tp.WindowEnd = &windowEnd
 			tp.FrequencyHz = params.Frequency
 		}
 

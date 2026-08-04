@@ -7,6 +7,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks, schedules } from '../api';
+import TimelineChart, { statusColor } from '../components/TimelineChart';
 
 const S = {
     container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
@@ -41,13 +42,6 @@ const S = {
 };
 
 const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
-const statusBadgeColor = (status) => {
-    if (status === 2) return '#4caf50';
-    if (status === 3) return '#f44336';
-    if (status === 4) return '#7c3aed';
-    if (status === 1) return '#2196f3';
-    return '#ffc107';
-};
 const isActiveTask = (status) => status === 0 || status === 1 || status === 4;
 
 export default function TimelinePage() {
@@ -286,12 +280,18 @@ export default function TimelinePage() {
 
             {!loading && points.length > 0 && (
                 <div style={S.card}>
-                    <h3>
-                        {queryMode === 'at' ? `回溯结果 (${points.length} 个窗口)`
-                            : queryMode === 'range' ? `区间结果 (${points.length} 个窗口)`
-                                : `历史采集 (${points.length} 个窗口)`} — {masterTid}
-                    </h3>
-                    <div style={S.timeline}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 }}>
+                        <h3 style={{ margin: '0 0 4px' }}>
+                            {queryMode === 'at' ? `回溯结果 (${points.length} 个窗口)`
+                                : queryMode === 'range' ? `区间结果 (${points.length} 个窗口)`
+                                    : `历史采集 (${points.length} 个窗口)`} — {masterTid}
+                        </h3>
+                        <span style={S.hint}>滚轮缩放 · 拖动平移 · 点击色块查看详情</span>
+                    </div>
+
+                    <TimelineChart points={points} />
+
+                    <div style={{ ...S.timeline, marginTop: 20 }}>
                         {points.map((p, i) => (
                             <div key={p.tid} style={S.point(p.status, p.is_effective)}>
                                 <div style={S.dot(p.status)} />
@@ -300,7 +300,7 @@ export default function TimelinePage() {
                                         <strong>{i + 1}. {p.name || p.tid}</strong>
                                         <span style={{
                                             marginLeft: 10, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 'bold',
-                                            background: statusBadgeColor(p.status),
+                                            background: statusColor(p.status),
                                             color: '#fff'
                                         }}>{ST[p.status] || '未知'}</span>
                                         {p.is_effective && <span style={{
