@@ -8,6 +8,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { tasks, cosfiles } from '../api';
 import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
 import AICard from '../components/AICard';
+import { collectorLabelFromTask, collectorLabelByKind, parseRequestParams } from '../utils/collectors';
 
 const styles = {
     container: { maxWidth: 1280, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif', color: '#202124' },
@@ -288,7 +289,9 @@ export default function TaskResultPage() {
     if (error) return <div style={styles.container}><p style={styles.error}>{error}</p></div>;
     if (!task) return <div style={styles.container}><p style={styles.error}>任务不存在</p></div>;
 
-    const bpfEvent = String(task.request_params?.event || '').toLowerCase();
+    const taskParams = parseRequestParams(task.request_params);
+    const collectorLabel = collectorLabelFromTask(task);
+    const bpfEvent = String(taskParams.event || '').toLowerCase();
     const isBpfTask = Number(task.type) === 5 || Boolean(bpfHistogram);
     const isBpfHistogramTask = isBpfTask && (bpfEvent === 'io' || bpfEvent === 'sched' || Boolean(bpfHistogram?.buckets));
     const isBpfCpuTask = isBpfTask && !isBpfHistogramTask;
@@ -370,9 +373,10 @@ export default function TaskResultPage() {
                 <div style={styles.grid}>
                     <Metric label="任务状态" value={<span style={{ ...styles.badge, background: statusColor }}>{statusName}</span>} />
                     <Metric label="分析状态" value={analysisNames[analysisStatus] || '未知'} />
-                    <Metric label="采集器" value={profilerLabel(task.profiler_type, task.type, task.request_params?.event)} />
+                    <Metric label="采集器" value={collectorLabel} />
+                    <Metric label="TaskKind" value={collectorLabelByKind(task.task_kind) || task.task_kind || '旧任务兼容'} />
                     <Metric label="目标 Agent" value={task.target_ip || '-'} />
-                    {isPprofTask && <Metric label="pprof 来源" value={redactProfileUrl(task.request_params?.pprof_url) || '-'} />}
+                    {isPprofTask && <Metric label="pprof 来源" value={redactProfileUrl(taskParams.pprof_url) || '-'} />}
                     <Metric label="创建时间" value={formatTime(task.create_time)} />
                     <Metric label="开始时间" value={formatTime(task.begin_time) || '-'} />
                     <Metric label="结束时间" value={formatTime(task.end_time) || '-'} />
@@ -528,9 +532,10 @@ function VisualResult({ artifact, task, isBpfHistogramTask, flameMeta }) {
 }
 
 function ParameterPanel({ task }) {
-    const params = task.request_params || {};
+    const params = parseRequestParams(task.request_params);
     const rows = [
-        ['采集器', profilerLabel(task.profiler_type, task.type, params.event)],
+        ['采集器', collectorLabelFromTask(task)],
+        ['TaskKind', collectorLabelByKind(task.task_kind) || task.task_kind || '旧任务兼容'],
         ['目标 PID', Number(params.target_pid || 0) > 0 ? params.target_pid : '整机'],
         ['采样时长', params.duration ? `${params.duration} 秒` : '-'],
         ['采样频率', params.frequency ? `${params.frequency} Hz` : '-'],
@@ -1001,19 +1006,6 @@ function isJavaFlamegraphFile(file) {
         name.includes('java_flamegraph') ||
         name.includes('java-flamegraph')
     );
-}
-
-function profilerLabel(profilerType, taskType, event) {
-    const pt = Number(profilerType);
-    if (Number(taskType) === 5) {
-        if (event === 'sched') return 'eBPF 调度延迟';
-        if (event === 'io' || event === 'blk') return 'eBPF IO 延迟';
-        return 'eBPF 内核探针';
-    }
-    if (pt === 1) return 'async-profiler';
-    if (pt === 2) return 'pprof';
-    if (pt === 3) return 'eBPF CPU';
-    return 'perf CPU';
 }
 
 function deriveBpfSuggestions(histogram) {

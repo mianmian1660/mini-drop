@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks, agents, schedules, taskKinds } from '../api';
+import { capabilityLabel, parseStringList } from '../utils/collectors';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15, 23, 42, 0.45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '48px 16px 24px', overflowY: 'auto' },
@@ -13,10 +14,22 @@ const S = {
     select: { width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14, marginBottom: 12, boxSizing: 'border-box', background: '#fff' },
     label: { display: 'block', marginBottom: 4, fontWeight: 'bold', fontSize: 13, color: '#555' },
     btn: { background: '#4a6cf7', color: '#fff', border: 'none', padding: '10px 20px', borderRadius: 6, cursor: 'pointer', fontSize: 14 },
+    linkBtn: { background: 'transparent', color: '#4a6cf7', border: 'none', padding: 0, cursor: 'pointer', fontSize: 12, fontWeight: 'bold' },
+    kindGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8, marginBottom: 8 },
+    kindCard: (active, disabled = false) => ({
+        textAlign: 'left', background: disabled ? '#f8fafc' : active ? '#eef3ff' : '#fff', border: active ? '2px solid #4a6cf7' : '1px solid #d0d7de',
+        borderRadius: 8, padding: 10, cursor: disabled ? 'not-allowed' : 'pointer', minHeight: 112, boxSizing: 'border-box',
+        opacity: disabled ? 0.72 : 1,
+    }),
+    kindTitle: { fontWeight: 'bold', color: '#111827', fontSize: 14, marginBottom: 6 },
+    kindMeta: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 },
+    pill: { display: 'inline-flex', alignItems: 'center', fontSize: 11, lineHeight: '16px', padding: '1px 6px', borderRadius: 999, background: '#f3f4f6', color: '#475467' },
+    kindDesc: { margin: 0, color: '#667085', fontSize: 12, lineHeight: 1.35 },
     err: { color: '#f44336', fontSize: 13, marginTop: 12 },
     ok: { color: '#4caf50', fontSize: 13, marginTop: 12 },
     hint: { fontSize: 11, color: '#888', marginTop: 2, marginBottom: 8 },
     warn: { fontSize: 12, color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '8px 10px', margin: '0 0 12px' },
+    capabilityList: { display: 'flex', gap: 6, flexWrap: 'wrap', margin: '4px 0 12px' },
     chk: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
     presetBtn: (active) => ({
         padding: '4px 10px', fontSize: 12, borderRadius: 4, cursor: 'pointer',
@@ -36,13 +49,61 @@ function valuesFromKind(kind) {
     (kind?.schema || []).forEach(field => {
         if (field.default !== undefined) out[field.name] = field.default;
     });
-    return { ...(kind?.default || {}), ...out };
+    return { ...out, ...(kind?.default || {}) };
 }
 
 function coerceField(field, value) {
     if (field.type === 'number') return parseInt(value, 10) || 0;
     if (field.type === 'boolean') return Boolean(value);
     return String(value ?? '');
+}
+
+function chooseDefaultKind(list, currentID) {
+    if (!Array.isArray(list) || list.length === 0) return null;
+    return list.find(k => k.id === currentID)
+        || list.find(k => k.id === 'perf_cpu')
+        || list.find(k => k.id === 'go_pprof')
+        || list[0];
+}
+
+function kindDescription(kind) {
+    switch (kind?.id) {
+        case 'perf_cpu':
+            return '本机 perf CPU 采样，适合生成 CPU 火焰图。';
+        case 'async_profiler_java':
+            return '采集 Java 进程 CPU/wall/alloc，需要填写目标 PID。';
+        case 'go_pprof':
+            return '拉取 Go pprof profile，需要填写 Profile URL。';
+        case 'ebpf_cpu':
+            return '使用 eBPF 采集 CPU 栈，适合内核态低开销观测。';
+        case 'ebpf_io':
+            return '采集块 IO 延迟与调用栈，适合排查磁盘抖动。';
+        case 'ebpf_sched':
+            return '采集调度延迟，适合排查线程等待和运行队列问题。';
+        default:
+            return kind?.description || '按后端 TaskKind 契约创建采样任务。';
+    }
+}
+
+function kindNeedsURL(kind) {
+    return (kind?.schema || []).some(field => field.name === 'pprof_url' || field.type === 'url');
+}
+
+function kindNeedsPID(kind) {
+    return (kind?.schema || []).some(field => field.name === 'target_pid' && field.required);
+}
+
+function capabilityMatches(kind, capabilities) {
+    if (!kind) return true;
+    const capSet = new Set(capabilities.map(cap => String(cap).toLowerCase()));
+    const candidates = [kind.id, kind.runner, ...(kind.capabilities || [])].map(item => String(item || '').toLowerCase());
+    return candidates.some(item => item && capSet.has(item));
+}
+
+function missingCapabilityText(kind, capabilities) {
+    if (!kind || capabilityMatches(kind, capabilities)) return '';
+    const labels = (kind.capabilities || [kind.runner || kind.id]).map(capabilityLabel).filter(Boolean);
+    return `当前 Agent 未声明 ${labels.join(' / ')} capability`;
 }
 
 export default function CreateTaskModal({ onClose, onSuccess }) {
@@ -58,8 +119,10 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
     const [isSch, setIsSch] = useState(false);
     const [agentList, setAgentList] = useState([]);
     const [kindList, setKindList] = useState([]);
+    const [catalogKinds, setCatalogKinds] = useState([]);
     const [aload, setAload] = useState(true);
     const [kload, setKload] = useState(true);
+    const [taskKindError, setTaskKindError] = useState('');
 
     useEffect(() => {
         agents.list().then(r => {
@@ -73,20 +136,27 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
 
     }, []);
 
+    useEffect(() => {
+        taskKinds.list().then(r => {
+            if (r.code === 0) setCatalogKinds(r.data?.task_kinds || []);
+        }).catch(() => {});
+    }, []);
+
     const loadTaskKinds = useCallback((targetIP) => {
         setKload(true);
+        setTaskKindError('');
         taskKinds.list(targetIP ? { target_ip: targetIP } : {}).then(r => {
             if (r.code !== 0) throw new Error(r.message || '加载 TaskKind 失败');
             const list = r.data?.task_kinds || [];
             setKindList(list);
             setF(p => {
                 if (list.length === 0) return { ...p, task_kind: '' };
-                const kind = list.find(k => k.id === p.task_kind) || list[0];
+                const kind = chooseDefaultKind(list, p.task_kind);
                 return { ...p, task_kind: kind.id, ...valuesFromKind(kind) };
             });
         }).catch(e => {
             setKindList([]);
-            setErr(e.message || '任务类型元数据加载失败');
+            setTaskKindError(e.message || '任务类型元数据加载失败');
         }).finally(() => setKload(false));
     }, []);
 
@@ -98,22 +168,38 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
         () => kindList.find(k => k.id === f.task_kind) || null,
         [kindList, f.task_kind],
     );
+    const selectedAgent = useMemo(
+        () => agentList.find(a => a.ip_addr === f.target_ip) || null,
+        [agentList, f.target_ip],
+    );
+    const selectedCapabilities = useMemo(
+        () => parseStringList(selectedAgent?.capabilities),
+        [selectedAgent],
+    );
+    const unavailableKinds = useMemo(() => {
+        const available = new Set(kindList.map(kind => kind.id));
+        return catalogKinds.filter(kind => kind.enabled !== false && !available.has(kind.id));
+    }, [catalogKinds, kindList]);
 
-    const up = (k, v) => setF(p => {
-        if (k === 'task_kind') {
-            const kind = kindList.find(item => item.id === v);
-            return { ...p, task_kind: v, ...valuesFromKind(kind) };
-        }
-        const n = { ...p, [k]: v };
-        if (k === 'continuous' && v === true && !p.continuous) {
-            const preset = WINDOW_PRESETS[0];
-            n.cron_expr = preset.cron;
-            n.duration = preset.duration;
-            n.frequency = preset.frequency;
-            n.window_seconds = preset.windowSeconds;
-        }
-        return n;
-    });
+    const up = (k, v) => {
+        setErr('');
+        if (k === 'target_ip' || k === 'task_kind') setTaskKindError('');
+        setF(p => {
+            if (k === 'task_kind') {
+                const kind = kindList.find(item => item.id === v);
+                return { ...p, task_kind: v, ...valuesFromKind(kind) };
+            }
+            const n = { ...p, [k]: v };
+            if (k === 'continuous' && v === true && !p.continuous) {
+                const preset = WINDOW_PRESETS[0];
+                n.cron_expr = preset.cron;
+                n.duration = preset.duration;
+                n.frequency = preset.frequency;
+                n.window_seconds = preset.windowSeconds;
+            }
+            return n;
+        });
+    };
 
     const applyWindowPreset = (preset) => setF(p => ({
         ...p,
@@ -141,15 +227,18 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
             );
         }
         return (
-            <input
-                style={S.input}
-                type={field.type === 'url' ? 'url' : field.type}
-                min={field.min}
-                max={field.max}
-                placeholder={field.placeholder || ''}
-                value={value}
-                onChange={e => up(field.name, coerceField(field, e.target.value))}
-            />
+            <>
+                <input
+                    style={S.input}
+                    type={field.type === 'url' ? 'url' : field.type}
+                    min={field.min}
+                    max={field.max}
+                    placeholder={field.placeholder || ''}
+                    value={value}
+                    onChange={e => up(field.name, coerceField(field, e.target.value))}
+                />
+                {field.placeholder && <p style={S.hint}>示例：{field.placeholder}</p>}
+            </>
         );
     };
 
@@ -164,10 +253,21 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
             setErr(`采样时长(${dur}s)需小于窗口周期(${f.window_seconds}s)，否则相邻窗口会重叠`);
             return;
         }
+        if (selectedKind.id === 'async_profiler_java' && (parseInt(f.target_pid, 10) || 0) < 1) {
+            setErr('Java async-profiler 需要填写大于 0 的 Java 目标 PID');
+            return;
+        }
         for (const field of selectedKind.schema || []) {
             const value = f[field.name];
             if (field.required && (value === '' || value === undefined || value === null || value === 0 && field.min > 0)) {
                 setErr(`请填写${field.label}`);
+                return;
+            }
+        }
+        if (selectedKind.id === 'go_pprof') {
+            const pprofURL = String(f.pprof_url || '').trim();
+            if (!/^https?:\/\//i.test(pprofURL)) {
+                setErr('Go pprof 需要填写 http/https 开头的完整 Profile URL');
                 return;
             }
         }
@@ -227,15 +327,62 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
                     <div><label style={S.label}>任务名称 *</label><input style={S.input} placeholder="CPU采样-nginx" value={f.name} onChange={e => up('name', e.target.value)} /></div>
-                    <div>
-                        <label style={S.label}>任务类型</label>
-                        {kload ? <p style={{ fontSize: 12, color: '#999' }}>加载中...</p> : (
-                            <select style={S.select} value={f.task_kind} onChange={e => up('task_kind', e.target.value)}>
-                                {kindList.map(kind => <option key={kind.id} value={kind.id}>{kind.display_name}</option>)}
-                            </select>
+                    <div style={{ gridColumn: '1 / -1' }}>
+                        <label style={S.label}>任务类型 *</label>
+                        {kload ? <p style={{ fontSize: 12, color: '#999' }}>加载中...</p> : taskKindError ? (
+                            <p style={S.warn}>
+                                {taskKindError}
+                                <button type="button" style={{ ...S.linkBtn, marginLeft: 8 }} onClick={() => loadTaskKinds(f.target_ip)}>重试</button>
+                            </p>
+                        ) : (
+                            <>
+                                {selectedCapabilities.length > 0 && (
+                                    <div style={S.capabilityList}>
+                                        {selectedCapabilities.map(cap => <span key={cap} style={S.pill}>{capabilityLabel(cap)}</span>)}
+                                    </div>
+                                )}
+                                <div style={S.kindGrid}>
+                                    {kindList.map(kind => (
+                                        <button
+                                            type="button"
+                                            key={kind.id}
+                                            style={S.kindCard(f.task_kind === kind.id)}
+                                            onClick={() => up('task_kind', kind.id)}
+                                        >
+                                            <div style={S.kindTitle}>{kind.display_name}</div>
+                                            <div style={S.kindMeta}>
+                                                <span style={S.pill}>{kind.runner || 'runner'}</span>
+                                                {kindNeedsPID(kind) && <span style={{ ...S.pill, background: '#ecfdf3', color: '#027a48' }}>需要 PID</span>}
+                                                {kindNeedsURL(kind) && <span style={{ ...S.pill, background: '#fff7ed', color: '#c2410c' }}>需要 URL</span>}
+                                                {kind.analysis_pipeline && <span style={S.pill}>{kind.analysis_pipeline}</span>}
+                                            </div>
+                                            <p style={S.kindDesc}>{kindDescription(kind)}</p>
+                                        </button>
+                                    ))}
+                                    {unavailableKinds.map(kind => (
+                                        <button
+                                            type="button"
+                                            key={kind.id}
+                                            style={S.kindCard(false, true)}
+                                            disabled
+                                            title={missingCapabilityText(kind, selectedCapabilities)}
+                                        >
+                                            <div style={S.kindTitle}>{kind.display_name}</div>
+                                            <div style={S.kindMeta}>
+                                                <span style={S.pill}>{kind.runner || 'runner'}</span>
+                                                <span style={{ ...S.pill, background: '#fef3c7', color: '#92400e' }}>当前不可用</span>
+                                            </div>
+                                            <p style={S.kindDesc}>{missingCapabilityText(kind, selectedCapabilities) || '当前 Agent 暂不支持该采集器。'}</p>
+                                        </button>
+                                    ))}
+                                </div>
+                                <select style={S.select} value={f.task_kind} onChange={e => up('task_kind', e.target.value)} aria-label="任务类型兼容选择">
+                                    {kindList.map(kind => <option key={kind.id} value={kind.id}>{kind.display_name}</option>)}
+                                </select>
+                            </>
                         )}
-                        {!kload && f.target_ip && kindList.length === 0 && (
-                            <p style={S.warn}>当前 Agent 未声明可用采集能力，或没有匹配的 TaskKind。</p>
+                        {!kload && !taskKindError && f.target_ip && kindList.length === 0 && (
+                            <p style={S.warn}>目标 Agent {f.target_ip} 没有匹配的 TaskKind。请切换 Agent，或检查 drop_agent capability 上报。</p>
                         )}
                     </div>
                     {(selectedKind?.schema || []).map(field => (

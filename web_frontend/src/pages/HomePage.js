@@ -9,6 +9,7 @@ import { Link } from 'react-router-dom';
 import { agents, tasks } from '../api';
 import CreateTaskModal from '../components/CreateTaskModal';
 import Pagination from '../components/Pagination';
+import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 
 const styles = {
     container: { maxWidth: 1280, margin: '0 auto', padding: 24, fontFamily: 'Arial, sans-serif', color: '#202124' },
@@ -27,6 +28,8 @@ const styles = {
     th: { textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
     td: { padding: '12px 16px', borderBottom: '1px solid #edf0f3', fontSize: 14, verticalAlign: 'top' },
     badge: { display: 'inline-flex', alignItems: 'center', padding: '3px 9px', borderRadius: 999, fontSize: 12, fontWeight: 'bold' },
+    capWrap: { display: 'flex', gap: 6, flexWrap: 'wrap' },
+    capPill: { display: 'inline-flex', alignItems: 'center', padding: '2px 7px', borderRadius: 999, background: '#eef2ff', color: '#315efb', fontSize: 11, fontWeight: 700 },
     empty: { textAlign: 'center', padding: 40, color: '#999' },
     loading: { textAlign: 'center', padding: 40, color: '#999' },
     searchRow: { display: 'flex', gap: 12, marginBottom: 16 },
@@ -49,6 +52,7 @@ const styles = {
     tileValue: { color: '#f8fafc', fontSize: 18, fontWeight: 700 },
     policyRow: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(120px, 1fr))', gap: 10, marginTop: 14 },
     policyPill: { background: '#101827', border: '1px solid #334155', borderRadius: 6, padding: '10px 12px', color: '#cbd5e1', fontSize: 13 },
+    darkCapPill: { display: 'inline-flex', alignItems: 'center', borderRadius: 999, padding: '3px 8px', background: '#1e293b', color: '#bfdbfe', border: '1px solid #334155', fontSize: 12, fontWeight: 700 },
     terminal: { background: '#07111f', border: '1px solid #1e293b', borderRadius: 6, padding: 12, minHeight: 258, fontFamily: 'Menlo, Consolas, monospace', fontSize: 12, overflow: 'auto' },
     terminalLine: { display: 'grid', gridTemplateColumns: '142px 78px minmax(80px, 1fr)', gap: 10, alignItems: 'baseline', padding: '6px 0', borderBottom: '1px solid rgba(148,163,184,0.12)' },
     terminalTime: { color: '#7dd3fc' },
@@ -253,6 +257,7 @@ export default function HomePage() {
                                 <th style={styles.th}>IP 地址</th>
                                 <th style={styles.th}>状态</th>
                                 <th style={styles.th}>版本</th>
+                                <th style={styles.th}>采集能力</th>
                                 <th style={styles.th}>最后心跳</th>
                                 <th style={styles.th}>操作</th>
                             </tr>
@@ -268,6 +273,7 @@ export default function HomePage() {
                                         </span>
                                     </td>
                                     <td style={styles.td}>{a.version}</td>
+                                    <td style={styles.td}><CapabilityTags value={a.capabilities} /></td>
                                     <td style={styles.td}>{formatTime(a.last_seen) || '-'}</td>
                                     <td style={styles.td}>
                                         <button
@@ -372,6 +378,7 @@ export default function HomePage() {
                                 <th style={styles.th}>任务ID</th>
                                 <th style={styles.th}>名称</th>
                                 <th style={styles.th}>目标IP</th>
+                                <th style={styles.th}>采集器</th>
                                 <th style={styles.th}>状态</th>
                                 <th style={styles.th}>Reason</th>
                                 <th style={styles.th}>创建时间</th>
@@ -384,6 +391,7 @@ export default function HomePage() {
                                     <td style={{ ...styles.td, fontSize: 12, color: '#888' }}>{t.tid}</td>
                                     <td style={styles.td}>{t.name}</td>
                                     <td style={styles.td}>{t.target_ip}</td>
+                                    <td style={styles.td}>{collectorLabelFromTask(t)}</td>
                                     <td style={styles.td}>
                                         <span style={{ ...styles.badge, background: statusColors[t.status] || '#999', color: '#fff' }}>
                                             {statusNames[t.status] || '未知'}
@@ -413,6 +421,8 @@ function AgentDetailPanel({ detail, loading, error, onRefresh, onClose }) {
     const audits = (detail?.audits || []).slice(0, 10);
     const online = Boolean(agent.online);
     const source = stat.source === 'grpc' ? '实时 gRPC' : '数据库快照';
+    const capabilities = parseStringList(agent.capabilities);
+    const collectorHints = collectorHintsFromCapabilities(capabilities);
 
     return (
         <div style={styles.agentDetail}>
@@ -448,6 +458,19 @@ function AgentDetailPanel({ detail, loading, error, onRefresh, onClose }) {
                 <div style={styles.policyRow}>
                     <div style={styles.policyPill}>Agent 每 {detail?.heartbeat_interval_sec || 5}s 心跳上报</div>
                     <div style={styles.policyPill}>Server 超过 {detail?.offline_after_sec || 30}s 判定离线</div>
+                </div>
+                <div style={{ marginTop: 14 }}>
+                    <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 8 }}>可创建采集器</div>
+                    <div style={styles.capWrap}>
+                        {collectorHints.length === 0 ? <span style={{ color: '#cbd5e1', fontSize: 13 }}>未声明采集能力</span> : collectorHints.map(item => (
+                            <span key={item} style={styles.darkCapPill}>{item}</span>
+                        ))}
+                    </div>
+                    {capabilities.length > 0 && (
+                        <div style={{ ...styles.capWrap, marginTop: 8 }}>
+                            {capabilities.map(cap => <span key={cap} style={styles.darkCapPill}>{capabilityLabel(cap)}</span>)}
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -497,6 +520,29 @@ function Metric({ label, value }) {
             <div style={styles.metricValue}>{value}</div>
         </div>
     );
+}
+
+function CapabilityTags({ value }) {
+    const caps = parseStringList(value);
+    if (caps.length === 0) return <span style={styles.subtle}>未声明</span>;
+    return (
+        <div style={styles.capWrap}>
+            {caps.slice(0, 6).map(cap => <span key={cap} style={styles.capPill}>{capabilityLabel(cap)}</span>)}
+            {caps.length > 6 && <span style={styles.subtle}>+{caps.length - 6}</span>}
+        </div>
+    );
+}
+
+function collectorHintsFromCapabilities(capabilities) {
+    const caps = new Set(capabilities.map(cap => String(cap).toLowerCase()));
+    const out = [];
+    if (caps.has('perf_cpu') || caps.has('perf')) out.push('perf CPU 火焰图');
+    if (caps.has('async-profiler') || caps.has('java') || caps.has('async_profiler_java')) out.push('Java async-profiler');
+    if (caps.has('go_pprof') || caps.has('pprof')) out.push('Go pprof');
+    if (caps.has('ebpf_io') || caps.has('ebpf') || caps.has('bpftrace')) out.push('eBPF IO 延迟');
+    if (caps.has('ebpf_sched') || caps.has('ebpf') || caps.has('bpftrace')) out.push('eBPF 调度延迟');
+    if (caps.has('ebpf_cpu') || caps.has('ebpf') || caps.has('bpftrace')) out.push('eBPF CPU 火焰图');
+    return Array.from(new Set(out));
 }
 
 function formatTime(value) {

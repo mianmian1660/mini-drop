@@ -8,6 +8,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks } from '../api';
 import Pagination from '../components/Pagination';
+import { collectorLabelFromTask } from '../utils/collectors';
 
 const styles = {
     container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
@@ -160,6 +161,7 @@ export default function TaskListPage() {
                                 <th style={styles.th}>任务ID</th>
                                 <th style={styles.th}>名称</th>
                                 <th style={styles.th}>目标IP</th>
+                                <th style={styles.th}>采集器</th>
                                 <th style={styles.th}>状态</th>
                                 <th style={styles.th}>创建时间</th>
                                 <th style={styles.th}>操作</th>
@@ -171,6 +173,7 @@ export default function TaskListPage() {
                                     <td style={{ ...styles.td, fontSize: 12, color: '#888' }}>{t.tid}</td>
                                     <td style={styles.td}>{t.name}</td>
                                     <td style={styles.td}>{t.target_ip}</td>
+                                    <td style={styles.td}>{collectorLabelFromTask(t)}</td>
                                     <td style={styles.td}>
                                         <span style={{ ...styles.badge, background: statusColors[t.status] || '#999', color: '#fff' }}>
                                             {statusNames[t.status] || '未知'}
