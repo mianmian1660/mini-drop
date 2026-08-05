@@ -352,6 +352,172 @@ def t_attribution_disabled_is_non_blocking():
     )
     assert result["status"] == "skipped" and result["done"] is True
 
+def t_analyzer_contract_lifecycle_and_manifest():
+    from analyzer_contract import BaseAnalyzer, AnalyzerResult, InputSpec
+
+    calls = []
+
+    class DemoAnalyzer(BaseAnalyzer):
+        name = "demo"
+        pipeline = "demo_pipeline"
+        input_spec = InputSpec("perf.data", ["perf"])
+        def validate(self, context):
+            calls.append("validate")
+            return {"input_artifacts": [{"id": 1, "object_key": "tid/perf.data", "size": 5}]}
+        def prepare(self, context, validated_input):
+            calls.append("prepare")
+            return super().prepare(context, validated_input)
+        def analyze(self, prepared):
+            calls.append("analyze")
+            return AnalyzerResult(outputs=["tid/top.json"])
+        def build_manifest(self, prepared, result):
+            calls.append("build_manifest")
+            return super().build_manifest(prepared, result)
+        def cleanup(self, prepared, result=None):
+            calls.append("cleanup")
+
+    result = DemoAnalyzer().run(None, {}, {"tid": "tid"}, "bucket", "tid")
+    assert calls == ["validate", "prepare", "analyze", "build_manifest", "cleanup"]
+    assert result["manifest"]["task_id"] == "tid"
+    assert result["manifest"]["pipeline"] == "demo_pipeline"
+    assert result["manifest"]["output_artifacts"][0]["content_type"] == "application/json"
+
+def t_validate_raw_input_checks_hash_size_manifest():
+    import analyzer_contract
+    from analyzer_contract import InputSpec, validate_raw_input
+
+    data = b"abc123"
+    import hashlib
+    digest = hashlib.sha256(data).hexdigest()
+
+    class FakeCursor:
+        def __init__(self):
+            self.rows = [{
+                "id": 9,
+                "object_key": "tid/perf.data",
+                "size": len(data),
+                "sha256": digest,
+                "hash": "",
+                "etag": "",
+                "manifest_key": "tid/raw_manifest.json",
+            }]
+        def execute(self, query, params):
+            pass
+        def fetchall(self):
+            return self.rows
+        def close(self):
+            pass
+
+    class FakeConn:
+        def cursor(self, *args, **kwargs):
+            return FakeCursor()
+
+    class FakeStorage:
+        def get_object(self, bucket, key):
+            if key.endswith("raw_manifest.json"):
+                return json.dumps({
+                    "object_key": "tid/perf.data",
+                    "size": len(data),
+                    "sha256": digest,
+                }).encode()
+            return data
+
+    old_connect = analyzer_contract._connect_storage
+    try:
+        analyzer_contract._connect_storage = lambda cfg: FakeStorage()
+        result = validate_raw_input(
+            {"conn": FakeConn(), "tid": "tid", "storage_cfg": {}, "bucket": "b"},
+            InputSpec("perf.data", ["perf"], max_size=100),
+        )
+    finally:
+        analyzer_contract._connect_storage = old_connect
+    assert result["source"] == "object_storage"
+    assert result["input_artifacts"][0]["sha256"] == digest
+
+def t_validate_raw_input_rejects_hash_mismatch():
+    import analyzer_contract
+    from analyzer_contract import AnalyzerInputError, InputSpec, validate_raw_input
+
+    class FakeCursor:
+        def execute(self, query, params):
+            pass
+        def fetchall(self):
+            return [{"id": 1, "object_key": "tid/perf.data", "size": 3, "sha256": "0" * 64}]
+        def close(self):
+            pass
+
+    class FakeConn:
+        def cursor(self, *args, **kwargs):
+            return FakeCursor()
+
+    class FakeStorage:
+        def get_object(self, bucket, key):
+            return b"abc"
+
+    old_connect = analyzer_contract._connect_storage
+    try:
+        analyzer_contract._connect_storage = lambda cfg: FakeStorage()
+        try:
+            validate_raw_input(
+                {"conn": FakeConn(), "tid": "tid", "storage_cfg": {}, "bucket": "b"},
+                InputSpec("perf.data", ["perf"], max_size=100),
+            )
+            assert False, "hash mismatch should fail"
+        except AnalyzerInputError as e:
+            assert "sha256" in str(e)
+    finally:
+        analyzer_contract._connect_storage = old_connect
+
+def t_advisor_stage4_fields_are_backward_compatible():
+    from analysis_advisor import generate_suggestions
+    result = generate_suggestions({"self_time_top": [
+        {"function": "pthread_mutex_lock", "samples": 10, "percentage": 80.0}
+    ]})
+    item = result["suggestions"][0]
+    assert "advice" in item and "rule_regex" in item
+    assert item["evidence"][0]["function"] == "pthread_mutex_lock"
+    assert {"threshold", "severity", "action", "rule_version"}.issubset(item.keys())
+    assert result["rule_version"]
+
+def t_finalize_success_updates_job_and_task_in_one_connection():
+    from lease import AnalysisJob, AnalysisLeaseClient
+    from analysis_daemon import finalize_success_tx
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.rowcount = 1
+        def execute(self, query, params=None):
+            self.conn.queries.append((query, params))
+            if "SELECT id FROM task_attempts" in query:
+                self.fetchone_value = (7,)
+            elif "RETURNING id" in query:
+                self.fetchone_value = (11,)
+            elif "COALESCE(MAX(sequence)" in query:
+                self.fetchone_value = (2,)
+            else:
+                self.fetchone_value = None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def __init__(self):
+            self.queries = []
+        def cursor(self, *args, **kwargs):
+            return FakeCursor(self)
+
+    conn = FakeConn()
+    client = AnalysisLeaseClient("fake", worker_id="owner-a")
+    job = AnalysisJob(id=5, task_tid="tid", pipeline="perf", status="running", attempt=1)
+    finalize_success_tx(conn, client, job, "tid", {"outputs": ["tid/top.json"], "manifest": {"ok": True}}, "v4")
+    sql = "\n".join(q for q, _ in conn.queries)
+    assert "INSERT INTO artifacts" in sql
+    assert "UPDATE analysis_jobs" in sql and "output_artifact_ids" in sql
+    assert "UPDATE hotmethod_tasks" in sql
+    assert "INSERT INTO task_status_events" in sql
+
 if __name__ == "__main__":
     tests = [v for k,v in list(globals().items()) if k.startswith("t_") and callable(v)]
     passed = failed = 0

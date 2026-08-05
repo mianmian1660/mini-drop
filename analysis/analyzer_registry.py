@@ -3,24 +3,24 @@
 # analyzer_registry.py — task_type 到分析器的注册表
 # ============================================================
 
-from typing import Callable, Dict
+from typing import Dict
 
-AnalyzerFunc = Callable[..., dict]
+from analyzer_contract import InputSpec, LegacyFunctionAnalyzer, OutputSpec
 
 
 class AnalyzerRegistry:
-    """维护 task_type -> analyzer 函数的映射。"""
+    """维护 task_type -> analyzer 实例的映射。"""
 
     def __init__(self):
-        self._analyzers: Dict[int, AnalyzerFunc] = {}
+        self._analyzers: Dict[int, object] = {}
 
-    def register(self, task_type: int, analyzer: AnalyzerFunc):
+    def register(self, task_type: int, analyzer):
         self._analyzers[int(task_type)] = analyzer
 
     def get(self, task_type: int):
         return self._analyzers.get(int(task_type))
 
-    def require(self, task_type: int) -> AnalyzerFunc:
+    def require(self, task_type: int):
         analyzer = self.get(task_type)
         if analyzer is None:
             known = ", ".join(str(k) for k in sorted(self._analyzers))
@@ -42,7 +42,7 @@ def build_default_registry() -> AnalyzerRegistry:
 
     registry = AnalyzerRegistry()
 
-    def make_runner(task_type: int):
+    def make_legacy_func(task_type: int):
         def run(conn, storage_cfg, task, bucket, tid, local_dir=""):
             return hm.run_analysis_for_type(
                 conn, storage_cfg, task, bucket, tid, task_type, local_dir=local_dir
@@ -50,14 +50,87 @@ def build_default_registry() -> AnalyzerRegistry:
 
         return run
 
-    for task_type in (
+    registry.register(
         hm.TASK_TYPE_GENERIC,
+        LegacyFunctionAnalyzer(
+            name="perf_flamegraph",
+            pipeline="perf_flamegraph",
+            input_spec=InputSpec("perf.data", ["perf"], max_size=1024 * 1024 * 1024),
+            output_specs=[
+                OutputSpec("flamegraph.svg", "RESULT", "image/svg+xml"),
+                OutputSpec("top.json", "RESULT", "application/json"),
+                OutputSpec("suggestions.json", "RESULT", "application/json"),
+            ],
+            analyze_func=make_legacy_func(hm.TASK_TYPE_GENERIC),
+            timeout_seconds=600,
+        ),
+    )
+    registry.register(
         hm.TASK_TYPE_JAVA,
+        LegacyFunctionAnalyzer(
+            name="java_async_profiler",
+            pipeline="java_async_profiler",
+            input_spec=InputSpec("perf.data", ["java"], max_size=512 * 1024 * 1024),
+            output_specs=[
+                OutputSpec("java_flamegraph.svg", "RESULT", "image/svg+xml"),
+                OutputSpec("java_top.json", "RESULT", "application/json"),
+            ],
+            analyze_func=make_legacy_func(hm.TASK_TYPE_JAVA),
+            timeout_seconds=600,
+        ),
+    )
+    registry.register(
         hm.TASK_TYPE_TRACING,
+        LegacyFunctionAnalyzer(
+            name="go_pprof",
+            pipeline="pprof",
+            input_spec=InputSpec("perf.data", ["pprof"], max_size=256 * 1024 * 1024),
+            output_specs=[
+                OutputSpec("flamegraph.svg", "RESULT", "image/svg+xml"),
+                OutputSpec("top.json", "RESULT", "application/json"),
+            ],
+            analyze_func=make_legacy_func(hm.TASK_TYPE_TRACING),
+            timeout_seconds=300,
+        ),
+    )
+    registry.register(
         hm.TASK_TYPE_MEMCHECK,
+        LegacyFunctionAnalyzer(
+            name="memleak",
+            pipeline="memleak",
+            input_spec=InputSpec("memtrace.txt", ["memtrace"], max_size=128 * 1024 * 1024),
+            output_specs=[
+                OutputSpec("memleak_report.md", "RESULT", "text/markdown"),
+                OutputSpec("memleak.json", "RESULT", "application/json"),
+            ],
+            analyze_func=make_legacy_func(hm.TASK_TYPE_MEMCHECK),
+            timeout_seconds=300,
+        ),
+    )
+    registry.register(
         hm.TASK_TYPE_BPF,
+        LegacyFunctionAnalyzer(
+            name="ebpf",
+            pipeline="bpf_histogram",
+            input_spec=InputSpec("perf.data", ["bpf"], max_size=256 * 1024 * 1024),
+            output_specs=[
+                OutputSpec("bpf_histogram.svg", "RESULT", "image/svg+xml"),
+                OutputSpec("bpf_data.json", "RESULT", "application/json"),
+            ],
+            analyze_func=make_legacy_func(hm.TASK_TYPE_BPF),
+            timeout_seconds=300,
+        ),
+    )
+    registry.register(
         hm.TASK_TYPE_JAVA_HEAP,
-    ):
-        registry.register(task_type, make_runner(task_type))
+        LegacyFunctionAnalyzer(
+            name="java_heap_declared",
+            pipeline="java_heap",
+            input_spec=InputSpec("heapdump.hprof", ["java"], max_size=2 * 1024 * 1024 * 1024),
+            output_specs=[OutputSpec("heap_summary.json", "RESULT", "application/json")],
+            analyze_func=make_legacy_func(hm.TASK_TYPE_JAVA_HEAP),
+            timeout_seconds=900,
+        ),
+    )
 
     return registry

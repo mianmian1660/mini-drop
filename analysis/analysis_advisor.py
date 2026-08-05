@@ -106,17 +106,29 @@ DEFAULT_RULES = [
 # ----------------------------------------------------------
 # Rule — 单条规则
 # ----------------------------------------------------------
+RULE_VERSION = "stage4-rules-v1"
+
+
 class Rule:
     """单条优化规则"""
 
-    def __init__(self, regex: str, advice: str):
+    def __init__(self, regex: str, advice: str, threshold: float = 0.0,
+                 severity: str = "medium", action: str = ""):
         self.regex = regex
         self.advice = advice
+        self.threshold = float(threshold or 0.0)
+        self.severity = severity or "medium"
+        self.action = action or self._infer_action(advice)
         self._pattern = re.compile(regex)
 
     def matches(self, func_name: str) -> bool:
         """检查函数名是否匹配此规则"""
         return bool(self._pattern.search(func_name))
+
+    @staticmethod
+    def _infer_action(advice: str) -> str:
+        text = str(advice or "").strip().splitlines()
+        return text[0][:160] if text else "review_hot_path"
 
     def __repr__(self):
         return f"Rule(regex={self.regex[:40]}...)"
@@ -198,12 +210,23 @@ class AnalysisAdvisor:
 
             for rule in self.rules:
                 if rule.matches(func_name):
+                    percentage = float(func.get("percentage", 0) or 0)
+                    samples = func.get("samples", 0)
                     suggestions.append({
                         "function": func_name,
-                        "percentage": func.get("percentage", 0),
-                        "samples": func.get("samples", 0),
+                        "percentage": percentage,
+                        "samples": samples,
                         "advice": rule.advice,
                         "rule_regex": rule.regex,
+                        "evidence": [{
+                            "function": func_name,
+                            "detail": f"热点占比 {percentage}%，样本 {samples}",
+                            "source": "topn",
+                        }],
+                        "threshold": rule.threshold,
+                        "severity": rule.severity,
+                        "action": rule.action,
+                        "rule_version": RULE_VERSION,
                     })
 
         # 去重（同一函数可能匹配多条规则，合并建议）
@@ -223,6 +246,9 @@ class AnalysisAdvisor:
                 # 追加建议
                 merged[func_name]["advice"] += "\n\n" + s["advice"]
                 merged[func_name]["rule_regex"] += " | " + s["rule_regex"]
+                merged[func_name]["evidence"].extend(s.get("evidence", []))
+                if _severity_rank(s.get("severity")) > _severity_rank(merged[func_name].get("severity")):
+                    merged[func_name]["severity"] = s.get("severity", "medium")
             else:
                 merged[func_name] = dict(s)
         return list(merged.values())
@@ -260,9 +286,9 @@ class AnalysisAdvisor:
             lines.append("")
             lines.append("| 排名 | 函数 | CPU 占比 |")
             lines.append("|------|------|----------|")
-            for item in (top_json.get("self_time_top") or [])[:10]:
+            for index, item in enumerate((top_json.get("self_time_top") or [])[:10], 1):
                 lines.append(
-                    f"| {item['rank']} | `{item['function']}` | {item['percentage']}% |"
+                    f"| {item.get('rank', index)} | `{item['function']}` | {item['percentage']}% |"
                 )
             lines.append("")
 
@@ -335,4 +361,9 @@ def generate_suggestions(top_json: dict,
         "suggestions": suggestions,
         "suggestions_md": md,
         "rules_loaded": len(advisor.rules),
+        "rule_version": RULE_VERSION,
     }
+
+
+def _severity_rank(value: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3, "critical": 4}.get(str(value or "medium"), 2)

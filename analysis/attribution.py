@@ -7,6 +7,7 @@ from llm_client import LLMClient, LLMClientError
 
 
 MAX_TOOL_ROUNDS = 4
+RULE_VERSION = "stage4-rules-v1"
 
 
 def _json(value):
@@ -73,6 +74,25 @@ def _compare_samples(current_top, baseline_top):
     return changes
 
 
+def _redact(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(word in lowered for word in ("secret", "token", "key", "password")):
+                out[key] = "***"
+            elif "url" in lowered:
+                out[key] = str(item).split("?", 1)[0][:160]
+            else:
+                out[key] = _redact(item)
+        return out
+    if isinstance(value, list):
+        return [_redact(item) for item in value[:20]]
+    if isinstance(value, str):
+        return value[:400]
+    return value
+
+
 TOOL_SCHEMAS = [
     {"type": "function", "function": {"name": "get_history_baseline", "description": "查询同目标、同采集器的历史完成任务元数据。", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
     {"type": "function", "function": {"name": "compare_samples", "description": "比较当前 TopN 与调用方提供的 baseline TopN，返回可验证的占比变化。", "parameters": {"type": "object", "properties": {"baseline_top": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": False}}},
@@ -131,6 +151,8 @@ def run_attribution(conn, task, top_json, folded_text="", llm_client=None):
         "evidence": [],
         "done": True,
         "engine": "",
+        "model": "",
+        "rule_version": RULE_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     if not top_functions:
@@ -139,6 +161,7 @@ def run_attribution(conn, task, top_json, folded_text="", llm_client=None):
 
     client = llm_client or LLMClient()
     base["engine"] = getattr(client, "model", "configured-llm")
+    base["model"] = base["engine"]
     if not getattr(client, "enabled", True):
         base.update(status="skipped", reasoning_summary="未配置 LLM，已保留规则建议和热点证据。")
         return base
@@ -149,9 +172,10 @@ def run_attribution(conn, task, top_json, folded_text="", llm_client=None):
     }, {
         "role": "user",
         "content": _json({
-            "task": {"name": task.get("name", ""), "type": task.get("type", 0), "params": task.get("request_params", {})},
+            "task": {"name": task.get("name", ""), "type": task.get("type", 0), "params": _redact(task.get("request_params", {}))},
             "top_functions": top_functions,
             "total_samples": (top_json or {}).get("total_samples", 0),
+            "rule_version": RULE_VERSION,
         }),
     }]
 

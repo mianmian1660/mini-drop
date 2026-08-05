@@ -24,6 +24,8 @@ class AnalysisJob:
     pipeline: str
     status: str
     attempt: int
+    max_attempts: int = 3
+    input_artifact_ids: object = None
 
 
 def default_worker_id() -> str:
@@ -75,7 +77,8 @@ class AnalysisLeaseClient:
                     updated_at = NOW()
                 FROM picked
                 WHERE j.id = picked.id
-                RETURNING j.id, j.task_tid, j.pipeline, j.status, j.attempt
+                RETURNING j.id, j.task_tid, j.pipeline, j.status, j.attempt,
+                          COALESCE(j.max_attempts, 3), j.input_artifact_ids
                 """,
                 (
                     STATUS_PENDING,
@@ -97,6 +100,8 @@ class AnalysisLeaseClient:
                 pipeline=row[2],
                 status=row[3],
                 attempt=row[4],
+                max_attempts=row[5],
+                input_artifact_ids=row[6],
             )
         except Exception:
             conn.rollback()
@@ -125,19 +130,31 @@ class AnalysisLeaseClient:
         finally:
             conn.close()
 
-    def complete(self, job_id: int, analyzer_version: str = "") -> bool:
-        return self._finish(job_id, STATUS_SUCCESS, analyzer_version)
+    def complete(self, job_id: int, analyzer_version: str = "",
+                 conn=None, output_artifact_ids=None) -> bool:
+        return self._finish(
+            job_id,
+            STATUS_SUCCESS,
+            analyzer_version,
+            conn=conn,
+            output_artifact_ids=output_artifact_ids,
+        )
 
     def fail(self, job_id: int, retry: bool = True,
-             analyzer_version: str = "") -> bool:
+             analyzer_version: str = "", last_error: str = "", conn=None) -> bool:
         return self._finish(
             job_id,
             STATUS_RETRY if retry else STATUS_FAILED,
             analyzer_version,
+            last_error=last_error,
+            conn=conn,
         )
 
-    def _finish(self, job_id: int, status: str, analyzer_version: str) -> bool:
-        conn = self.connect()
+    def _finish(self, job_id: int, status: str, analyzer_version: str,
+                last_error: str = "", conn=None, output_artifact_ids=None) -> bool:
+        owns_conn = conn is None
+        if owns_conn:
+            conn = self.connect()
         try:
             cur = conn.cursor()
             cur.execute(
@@ -147,17 +164,35 @@ class AnalysisLeaseClient:
                     lease_owner = '',
                     lease_expires_at = NULL,
                     analyzer_version = CASE WHEN %s = '' THEN analyzer_version ELSE %s END,
+                    last_error = CASE WHEN %s = '' THEN last_error ELSE %s END,
+                    output_artifact_ids = CASE WHEN %s::jsonb IS NULL THEN output_artifact_ids ELSE %s::jsonb END,
                     updated_at = NOW()
                 WHERE id = %s AND lease_owner = %s
                 """,
-                (status, analyzer_version, analyzer_version, job_id, self.worker_id),
+                (
+                    status,
+                    analyzer_version,
+                    analyzer_version,
+                    last_error[:1024],
+                    last_error[:1024],
+                    output_artifact_ids,
+                    output_artifact_ids,
+                    job_id,
+                    self.worker_id,
+                ),
             )
             ok = cur.rowcount == 1
-            conn.commit()
             cur.close()
+            if owns_conn:
+                conn.commit()
             return ok
+        except Exception:
+            if owns_conn:
+                conn.rollback()
+            raise
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
 
 
 class LeaseHeartbeat:

@@ -57,6 +57,8 @@
 - 完成核心流水线：perf flamegraph/topN、pprof CPU/heap、async-profiler Java、eBPF IO/sched/cpu 至少都有黄金样本和结果产物。
 - 增强建议系统：规则建议输出 evidence、threshold、severity、action、rule_version；AI 建议只基于脱敏结果生成，并记录模型/规则版本。
 
+完成记录（2026-08-05）：阶段 4 已按兼容方式落地。Python Analyzer 新增统一契约层，默认注册表改为注册 analyzer 实例并保留旧函数调用兼容；perf、pprof、Java async-profiler、eBPF、memleak 均声明输入格式、大小上限、超时、输出产物和重试语义。RAW artifact 分析前会校验元数据、大小、sha256/hash、manifest 和格式，缺失/损坏输入进入不可重试失败，本地 fallback 仅在显式输出目录场景保留。AnalysisJob 租约完成/失败继续校验 `lease_owner`，写入 `last_error`、`output_artifact_ids` 和 analyzer version；daemon 在结果上传后同一事务写 Artifact、AnalysisJob success、TaskEvent 与 `analysis_status`。每次分析生成 manifest，规则建议补齐 evidence、threshold、severity、action、rule_version，AI 归因仅接收脱敏参数和 TopN 摘要并记录模型/规则版本。新增 Python 单测覆盖生命周期、RAW 校验、owner guard、事务完成和建议字段。
+
 ### 阶段 5：Web 展示模块升级
 
 - TaskKind 驱动表单：选择 Agent 后只展示该 Agent 支持的 TaskKind，参数控件由 schema/metadata 生成，提交仍以后端校验为准。

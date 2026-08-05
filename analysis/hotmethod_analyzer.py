@@ -599,6 +599,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
             sugg_json = {
                 "suggestions": suggestions_result.get("suggestions", []),
                 "rules_loaded": suggestions_result.get("rules_loaded", 0),
+                "rule_version": suggestions_result.get("rule_version", ""),
             }
             sugg_key = _upload_output(storage, bucket, tid,
                                       "suggestions.json", sugg_json,
@@ -821,6 +822,7 @@ def _analyze_java_async_profiler(conn, storage_cfg: dict, task: dict,
     suggestions_json = {
         "suggestions": suggestions_result.get("suggestions", []),
         "rules_loaded": suggestions_result.get("rules_loaded", 0),
+        "rule_version": suggestions_result.get("rule_version", ""),
         "language": "java",
         "source_format": top_json.get("source_format", ""),
     }

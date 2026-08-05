@@ -7,11 +7,13 @@
 # ============================================================
 
 import argparse
+import json
 import os
 import sys
 import threading
 import time
 
+from analyzer_contract import AnalyzerError, AnalyzerInputError
 from analyzer_registry import build_default_registry
 from lease import AnalysisLeaseClient
 from observability import elapsed_seconds, log_event, now_seconds
@@ -26,36 +28,39 @@ PG_DSN = os.environ.get(
 )
 
 
-def record_result_artifacts(conn, tid: str, outputs):
+def record_result_artifacts(conn, tid: str, outputs, manifest=None):
     """Persist analyzer outputs as Artifact metadata without storing URLs."""
     keys = [value for value in (outputs or []) if isinstance(value, str) and value.startswith(tid + "/")]
+    if manifest and f"{tid}/manifest.json" not in keys:
+        keys.append(f"{tid}/manifest.json")
     if not keys:
-        return
-    try:
-        cur = conn.cursor()
+        return []
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM task_attempts WHERE task_tid = %s ORDER BY attempt_seq DESC LIMIT 1", (tid,)
+    )
+    row = cur.fetchone()
+    attempt_id = row[0] if row else 0
+    artifact_ids = []
+    for key in keys:
+        name = key.rsplit("/", 1)[-1]
+        kind = "MANIFEST" if name == "manifest.json" else "RESULT" if name.endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE"
+        content_type = "application/json" if name.endswith(".json") else "image/svg+xml" if name.endswith(".svg") else "text/markdown" if name.endswith(".md") else "application/octet-stream"
         cur.execute(
-            "SELECT id FROM task_attempts WHERE task_tid = %s ORDER BY attempt_seq DESC LIMIT 1", (tid,)
+            """
+            INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, 'ready', NOW())
+            ON CONFLICT (task_tid, kind, object_key) DO UPDATE
+            SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status
+            RETURNING id
+            """,
+            (tid, attempt_id, kind, key, content_type),
         )
         row = cur.fetchone()
-        attempt_id = row[0] if row else 0
-        for key in keys:
-            name = key.rsplit("/", 1)[-1]
-            kind = "RESULT" if name.endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE"
-            content_type = "application/json" if name.endswith(".json") else "image/svg+xml" if name.endswith(".svg") else "application/octet-stream"
-            cur.execute(
-                """
-                INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, 'ready', NOW())
-                ON CONFLICT (task_tid, kind, object_key) DO UPDATE
-                SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status
-                """,
-                (tid, attempt_id, kind, key, content_type),
-            )
-        conn.commit()
-        cur.close()
-    except Exception as e:
-        # Artifact registration improves traceability but must not make analysis fail.
-        log_event("artifact_registry_failed", task_tid=tid, error=str(e))
+        if row:
+            artifact_ids.append(row[0])
+    cur.close()
+    return artifact_ids
 
 
 def update_analysis_status(dsn: str, tid: str, status: int, status_info: str = ""):
@@ -107,7 +112,105 @@ def _start_heartbeat(lease_client: AnalysisLeaseClient, job_id: int,
 
 
 def should_retry(job) -> bool:
-    return int(getattr(job, "attempt", 0) or 0) < MAX_ANALYSIS_ATTEMPTS
+    max_attempts = int(getattr(job, "max_attempts", 0) or MAX_ANALYSIS_ATTEMPTS)
+    return int(getattr(job, "attempt", 0) or 0) < max_attempts
+
+
+def _record_task_event_tx(conn, tid: str, reason: str, source: str, payload: dict = None):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(MAX(sequence), 0) FROM task_status_events WHERE tid = %s",
+        (tid,),
+    )
+    row = cur.fetchone()
+    sequence = int(row[0] or 0) + 1
+    cur.execute(
+        """
+        INSERT INTO task_status_events
+            (tid, from_status, to_status, reason, source, sequence,
+             source_module, payload, created_at)
+        SELECT tid, status, status, %s, %s, %s, %s, %s::jsonb, NOW()
+        FROM hotmethod_tasks WHERE tid = %s
+        """,
+        (
+            reason,
+            source,
+            sequence,
+            source,
+            json.dumps(payload or {}, ensure_ascii=False),
+            tid,
+        ),
+    )
+    cur.close()
+
+
+def _upload_manifest(storage_cfg: dict, bucket: str, tid: str, manifest: dict) -> str:
+    import hotmethod_analyzer as hm
+
+    try:
+        storage, storage_ok = hm._connect_storage(storage_cfg)
+        if not storage_ok:
+            raise RuntimeError("storage unavailable")
+        return hm._upload_output(storage, bucket, tid, "manifest.json", manifest, "application/json")
+    except Exception as exc:
+        raise RuntimeError(f"manifest 上传失败: {exc}") from exc
+
+
+def finalize_success_tx(conn, lease_client, job, tid: str, result: dict,
+                        analyzer_version: str):
+    manifest = result.get("manifest") or {}
+    artifact_ids = record_result_artifacts(conn, tid, result.get("outputs", []), manifest=manifest)
+    if not lease_client.complete(
+        job.id,
+        analyzer_version,
+        conn=conn,
+        output_artifact_ids=json.dumps(artifact_ids),
+    ):
+        raise RuntimeError("AnalysisJob 完成失败：lease_owner 已变化")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE hotmethod_tasks
+        SET analysis_status = 2,
+            status_info = CASE
+                WHEN COALESCE(status_info, '') = '' THEN '分析完成'
+                ELSE COALESCE(status_info, '') || '; 分析完成'
+            END
+        WHERE tid = %s
+        """,
+        (tid,),
+    )
+    cur.close()
+    _record_task_event_tx(conn, tid, "分析完成", "analysis_daemon",
+                          {"job_id": job.id, "outputs": result.get("outputs", [])})
+
+
+def finalize_failure_tx(conn, lease_client, job, tid: str, error: str, retry: bool,
+                        analyzer_version: str):
+    if not lease_client.fail(
+        job.id,
+        retry=retry,
+        analyzer_version=analyzer_version,
+        last_error=error,
+        conn=conn,
+    ):
+        raise RuntimeError("AnalysisJob 失败标记未生效：lease_owner 已变化")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE hotmethod_tasks
+        SET analysis_status = 3,
+            status_info = CASE
+                WHEN COALESCE(status_info, '') = '' THEN %s
+                ELSE COALESCE(status_info, '') || '; ' || %s
+            END
+        WHERE tid = %s
+        """,
+        (error[:1024], error[:1024], tid),
+    )
+    cur.close()
+    _record_task_event_tx(conn, tid, error[:1024], "analysis_daemon",
+                          {"job_id": job.id, "retryable": retry})
 
 
 def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
@@ -142,16 +245,19 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         task = hm.get_task(conn, tid)
         task_type = int(task.get("type", 0))
         analyzer = registry.require(task_type)
+        analyzer_version = getattr(analyzer, "analyzer_version", ANALYZER_VERSION)
 
         hm.update_analysis_status(conn, tid, 1, "分析中")
         result = analyzer(
-            conn, storage_cfg, task, bucket, tid, local_dir=local_output_dir
+            conn, storage_cfg, task, bucket, tid, local_dir=local_output_dir, job=job
         )
-        record_result_artifacts(conn, tid, result.get("outputs", []))
-        hm.update_analysis_status(conn, tid, 2, "分析完成")
+        if result.get("manifest"):
+            manifest_key = _upload_manifest(storage_cfg, bucket, tid, result["manifest"])
+            if manifest_key:
+                result.setdefault("outputs", []).append(manifest_key)
 
-        if not lease_client.complete(job.id, ANALYZER_VERSION):
-            print(f"[analysis_daemon] 完成标记未生效: job_id={job.id}", file=sys.stderr)
+        finalize_success_tx(conn, lease_client, job, tid, result, analyzer_version)
+        conn.commit()
 
         log_event("analysis_succeeded", **common,
                   analysis_duration_seconds=elapsed_seconds(started_at),
@@ -162,8 +268,9 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         return True
 
     except KeyError as e:
-        update_analysis_status(dsn, tid, 3, f"未注册分析器: {e}")
-        lease_client.fail(job.id, retry=False, analyzer_version=ANALYZER_VERSION)
+        error = f"未注册分析器: {e}"
+        update_analysis_status(dsn, tid, 3, error)
+        lease_client.fail(job.id, retry=False, analyzer_version=ANALYZER_VERSION, last_error=error)
         log_event("analysis_failed", **common,
                   analysis_duration_seconds=elapsed_seconds(started_at),
                   duration_seconds=elapsed_seconds(started_at),
@@ -182,8 +289,9 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
                       exit_code=code)
         else:
             retry = should_retry(job)
-            update_analysis_status(dsn, tid, 3, f"分析失败: exit={code}")
-            lease_client.fail(job.id, retry=retry, analyzer_version=ANALYZER_VERSION)
+            error = f"分析失败: exit={code}"
+            update_analysis_status(dsn, tid, 3, error)
+            lease_client.fail(job.id, retry=retry, analyzer_version=ANALYZER_VERSION, last_error=error)
             log_event("analysis_failed", **common,
                       analysis_duration_seconds=elapsed_seconds(started_at),
                       duration_seconds=elapsed_seconds(started_at),
@@ -191,8 +299,22 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         return ok
     except Exception as e:
         retry = should_retry(job)
-        update_analysis_status(dsn, tid, 3, f"分析异常: {e}")
-        lease_client.fail(job.id, retry=retry, analyzer_version=ANALYZER_VERSION)
+        if isinstance(e, AnalyzerInputError):
+            retry = False
+        elif isinstance(e, AnalyzerError):
+            retry = bool(getattr(e, "retryable", True)) and should_retry(job)
+        error = f"分析异常: {e}"
+        try:
+            if conn is not None:
+                conn.rollback()
+                finalize_failure_tx(conn, lease_client, job, tid, error, retry, ANALYZER_VERSION)
+                conn.commit()
+            else:
+                update_analysis_status(dsn, tid, 3, error)
+                lease_client.fail(job.id, retry=retry, analyzer_version=ANALYZER_VERSION, last_error=error)
+        except Exception as finish_error:
+            update_analysis_status(dsn, tid, 3, f"{error}; 完成失败: {finish_error}")
+            lease_client.fail(job.id, retry=retry, analyzer_version=ANALYZER_VERSION, last_error=error)
         log_event("analysis_failed", **common,
                   analysis_duration_seconds=elapsed_seconds(started_at),
                   duration_seconds=elapsed_seconds(started_at),
