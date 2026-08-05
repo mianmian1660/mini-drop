@@ -1234,10 +1234,16 @@ func TestScheduleHandlersAndExecution(t *testing.T) {
 		t.Fatalf("load schedule: %v", err)
 	}
 	s.executeScheduledTask(sch)
+	s.executeScheduledTask(sch)
 	var childCount int64
 	s.DB.Model(&model.HotmethodTask{}).Where("master_task_tid = ?", sid).Count(&childCount)
 	if childCount != 1 {
 		t.Fatalf("scheduled child count=%d, want 1", childCount)
+	}
+	var triggerCount int64
+	s.DB.Model(&model.ScheduleTrigger{}).Where("schedule_id = ?", sid).Count(&triggerCount)
+	if triggerCount != 1 {
+		t.Fatalf("schedule trigger count=%d, want 1", triggerCount)
 	}
 
 	req = httptest.NewRequest(http.MethodDelete, "/api/v1/schedule/"+sid, nil)
@@ -1246,6 +1252,83 @@ func TestScheduleHandlersAndExecution(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("delete schedule status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestCompositeTaskCreateChildrenAndAggregate(t *testing.T) {
+	s := newTestAPIServer(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/tasks/composite", s.CreateCompositeTask)
+	router.GET("/api/v1/tasks/:tid/children", s.ListTaskChildren)
+
+	body := `{"name":"复合诊断","target_ip":"127.0.0.1","aggregation_policy":"QUORUM","quorum":1,"children":[{"name":"cpu","task_kind":"perf_cpu","duration":2},{"name":"io","task_kind":"ebpf_io","duration":2,"frequency":1}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/composite", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Drop-User-Name", "Owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create composite status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	parentTID := resp["data"].(map[string]interface{})["tid"].(string)
+
+	var outboxCount int64
+	s.DB.Model(&model.Outbox{}).Where("aggregate_id = ?", parentTID).Count(&outboxCount)
+	if outboxCount != 0 {
+		t.Fatalf("parent outbox count=%d, want 0", outboxCount)
+	}
+	s.DB.Model(&model.Outbox{}).Where("event = ?", model.OutboxEventDispatchTask).Count(&outboxCount)
+	if outboxCount != 2 {
+		t.Fatalf("child outbox count=%d, want 2", outboxCount)
+	}
+
+	var children []model.HotmethodTask
+	if err := s.DB.Where("master_task_tid = ?", parentTID).Order("create_time ASC").Find(&children).Error; err != nil || len(children) != 2 {
+		t.Fatalf("children len=%d err=%v", len(children), err)
+	}
+	end := time.Now()
+	s.DB.Model(&model.HotmethodTask{}).Where("tid = ?", children[0].TID).Updates(map[string]interface{}{"status": TaskStatusDone, "analysis_status": 2, "end_time": &end})
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/"+parentTID+"/children", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("children status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"status":2`) || !strings.Contains(w.Body.String(), `"aggregation_policy":"QUORUM"`) {
+		t.Fatalf("children body missing aggregate success: %s", w.Body.String())
+	}
+}
+
+func TestTimelineFiltersAndResultMetadata(t *testing.T) {
+	s := newTestAPIServer(t)
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	params, _ := util.MarshalJSONB(PerfParams{Duration: 60, Frequency: 99})
+	fixtures := []model.HotmethodTask{
+		{TID: "tl-ok", Name: "ok", TaskKind: TaskKindPerfCPU, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: base},
+		{TID: "tl-running", Name: "running", TaskKind: TaskKindEBPFIO, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusRunning, AnalysisStatus: 0, CreateTime: base.Add(time.Minute)},
+	}
+	if err := s.DB.Create(&fixtures).Error; err != nil {
+		t.Fatalf("create timeline fixtures: %v", err)
+	}
+	_ = s.DB.Create(&model.ScheduleTrigger{ScheduleID: "sch-filter", ScheduledAt: base, ChildTID: "tl-ok", Status: "created", CreatedAt: base}).Error
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks/timeline", s.GetTimeline)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/timeline?master_tid=sch-filter&status=2&task_kind=perf_cpu&has_result=true", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("timeline status=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"total":1`) || !strings.Contains(body, `"result_url":"/task/result?tid=tl-ok"`) || !strings.Contains(body, `"duration_seconds":60`) {
+		t.Fatalf("timeline body missing filter metadata: %s", body)
 	}
 }
 
@@ -1393,6 +1476,29 @@ func TestTaskKindDefinitionsCoverCurrentCollectors(t *testing.T) {
 	}
 	if seen[TaskKindEBPFIO].AnalysisPipeline != "bpf_histogram" {
 		t.Fatalf("eBPF IO pipeline=%q, want bpf_histogram", seen[TaskKindEBPFIO].AnalysisPipeline)
+	}
+	if seen[TaskKindPythonPySpy].Enabled || seen[TaskKindJavaHeap].Enabled {
+		t.Fatalf("stage6 extension collectors should be declared but disabled by default")
+	}
+}
+
+func TestTaskKindsHideDisabledCollectorsByDefault(t *testing.T) {
+	s := newTestAPIServer(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/task-kinds", s.ListTaskKinds)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/task-kinds", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), TaskKindPythonPySpy) {
+		t.Fatalf("disabled collector leaked by default status=%d body=%s", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/task-kinds?include_disabled=true", nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), TaskKindPythonPySpy) || !strings.Contains(w.Body.String(), `"enabled":false`) {
+		t.Fatalf("disabled collector declaration missing status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

@@ -49,6 +49,29 @@ BEGIN
     ALTER TABLE schedule_tasks ADD COLUMN IF NOT EXISTS task_kind varchar(64);
   END IF;
 
+  IF to_regclass('public.multi_tasks') IS NOT NULL THEN
+    ALTER TABLE multi_tasks ADD COLUMN IF NOT EXISTS aggregation_policy varchar(32) DEFAULT 'ALL_REQUIRED';
+    ALTER TABLE multi_tasks ADD COLUMN IF NOT EXISTS quorum integer DEFAULT 0;
+    ALTER TABLE multi_tasks ADD COLUMN IF NOT EXISTS dag jsonb;
+    ALTER TABLE multi_tasks ADD COLUMN IF NOT EXISTS summary jsonb;
+    ALTER TABLE multi_tasks ADD COLUMN IF NOT EXISTS created_at timestamptz;
+    ALTER TABLE multi_tasks ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+  END IF;
+
+  CREATE TABLE IF NOT EXISTS schedule_triggers (
+    id bigserial PRIMARY KEY,
+    schedule_id varchar(64) NOT NULL,
+    scheduled_at timestamptz NOT NULL,
+    child_tid varchar(64),
+    status varchar(32) DEFAULT 'claimed',
+    created_at timestamptz,
+    updated_at timestamptz
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_trigger_once
+    ON schedule_triggers(schedule_id, scheduled_at);
+  CREATE INDEX IF NOT EXISTS idx_schedule_triggers_child_tid
+    ON schedule_triggers(child_tid);
+
   IF to_regclass('public.outboxes') IS NOT NULL THEN
     ALTER TABLE outboxes ADD COLUMN IF NOT EXISTS status varchar(32) DEFAULT 'pending';
     ALTER TABLE outboxes ADD COLUMN IF NOT EXISTS locked_at timestamptz;

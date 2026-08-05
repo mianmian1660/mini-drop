@@ -128,13 +128,19 @@ type TaskStatusEvent struct {
 // MultiTask — 组合任务表（一个任务包含多个子任务）
 // ----------------------------------------------------------
 type MultiTask struct {
-	ID             uint   `gorm:"primaryKey" json:"id"`
-	TID            string `gorm:"column:tid;uniqueIndex;size:64" json:"tid"`
-	SubTIDs        []byte `gorm:"column:sub_tids;type:jsonb" json:"sub_tids"`
-	Type           uint32 `gorm:"column:type" json:"type"`
-	Status         int    `gorm:"column:status" json:"status"`
-	AnalysisStatus int    `gorm:"column:analysis_status" json:"analysis_status"`
-	TriggerType    uint32 `gorm:"column:trigger_type" json:"trigger_type"`
+	ID                uint      `gorm:"primaryKey" json:"id"`
+	TID               string    `gorm:"column:tid;uniqueIndex;size:64" json:"tid"`
+	SubTIDs           []byte    `gorm:"column:sub_tids;type:jsonb" json:"sub_tids"`
+	Type              uint32    `gorm:"column:type" json:"type"`
+	Status            int       `gorm:"column:status" json:"status"`
+	AnalysisStatus    int       `gorm:"column:analysis_status" json:"analysis_status"`
+	TriggerType       uint32    `gorm:"column:trigger_type" json:"trigger_type"`
+	AggregationPolicy string    `gorm:"column:aggregation_policy;size:32;default:ALL_REQUIRED" json:"aggregation_policy"`
+	Quorum            int       `gorm:"column:quorum;default:0" json:"quorum"`
+	DAG               []byte    `gorm:"column:dag;type:jsonb" json:"dag"`
+	Summary           []byte    `gorm:"column:summary;type:jsonb" json:"summary"`
+	CreatedAt         time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt         time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 // ----------------------------------------------------------
@@ -192,6 +198,19 @@ type ScheduleTask struct {
 	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
 }
 
+// ScheduleTrigger — 定时任务触发表。
+// 同一个 schedule 在同一个 scheduled_at 只允许触发一次，解决多 API 实例或
+// cron 重入造成的重复子任务问题。
+type ScheduleTrigger struct {
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	ScheduleID  string    `gorm:"column:schedule_id;size:64;uniqueIndex:idx_schedule_trigger_once,priority:1" json:"schedule_id"`
+	ScheduledAt time.Time `gorm:"column:scheduled_at;uniqueIndex:idx_schedule_trigger_once,priority:2" json:"scheduled_at"`
+	ChildTID    string    `gorm:"column:child_tid;size:64;index" json:"child_tid"`
+	Status      string    `gorm:"column:status;size:32;default:claimed" json:"status"`
+	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
 // ----------------------------------------------------------
 // AutoMigrate：一键创建/更新所有表
 // 调用这个方法，GORM 会检查每张表是否存在：
@@ -213,6 +232,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&GroupMember{},
 		&AnalysisSuggestion{},
 		&ScheduleTask{},
+		&ScheduleTrigger{},
 		&TaskAttempt{},
 		&Artifact{},
 		&AnalysisJob{},

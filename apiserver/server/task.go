@@ -69,10 +69,12 @@ const (
 	ProfilerPprof uint32 = 2
 	ProfilerBPF   uint32 = 3
 
-	TaskTypeGeneric uint32 = 0
-	TaskTypeJava    uint32 = 1
-	TaskTypePprof   uint32 = 2
-	TaskTypeBPF     uint32 = 5
+	TaskTypeGeneric  uint32 = 0
+	TaskTypeJava     uint32 = 1
+	TaskTypePprof    uint32 = 2
+	TaskTypeMemcheck uint32 = 4
+	TaskTypeBPF      uint32 = 5
+	TaskTypeJavaHeap uint32 = 6
 )
 
 // TaskResultNotifyReq 是 drop_server 完成采集后回调 apiserver 的内部请求体。
@@ -267,6 +269,7 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 				Where("tid = ?", task.TID).
 				Update("analysis_status", 3).Error
 		}
+		s.refreshCompositeParent(task)
 		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"tid": task.TID}})
 		return
 	}
@@ -376,6 +379,7 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		zap.String("cos_key", req.CosKey),
 		zap.String("source", "drop_server_notify"),
 	)
+	s.refreshCompositeParent(task)
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"tid": task.TID}})
 }
 
@@ -631,6 +635,9 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	statusEvents := s.fetchTaskStatusEvents(task.TID)
 	attempts := s.fetchTaskAttempts(task.TID)
 	artifacts := s.fetchArtifacts(task.TID)
+	if childPayload, err := s.compositeChildrenPayload(task.TID); err == nil {
+		result["children"] = childPayload
+	}
 
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
@@ -1613,6 +1620,33 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 	atRaw := c.Query("at")
 	fromRaw := c.Query("from")
 	toRaw := c.Query("to")
+	statusRaw := c.Query("status")
+	taskKindRaw := strings.TrimSpace(c.Query("task_kind"))
+	hasResultRaw := strings.TrimSpace(c.Query("has_result"))
+
+	if statusRaw != "" {
+		statusValue, err := strconv.Atoi(statusRaw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "status 参数必须是数字"})
+			return
+		}
+		query = query.Where("status = ?", statusValue)
+	}
+	if taskKindRaw != "" {
+		query = query.Where("task_kind = ?", taskKindRaw)
+	}
+	if hasResultRaw != "" {
+		hasResult, err := strconv.ParseBool(hasResultRaw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "has_result 参数必须是 true/false"})
+			return
+		}
+		if hasResult {
+			query = query.Where("status = ? AND analysis_status >= ?", TaskStatusDone, 2)
+		} else {
+			query = query.Where("NOT (status = ? AND analysis_status >= ?)", TaskStatusDone, 2)
+		}
+	}
 
 	// effective 仅在 at 模式下非空：at 时刻正在生效（最近一次触发）的窗口
 	var effective *model.HotmethodTask
@@ -1712,17 +1746,37 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		WindowEnd   *time.Time `json:"window_end,omitempty"`
 		FrequencyHz uint32     `json:"frequency_hz"` // 该窗口的采样频率
 		IsEffective bool       `json:"is_effective"` // at 模式下：该窗口是 at 时刻正在生效的那一个
+		TaskKind    string     `json:"task_kind"`
+		ScheduledAt time.Time  `json:"scheduled_at"`
+		DurationSec uint64     `json:"duration_seconds"`
+		ResultURL   string     `json:"result_url,omitempty"`
 	}
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
+	trends := gin.H{
+		"total":        len(tasks),
+		"success":      0,
+		"failed":       0,
+		"running":      0,
+		"has_result":   0,
+		"by_task_kind": gin.H{},
+	}
+	byKind := map[string]int{}
 	for _, t := range tasks {
+		scheduledAt := t.CreateTime
+		var trigger model.ScheduleTrigger
+		if err := s.DB.Where("child_tid = ?", t.TID).First(&trigger).Error; err == nil {
+			scheduledAt = trigger.ScheduledAt
+		}
 		tp := TimelinePoint{
 			TID:            t.TID,
 			Name:           t.Name,
+			TaskKind:       t.TaskKind,
 			Status:         t.Status,
 			CreateTime:     t.CreateTime,
 			AnalysisStatus: t.AnalysisStatus,
 			WindowStart:    t.CreateTime,
+			ScheduledAt:    scheduledAt,
 			IsEffective:    effective != nil && t.TID == effective.TID,
 		}
 		if t.BeginTime != nil {
@@ -1733,6 +1787,21 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		}
 		// DONE 且 analysis_status >= 2 (分析完成) 视为有结果，UPLOADING 仍需继续轮询。
 		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus >= 2
+		if tp.HasResult {
+			tp.ResultURL = "/task/result?tid=" + t.TID
+			trends["has_result"] = trends["has_result"].(int) + 1
+		}
+		switch t.Status {
+		case TaskStatusDone:
+			trends["success"] = trends["success"].(int) + 1
+		case TaskStatusFailed:
+			trends["failed"] = trends["failed"].(int) + 1
+		case TaskStatusRunning, TaskStatusUploading, TaskStatusCreated:
+			trends["running"] = trends["running"].(int) + 1
+		}
+		if t.TaskKind != "" {
+			byKind[t.TaskKind]++
+		}
 
 		// 窗口结束时间 = 触发时刻 + 该任务自身的采集时长（每条任务参数独立，不依赖 schedule 当前配置）
 		// 解析失败或 duration 缺失时保持 WindowEnd 为 nil，让它从 JSON 里消失
@@ -1740,11 +1809,13 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		if err := util.UnmarshalJSONB(t.RequestParams, &params); err == nil && params.Duration > 0 {
 			windowEnd := t.CreateTime.Add(time.Duration(params.Duration) * time.Second)
 			tp.WindowEnd = &windowEnd
+			tp.DurationSec = params.Duration
 			tp.FrequencyHz = params.Frequency
 		}
 
 		timeline = append(timeline, tp)
 	}
+	trends["by_task_kind"] = byKind
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
@@ -1752,6 +1823,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			"master_tid": masterTID,
 			"total":      len(timeline),
 			"points":     timeline,
+			"trends":     trends,
 		},
 	})
 }

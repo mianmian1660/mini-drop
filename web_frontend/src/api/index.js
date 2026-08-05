@@ -51,10 +51,14 @@ export const taskKinds = {
 export const tasks = {
     // 创建任务（POST /api/v1/tasks）
     create: (data) => client.post('/api/v1/tasks', data),
+    // 创建复合任务（POST /api/v1/tasks/composite）
+    createComposite: (data) => client.post('/api/v1/tasks/composite', data),
     // 任务列表（GET /api/v1/tasks?page=&pageSize=&keyword=&status=）
     list: (params = {}) => client.get('/api/v1/tasks', { params }),
     // 任务详情（GET /api/v1/tasks/:tid）
     detail: (tid) => client.get(`/api/v1/tasks/${tid}`),
+    // 复合任务子任务列表（GET /api/v1/tasks/:tid/children）
+    children: (tid) => client.get(`/api/v1/tasks/${tid}/children`),
     // 删除任务（DELETE /api/v1/tasks/:tid）
     delete: (tid) => client.delete(`/api/v1/tasks/${tid}`),
     // 重试任务（POST /api/v1/tasks/:tid/retry）
@@ -73,8 +77,8 @@ export const tasks = {
     // 按时刻回溯:    tasks.timeline(masterTid, { at, span })    at 为 RFC3339，span 为时长如 '30m'/'2h'
     //               返回 [at-span, at+span] 内的全部窗口，当时生效的那个 is_effective=true
     // GET /api/v1/tasks/timeline?master_tid=xxx&from=&to=&at=&span=
-    timeline: (masterTid, { from, to, at, span } = {}) =>
-        client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid, from, to, at, span } }),
+    timeline: (masterTid, { from, to, at, span, status, task_kind, has_result } = {}) =>
+        client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid, from, to, at, span, status, task_kind, has_result } }),
 };
 
 // ---------- 分析结果 ----------

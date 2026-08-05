@@ -31,6 +31,25 @@ class AnalyzerRegistry:
         return sorted(self._analyzers)
 
 
+def collector_declarations():
+    """
+    阶段 6 扩展采样器声明。
+
+    enabled=False 表示契约、能力名和目标分析流水线已经固定，但 Agent Runner
+    尚未接入，API/Web 不应默认展示或允许创建这些采样任务。
+    """
+    return [
+        {"task_kind": "go_pprof", "pipeline": "pprof", "capabilities": ["pprof"], "enabled": True},
+        {"task_kind": "async_profiler_java", "pipeline": "java_async_profiler", "capabilities": ["async-profiler", "java"], "enabled": True},
+        {"task_kind": "java_heap", "pipeline": "java_heap", "capabilities": ["java", "java-heap"], "enabled": False},
+        {"task_kind": "python_py_spy", "pipeline": "perf_flamegraph", "capabilities": ["py-spy", "python"], "enabled": False},
+        {"task_kind": "python_memray", "pipeline": "memleak", "capabilities": ["memray", "python"], "enabled": False},
+        {"task_kind": "gperftools_cpu", "pipeline": "perf_flamegraph", "capabilities": ["gperftools"], "enabled": False},
+        {"task_kind": "bolt_profile", "pipeline": "perf_flamegraph", "capabilities": ["bolt"], "enabled": False},
+        {"task_kind": "script_diagnostic", "pipeline": "script_diagnostic", "capabilities": ["restricted-script"], "enabled": False},
+    ]
+
+
 def build_default_registry() -> AnalyzerRegistry:
     """
     构造当前项目默认注册表。

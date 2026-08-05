@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +19,12 @@ const (
 	TaskKindEBPFCPU           = "ebpf_cpu"
 	TaskKindEBPFIO            = "ebpf_io"
 	TaskKindEBPFSched         = "ebpf_sched"
+	TaskKindJavaHeap          = "java_heap"
+	TaskKindPythonPySpy       = "python_py_spy"
+	TaskKindPythonMemray      = "python_memray"
+	TaskKindGperftools        = "gperftools_cpu"
+	TaskKindBOLT              = "bolt_profile"
+	TaskKindScriptDiagnostic  = "script_diagnostic"
 )
 
 type TaskKindField struct {
@@ -47,6 +54,8 @@ type TaskKindDefinition struct {
 	TaskType         uint32                 `json:"task_type"`
 	ProfilerType     uint32                 `json:"profiler_type"`
 	Event            string                 `json:"event,omitempty"`
+	Enabled          bool                   `json:"enabled"`
+	DisabledReason   string                 `json:"disabled_reason,omitempty"`
 }
 
 func ptrInt(v int) *int { return &v }
@@ -75,6 +84,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 				TaskKindField{Name: "subprocess", Label: "包含子进程", Type: "boolean", Default: false},
 			),
 			MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeGeneric, ProfilerType: ProfilerPerf, Event: "cpu-clock",
+			Enabled: true,
 		},
 		{
 			ID: TaskKindAsyncProfilerJava, Name: "async_profiler_java", DisplayName: "Java async-profiler",
@@ -88,6 +98,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 				{Name: "event", Label: "采样事件", Type: "select", Default: "cpu", Options: []string{"cpu", "wall", "alloc"}},
 			},
 			MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeJava, ProfilerType: ProfilerAsync, Event: "cpu",
+			Enabled: true,
 		},
 		{
 			ID: TaskKindGoPprof, Name: "go_pprof", DisplayName: "Go pprof",
@@ -100,6 +111,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 				{Name: "pprof_url", Label: "pprof Profile URL", Type: "url", Required: true, Default: "", Placeholder: "http://127.0.0.1:6060/debug/pprof/profile"},
 			},
 			MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypePprof, ProfilerType: ProfilerPprof,
+			Enabled: true,
 		},
 		{
 			ID: TaskKindEBPFCPU, Name: "ebpf_cpu", DisplayName: "eBPF CPU 火焰图",
@@ -108,6 +120,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 			Default:     mergeDefaults(commonDefaults, map[string]interface{}{"event": "cpu", "frequency": 1}),
 			Schema:      commonFields,
 			MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeBPF, ProfilerType: ProfilerBPF, Event: "cpu",
+			Enabled: true,
 		},
 		{
 			ID: TaskKindEBPFIO, Name: "ebpf_io", DisplayName: "eBPF IO 延迟直方图",
@@ -116,6 +129,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 			Default:     mergeDefaults(commonDefaults, map[string]interface{}{"event": "io", "frequency": 1}),
 			Schema:      commonFields,
 			MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeBPF, ProfilerType: ProfilerBPF, Event: "io",
+			Enabled: true,
 		},
 		{
 			ID: TaskKindEBPFSched, Name: "ebpf_sched", DisplayName: "eBPF 调度延迟直方图",
@@ -124,6 +138,58 @@ func taskKindDefinitions() []TaskKindDefinition {
 			Default:     mergeDefaults(commonDefaults, map[string]interface{}{"event": "sched", "frequency": 1}),
 			Schema:      commonFields,
 			MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeBPF, ProfilerType: ProfilerBPF, Event: "sched",
+			Enabled: true,
+		},
+		{
+			ID: TaskKindJavaHeap, Name: "java_heap", DisplayName: "Java Heap Dump",
+			Runner: "async-profiler", AnalysisPipeline: "java_heap",
+			Capabilities: []string{"java", "java-heap"}, SupportedOS: []string{"linux"},
+			Default: map[string]interface{}{"target_pid": 0, "duration": 1, "frequency": 1, "event": "heap"},
+			Schema: []TaskKindField{
+				{Name: "target_pid", Label: "Java 目标 PID", Type: "number", Required: true, Default: 0, Min: ptrInt(1)},
+			},
+			MaxDuration: 60, MaxConcurrency: 1, TaskType: TaskTypeJavaHeap, ProfilerType: ProfilerAsync, Event: "heap",
+			Enabled: false, DisabledReason: "阶段 6 仅声明契约；真实 heap dump Runner 后续接入",
+		},
+		{
+			ID: TaskKindPythonPySpy, Name: "python_py_spy", DisplayName: "Python py-spy",
+			Runner: "py-spy", AnalysisPipeline: "perf_flamegraph",
+			Capabilities: []string{"py-spy", "python"}, SupportedOS: []string{"linux"},
+			Default: mergeDefaults(commonDefaults, map[string]interface{}{"event": "cpu"}),
+			Schema:  commonFields, MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeGeneric, ProfilerType: ProfilerPerf,
+			Enabled: false, DisabledReason: "阶段 6 仅声明契约；Agent Runner 后续接入",
+		},
+		{
+			ID: TaskKindPythonMemray, Name: "python_memray", DisplayName: "Python memray",
+			Runner: "memray", AnalysisPipeline: "memleak",
+			Capabilities: []string{"memray", "python"}, SupportedOS: []string{"linux"},
+			Default: mergeDefaults(commonDefaults, map[string]interface{}{"event": "alloc"}),
+			Schema:  commonFields, MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeMemcheck, ProfilerType: ProfilerPerf,
+			Enabled: false, DisabledReason: "阶段 6 仅声明契约；Agent Runner 后续接入",
+		},
+		{
+			ID: TaskKindGperftools, Name: "gperftools_cpu", DisplayName: "gperftools CPU",
+			Runner: "gperftools", AnalysisPipeline: "perf_flamegraph",
+			Capabilities: []string{"gperftools"}, SupportedOS: []string{"linux"},
+			Default: mergeDefaults(commonDefaults, map[string]interface{}{"event": "cpu"}),
+			Schema:  commonFields, MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeGeneric, ProfilerType: ProfilerPerf,
+			Enabled: false, DisabledReason: "阶段 6 仅声明契约；Agent Runner 后续接入",
+		},
+		{
+			ID: TaskKindBOLT, Name: "bolt_profile", DisplayName: "BOLT 优化 Profile",
+			Runner: "bolt", AnalysisPipeline: "perf_flamegraph",
+			Capabilities: []string{"bolt"}, SupportedOS: []string{"linux"},
+			Default: mergeDefaults(commonDefaults, map[string]interface{}{"event": "branch"}),
+			Schema:  commonFields, MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypeGeneric, ProfilerType: ProfilerPerf,
+			Enabled: false, DisabledReason: "阶段 6 仅声明契约；Agent Runner 后续接入",
+		},
+		{
+			ID: TaskKindScriptDiagnostic, Name: "script_diagnostic", DisplayName: "受限脚本诊断",
+			Runner: "restricted-script", AnalysisPipeline: "script_diagnostic",
+			Capabilities: []string{"restricted-script"}, SupportedOS: []string{"linux"},
+			Default: map[string]interface{}{"target_pid": 0, "duration": 10, "frequency": 1},
+			Schema:  commonFields, MaxDuration: 300, MaxConcurrency: 1, TaskType: TaskTypeGeneric, ProfilerType: ProfilerPerf,
+			Enabled: false, DisabledReason: "阶段 6 仅声明契约；安全沙箱与 Runner 后续接入",
 		},
 	}
 }
@@ -176,6 +242,9 @@ func normalizeAndValidateCollector(req *CreateTaskReq) error {
 	kind, ok := taskKindByID(kindID)
 	if !ok {
 		return fmt.Errorf("不支持的 task_kind=%s", kindID)
+	}
+	if !kind.Enabled {
+		return fmt.Errorf("task_kind=%s 当前仅声明契约，尚未启用: %s", kindID, kind.DisabledReason)
 	}
 	req.TaskKind = kind.ID
 	req.TaskType = kind.TaskType
@@ -292,6 +361,16 @@ func (s *APIServer) agentSupportsTaskKind(targetIP string, kind TaskKindDefiniti
 
 func (s *APIServer) ListTaskKinds(c *gin.Context) {
 	kinds := taskKindDefinitions()
+	includeDisabled, _ := strconv.ParseBool(c.DefaultQuery("include_disabled", "false"))
+	if !includeDisabled {
+		enabled := make([]TaskKindDefinition, 0, len(kinds))
+		for _, kind := range kinds {
+			if kind.Enabled {
+				enabled = append(enabled, kind)
+			}
+		}
+		kinds = enabled
+	}
 	if targetIP := strings.TrimSpace(c.Query("target_ip")); targetIP != "" {
 		filtered := make([]TaskKindDefinition, 0, len(kinds))
 		for _, kind := range kinds {

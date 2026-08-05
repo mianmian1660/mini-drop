@@ -61,6 +61,16 @@ export default function TimelinePage() {
     // 已生效区间保存为两个字符串而非对象，避免轮询 effect 因引用变化被反复重建
     const [rangeFrom, setRangeFrom] = useState('');
     const [rangeTo, setRangeTo] = useState('');
+    const [statusFilter, setStatusFilter] = useState('');
+    const [kindFilter, setKindFilter] = useState('');
+    const [hasResultFilter, setHasResultFilter] = useState('');
+    const [trends, setTrends] = useState(null);
+
+    const timelineFilters = useCallback(() => ({
+        status: statusFilter || undefined,
+        task_kind: kindFilter || undefined,
+        has_result: hasResultFilter || undefined,
+    }), [statusFilter, kindFilter, hasResultFilter]);
 
     // 加载定时任务列表
     useEffect(() => {
@@ -76,12 +86,12 @@ export default function TimelinePage() {
         setActiveRange(0);
         setLoading(true); setError('');
         try {
-            const r = await tasks.timeline(sid);
-            if (r.code === 0) setPoints(r.data?.points || []);
+            const r = await tasks.timeline(sid, timelineFilters());
+            if (r.code === 0) { setPoints(r.data?.points || []); setTrends(r.data?.trends || null); }
             else setError(r.message || '查询失败');
         } catch (e) { setError('请求失败: ' + (e.message || '')); }
         finally { setLoading(false); }
-    }, []);
+    }, [timelineFilters]);
 
     // 按时刻回溯：返回 [at-span, at+span] 内的全部窗口，其中当时生效的一个带 is_effective
     const loadAt = useCallback(async () => {
@@ -91,12 +101,12 @@ export default function TimelinePage() {
         setLoading(true); setError('');
         try {
             const atISO = new Date(atInput).toISOString();
-            const r = await tasks.timeline(masterTid, { at: atISO, span: spanInput });
-            if (r.code === 0) setPoints(r.data?.points || []);
+            const r = await tasks.timeline(masterTid, { at: atISO, span: spanInput, ...timelineFilters() });
+            if (r.code === 0) { setPoints(r.data?.points || []); setTrends(r.data?.trends || null); }
             else setError(r.message || '查询失败');
         } catch (e) { setError('请求失败: ' + (e.message || '')); }
         finally { setLoading(false); }
-    }, [masterTid, atInput, spanInput]);
+    }, [masterTid, atInput, spanInput, timelineFilters]);
 
     // 区间查询：返回 [from, to] 内触发的全部采集窗口
     const loadRange = useCallback(async (fromISO, toISO) => {
@@ -105,12 +115,12 @@ export default function TimelinePage() {
         setRangeFrom(fromISO); setRangeTo(toISO);
         setLoading(true); setError('');
         try {
-            const r = await tasks.timeline(masterTid, { from: fromISO, to: toISO });
-            if (r.code === 0) setPoints(r.data?.points || []);
+            const r = await tasks.timeline(masterTid, { from: fromISO, to: toISO, ...timelineFilters() });
+            if (r.code === 0) { setPoints(r.data?.points || []); setTrends(r.data?.trends || null); }
             else setError(r.message || '查询失败');
         } catch (e) { setError('请求失败: ' + (e.message || '')); }
         finally { setLoading(false); }
-    }, [masterTid]);
+    }, [masterTid, timelineFilters]);
 
     // 快捷区间：最近 N 小时（区间在点击时固定，不随轮询滑动）
     const loadQuickRange = useCallback((hours) => {
@@ -250,6 +260,35 @@ export default function TimelinePage() {
                     )}
 
                     <div style={{ borderTop: '1px solid #eee', paddingTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <span style={{ ...S.label, marginBottom: 0 }}>筛选</span>
+                        <select style={{ ...S.input, width: 130, marginBottom: 0 }} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+                            <option value="">全部状态</option>
+                            <option value="0">待处理</option>
+                            <option value="1">执行中</option>
+                            <option value="2">已完成</option>
+                            <option value="3">失败</option>
+                            <option value="4">上传中</option>
+                            <option value="5">已取消</option>
+                        </select>
+                        <input
+                            style={{ ...S.input, width: 180, marginBottom: 0 }}
+                            value={kindFilter}
+                            onChange={e => setKindFilter(e.target.value)}
+                            placeholder="task_kind"
+                        />
+                        <select style={{ ...S.input, width: 130, marginBottom: 0 }} value={hasResultFilter} onChange={e => setHasResultFilter(e.target.value)}>
+                            <option value="">全部结果</option>
+                            <option value="true">有结果</option>
+                            <option value="false">无结果</option>
+                        </select>
+                        <button style={S.btnSm} onClick={() => {
+                            if (queryMode === 'at') loadAt();
+                            else if (queryMode === 'range' && rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo);
+                            else loadTimeline(masterTid);
+                        }}>应用筛选</button>
+                    </div>
+
+                    <div style={{ borderTop: '1px solid #eee', paddingTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                         <span style={{ ...S.label, marginBottom: 0 }}>🕐 按时刻回溯</span>
                         <input
                             type="datetime-local"
@@ -291,6 +330,16 @@ export default function TimelinePage() {
 
                     <TimelineChart points={points} />
 
+                    {trends && (
+                        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '12px 0 4px' }}>
+                            <span style={S.btnSm}>窗口 {trends.total || 0}</span>
+                            <span style={S.btnSm}>成功 {trends.success || 0}</span>
+                            <span style={S.btnSm}>失败 {trends.failed || 0}</span>
+                            <span style={S.btnSm}>进行中 {trends.running || 0}</span>
+                            <span style={S.btnSm}>有结果 {trends.has_result || 0}</span>
+                        </div>
+                    )}
+
                     <div style={{ ...S.timeline, marginTop: 20 }}>
                         {points.map((p, i) => (
                             <div key={p.tid} style={S.point(p.status, p.is_effective)}>
@@ -307,9 +356,10 @@ export default function TimelinePage() {
                                             marginLeft: 6, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 'bold',
                                             background: '#4a6cf7', color: '#fff'
                                         }}>当时生效</span>}
+                                        {p.task_kind && <span style={{ marginLeft: 6, fontSize: 11, color: '#666' }}>{p.task_kind}</span>}
                                         {p.has_result && <span style={{ marginLeft: 6, fontSize: 11, color: '#4caf50' }}>✅ 有结果</span>}
                                     </div>
-                                    <Link to={`/task/result?tid=${p.tid}`}
+                                    <Link to={p.result_url || `/task/result?tid=${p.tid}`}
                                         style={{ color: '#4a6cf7', fontSize: 13, fontWeight: 'bold', textDecoration: 'none' }}>
                                         查看详情 →
                                     </Link>
@@ -321,6 +371,8 @@ export default function TimelinePage() {
                                         ? new Date(p.window_end).toLocaleString('zh-CN')
                                         : (p.end_time ? new Date(p.end_time).toLocaleString('zh-CN') : '进行中')}
                                     {p.frequency_hz ? ` · ${p.frequency_hz}Hz` : ''}
+                                    {p.duration_seconds ? ` · ${p.duration_seconds}s` : ''}
+                                    {p.scheduled_at ? ` · 触发 ${new Date(p.scheduled_at).toLocaleString('zh-CN')}` : ''}
                                 </div>
                             </div>
                         ))}

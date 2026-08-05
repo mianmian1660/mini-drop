@@ -78,6 +78,8 @@
 - 扩展采样器顺序：先 pprof 和 async-profiler 稳定化，再补 Python py-spy/memray、Java Heap、gperftools、BOLT、受限脚本诊断。
 - 每新增采样器必须同步补 TaskKind、Schema、Agent capability、Runner、Analyzer、黄金样本、错误码和 Web 展示。
 
+完成记录（2026-08-05）：阶段 6 已按兼容方式落地。后端新增复合任务 API，主任务只做编排落库，不进入下发 outbox；子任务按 `master_task_tid` 关联并支持 `ALL_REQUIRED/BEST_EFFORT/QUORUM/DAG` 聚合策略，查询子任务或收到子任务完成通知时会刷新父任务聚合状态。计划任务新增 `schedule_triggers` 触发表，以 `schedule_id + scheduled_at` 唯一约束防重复触发；Postgres 触发前使用事务级 advisory lock，SQLite/测试环境使用唯一键兜底。Continuous Profiling 时间轴兼容旧查询并新增 `status/task_kind/has_result` 筛选，返回 `scheduled_at/duration_seconds/result_url/trends`，前端支持状态、TaskKind、结果筛选、窗口跳转和基础趋势摘要。扩展采样器补齐 TaskKind 与 Analyzer 声明，pprof 和 async-profiler 保持启用，Java Heap、py-spy、memray、gperftools、BOLT、受限脚本诊断作为 disabled/capability-gated 契约占位，不默认展示或允许创建真实任务。新增 Go/Python 测试覆盖复合任务展开与聚合、计划任务防重、时间轴筛选、新采样器声明门控；最终以 `make verify` 为准。
+
 ### 阶段 7：安全、可观测性与部署
 
 - 安全边界：API 负责用户权限，Server 负责 Agent 身份和调度约束，Agent 负责本地执行约束，Artifact 下载入口二次鉴权。

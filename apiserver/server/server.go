@@ -637,7 +637,9 @@ func (s *APIServer) registerRoutes() {
 		// 任务管理
 		api.GET("/task-kinds", s.ListTaskKinds)
 		api.POST("/tasks", s.CreateTask)
+		api.POST("/tasks/composite", s.CreateCompositeTask)
 		api.GET("/tasks", s.ListTasks)
+		api.GET("/tasks/:tid/children", s.ListTaskChildren)
 		api.GET("/tasks/:tid", s.GetTaskDetail)
 		api.DELETE("/tasks/:tid", s.DeleteTask)
 		api.POST("/tasks/:tid/retry", s.RetryTask)

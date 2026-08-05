@@ -518,6 +518,16 @@ def t_finalize_success_updates_job_and_task_in_one_connection():
     assert "UPDATE hotmethod_tasks" in sql
     assert "INSERT INTO task_status_events" in sql
 
+def t_stage6_collector_declarations_are_gated():
+    from analyzer_registry import collector_declarations
+    decls = {item["task_kind"]: item for item in collector_declarations()}
+    assert decls["go_pprof"]["enabled"] is True
+    assert decls["async_profiler_java"]["pipeline"] == "java_async_profiler"
+    for task_kind in ["java_heap", "python_py_spy", "python_memray", "gperftools_cpu", "bolt_profile", "script_diagnostic"]:
+        assert task_kind in decls
+        assert decls[task_kind]["enabled"] is False
+        assert decls[task_kind]["capabilities"]
+
 if __name__ == "__main__":
     tests = [v for k,v in list(globals().items()) if k.startswith("t_") and callable(v)]
     passed = failed = 0

@@ -13,6 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/mini-drop/apiserver/model"
 	"github.com/mini-drop/apiserver/util"
@@ -91,10 +93,20 @@ func (s *APIServer) removeCronJob(sid string) {
 
 // executeScheduledTask 执行定时任务（创建实际的采集任务）
 func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
+	scheduledAt := time.Now().Truncate(time.Minute)
 	s.Logger.Info("触发定时任务",
 		zap.String("sid", sch.SID),
 		zap.String("name", sch.Name),
+		zap.Time("scheduled_at", scheduledAt),
 	)
+	trigger, claimed := s.claimScheduleTrigger(sch.SID, scheduledAt)
+	if !claimed {
+		s.Logger.Info("定时任务触发已存在，跳过重复创建",
+			zap.String("sid", sch.SID),
+			zap.Time("scheduled_at", scheduledAt),
+			zap.String("child_tid", trigger.ChildTID))
+		return
+	}
 
 	// 解析任务参数
 	var params PerfParams
@@ -122,7 +134,7 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 		UID:            sch.UID,
 		UserName:       sch.UserName,
 		MasterTaskTID:  sch.SID,
-		CreateTime:     now,
+		CreateTime:     scheduledAt,
 		DeadlineUnixMS: int64(now.Add(time.Duration(params.Duration+30) * time.Second).UnixMilli()),
 	}
 
@@ -144,8 +156,16 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 	// A5: 同事务写 Task + Outbox，下发交给后台 dispatchOutboxLoop 异步执行
 	if err := s.createTaskWithOutbox(task, req); err != nil {
 		s.Logger.Error("定时任务创建失败", zap.String("sid", sch.SID), zap.Error(err))
+		nowFailed := time.Now()
+		_ = s.DB.Model(&model.ScheduleTrigger{}).
+			Where("schedule_id = ? AND scheduled_at = ?", sch.SID, scheduledAt).
+			Updates(map[string]interface{}{"status": "failed", "updated_at": nowFailed}).Error
 		return
 	}
+	nowDone := time.Now()
+	_ = s.DB.Model(&model.ScheduleTrigger{}).
+		Where("schedule_id = ? AND scheduled_at = ?", sch.SID, scheduledAt).
+		Updates(map[string]interface{}{"child_tid": tid, "status": "created", "updated_at": nowDone}).Error
 
 	// 更新最后运行时间
 	now2 := time.Now()
@@ -154,6 +174,44 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 	})
 
 	s.Logger.Info("定时任务执行完成", zap.String("sid", sch.SID), zap.String("tid", tid))
+}
+
+func (s *APIServer) claimScheduleTrigger(scheduleID string, scheduledAt time.Time) (model.ScheduleTrigger, bool) {
+	trigger := model.ScheduleTrigger{
+		ScheduleID:  scheduleID,
+		ScheduledAt: scheduledAt,
+		Status:      "claimed",
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		if tx.Dialector.Name() == "postgres" {
+			var locked bool
+			if err := tx.Raw("SELECT pg_try_advisory_xact_lock(hashtext(?))", scheduleID+"|"+scheduledAt.Format(time.RFC3339)).Scan(&locked).Error; err != nil {
+				return err
+			}
+			if !locked {
+				return gorm.ErrDuplicatedKey
+			}
+		}
+		res := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "schedule_id"}, {Name: "scheduled_at"}},
+			DoNothing: true,
+		}).Create(&trigger)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrDuplicatedKey
+		}
+		return nil
+	})
+	if err == nil {
+		return trigger, true
+	}
+	var existing model.ScheduleTrigger
+	_ = s.DB.Where("schedule_id = ? AND scheduled_at = ?", scheduleID, scheduledAt).First(&existing).Error
+	return existing, false
 }
 
 // ----------------------------------------------------------
