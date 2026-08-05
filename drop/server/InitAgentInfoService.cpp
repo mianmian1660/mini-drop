@@ -70,7 +70,9 @@ namespace drop_server
         cosCfg->set_region("us-east-1");
 
         cout << "[server] 下发 COS 配置: endpoint=" << cosCfg->endpoint()
-             << " bucket=" << cosCfg->bucket() << endl;
+             << " bucket=" << cosCfg->bucket()
+             << " insecure_transport=" << (cosCfg->usessl() ? "false" : "true")
+             << " credentials=redacted" << endl;
         return grpc::Status::OK;
     }
 

@@ -24,6 +24,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Log.Format != "json" {
 		t.Fatalf("default log format = %q, want json", cfg.Log.Format)
 	}
+	if cfg.Security.Environment != "development" || !cfg.Security.AllowInsecureTransport {
+		t.Fatalf("default security config = %+v", cfg.Security)
+	}
+	if !cfg.Observability.MetricsEnabled {
+		t.Fatalf("metrics should be enabled by default")
+	}
 }
 
 func TestLoadEnvOverrides(t *testing.T) {
@@ -34,6 +40,12 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("S3_ACCESS_KEY", "ak")
 	t.Setenv("S3_SECRET_KEY", "sk")
 	t.Setenv("PORT", "18888")
+	t.Setenv("MINI_DROP_ENV", "production")
+	t.Setenv("ALLOW_INSECURE_TRANSPORT", "true")
+	t.Setenv("GRPC_MTLS_CERT_FILE", "/certs/client.crt")
+	t.Setenv("GRPC_MTLS_KEY_FILE", "/certs/client.key")
+	t.Setenv("GRPC_MTLS_CA_FILE", "/certs/ca.crt")
+	t.Setenv("METRICS_ENABLED", "false")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -54,6 +66,15 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if cfg.Server.Port != 18888 {
 		t.Fatalf("server port = %d, want 18888", cfg.Server.Port)
+	}
+	if cfg.Security.Environment != "production" || !cfg.Security.AllowInsecureTransport {
+		t.Fatalf("security env overrides failed: %+v", cfg.Security)
+	}
+	if cfg.GRPC.MTLSCertFile != "/certs/client.crt" || cfg.GRPC.MTLSKeyFile != "/certs/client.key" || cfg.GRPC.MTLSCAFile != "/certs/ca.crt" {
+		t.Fatalf("mTLS paths not overridden: %+v", cfg.GRPC)
+	}
+	if cfg.Observability.MetricsEnabled {
+		t.Fatalf("metrics override should disable metrics")
 	}
 }
 
@@ -85,6 +106,9 @@ database:
   max_open_conns: 11
 grpc:
   addr: server:50051
+  mtls_cert_file: /certs/client.crt
+  mtls_key_file: /certs/client.key
+  mtls_ca_file: /certs/ca.crt
 storage:
   endpoint: minio:9000
   public_endpoint: localhost:9000
@@ -92,6 +116,11 @@ storage:
 log:
   level: debug
   format: console
+security:
+  environment: production
+  allow_insecure_transport: false
+observability:
+  metrics_enabled: true
 `)
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -113,6 +142,12 @@ log:
 	if cfg.Log.Level != "debug" || cfg.Log.Format != "console" {
 		t.Fatalf("log config = %+v", cfg.Log)
 	}
+	if cfg.Security.Environment != "production" || cfg.Security.AllowInsecureTransport {
+		t.Fatalf("security yaml config = %+v", cfg.Security)
+	}
+	if cfg.GRPC.MTLSCAFile != "/certs/ca.crt" {
+		t.Fatalf("grpc mTLS yaml config = %+v", cfg.GRPC)
+	}
 }
 
 func TestLoadInvalidYAML(t *testing.T) {
@@ -124,5 +159,21 @@ func TestLoadInvalidYAML(t *testing.T) {
 
 	if _, err := Load(path); err == nil {
 		t.Fatalf("Load invalid yaml should fail")
+	}
+}
+
+func TestProductionRequiresTrustedTransportOrExplicitInsecure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prod.yaml")
+	content := []byte(`
+security:
+  environment: production
+  allow_insecure_transport: false
+`)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatalf("production config without mTLS or explicit insecure should fail")
 	}
 }

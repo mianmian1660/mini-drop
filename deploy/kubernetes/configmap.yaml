@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mini-drop-config
+  namespace: mini-drop
+data:
+  MINI_DROP_ENV: "production"
+  ALLOW_INSECURE_TRANSPORT: "false"
+  METRICS_ENABLED: "true"
+  DROP_GRPC: "drop-server:50051"
+  S3_ENDPOINT: "minio:9000"
+  S3_PUBLIC_ENDPOINT: "minio.mini-drop.svc.cluster.local:9000"
+  S3_BUCKET: "drop-data"
+  GRPC_MTLS_CERT_FILE: "/etc/mini-drop/tls/client.crt"
+  GRPC_MTLS_KEY_FILE: "/etc/mini-drop/tls/client.key"
+  GRPC_MTLS_CA_FILE: "/etc/mini-drop/tls/ca.crt"

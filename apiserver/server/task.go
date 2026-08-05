@@ -103,7 +103,15 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
-	s.Logger.Info("任务创建成功", zap.String("tid", data["tid"].(string)), zap.String("target_ip", req.TargetIP), zap.String("name", req.Name))
+	incTasksCreated()
+	s.Logger.Info("任务创建成功",
+		zap.String("request_id", requestIDFromGin(c)),
+		zap.String("tid", data["tid"].(string)),
+		zap.String("task_id", data["tid"].(string)),
+		zap.String("target_ip", req.TargetIP),
+		zap.String("task_kind", req.TaskKind),
+		zap.String("name", req.Name),
+	)
 	s.RespondOK(c, data)
 }
 
@@ -201,7 +209,10 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq, t
 		errMsg := fmt.Sprintf("gRPC 下发失败: %v", err)
 		s.Logger.Error("任务下发到 drop_server 失败",
 			zap.String("tid", task.TID),
+			zap.String("task_id", task.TID),
+			zap.Uint("attempt_id", attempt.ID),
 			zap.String("target_ip", req.TargetIP),
+			zap.String("error_code", ErrCodeDependencyUnavailable),
 			zap.Error(err),
 		)
 		s.finishTaskAttempt(attempt.ID, ErrCodeDependencyUnavailable, errMsg)
@@ -216,6 +227,8 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq, t
 	// 下发成功，更新状态为"已下发"
 	s.Logger.Info("任务已下发到 drop_server",
 		zap.String("tid", task.TID),
+		zap.String("task_id", task.TID),
+		zap.Uint("attempt_id", attempt.ID),
 		zap.String("grpc_resp_code", fmt.Sprintf("%d", resp.Code)),
 	)
 
@@ -250,6 +263,7 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 	}
 
 	if strings.TrimSpace(req.ErrorMessage) != "" {
+		incTaskNotifyFailed()
 		endTime := time.Now()
 		errorCode := req.ErrorCode
 		if errorCode == "" {
@@ -275,6 +289,8 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 	}
 
 	if strings.TrimSpace(req.CosKey) == "" {
+		incTaskNotifyFailed()
+		incArtifactUploadFailed()
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code":    400,
 			"message": "采集成功通知缺少 cos_key",
@@ -362,9 +378,14 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		return s.finishTaskAttemptForNotifyTx(tx, task.TID, req.AttemptID, "", "", []string{req.CosKey}, 0)
 	})
 	if err != nil {
+		incTaskNotifyFailed()
+		incArtifactUploadFailed()
 		s.Logger.Error("处理采集结果通知失败",
 			zap.String("tid", task.TID),
-			zap.String("cos_key", req.CosKey),
+			zap.String("task_id", task.TID),
+			zap.Uint("attempt_id", req.AttemptID),
+			zap.String("cos_key", util.RedactObjectKey(req.CosKey)),
+			zap.String("error_code", ErrCodeArtifactUploadFailed),
 			zap.Error(err),
 		)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -376,7 +397,9 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 
 	s.Logger.Info("采集结果已登记并进入分析队列",
 		zap.String("tid", task.TID),
-		zap.String("cos_key", req.CosKey),
+		zap.String("task_id", task.TID),
+		zap.Uint("attempt_id", req.AttemptID),
+		zap.String("cos_key", util.RedactObjectKey(req.CosKey)),
 		zap.String("source", "drop_server_notify"),
 	)
 	s.refreshCompositeParent(task)
@@ -438,11 +461,15 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey st
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
 	}
-	if err := tx.Clauses(clause.OnConflict{
+	result := tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "task_tid"}},
 		DoNothing: true,
-	}).Create(&job).Error; err != nil {
+	}).Create(&job)
+	if err := result.Error; err != nil {
 		return err
+	}
+	if result.RowsAffected > 0 {
+		incAnalysisQueued()
 	}
 	return nil
 }
@@ -720,6 +747,8 @@ func (s *APIServer) StreamTaskEvents(c *gin.Context) {
 		return
 	}
 	s.prepareSSE(c)
+	incSSEActive()
+	defer decSSEActive()
 
 	lastSequence := parseLastEventID(c.GetHeader("Last-Event-ID"))
 	send := func(eventName string, eventID int64, payload gin.H) bool {
@@ -782,6 +811,8 @@ func (s *APIServer) StreamTaskSuggestions(c *gin.Context) {
 		return
 	}
 	s.prepareSSE(c)
+	incSSEActive()
+	defer decSSEActive()
 
 	lastHash := ""
 	sendSuggestions := func(eventName string) bool {

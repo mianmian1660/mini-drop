@@ -19,6 +19,10 @@ database:
 grpc:
   addr: "localhost:50051"
   timeout_sec: 5
+  # 生产环境如启用 mTLS，请配置以下三个文件路径；本地开发默认使用 insecure gRPC。
+  mtls_cert_file: ""
+  mtls_key_file: ""
+  mtls_ca_file: ""
 
 # 对象存储 MinIO
 storage:
@@ -34,3 +38,13 @@ log:
   level: info               # debug / info / warn / error
   format: json              # json / console
   output: stdout            # stdout / stderr / 文件路径
+
+# 安全配置
+# development 默认允许 insecure，production 必须配置 mTLS 或显式设置 allow_insecure_transport=true。
+security:
+  environment: development
+  allow_insecure_transport: true
+
+# 可观测性配置
+observability:
+  metrics_enabled: true

@@ -15,11 +15,13 @@ import (
 
 // Config 是全局配置结构体，包含所有运行时配置
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Database DatabaseConfig `mapstructure:"database"`
-	GRPC     GRPCConfig     `mapstructure:"grpc"`
-	Storage  StorageConfig  `mapstructure:"storage"`
-	Log      LogConfig      `mapstructure:"log"`
+	Server        ServerConfig        `mapstructure:"server"`
+	Database      DatabaseConfig      `mapstructure:"database"`
+	GRPC          GRPCConfig          `mapstructure:"grpc"`
+	Storage       StorageConfig       `mapstructure:"storage"`
+	Log           LogConfig           `mapstructure:"log"`
+	Security      SecurityConfig      `mapstructure:"security"`
+	Observability ObservabilityConfig `mapstructure:"observability"`
 }
 
 // ServerConfig HTTP 服务配置
@@ -30,16 +32,19 @@ type ServerConfig struct {
 
 // DatabaseConfig 数据库连接配置
 type DatabaseConfig struct {
-	DSN               string `mapstructure:"dsn"`
-	MaxOpenConns      int    `mapstructure:"max_open_conns"`
-	MaxIdleConns      int    `mapstructure:"max_idle_conns"`
-	ConnMaxLifetimeSec int   `mapstructure:"conn_max_lifetime_sec"`
+	DSN                string `mapstructure:"dsn"`
+	MaxOpenConns       int    `mapstructure:"max_open_conns"`
+	MaxIdleConns       int    `mapstructure:"max_idle_conns"`
+	ConnMaxLifetimeSec int    `mapstructure:"conn_max_lifetime_sec"`
 }
 
 // GRPCConfig gRPC 客户端配置
 type GRPCConfig struct {
-	Addr       string `mapstructure:"addr"`
-	TimeoutSec int    `mapstructure:"timeout_sec"`
+	Addr         string `mapstructure:"addr"`
+	TimeoutSec   int    `mapstructure:"timeout_sec"`
+	MTLSCertFile string `mapstructure:"mtls_cert_file"`
+	MTLSKeyFile  string `mapstructure:"mtls_key_file"`
+	MTLSCAFile   string `mapstructure:"mtls_ca_file"`
 }
 
 // StorageConfig 对象存储配置
@@ -58,6 +63,18 @@ type LogConfig struct {
 	Level  string `mapstructure:"level"`
 	Format string `mapstructure:"format"`
 	Output string `mapstructure:"output"`
+}
+
+// SecurityConfig 控制生产/开发安全边界。开发环境默认允许 insecure，
+// 生产环境必须显式配置可信通道或明确承认 insecure 例外。
+type SecurityConfig struct {
+	Environment            string `mapstructure:"environment"`
+	AllowInsecureTransport bool   `mapstructure:"allow_insecure_transport"`
+}
+
+// ObservabilityConfig 控制运行时可观测性入口。
+type ObservabilityConfig struct {
+	MetricsEnabled bool `mapstructure:"metrics_enabled"`
 }
 
 // Load 加载配置文件并返回 Config 结构体
@@ -109,6 +126,9 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")
 	v.SetDefault("log.output", "stdout")
+	v.SetDefault("security.environment", "development")
+	v.SetDefault("security.allow_insecure_transport", true)
+	v.SetDefault("observability.metrics_enabled", true)
 
 	// 环境变量覆盖（优先级最高）
 	// PG_DSN → database.dsn
@@ -117,6 +137,15 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envGRPC := os.Getenv("DROP_GRPC"); envGRPC != "" {
 		v.Set("grpc.addr", envGRPC)
+	}
+	if envCert := os.Getenv("GRPC_MTLS_CERT_FILE"); envCert != "" {
+		v.Set("grpc.mtls_cert_file", envCert)
+	}
+	if envKey := os.Getenv("GRPC_MTLS_KEY_FILE"); envKey != "" {
+		v.Set("grpc.mtls_key_file", envKey)
+	}
+	if envCA := os.Getenv("GRPC_MTLS_CA_FILE"); envCA != "" {
+		v.Set("grpc.mtls_ca_file", envCA)
 	}
 	if envS3 := os.Getenv("S3_ENDPOINT"); envS3 != "" {
 		v.Set("storage.endpoint", envS3)
@@ -137,10 +166,47 @@ func Load(configPath string) (*Config, error) {
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		v.Set("server.port", envPort)
 	}
+	if envName := os.Getenv("MINI_DROP_ENV"); envName != "" {
+		v.Set("security.environment", envName)
+	}
+	if envInsecure := os.Getenv("ALLOW_INSECURE_TRANSPORT"); envInsecure != "" {
+		v.Set("security.allow_insecure_transport", parseBoolEnv(envInsecure))
+	}
+	if envMetrics := os.Getenv("METRICS_ENABLED"); envMetrics != "" {
+		v.Set("observability.metrics_enabled", parseBoolEnv(envMetrics))
+	}
 
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("配置解析失败: %w", err)
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 
 	return cfg, nil
+}
+
+func parseBoolEnv(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (cfg *Config) Validate() error {
+	if cfg == nil {
+		return fmt.Errorf("配置为空")
+	}
+	env := strings.ToLower(strings.TrimSpace(cfg.Security.Environment))
+	if env == "" {
+		env = "development"
+	}
+	cfg.Security.Environment = env
+	hasMTLS := cfg.GRPC.MTLSCertFile != "" && cfg.GRPC.MTLSKeyFile != "" && cfg.GRPC.MTLSCAFile != ""
+	if env == "production" && !cfg.Security.AllowInsecureTransport && !hasMTLS {
+		return fmt.Errorf("生产环境必须配置 gRPC mTLS 证书，或显式设置 ALLOW_INSECURE_TRANSPORT=true 承认 insecure 通道")
+	}
+	return nil
 }

@@ -3,6 +3,8 @@
 # ============================================================
 # 一个命令启动 6 个容器：数据库 + 存储 + Server + Agent + 后台 + 前端
 # 用法：docker compose up
+# 注意：本 Compose 面向本地开发/演示，显式使用 development + insecure 传输；
+# 生产部署请使用 deploy/kubernetes 中的 Secret/ConfigMap 模板替换凭据和证书。
 #
 # YAML 语法小课堂：
 #   缩进表示层级（只能用空格，不能用 Tab）
@@ -143,6 +145,9 @@ services:
     environment:
       PG_DSN: "host=postgres user=postgres password=dev dbname=drop sslmode=disable"
       DROP_GRPC: "drop_server:50051" # drop_server 的地址
+      MINI_DROP_ENV: "development"
+      ALLOW_INSECURE_TRANSPORT: "true"
+      METRICS_ENABLED: "true"
       S3_ENDPOINT: "minio:9000" # MinIO 地址（Docker 内部网络）
       S3_PUBLIC_ENDPOINT: "localhost:9000" # 浏览器访问地址（预签名 URL 用）
       S3_ACCESS_KEY: "drop"
@@ -173,6 +178,8 @@ services:
       dockerfile: Dockerfile
     environment:
       PG_DSN: "host=postgres user=postgres password=dev dbname=drop sslmode=disable"
+      MINI_DROP_ENV: "development"
+      ALLOW_INSECURE_TRANSPORT: "true"
       S3_ENDPOINT: "minio:9000"
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"

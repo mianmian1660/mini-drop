@@ -83,6 +83,7 @@ docker compose up -d --build
 - API: http://localhost:8191
 - MinIO Console: http://localhost:9001
 - gRPC drop_server: `localhost:50051`
+- Metrics: http://localhost:8191/metrics
 
 健康检查：
 
@@ -92,6 +93,8 @@ docker compose ps
 ```
 
 如果 `docker compose ps` 里主要服务都是 `Up` 或 `healthy`，说明平台已经启动。此时再运行 `make demo`，才会真正创建采样任务。
+
+本地 Compose 明确以 `MINI_DROP_ENV=development` 和 `ALLOW_INSECURE_TRANSPORT=true` 运行，方便一键演示。生产环境必须改用可信通道配置，至少替换 PostgreSQL、MinIO/S3、gRPC mTLS 证书和所有 Secret。
 
 ## Demo
 
@@ -282,6 +285,18 @@ make test
 ```bash
 make verify
 ```
+
+## 安全、可观测性与部署
+
+阶段 7 增加了生产配置边界和运行可观测性：
+
+- `/metrics` 暴露 Prometheus 文本指标，包括任务状态、Outbox、AnalysisJob、在线 Agent、SSE 连接数和关键计数器。
+- Go/Python/C++ 日志会脱敏 DSN password、access key、secret、Bearer token、profile URL token 和敏感对象路径。
+- `apiserver` 支持 `MINI_DROP_ENV`、`ALLOW_INSECURE_TRANSPORT`、`GRPC_MTLS_CERT_FILE`、`GRPC_MTLS_KEY_FILE`、`GRPC_MTLS_CA_FILE`、`METRICS_ENABLED` 环境变量。
+- `deploy/kubernetes/` 提供基础 Kubernetes 模板；部署前必须替换镜像、Secret、证书和域名。
+- `deploy/runbook.md` 覆盖 Agent 离线、任务积压、分析失败、存储不可用、Outbox 堆积和 SSE 异常。
+- `deploy/backup-restore.md` 描述 PostgreSQL、MinIO/S3 的备份恢复和数据保留策略。
+- `scripts/sbom_scan.sh` 使用 `syft` 生成 SBOM，并用 `grype` 或 `trivy` 扫描镜像。
 
 ## 状态机说明
 

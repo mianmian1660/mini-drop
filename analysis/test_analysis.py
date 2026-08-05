@@ -22,6 +22,26 @@ def t_observability_json_log_fields():
     assert payload["analysis_duration_seconds"] == 1.25
     assert "ignored_none" not in payload
 
+def t_observability_redacts_secrets():
+    import contextlib
+    import io
+    from observability import log_event
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        log_event(
+            "analysis_failed",
+            dsn="host=db user=drop password=dev dbname=drop",
+            profile_url="http://app/profile?token=abc123&debug=1",
+            headers={"Authorization": "Bearer top-secret", "secret_key": "dropdrop"},
+        )
+    line = buf.getvalue().strip().replace("[analysis_observe] ", "", 1)
+    payload = json.loads(line)
+    raw = json.dumps(payload, ensure_ascii=False)
+    for forbidden in ["password=dev", "token=abc123", "top-secret", "dropdrop"]:
+        assert forbidden not in raw
+    assert "password=***" in raw and "token=***" in raw
+
 def t_parse_collapsed_basic():
     from collapsed_data_parser import parse_collapsed
     folded = "func1;func2;func3 10\nfunc1;func2;func4 5\nfunc1;func5 3\n"

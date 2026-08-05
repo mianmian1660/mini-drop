@@ -812,6 +812,60 @@ func TestStage2HealthEndpoints(t *testing.T) {
 	}
 }
 
+func TestStage7MetricsEndpointExposesCoreMetricsAndRedactsSecrets(t *testing.T) {
+	resetMetricsForTest()
+	s := newTestAPIServer(t)
+	now := time.Now()
+	_ = s.DB.Create(&model.HotmethodTask{TID: "tid-metrics", Status: TaskStatusDone, UID: "owner", CreateTime: now}).Error
+	_ = s.DB.Create(&model.Outbox{Aggregate: model.OutboxAggregateTask, AggregateID: "tid-metrics", Event: model.OutboxEventDispatchTask, Status: model.OutboxStatusDeadLetter}).Error
+	_ = s.DB.Create(&model.AnalysisJob{TaskTID: "tid-metrics", Status: model.AnalysisJobStatusSuccess, CreatedAt: now, UpdatedAt: now}).Error
+	_ = s.DB.Create(&model.AgentInfo{IPAddr: "127.0.0.1", Online: true, LastSeen: now}).Error
+	incTasksCreated()
+	incAnalysisQueued()
+	incSSEActive()
+	defer decSSEActive()
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/metrics", s.Metrics)
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	body := w.Body.String()
+	if w.Code != http.StatusOK || !strings.Contains(w.Header().Get("Content-Type"), "text/plain") {
+		t.Fatalf("metrics status=%d content-type=%q body=%s", w.Code, w.Header().Get("Content-Type"), body)
+	}
+	for _, want := range []string{
+		"mini_drop_tasks_created_total 1",
+		"mini_drop_sse_active_connections 1",
+		`mini_drop_tasks_by_status{status="2"} 1`,
+		`mini_drop_outbox_by_status{status="dead_letter"} 1`,
+		`mini_drop_analysis_jobs_by_status{status="success"} 1`,
+		"mini_drop_agents_online 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "dropdrop") || strings.Contains(body, "password=dev") {
+		t.Fatalf("metrics must not expose secrets: %s", body)
+	}
+}
+
+func TestStage7GRPCTransportCredentialsRequireValidMTLSFiles(t *testing.T) {
+	s := newTestAPIServer(t)
+	creds, insecureTransport, err := s.grpcTransportCredentials()
+	if err != nil || creds == nil || !insecureTransport {
+		t.Fatalf("default grpc credentials err=%v insecure=%v creds=%v", err, insecureTransport, creds)
+	}
+	s.Config.GRPC.MTLSCertFile = "/no/such/client.crt"
+	s.Config.GRPC.MTLSKeyFile = "/no/such/client.key"
+	s.Config.GRPC.MTLSCAFile = "/no/such/ca.crt"
+	if _, _, err := s.grpcTransportCredentials(); err == nil {
+		t.Fatalf("missing mTLS files should fail")
+	}
+}
+
 func TestTimelineHandlerValidationAndEffectiveWindow(t *testing.T) {
 	s := newTestAPIServer(t)
 	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)

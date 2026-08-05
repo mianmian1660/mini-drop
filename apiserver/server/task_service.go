@@ -286,6 +286,13 @@ func (svc *TaskService) DownloadArtifact(tid string, artifactIDRaw string, auth 
 	if err != nil {
 		return nil, serviceError(http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "生成下载链接失败")
 	}
+	svc.server.Logger.Info("生成产物下载链接",
+		zap.String("task_id", task.TID),
+		zap.Uint("attempt_id", artifact.AttemptID),
+		zap.Uint("artifact_id", artifact.ID),
+		zap.String("object_key", util.RedactObjectKey(artifact.ObjectKey)),
+		zap.String("user_id", auth.UID),
+	)
 	svc.server.recordTaskStatusEvent(task.TID, task.Status, task.Status, fmt.Sprintf("用户 %s 生成产物下载链接", auth.UID), "artifact_download")
 	return gin.H{
 		"artifact":   publicArtifact(artifact),

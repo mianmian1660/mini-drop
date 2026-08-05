@@ -89,6 +89,8 @@
 - 告警与 Runbook：覆盖 Agent 离线、任务积压、分析失败率、存储不可用、Outbox 堆积、lease 过期过多。
 - 部署交付：Compose 保持本地一键启动；补 Kubernetes manifests、配置模板、备份恢复说明、数据保留策略、镜像 SBOM 和安全扫描。
 
+完成记录（2026-08-05）：阶段 7 已按兼容方式落地。本地 Compose 继续一键启动，但显式标注 `development` 与 insecure 传输；生产配置新增 `security`/`observability` 段，支持 mTLS 路径、metrics 开关和 `ALLOW_INSECURE_TRANSPORT` 显式例外校验。Go/Python/C++ 日志补齐 DSN、access key、secret、Bearer token、profile URL token、敏感 object key 脱敏，并在任务创建、下发、Artifact 下载、NotifyResult、SSE 等路径补充 `request_id/task_id/attempt_id/agent_id/job_id/error_code` 可用字段。后端新增 `/metrics` Prometheus 文本端点，暴露任务创建、任务状态、Outbox、AnalysisJob、在线 Agent、SSE 连接、上传/通知失败和分析入队指标。部署交付新增 Kubernetes 基础 manifests、Runbook、备份恢复与数据保留说明、`scripts/sbom_scan.sh` SBOM/安全扫描入口；README 已说明生产配置要求、metrics、部署和运维文档位置。新增 Go/Python 单测覆盖配置安全校验、脱敏、metrics 与健康检查兼容，最终以 `make verify` 为准。
+
 ## Test Plan
 
 - 契约测试：TaskKind、Status、ErrorCode、Proto 字段生成结果在 Go/C++/Python/Web 中一致。

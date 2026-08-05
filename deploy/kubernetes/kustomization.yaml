@@ -1,0 +1,6 @@
+resources:
+  - namespace.yaml
+  - secret-template.yaml
+  - configmap.yaml
+  - postgres-minio.yaml
+  - workloads.yaml

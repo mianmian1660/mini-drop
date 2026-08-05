@@ -48,6 +48,9 @@ func main() {
 		zap.Int("port", cfg.Server.Port),
 		zap.String("mode", cfg.Server.Mode),
 		zap.String("grpc_addr", cfg.GRPC.Addr),
+		zap.String("environment", cfg.Security.Environment),
+		zap.Bool("allow_insecure_transport", cfg.Security.AllowInsecureTransport),
+		zap.Bool("metrics_enabled", cfg.Observability.MetricsEnabled),
 	)
 
 	// ---------- 3. 连接数据库 ----------
@@ -58,7 +61,10 @@ func main() {
 		cfg.Database.ConnMaxLifetimeSec,
 	)
 	if err != nil {
-		logger.Fatal("数据库连接失败", zap.Error(err))
+		logger.Fatal("数据库连接失败",
+			zap.String("dsn", util.RedactSecret(cfg.Database.DSN)),
+			zap.Error(err),
+		)
 	}
 	logger.Info("数据库连接成功")
 

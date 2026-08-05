@@ -7,6 +7,8 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"os"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -68,6 +71,7 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	if err := s.initStorage(); err != nil {
 		logger.Warn("MinIO 初始化失败（文件上传/签名功能不可用）",
 			zap.String("endpoint", cfg.Storage.Endpoint),
+			zap.String("access_key", util.RedactSecret(cfg.Storage.AccessKey)),
 			zap.Error(err),
 		)
 		// 不阻止启动，降级运行
@@ -122,13 +126,21 @@ func (s *APIServer) initGRPC() {
 	s.ControlCli = nil
 
 	go func() {
+		transportCreds, insecureTransport, credErr := s.grpcTransportCredentials()
+		if credErr != nil {
+			s.Logger.Error("gRPC 传输凭证配置失败",
+				zap.String("addr", s.Config.GRPC.Addr),
+				zap.Error(credErr),
+			)
+			return
+		}
 		// 重试连接，最多尝试 10 次，每次间隔 2 秒
 		for i := 0; i < 10; i++ {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.Config.GRPC.TimeoutSec)*time.Second)
 
 			conn, err := grpc.DialContext(ctx,
 				s.Config.GRPC.Addr,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithTransportCredentials(transportCreds),
 				grpc.WithBlock(),
 			)
 			cancel()
@@ -137,6 +149,7 @@ func (s *APIServer) initGRPC() {
 				s.Logger.Warn("gRPC 连接 drop_server 失败，将重试...",
 					zap.String("addr", s.Config.GRPC.Addr),
 					zap.Int("attempt", i+1),
+					zap.Bool("insecure_transport", insecureTransport),
 					zap.Error(err),
 				)
 				time.Sleep(2 * time.Second)
@@ -148,6 +161,7 @@ func (s *APIServer) initGRPC() {
 			s.Logger.Info("gRPC 连接 drop_server 成功",
 				zap.String("addr", s.Config.GRPC.Addr),
 				zap.Int("attempts", i+1),
+				zap.Bool("insecure_transport", insecureTransport),
 			)
 			return
 		}
@@ -156,6 +170,31 @@ func (s *APIServer) initGRPC() {
 			zap.String("addr", s.Config.GRPC.Addr),
 		)
 	}()
+}
+
+func (s *APIServer) grpcTransportCredentials() (credentials.TransportCredentials, bool, error) {
+	cfg := s.Config.GRPC
+	hasMTLS := cfg.MTLSCertFile != "" && cfg.MTLSKeyFile != "" && cfg.MTLSCAFile != ""
+	if !hasMTLS {
+		return insecure.NewCredentials(), true, nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.MTLSCertFile, cfg.MTLSKeyFile)
+	if err != nil {
+		return nil, false, fmt.Errorf("加载 gRPC mTLS client cert/key 失败: %w", err)
+	}
+	caPEM, err := os.ReadFile(cfg.MTLSCAFile)
+	if err != nil {
+		return nil, false, fmt.Errorf("读取 gRPC mTLS CA 文件失败: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, false, fmt.Errorf("解析 gRPC mTLS CA 文件失败")
+	}
+	return credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS12,
+	}), false, nil
 }
 
 // Close 关闭资源（gRPC 连接、cron 调度器等）
@@ -208,6 +247,7 @@ func (s *APIServer) initStorage() error {
 		zap.String("endpoint", cfg.Endpoint),
 		zap.String("public_endpoint", publicEndpoint),
 		zap.String("bucket", cfg.Bucket),
+		zap.String("access_key", util.RedactSecret(cfg.AccessKey)),
 	)
 	return nil
 }
@@ -616,6 +656,9 @@ func (s *APIServer) registerRoutes() {
 	s.Router.GET("/healthz", s.Healthz)
 	s.Router.GET("/livez", s.Livez)
 	s.Router.GET("/readyz", s.Readyz)
+	if s.Config == nil || s.Config.Observability.MetricsEnabled {
+		s.Router.GET("/metrics", s.Metrics)
+	}
 
 	// 鉴权回调（不挂 CheckLogin，这是唯一的例外）
 	s.Router.GET("/api/v1/auth/check", s.AuthCheck)

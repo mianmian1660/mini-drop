@@ -1,0 +1,148 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drop-server
+  namespace: mini-drop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: drop-server
+  template:
+    metadata:
+      labels:
+        app: drop-server
+    spec:
+      containers:
+        - name: drop-server
+          image: REPLACE_REGISTRY/mini-drop-drop:latest
+          command: ["./drop_server"]
+          ports:
+            - containerPort: 50051
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drop-server
+  namespace: mini-drop
+spec:
+  selector:
+    app: drop-server
+  ports:
+    - port: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apiserver
+  namespace: mini-drop
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: apiserver
+  template:
+    metadata:
+      labels:
+        app: apiserver
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8191"
+    spec:
+      containers:
+        - name: apiserver
+          image: REPLACE_REGISTRY/mini-drop-apiserver:latest
+          envFrom:
+            - configMapRef:
+                name: mini-drop-config
+            - secretRef:
+                name: mini-drop-secrets
+          ports:
+            - containerPort: 8191
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8191
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8191
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apiserver
+  namespace: mini-drop
+spec:
+  selector:
+    app: apiserver
+  ports:
+    - port: 8191
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analysis
+  namespace: mini-drop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analysis
+  template:
+    metadata:
+      labels:
+        app: analysis
+    spec:
+      containers:
+        - name: analysis
+          image: REPLACE_REGISTRY/mini-drop-analysis:latest
+          command: ["python3", "analysis_daemon.py", "--interval", "5"]
+          envFrom:
+            - configMapRef:
+                name: mini-drop-config
+            - secretRef:
+                name: mini-drop-secrets
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  namespace: mini-drop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-frontend
+  template:
+    metadata:
+      labels:
+        app: web-frontend
+    spec:
+      containers:
+        - name: web-frontend
+          image: REPLACE_REGISTRY/mini-drop-web:latest
+          env:
+            - name: HOST_URL
+              value: "http://apiserver:8191"
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-frontend
+  namespace: mini-drop
+spec:
+  selector:
+    app: web-frontend
+  ports:
+    - port: 80

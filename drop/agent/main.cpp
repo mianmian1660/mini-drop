@@ -178,7 +178,9 @@ static shared_ptr<grpc::Channel> connect_to_server(
         {
             cosConfig.CopyFrom(cfgResp.cosconfig());
             cout << "[agent]   获取 COS 配置: endpoint=" << cosConfig.endpoint()
-                 << " bucket=" << cosConfig.bucket() << endl;
+                 << " bucket=" << cosConfig.bucket()
+                 << " insecure_transport=" << (cosConfig.usessl() ? "false" : "true")
+                 << " credentials=redacted" << endl;
         }
         else
         {
@@ -188,7 +190,7 @@ static shared_ptr<grpc::Channel> connect_to_server(
             cosConfig.set_secretaccesskey("dropdrop");
             cosConfig.set_bucket("drop-data");
             cosConfig.set_usessl(false);
-            cout << "[agent]   使用默认 MinIO 配置 (localhost:9000)" << endl;
+            cout << "[agent]   使用默认 MinIO 配置 (localhost:9000, insecure_transport=true, credentials=redacted)" << endl;
         }
 
         return channel;
