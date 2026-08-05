@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks, agents, schedules, taskKinds } from '../api';
 
@@ -16,6 +16,7 @@ const S = {
     err: { color: '#f44336', fontSize: 13, marginTop: 12 },
     ok: { color: '#4caf50', fontSize: 13, marginTop: 12 },
     hint: { fontSize: 11, color: '#888', marginTop: 2, marginBottom: 8 },
+    warn: { fontSize: 12, color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '8px 10px', margin: '0 0 12px' },
     chk: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
     presetBtn: (active) => ({
         padding: '4px 10px', fontSize: 12, borderRadius: 4, cursor: 'pointer',
@@ -70,18 +71,28 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
             }
         }).catch(() => { }).finally(() => setAload(false));
 
-        taskKinds.list().then(r => {
+    }, []);
+
+    const loadTaskKinds = useCallback((targetIP) => {
+        setKload(true);
+        taskKinds.list(targetIP ? { target_ip: targetIP } : {}).then(r => {
             if (r.code !== 0) throw new Error(r.message || '加载 TaskKind 失败');
             const list = r.data?.task_kinds || [];
             setKindList(list);
-            if (list.length > 0) {
-                setF(p => {
-                    const kind = list.find(k => k.id === p.task_kind) || list[0];
-                    return { ...p, task_kind: kind.id, ...valuesFromKind(kind) };
-                });
-            }
-        }).catch(e => setErr(e.message || '任务类型元数据加载失败')).finally(() => setKload(false));
+            setF(p => {
+                if (list.length === 0) return { ...p, task_kind: '' };
+                const kind = list.find(k => k.id === p.task_kind) || list[0];
+                return { ...p, task_kind: kind.id, ...valuesFromKind(kind) };
+            });
+        }).catch(e => {
+            setKindList([]);
+            setErr(e.message || '任务类型元数据加载失败');
+        }).finally(() => setKload(false));
     }, []);
+
+    useEffect(() => {
+        loadTaskKinds(f.target_ip);
+    }, [f.target_ip, loadTaskKinds]);
 
     const selectedKind = useMemo(
         () => kindList.find(k => k.id === f.task_kind) || null,
@@ -223,6 +234,9 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                                 {kindList.map(kind => <option key={kind.id} value={kind.id}>{kind.display_name}</option>)}
                             </select>
                         )}
+                        {!kload && f.target_ip && kindList.length === 0 && (
+                            <p style={S.warn}>当前 Agent 未声明可用采集能力，或没有匹配的 TaskKind。</p>
+                        )}
                     </div>
                     {(selectedKind?.schema || []).map(field => (
                         <div key={field.name}>
@@ -262,7 +276,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 </div>}
 
                 <div style={{ marginTop: 16, display: 'flex', gap: 10 }}>
-                    <button style={{ ...S.btn, opacity: sub ? 0.6 : 1 }} onClick={submit} disabled={sub || kload}>
+                    <button style={{ ...S.btn, opacity: sub || kload || kindList.length === 0 ? 0.6 : 1 }} onClick={submit} disabled={sub || kload || kindList.length === 0}>
                         {sub ? '提交中...' : f.continuous ? '创建持续采集' : '提交任务'}
                     </button>
                     <button style={{ ...S.btn, background: '#999' }} onClick={onClose} disabled={sub}>取消</button>

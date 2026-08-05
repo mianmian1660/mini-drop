@@ -617,43 +617,49 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		return
 	}
 
+	result := s.taskDetailPayload(task)
+
+	s.RespondOK(c, result)
+}
+
+func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	result := gin.H{"task": taskDetailResponse(task)}
 	files := []map[string]interface{}{}
 	var topFuncs []map[string]interface{}
 	var bpfData map[string]interface{}
 	var suggestions []map[string]interface{}
-	statusEvents := s.fetchTaskStatusEvents(tid)
-	attempts := s.fetchTaskAttempts(tid)
-	artifacts := s.fetchArtifacts(tid)
+	statusEvents := s.fetchTaskStatusEvents(task.TID)
+	attempts := s.fetchTaskAttempts(task.TID)
+	artifacts := s.fetchArtifacts(task.TID)
 
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
-		storageFiles, err := s.listTaskFiles(tid)
+		storageFiles, err := s.listTaskFiles(task.TID)
 		if err != nil {
-			s.Logger.Warn("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
+			s.Logger.Warn("列出任务文件失败", zap.String("tid", task.TID), zap.Error(err))
 		} else {
 			files = storageFiles
 
 			// 尝试从 MinIO 读取 top.json → TopN 热点数据
-			topFuncs = s.fetchTopFunctions(tid)
-			bpfData = s.fetchBPFData(tid)
-			suggestions = s.fetchSuggestions(tid)
+			topFuncs = s.fetchTopFunctions(task.TID)
+			bpfData = s.fetchBPFData(task.TID)
+			suggestions = s.fetchSuggestions(task.TID)
 		}
 	}
 	if len(files) == 0 {
-		files = s.listLocalFiles(tid)
+		files = s.listLocalFiles(task.TID)
 		if len(topFuncs) == 0 {
-			topFuncs = s.fetchLocalTopFunctions(tid)
+			topFuncs = s.fetchLocalTopFunctions(task.TID)
 		}
 		if bpfData == nil {
-			bpfData = s.fetchLocalBPFData(tid)
+			bpfData = s.fetchLocalBPFData(task.TID)
 		}
 	}
 	if len(suggestions) == 0 {
-		suggestions = s.fetchLocalSuggestions(tid)
+		suggestions = s.fetchLocalSuggestions(task.TID)
 	}
 	if len(suggestions) == 0 {
-		suggestions = s.fetchDBSuggestions(tid)
+		suggestions = s.fetchDBSuggestions(task.TID)
 	}
 	if len(topFuncs) > 0 {
 		result["top_functions"] = topFuncs
@@ -669,7 +675,7 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	result["artifacts"] = artifacts
 	result["files"] = files
 
-	s.RespondOK(c, result)
+	return result
 }
 
 func taskDetailResponse(task model.HotmethodTask) gin.H {
@@ -682,6 +688,8 @@ func taskDetailResponse(task model.HotmethodTask) gin.H {
 		"id":              task.ID,
 		"tid":             task.TID,
 		"name":            task.Name,
+		"task_kind":       task.TaskKind,
+		"request_id":      task.RequestID,
 		"type":            task.Type,
 		"profiler_type":   task.ProfilerType,
 		"target_ip":       task.TargetIP,
@@ -696,6 +704,211 @@ func taskDetailResponse(task model.HotmethodTask) gin.H {
 		"end_time":        task.EndTime,
 		"master_task_tid": task.MasterTaskTID,
 	}
+}
+
+func (s *APIServer) StreamTaskEvents(c *gin.Context) {
+	task, serr := s.taskService().requireReadableTask(c.Param("tid"), s.AuthContext(c))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
+		return
+	}
+	s.prepareSSE(c)
+
+	lastSequence := parseLastEventID(c.GetHeader("Last-Event-ID"))
+	send := func(eventName string, eventID int64, payload gin.H) bool {
+		return writeSSE(c, eventName, eventID, payload)
+	}
+
+	if latest, ok := s.latestTaskEventSequence(task.TID); ok && latest > lastSequence {
+		lastSequence = latest
+	}
+	if !send("snapshot", lastSequence, s.taskEventStreamPayload(task)) {
+		return
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-heartbeat.C:
+			if !send("heartbeat", lastSequence, gin.H{"request_id": requestIDFromGin(c), "tid": task.TID, "ts": time.Now()}) {
+				return
+			}
+		case <-ticker.C:
+			var fresh model.HotmethodTask
+			if err := s.DB.Where("tid = ?", task.TID).First(&fresh).Error; err != nil {
+				return
+			}
+			events := s.fetchTaskStatusEventsAfter(task.TID, lastSequence)
+			if len(events) == 0 {
+				if isTerminalTaskStatus(fresh.Status) && fresh.AnalysisStatus >= 2 {
+					_ = send("complete", lastSequence, s.taskEventStreamPayload(fresh))
+					return
+				}
+				continue
+			}
+			for _, event := range events {
+				if event.Sequence > lastSequence {
+					lastSequence = event.Sequence
+				}
+			}
+			if !send("task-events", lastSequence, s.taskEventStreamPayload(fresh)) {
+				return
+			}
+			if isTerminalTaskStatus(fresh.Status) && fresh.AnalysisStatus >= 2 {
+				_ = send("complete", lastSequence, s.taskEventStreamPayload(fresh))
+				return
+			}
+		}
+	}
+}
+
+func (s *APIServer) StreamTaskSuggestions(c *gin.Context) {
+	task, serr := s.taskService().requireReadableTask(c.Param("tid"), s.AuthContext(c))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
+		return
+	}
+	s.prepareSSE(c)
+
+	lastHash := ""
+	sendSuggestions := func(eventName string) bool {
+		payload := s.taskSuggestionStreamPayload(task.TID, requestIDFromGin(c))
+		raw, _ := json.Marshal(payload["suggestions"])
+		lastHash = string(raw)
+		return writeSSE(c, eventName, 0, payload)
+	}
+	if !sendSuggestions("suggestions") {
+		return
+	}
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-heartbeat.C:
+			_ = writeSSE(c, "heartbeat", 0, gin.H{"request_id": requestIDFromGin(c), "tid": task.TID, "ts": time.Now()})
+		case <-ticker.C:
+			payload := s.taskSuggestionStreamPayload(task.TID, requestIDFromGin(c))
+			raw, _ := json.Marshal(payload["suggestions"])
+			if string(raw) != lastHash {
+				lastHash = string(raw)
+				_ = writeSSE(c, "suggestions", 0, payload)
+			}
+			var fresh model.HotmethodTask
+			if err := s.DB.Where("tid = ?", task.TID).First(&fresh).Error; err == nil && isTerminalTaskStatus(fresh.Status) && fresh.AnalysisStatus >= 2 {
+				_ = writeSSE(c, "complete", 0, payload)
+				return
+			}
+		}
+	}
+}
+
+func (s *APIServer) prepareSSE(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+}
+
+func writeSSE(c *gin.Context, eventName string, eventID int64, payload interface{}) bool {
+	if eventID > 0 {
+		_, _ = fmt.Fprintf(c.Writer, "id: %d\n", eventID)
+	}
+	if eventName != "" {
+		_, _ = fmt.Fprintf(c.Writer, "event: %s\n", eventName)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		raw = []byte(`{"error":"marshal_failed"}`)
+	}
+	_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", raw)
+	if f, ok := c.Writer.(http.Flusher); ok {
+		f.Flush()
+	}
+	return c.Request.Context().Err() == nil
+}
+
+func parseLastEventID(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func (s *APIServer) taskEventStreamPayload(task model.HotmethodTask) gin.H {
+	events := s.fetchTaskStatusEvents(task.TID)
+	latest := latestSequenceFromEvents(events)
+	return gin.H{
+		"id":              latest,
+		"sequence":        latest,
+		"request_id":      task.RequestID,
+		"task":            taskDetailResponse(task),
+		"task_snapshot":   s.taskDetailPayload(task),
+		"status_events":   events,
+		"latest_event_id": latest,
+	}
+}
+
+func (s *APIServer) taskSuggestionStreamPayload(tid string, requestID string) gin.H {
+	var suggestions []map[string]interface{}
+	if s.StorageConnected() {
+		suggestions = s.fetchSuggestions(tid)
+	}
+	if len(suggestions) == 0 {
+		suggestions = s.fetchLocalSuggestions(tid)
+	}
+	if len(suggestions) == 0 {
+		suggestions = s.fetchDBSuggestions(tid)
+	}
+	return gin.H{"request_id": requestID, "tid": tid, "suggestions": suggestions}
+}
+
+func (s *APIServer) latestTaskEventSequence(tid string) (int64, bool) {
+	var seq int64
+	err := s.DB.Model(&model.TaskStatusEvent{}).
+		Where("tid = ?", tid).
+		Select("COALESCE(MAX(sequence), 0)").
+		Scan(&seq).Error
+	return seq, err == nil
+}
+
+func latestSequenceFromEvents(events []model.TaskStatusEvent) int64 {
+	var latest int64
+	for _, event := range events {
+		if event.Sequence > latest {
+			latest = event.Sequence
+		}
+	}
+	return latest
+}
+
+func (s *APIServer) fetchTaskStatusEventsAfter(tid string, sequence int64) []model.TaskStatusEvent {
+	var events []model.TaskStatusEvent
+	if err := s.DB.Where("tid = ? AND sequence > ?", tid, sequence).
+		Order("sequence ASC, created_at ASC, id ASC").
+		Find(&events).Error; err != nil {
+		return []model.TaskStatusEvent{}
+	}
+	if events == nil {
+		return []model.TaskStatusEvent{}
+	}
+	return events
 }
 
 // fetchLocalTopFunctions 从 /tmp/drop-output/{tid}_top.json 读取 TopN

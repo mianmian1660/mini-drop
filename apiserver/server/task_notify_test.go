@@ -670,6 +670,119 @@ func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 	}
 }
 
+func TestStage5TaskKindsFilterByAgentCapabilities(t *testing.T) {
+	s := newTestAPIServer(t)
+	caps, _ := util.MarshalJSONB([]string{"pprof"})
+	if err := s.DB.Create(&model.AgentInfo{Hostname: "pprof-agent", IPAddr: "10.0.0.8", Online: true, UID: "owner", Capabilities: caps, LastSeen: time.Now()}).Error; err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/task-kinds", s.ListTaskKinds)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/task-kinds?target_ip=10.0.0.8", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	items := resp["data"].(map[string]interface{})["task_kinds"].([]interface{})
+	if len(items) != 1 {
+		t.Fatalf("task kinds=%d, want only pprof-compatible kind: %s", len(items), w.Body.String())
+	}
+	if got := items[0].(map[string]interface{})["id"]; got != TaskKindGoPprof {
+		t.Fatalf("kind id=%v, want %s", got, TaskKindGoPprof)
+	}
+}
+
+func TestStage5TaskEventSSESnapshotLastEventIDAndPermission(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now()
+	task := model.HotmethodTask{
+		TID: "tid-sse", Name: "sse", UID: "owner", UserName: "owner",
+		Status: TaskStatusDone, AnalysisStatus: 2, RequestID: "task-rid",
+		TargetIP: "127.0.0.1", CreateTime: now, EndTime: &now,
+	}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := s.DB.Create(&model.TaskStatusEvent{
+		TID: task.TID, FromStatus: TaskStatusUploading, ToStatus: TaskStatusDone,
+		Reason: "采集完成", Source: "test", Sequence: 7, CreatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("create event: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks/:tid/events/stream", s.StreamTaskEvents)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-sse/events/stream", nil).WithContext(ctx)
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Last-Event-ID", "3")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	body := w.Body.String()
+	if w.Code != http.StatusOK || !strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("sse status=%d content-type=%q body=%s", w.Code, w.Header().Get("Content-Type"), body)
+	}
+	for _, want := range []string{"id: 7", "event: snapshot", `"sequence":7`, `"status_events"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("sse body missing %q: %s", want, body)
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-sse/events/stream", nil)
+	req.Header.Set("Drop-User-Uid", "other")
+	req.Header.Set("X-Request-ID", "rid-sse-forbid")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `"request_id":"rid-sse-forbid"`) {
+		t.Fatalf("forbidden sse status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestStage5SuggestionSSESendsInitialPayloadAndCompletes(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now()
+	task := model.HotmethodTask{
+		TID: "tid-suggest-sse", Name: "suggest", UID: "owner",
+		Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: now, EndTime: &now,
+	}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := s.DB.Create(&model.AnalysisSuggestion{
+		TID: task.TID, Func: "hot.work", Suggestion: "检查循环", Status: 0,
+	}).Error; err != nil {
+		t.Fatalf("create suggestion: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks/:tid/suggestions/stream", s.StreamTaskSuggestions)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-suggest-sse/suggestions/stream", nil).WithContext(ctx)
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("X-Request-ID", "rid-suggest-sse")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	body := w.Body.String()
+	if w.Code != http.StatusOK || !strings.Contains(body, "event: suggestions") || !strings.Contains(body, "hot.work") || !strings.Contains(body, "event: complete") {
+		t.Fatalf("suggestion sse status=%d body=%s", w.Code, body)
+	}
+}
+
 func TestStage2HealthEndpoints(t *testing.T) {
 	s := newTestAPIServer(t)
 	s.Storage = fakeStorage{}

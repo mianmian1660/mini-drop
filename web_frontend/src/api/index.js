@@ -11,6 +11,14 @@
 
 import client from './client';
 
+const HOST_URL = window.config?.HOST_URL || '';
+
+export function apiURL(path) {
+    if (/^https?:\/\//i.test(path)) return path;
+    const base = HOST_URL.replace(/\/$/, '');
+    return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
 // ---------- 鉴权 ----------
 export const auth = {
     // 检查登录状态（GET /api/v1/auth/check）
@@ -36,7 +44,7 @@ export const agents = {
 };
 
 export const taskKinds = {
-    list: () => client.get('/api/v1/task-kinds'),
+    list: (params = {}) => client.get('/api/v1/task-kinds', { params }),
 };
 
 // ---------- 任务 ----------
@@ -57,6 +65,8 @@ export const tasks = {
     artifacts: (tid) => client.get(`/api/v1/tasks/${tid}/artifacts`),
     // 任务级 Artifact 短期下载链接
     artifactDownload: (tid, artifactId) => client.get(`/api/v1/tasks/${tid}/artifacts/${artifactId}/download`),
+    eventsStreamURL: (tid) => apiURL(`/api/v1/tasks/${encodeURIComponent(tid)}/events/stream`),
+    suggestionsStreamURL: (tid) => apiURL(`/api/v1/tasks/${encodeURIComponent(tid)}/suggestions/stream`),
     // Continuous Profiling 时间轴
     // 全部窗口:      tasks.timeline(masterTid)
     // 区间筛选:      tasks.timeline(masterTid, { from, to })    （RFC3339 字符串）

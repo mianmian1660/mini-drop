@@ -292,6 +292,15 @@ func (s *APIServer) agentSupportsTaskKind(targetIP string, kind TaskKindDefiniti
 
 func (s *APIServer) ListTaskKinds(c *gin.Context) {
 	kinds := taskKindDefinitions()
+	if targetIP := strings.TrimSpace(c.Query("target_ip")); targetIP != "" {
+		filtered := make([]TaskKindDefinition, 0, len(kinds))
+		for _, kind := range kinds {
+			if s.agentSupportsTaskKind(targetIP, kind) {
+				filtered = append(filtered, kind)
+			}
+		}
+		kinds = filtered
+	}
 	sort.Slice(kinds, func(i, j int) bool { return kinds[i].ID < kinds[j].ID })
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"task_kinds": kinds, "total": len(kinds)}})
 }

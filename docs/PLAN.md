@@ -68,6 +68,8 @@
 - 大火焰图优化：火焰图解析/布局移入 Web Worker，限制节点数和深度，避免主线程长期阻塞。
 - 安全展示：Markdown/HTML 建议经过清洗；错误页和失败面板显示稳定错误码、retryable、request_id 和建议动作。
 
+完成记录（2026-08-05）：阶段 5 已按兼容方式落地。后端 `/api/v1/task-kinds` 支持按 `target_ip` 和 Agent capability 过滤 TaskKind；新增任务状态 SSE 与建议 SSE，复用任务读取权限，提供首帧快照、`Last-Event-ID` 断点续传、heartbeat、终态 complete 和统一错误响应。前端新建任务弹窗会在选择 Agent 后只展示匹配 TaskKind；任务详情页优先连接 SSE 实时刷新状态、建议和任务快照，异常时指数退避并回退轮询，终态后停止普通轮询。状态时间线扩展为 Created、Queued、Delivered、Running、Uploading、Collected、Analyzing、Success/Failed/Canceled，并展示 reason、时间、来源和 request_id。Artifact 下载区优先使用任务级 Artifact API 生成/刷新短期 URL，失败时展示稳定错误码、retryable 和 request_id；规则建议、AI 建议、失败 reason 统一按安全文本展示。火焰图新增 Web Worker 后台检测节点数和深度，超限时提示使用新窗口或下载 fallback，避免大 SVG 检测阻塞主线程。验收已覆盖 Go 单测和 React build，最终以 `make verify` 为准。
+
 ### 阶段 6：复合任务、计划任务与高级能力
 
 - 复合任务：主任务只做编排，展开 CPU/内存/I/O 等子任务 DAG；支持 `ALL_REQUIRED/BEST_EFFORT/QUORUM/DAG` 聚合策略。

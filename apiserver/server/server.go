@@ -644,6 +644,8 @@ func (s *APIServer) registerRoutes() {
 		api.POST("/tasks/:tid/cancel", s.CancelTask)
 		api.GET("/tasks/:tid/artifacts", s.ListTaskArtifacts)
 		api.GET("/tasks/:tid/artifacts/:artifact_id/download", s.DownloadTaskArtifact)
+		api.GET("/tasks/:tid/events/stream", s.StreamTaskEvents)
+		api.GET("/tasks/:tid/suggestions/stream", s.StreamTaskSuggestions)
 
 		// Continuous Profiling 时间轴 (W6)
 		api.GET("/tasks/timeline", s.GetTimeline)

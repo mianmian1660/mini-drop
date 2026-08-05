@@ -24,10 +24,10 @@ const styles = {
     metricLabel: { fontSize: 12, color: '#667085', marginBottom: 6 },
     metricValue: { fontSize: 14, color: '#202124', wordBreak: 'break-word' },
     badge: { display: 'inline-flex', alignItems: 'center', borderRadius: 999, padding: '4px 10px', fontSize: 12, fontWeight: 700, color: '#fff' },
-    stageTimeline: { display: 'grid', gridTemplateColumns: 'repeat(7, minmax(112px, 1fr))', gap: 8, overflowX: 'auto', paddingBottom: 4, marginBottom: 16 },
+    stageTimeline: { display: 'grid', gridTemplateColumns: 'repeat(10, minmax(112px, 1fr))', gap: 8, overflowX: 'auto', paddingBottom: 4, marginBottom: 16 },
     stage: (state) => ({ minHeight: 74, borderRadius: 6, border: `1px solid ${state === 'failed' ? '#fda29b' : state === 'done' ? '#86efac' : state === 'active' ? '#93c5fd' : '#e2e8f0'}`, background: state === 'failed' ? '#fee4e2' : state === 'done' ? '#f0fdf4' : state === 'active' ? '#eff6ff' : '#f8fafc', padding: '10px 11px' }),
     stageTitle: (state) => ({ margin: 0, fontSize: 13, fontWeight: 700, color: state === 'failed' ? '#b42318' : state === 'done' ? '#166534' : state === 'active' ? '#1d4ed8' : '#64748b', whiteSpace: 'nowrap' }),
-    stageMeta: { margin: '6px 0 0 0', fontSize: 11, lineHeight: 1.35, color: '#667085', wordBreak: 'break-word' },
+    stageMeta: { margin: '6px 0 0 0', fontSize: 11, lineHeight: 1.35, color: '#667085', wordBreak: 'break-word', whiteSpace: 'pre-wrap' },
     failure: { border: '1px solid #fda29b', background: '#fff6f5', borderRadius: 6, padding: 14, marginBottom: 16, display: 'flex', gap: 14, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' },
     notice: { display: 'flex', gap: 8, alignItems: 'center', background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 13 },
     flameFrame: { width: '100%', height: 560, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
@@ -53,21 +53,26 @@ const styles = {
     fileItem: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '11px 12px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fbfcfe' },
     fileName: { fontSize: 13, color: '#202124', wordBreak: 'break-all', fontWeight: 600 },
     fileMeta: { fontSize: 11, color: '#667085', marginTop: 4 },
+    streamState: { marginTop: 6, color: '#667085', fontSize: 12 },
+    inlineError: { color: '#b42318', fontSize: 12, marginTop: 8, wordBreak: 'break-word' },
     error: { textAlign: 'center', padding: 60, color: '#b42318' },
     loading: { textAlign: 'center', padding: 60, color: '#667085' },
 };
 
-const statusColors = { 0: '#d97706', 1: '#2563eb', 2: '#16a34a', 3: '#dc2626', 4: '#7c3aed' };
-const statusNames = { 0: 'PENDING', 1: 'RUNNING', 2: 'DONE', 3: 'FAILED', 4: 'UPLOADING' };
+const statusColors = { 0: '#d97706', 1: '#2563eb', 2: '#16a34a', 3: '#dc2626', 4: '#7c3aed', 5: '#64748b' };
+const statusNames = { 0: 'PENDING', 1: 'RUNNING', 2: 'DONE', 3: 'FAILED', 4: 'UPLOADING', 5: 'CANCELED' };
 const analysisNames = { 0: '待分析', 1: '分析中', 2: '分析完成', 3: '分析失败' };
 const stageDefinitions = [
-    { id: 'created', label: '已创建' },
-    { id: 'dispatch', label: '等待下发' },
-    { id: 'accepted', label: 'Agent 已接收' },
-    { id: 'collecting', label: '采集中' },
-    { id: 'raw_saved', label: '原始数据已保存' },
-    { id: 'analyzing', label: '分析中' },
-    { id: 'available', label: '结果可用' },
+    { id: 'created', label: 'Created' },
+    { id: 'queued', label: 'Queued' },
+    { id: 'delivered', label: 'Delivered' },
+    { id: 'running', label: 'Running' },
+    { id: 'uploading', label: 'Uploading' },
+    { id: 'collected', label: 'Collected' },
+    { id: 'analyzing', label: 'Analyzing' },
+    { id: 'success', label: 'Success' },
+    { id: 'failed', label: 'Failed' },
+    { id: 'canceled', label: 'Canceled' },
 ];
 
 export default function TaskResultPage() {
@@ -76,6 +81,9 @@ export default function TaskResultPage() {
 
     const [task, setTask] = useState(null);
     const [files, setFiles] = useState([]);
+    const [artifacts, setArtifacts] = useState([]);
+    const [artifactLinks, setArtifactLinks] = useState({});
+    const [artifactError, setArtifactError] = useState('');
     const [topFunctions, setTopFunctions] = useState([]);
     const [bpfHistogram, setBpfHistogram] = useState(null);
     const [suggestions, setSuggestions] = useState([]);
@@ -86,6 +94,8 @@ export default function TaskResultPage() {
     const [polling, setPolling] = useState(false);
     const [retrying, setRetrying] = useState(false);
     const [retryNotice, setRetryNotice] = useState('');
+    const [streamState, setStreamState] = useState('connecting');
+    const [flameMeta, setFlameMeta] = useState(null);
 
     const applyFiles = useCallback((inputFiles = []) => {
         const safeFiles = Array.isArray(inputFiles)
@@ -98,6 +108,18 @@ export default function TaskResultPage() {
         setFiles(safeFiles);
     }, []);
 
+    const applyTaskData = useCallback((data = {}) => {
+        setTask(data.task || {});
+        setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
+        setBpfHistogram(data.bpf_histogram || null);
+        setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
+        setAttribution(readEmbeddedAttribution(data.suggestions));
+        setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
+        setArtifacts(Array.isArray(data.artifacts) ? data.artifacts : []);
+        applyFiles(data.files || []);
+        setError('');
+    }, [applyFiles]);
+
     const loadTask = useCallback(async (isPoll = false) => {
         if (!tid) return;
         if (!isPoll) setLoading(true);
@@ -109,22 +131,14 @@ export default function TaskResultPage() {
                 if (!isPoll) setError(res.message || '任务不存在');
                 return;
             }
-            const data = res.data || {};
-            setTask(data.task || {});
-            setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
-            setBpfHistogram(data.bpf_histogram || null);
-            setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
-            setAttribution(readEmbeddedAttribution(data.suggestions));
-            setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
-            applyFiles(data.files || []);
-            setError('');
+            applyTaskData(res.data || {});
         } catch (err) {
             if (!isPoll) setError('加载任务详情失败: ' + (err.message || '未知错误'));
         } finally {
             setLoading(false);
             setPolling(false);
         }
-    }, [tid, applyFiles]);
+    }, [tid, applyTaskData]);
 
     useEffect(() => {
         if (attribution) return;
@@ -159,22 +173,109 @@ export default function TaskResultPage() {
     }, [tid, loadTask]);
 
     useEffect(() => {
-        if (!task || Number(task.status) >= 2) return;
+        if (!tid || typeof EventSource === 'undefined') {
+            setStreamState('polling');
+            return undefined;
+        }
+        let closed = false;
+        let reconnectTimer = null;
+        let retryDelay = 1000;
+        let eventsSource = null;
+        let suggestionsSource = null;
+
+        const openStreams = () => {
+            if (closed) return;
+            setStreamState('connecting');
+            eventsSource = new EventSource(tasks.eventsStreamURL(tid), { withCredentials: true });
+            suggestionsSource = new EventSource(tasks.suggestionsStreamURL(tid), { withCredentials: true });
+
+            const handleTaskPayload = (evt) => {
+                retryDelay = 1000;
+                setStreamState('live');
+                try {
+                    const payload = JSON.parse(evt.data || '{}');
+                    const data = payload.task_snapshot || payload;
+                    applyTaskData(data);
+                } catch (_) {
+                    setStreamState('polling');
+                }
+            };
+            eventsSource.addEventListener('snapshot', handleTaskPayload);
+            eventsSource.addEventListener('task-events', handleTaskPayload);
+            eventsSource.addEventListener('complete', handleTaskPayload);
+            eventsSource.onerror = () => {
+                eventsSource?.close();
+                suggestionsSource?.close();
+                setStreamState('polling');
+                if (!closed) {
+                    reconnectTimer = setTimeout(openStreams, retryDelay);
+                    retryDelay = Math.min(retryDelay * 2, 15000);
+                }
+            };
+
+            const handleSuggestions = (evt) => {
+                try {
+                    const payload = JSON.parse(evt.data || '{}');
+                    if (Array.isArray(payload.suggestions)) {
+                        setSuggestions(payload.suggestions);
+                        const embedded = readEmbeddedAttribution(payload.suggestions);
+                        if (embedded) setAttribution(embedded);
+                    }
+                } catch (_) {}
+            };
+            suggestionsSource.addEventListener('suggestions', handleSuggestions);
+            suggestionsSource.addEventListener('complete', handleSuggestions);
+            suggestionsSource.onerror = () => {
+                suggestionsSource?.close();
+            };
+        };
+
+        openStreams();
+        return () => {
+            closed = true;
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            eventsSource?.close();
+            suggestionsSource?.close();
+        };
+    }, [tid, applyTaskData]);
+
+    useEffect(() => {
+        if (!task || Number(task.status) >= 2 || streamState === 'live' || streamState === 'connecting') return;
         const timer = setInterval(() => loadTask(true), 3000);
         return () => clearInterval(timer);
-    }, [task, loadTask]);
+    }, [task, loadTask, streamState]);
 
     useEffect(() => {
         if (!task || Number(task.status) !== 2) return;
+        if (streamState === 'live' && Number(task.analysis_status) < 2) return;
         if (hasVisual(files)) return;
         const timer = setInterval(() => {
             loadTask(true);
             loadFiles();
         }, 5000);
         return () => clearInterval(timer);
-    }, [task, files, loadTask, loadFiles]);
+    }, [task, files, loadTask, loadFiles, streamState]);
 
     const artifact = useMemo(() => pickVisualArtifact(files), [files]);
+    useEffect(() => {
+        if (!artifact?.url || artifact.type !== 'flamegraph') {
+            setFlameMeta(null);
+            return undefined;
+        }
+        let cancelled = false;
+        const worker = new Worker(new URL('../workers/flamegraphWorker.js', import.meta.url));
+        worker.onmessage = (event) => {
+            if (!cancelled) setFlameMeta(event.data || null);
+        };
+        worker.onerror = () => {
+            if (!cancelled) setFlameMeta({ ok: false, reason: 'worker_error' });
+        };
+        worker.postMessage({ url: artifact.url, maxNodes: 6000, maxDepth: 160 });
+        return () => {
+            cancelled = true;
+            worker.terminate();
+        };
+    }, [artifact]);
     const stageStatus = Number(task?.status);
     const stageAnalysisStatus = Number(task?.analysis_status);
     const stages = useMemo(
@@ -198,6 +299,29 @@ export default function TaskResultPage() {
     const statusName = statusNames[status] || 'UNKNOWN';
     const statusColor = statusColors[status] || '#667085';
     const shouldPoll = isActiveTaskStatus(status) || (status === 2 && analysisStatus < 2 && !artifact);
+
+    const refreshArtifactLink = async (artifactItem) => {
+        if (!artifactItem?.id) return;
+        setArtifactError('');
+        try {
+            const response = await tasks.artifactDownload(tid, artifactItem.id);
+            if (response.code !== 0) throw response;
+            setArtifactLinks(prev => ({
+                ...prev,
+                [artifactItem.id]: {
+                    url: resolveUrl(response.data?.url),
+                    expiresAt: response.data?.expires_at,
+                },
+            }));
+        } catch (err) {
+            const payload = err?.response?.data || err;
+            const requestID = payload?.request_id || '-';
+            const apiError = payload?.error || {};
+            const code = apiError.code || payload?.code || 'ARTIFACT_DOWNLOAD_FAILED';
+            const retryable = apiError.retryable;
+            setArtifactError(`下载链接刷新失败：${code} · retryable=${String(Boolean(retryable))} · request_id=${requestID}`);
+        }
+    };
 
     const retryTask = async () => {
         setRetrying(true);
@@ -224,6 +348,7 @@ export default function TaskResultPage() {
                 <div style={styles.titleBlock}>
                     <h2 style={styles.pageTitle}>{task.name || '任务详情'}</h2>
                     <p style={styles.subtitle}>{tid}</p>
+                    <p style={styles.streamState}>{streamState === 'live' ? '实时事件流已连接' : streamState === 'connecting' ? '正在连接实时事件流' : '实时事件流不可用，已回退轮询'}</p>
                 </div>
                 <button style={styles.button} onClick={() => loadTask(true)} disabled={polling}>
                     {polling ? '刷新中...' : '刷新'}
@@ -251,7 +376,8 @@ export default function TaskResultPage() {
                     <Metric label="创建时间" value={formatTime(task.create_time)} />
                     <Metric label="开始时间" value={formatTime(task.begin_time) || '-'} />
                     <Metric label="结束时间" value={formatTime(task.end_time) || '-'} />
-                    <Metric label="状态 reason" value={task.status_info || '-'} />
+                    <Metric label="状态 reason" value={safeText(task.status_info) || '-'} />
+                    <Metric label="request_id" value={task.request_id || '-'} />
                 </div>
             </div>
 
@@ -260,7 +386,7 @@ export default function TaskResultPage() {
             <div style={styles.split}>
                 <div style={styles.card}>
                     <h3 style={styles.sectionTitle}>{isBpfHistogramTask ? 'eBPF 直方图' : isBpfCpuTask ? 'eBPF CPU 火焰图' : isJavaTask ? 'Java 火焰图' : isPprofTask ? 'Go pprof 调用图' : '火焰图'}</h3>
-                    <VisualResult artifact={artifact} task={task} isBpfHistogramTask={isBpfHistogramTask} />
+                    <VisualResult artifact={artifact} task={task} isBpfHistogramTask={isBpfHistogramTask} flameMeta={flameMeta} />
                 </div>
 
                 <div style={styles.card}>
@@ -297,7 +423,13 @@ export default function TaskResultPage() {
                 status={status}
             />
 
-            <ArtifactsPanel files={files} />
+            <ArtifactsPanel
+                files={files}
+                artifacts={artifacts}
+                artifactLinks={artifactLinks}
+                artifactError={artifactError}
+                onRefreshDownload={refreshArtifactLink}
+            />
         </div>
     );
 }
@@ -327,7 +459,7 @@ function Metric({ label, value }) {
     );
 }
 
-function VisualResult({ artifact, task, isBpfHistogramTask }) {
+function VisualResult({ artifact, task, isBpfHistogramTask, flameMeta }) {
     if (artifact?.url) {
         if (artifact.type === 'bpf' || isBpfHistogramTask) {
             return (
@@ -353,6 +485,16 @@ function VisualResult({ artifact, task, isBpfHistogramTask }) {
 
         return (
             <div>
+                {flameMeta?.truncated && (
+                    <div style={styles.notice}>
+                        火焰图节点 {flameMeta.nodeCount}、深度 {flameMeta.depth}，已建议使用新窗口或下载查看，避免主线程长时间阻塞。
+                    </div>
+                )}
+                {flameMeta && flameMeta.ok === false && (
+                    <div style={styles.notice}>
+                        火焰图后台检测失败：{safeText(flameMeta.reason)}。仍可使用 iframe 或新窗口查看。
+                    </div>
+                )}
                 <iframe
                     src={artifact.url}
                     title={isBpfHistogramTask ? 'eBPF Histogram' : 'Flame Graph'}
@@ -434,8 +576,8 @@ function StatusEventsPanel({ events }) {
                                 <tr key={event.id}>
                                     <td style={styles.td}>{formatTime(event.created_at)}</td>
                                     <td style={styles.td}>{statusLabel(event.from_status)} -> {statusLabel(event.to_status)}</td>
-                                    <td style={styles.td}>{event.source || '-'}</td>
-                                    <td style={styles.td}>{event.reason || '-'}</td>
+                                    <td style={styles.td}>{safeText(event.source || event.source_module) || '-'}</td>
+                                    <td style={styles.td}>{safeText(event.reason) || '-'}</td>
                                 </tr>
                             ))}
                         </tbody>
@@ -551,13 +693,13 @@ function SuggestionsPanel({ suggestions, bpfHistogram, isBpfHistogramTask, statu
                         <div key={`${item.function || item.title || 'suggestion'}-${index}`} style={styles.suggestionItem}>
                             <div style={styles.suggestionHead}>
                                 <div style={styles.suggestionTitle}>
-                                    {item.function || item.title || `建议 ${index + 1}`}
+                                    {safeText(item.function || item.title || `建议 ${index + 1}`)}
                                 </div>
                                 <div style={styles.suggestionMeta}>
                                     {formatSuggestionMeta(item)}
                                 </div>
                             </div>
-                            <p style={styles.suggestionBody}>{item.advice || item.suggestion || '-'}</p>
+                            <p style={styles.suggestionBody}>{safeText(item.advice || item.suggestion) || '-'}</p>
                         </div>
                     ))}
                 </div>
@@ -572,11 +714,40 @@ function SuggestionsPanel({ suggestions, bpfHistogram, isBpfHistogramTask, statu
     );
 }
 
-function ArtifactsPanel({ files }) {
+function ArtifactsPanel({ files, artifacts, artifactLinks, artifactError, onRefreshDownload }) {
+    const hasRegisteredArtifacts = Array.isArray(artifacts) && artifacts.length > 0;
     return (
         <div style={styles.card}>
             <h3 style={styles.sectionTitle}>产物文件下载</h3>
-            {files.length > 0 ? (
+            {artifactError && <div style={styles.inlineError}>{safeText(artifactError)}</div>}
+            {hasRegisteredArtifacts ? (
+                <div style={styles.fileList}>
+                    {artifacts.map((artifact) => {
+                        const link = artifactLinks[artifact.id];
+                        return (
+                            <div key={artifact.id} style={styles.fileItem}>
+                                <div style={{ minWidth: 0 }}>
+                                    <div style={styles.fileName}>{displayFileName(artifact.name)}</div>
+                                    <div style={styles.fileMeta}>
+                                        {artifact.content_type || 'application/octet-stream'} · {formatSize(artifact.size)} · {artifact.kind || 'artifact'}
+                                        {link?.expiresAt ? ` · 过期 ${formatTime(link.expiresAt)}` : ''}
+                                    </div>
+                                </div>
+                                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                                    {link?.url && (
+                                        <a href={link.url} download={displayFileName(artifact.name)} style={{ ...styles.button, ...styles.primaryButton }}>
+                                            下载
+                                        </a>
+                                    )}
+                                    <button style={styles.button} onClick={() => onRefreshDownload(artifact)}>
+                                        {link?.url ? '刷新链接' : '生成链接'}
+                                    </button>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            ) : files.length > 0 ? (
                 <div style={styles.fileList}>
                     {files.map((file, index) => (
                         <div key={file.name || index} style={styles.fileItem}>
@@ -630,12 +801,15 @@ function FailurePanel({ failure, retrying, onRetry, notice }) {
             <div>
                 <div style={{ fontSize: 14, fontWeight: 700, color: '#b42318' }}>任务失败</div>
                 <div style={{ marginTop: 5, fontSize: 13, color: '#475467', wordBreak: 'break-word' }}>
-                    错误码：{failure.code} · {failure.message}
+                    错误码：{failure.code} · {safeText(failure.message)}
                 </div>
                 <div style={{ marginTop: 4, fontSize: 12, color: '#667085' }}>
-                    {failure.retryable ? '该错误可重试，将使用原参数创建新的任务。' : '该错误通常不可通过直接重试恢复，请先修正任务参数或运行环境。'}
+                    stage: {failure.stage} · retryable: {String(failure.retryable)} · request_id: {failure.requestID || '-'}
                 </div>
-                {notice && <div style={{ marginTop: 6, fontSize: 12, color: '#b42318' }}>{notice}</div>}
+                <div style={{ marginTop: 4, fontSize: 12, color: '#667085' }}>
+                    {failure.action}
+                </div>
+                {notice && <div style={{ marginTop: 6, fontSize: 12, color: '#b42318' }}>{safeText(notice)}</div>}
             </div>
             {failure.retryable && (
                 <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onRetry} disabled={retrying}>
@@ -647,54 +821,79 @@ function FailurePanel({ failure, retrying, onRetry, notice }) {
 }
 
 function buildStages(task, events, status, analysisStatus, artifact, files) {
-    const hasEvent = (patterns) => events.some(event => patterns.some(pattern =>
-        pattern.test(`${event?.reason || ''} ${event?.source || ''}`),
-    ));
+    const hasEvent = (stageId) => events.some(event => eventMatchesStage(event, stageId));
     const rawArtifact = files.some(file => /(?:perf\.data|folded\.txt|bpf_raw|java_folded)/i.test(String(file?.name || '')));
-    const dispatched = status !== 0 || events.length > 1 || hasEvent([/下发|dispatch|deliver/i]);
-    const accepted = status === 1 || status === 4 || status === 2 || analysisStatus > 0 || hasEvent([/接收|accepted|runner.started|agent/i]);
-    const collecting = status === 4 || status === 2 || analysisStatus > 0 || hasEvent([/采集|collect|runner.started/i]);
-    const rawSaved = status === 4 || status === 2 || analysisStatus > 0 || rawArtifact || hasEvent([/原始.*保存|上传|raw.*artifact/i]);
-    const analyzing = analysisStatus >= 2 || Boolean(artifact) || hasEvent([/分析|analysis/i]);
-    const available = (status === 2 && analysisStatus >= 2) || Boolean(artifact);
-    const complete = [true, dispatched, accepted, collecting, rawSaved, analyzing, available];
-    const current = available ? 6 : analyzing ? 5 : rawSaved ? 4 : collecting ? 3 : accepted ? 2 : dispatched ? 1 : 0;
-    const failedAt = status === 3 ? current : -1;
+    const stateByID = {
+        created: true,
+        queued: hasEvent('queued') || status !== 0 || events.length > 1,
+        delivered: hasEvent('delivered') || status === 1 || status === 4 || status === 2 || analysisStatus > 0,
+        running: hasEvent('running') || status === 1 || status === 4 || status === 2 || analysisStatus > 0,
+        uploading: hasEvent('uploading') || status === 4 || status === 2 || rawArtifact,
+        collected: hasEvent('collected') || status === 2 || analysisStatus > 0 || rawArtifact,
+        analyzing: hasEvent('analyzing') || analysisStatus > 0 || Boolean(artifact),
+        success: status === 2 && (analysisStatus >= 2 || Boolean(artifact)),
+        failed: status === 3,
+        canceled: status === 5,
+    };
+    const activeOrder = ['created', 'queued', 'delivered', 'running', 'uploading', 'collected', 'analyzing', 'success'];
+    const currentID = status === 5 ? 'canceled' : status === 3 ? 'failed' : [...activeOrder].reverse().find(id => stateByID[id]) || 'created';
 
-    return stageDefinitions.map((definition, index) => {
-        const state = index === failedAt ? 'failed' : complete[index] ? 'done' : index === current ? 'active' : 'pending';
+    return stageDefinitions.map((definition) => {
+        let state = 'pending';
+        if (definition.id === currentID && (definition.id === 'failed' || definition.id === 'canceled')) state = 'failed';
+        else if (definition.id === currentID) state = 'active';
+        else if (stateByID[definition.id]) state = 'done';
         const source = events.find(event => eventMatchesStage(event, definition.id));
         return {
             ...definition,
             state,
-            detail: source?.reason || stageDetail(definition.id, task, status, analysisStatus, available),
+            detail: stageLine(source, stageDetail(definition.id, task, status, analysisStatus, Boolean(artifact))),
         };
     });
 }
 
 function eventMatchesStage(event, stageId) {
-    const text = `${event?.reason || ''} ${event?.source || ''}`.toLowerCase();
+    const text = `${event?.reason || ''} ${event?.source || ''} ${event?.source_module || ''}`.toLowerCase();
+    const to = Number(event?.to_status);
     const patterns = {
         created: /创建|created/,
-        dispatch: /下发|dispatch|deliver/,
-        accepted: /接收|accepted|agent|runner.started/,
-        collecting: /采集|collect|runner.started/,
-        raw_saved: /原始.*保存|上传|raw.*artifact/,
+        queued: /等待|queued|outbox/,
+        delivered: /下发|dispatch|deliver/,
+        running: /接收|accepted|agent|runner.started|采集|collect/,
+        uploading: /上传|uploading|raw.*artifact/,
+        collected: /完成|collected|done|采集产物/,
         analyzing: /分析|analysis/,
-        available: /完成|succeeded|result/,
+        success: /succeeded|result|分析完成/,
+        failed: /failed|失败|error/,
+        canceled: /cancel|取消/,
     };
+    if (stageId === 'uploading' && to === 4) return true;
+    if (stageId === 'collected' && to === 2) return true;
+    if (stageId === 'failed' && to === 3) return true;
+    if (stageId === 'canceled' && to === 5) return true;
     return patterns[stageId]?.test(text);
 }
 
 function stageDetail(stageId, task, status, analysisStatus, available) {
     if (stageId === 'created') return formatTime(task.create_time) || '任务已记录';
-    if (stageId === 'dispatch') return status === 0 ? '等待 Server 下发' : '下发流程已推进';
-    if (stageId === 'accepted') return status >= 1 ? '已进入执行链路' : '等待 Agent 接收';
-    if (stageId === 'collecting') return status === 1 ? '采集器正在运行' : '等待采集开始';
-    if (stageId === 'raw_saved') return status === 4 ? '正在上传原始数据' : '等待原始数据保存';
+    if (stageId === 'queued') return status === 0 ? '等待 Server 下发' : '队列阶段已推进';
+    if (stageId === 'delivered') return status >= 1 ? '已下发到执行链路' : '等待下发';
+    if (stageId === 'running') return status === 1 ? '采集器正在运行' : '等待 Agent 执行';
+    if (stageId === 'uploading') return status === 4 ? '正在上传原始数据' : '等待上传';
+    if (stageId === 'collected') return status >= 2 ? '采集结果已登记' : '等待采集结果';
     if (stageId === 'analyzing') return analysisStatus === 1 ? '分析器正在处理' : analysisStatus >= 2 ? '分析已完成' : '等待分析器领取';
-    if (stageId === 'available') return available ? '结果与产物已可查看' : '等待分析产物';
+    if (stageId === 'success') return available ? '结果与产物已可查看' : '等待成功终态';
+    if (stageId === 'failed') return status === 3 ? safeText(task.status_info) || '任务失败' : '未失败';
+    if (stageId === 'canceled') return status === 5 ? '任务已取消' : '未取消';
     return '';
+}
+
+function stageLine(event, fallback) {
+    if (!event) return safeText(fallback);
+    const parts = [safeText(event.reason || fallback)];
+    const meta = [formatTime(event.created_at), event.source || event.source_module].filter(Boolean).join(' · ');
+    if (meta) parts.push(meta);
+    return parts.filter(Boolean).join('\n');
 }
 
 function describeFailure(task, events) {
@@ -703,7 +902,15 @@ function describeFailure(task, events) {
     const match = String(message).match(/\b[A-Z][A-Z0-9_]{2,}\b/);
     const code = match ? match[0] : 'TASK_FAILED';
     const nonRetryable = new Set(['AUTH_FORBIDDEN', 'TASK_INVALID_ARGUMENT', 'TARGET_NOT_FOUND', 'AGENT_INCOMPATIBLE']);
-    return { code, message, retryable: !nonRetryable.has(code) };
+    const retryable = !nonRetryable.has(code);
+    return {
+        code,
+        message,
+        retryable,
+        requestID: task.request_id || '',
+        stage: last.source_module || last.source || 'task',
+        action: retryable ? '该错误可重试，将使用原参数创建新的任务。' : '该错误通常不可通过直接重试恢复，请先修正任务参数或运行环境。',
+    };
 }
 
 function pickVisualArtifact(files) {
@@ -729,7 +936,7 @@ function isActiveTaskStatus(status) {
 }
 
 function isFinalTaskStatus(status) {
-    return status === 2 || status === 3;
+    return status === 2 || status === 3 || status === 5;
 }
 
 function statusLabel(status) {
@@ -740,6 +947,7 @@ function statusLabel(status) {
     if (n === 2) return 'DONE';
     if (n === 3) return 'FAILED';
     if (n === 4) return 'UPLOADING';
+    if (n === 5) return 'CANCELED';
     return String(status);
 }
 
@@ -763,6 +971,14 @@ function redactProfileUrl(value) {
         if (url.username || url.password) { url.username = ''; url.password = ''; }
         return url.toString();
     } catch (_) { return ''; }
+}
+
+function safeText(value, maxLength = 2400) {
+    return String(value || '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/!?\[([^\]]*)\]\((?:javascript|data):[^)]*\)/gi, '$1')
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+        .slice(0, maxLength);
 }
 
 function isBpfHistogramFile(file) {
