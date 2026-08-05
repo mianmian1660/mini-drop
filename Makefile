@@ -67,6 +67,7 @@ demo-pprof:
 		if [[ -n "$$TID" ]]; then echo "[demo-pprof] result: http://localhost/task/result?tid=$$TID"; fi
 
 test:
+	cmake -S drop -B drop/build
 	$(MAKE) -C drop/build
 	cd apiserver && go test ./...
 	cd analysis && python3 test_analysis.py
@@ -74,10 +75,14 @@ test:
 
 coverage:
 	cd apiserver && go test ./... -coverprofile=/tmp/mini-drop-apiserver.cover
-	cd apiserver && go tool cover -func=/tmp/mini-drop-apiserver.cover | tail -1
+	cd apiserver && total=$$(go tool cover -func=/tmp/mini-drop-apiserver.cover | awk '/^total:/ {gsub("%","",$$3); print $$3}'); \
+		echo "total coverage: $$total%"; \
+		awk -v total="$$total" 'BEGIN { if (total + 0 < 50.0) { printf("coverage %.1f%% is below required 50.0%%\n", total); exit 1 } }'
 
 e2e:
 	bash scripts/e2e_smoke.sh
 
 verify: test coverage
+	sleep 3
+	$(MAKE) e2e
 	git diff --check

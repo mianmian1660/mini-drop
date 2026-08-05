@@ -1,15 +1,87 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/robfig/cron/v3"
+	"go.uber.org/zap"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 
+	"github.com/mini-drop/apiserver/config"
+	"github.com/mini-drop/apiserver/model"
 	"github.com/mini-drop/apiserver/pkg/storage"
+	"github.com/mini-drop/apiserver/util"
 )
+
+func newTestAPIServer(t *testing.T) *APIServer {
+	t.Helper()
+	dbName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	db, err := gorm.Open(sqlite.Open("file:"+dbName+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := model.AutoMigrate(db); err != nil {
+		t.Fatalf("migrate sqlite: %v", err)
+	}
+	return &APIServer{
+		DB:       db,
+		Logger:   zap.NewNop(),
+		Config:   &config.Config{Storage: config.StorageConfig{Bucket: "drop-data", PresignExpireSec: 900}},
+		Cron:     cron.New(),
+		CronJobs: map[string]cron.EntryID{},
+	}
+}
+
+func postNotify(t *testing.T, s *APIServer, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/internal/task-notify", s.NotifyTaskResult)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/task-notify", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func mustCreateRunningTask(t *testing.T, s *APIServer, tid string) model.HotmethodTask {
+	t.Helper()
+	now := time.Now().Add(-time.Minute)
+	params, err := util.MarshalJSONB(PerfParams{Duration: 2, Frequency: 49, Event: "cpu-cycles"})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	task := model.HotmethodTask{
+		TID:            tid,
+		Name:           "notify test",
+		Type:           TaskTypeGeneric,
+		ProfilerType:   ProfilerPerf,
+		TargetIP:       "127.0.0.1",
+		RequestParams:  params,
+		Status:         TaskStatusRunning,
+		StatusInfo:     "running",
+		AnalysisStatus: 0,
+		UID:            "u1",
+		UserName:       "tester",
+		CreateTime:     now,
+		BeginTime:      &now,
+	}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, err := s.startTaskAttempt(&task, model.AttemptTriggerInitial); err != nil {
+		t.Fatalf("create attempt: %v", err)
+	}
+	return task
+}
 
 func TestPickRawCollectionObjectPrefersPerfData(t *testing.T) {
 	key, size, ok := pickRawCollectionObject([]storage.FileInfo{
@@ -66,6 +138,803 @@ func TestNotifyTaskResultRejectsMissingTaskID(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d, want 400, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestNotifyTaskResultRunningRecordsUploadingBeforeDone(t *testing.T) {
+	s := newTestAPIServer(t)
+	mustCreateRunningTask(t, s, "tid-notify-success")
+
+	w := postNotify(t, s, `{"task_id":"tid-notify-success","cos_key":"tid-notify-success/perf.data"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200, body=%s", w.Code, w.Body.String())
+	}
+
+	var task model.HotmethodTask
+	if err := s.DB.Where("tid = ?", "tid-notify-success").First(&task).Error; err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if task.Status != TaskStatusDone || task.EndTime == nil {
+		t.Fatalf("task status=%d end=%v, want done with end_time", task.Status, task.EndTime)
+	}
+
+	var events []model.TaskStatusEvent
+	if err := s.DB.Where("tid = ?", task.TID).Order("created_at ASC, id ASC").Find(&events).Error; err != nil {
+		t.Fatalf("load events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events=%d, want 2: %#v", len(events), events)
+	}
+	if events[0].FromStatus != TaskStatusRunning || events[0].ToStatus != TaskStatusUploading {
+		t.Fatalf("first event=%d->%d, want running->uploading", events[0].FromStatus, events[0].ToStatus)
+	}
+	if events[1].FromStatus != TaskStatusUploading || events[1].ToStatus != TaskStatusDone {
+		t.Fatalf("second event=%d->%d, want uploading->done", events[1].FromStatus, events[1].ToStatus)
+	}
+
+	var artifact model.Artifact
+	if err := s.DB.Where("task_tid = ? AND kind = ?", task.TID, model.ArtifactKindRaw).First(&artifact).Error; err != nil {
+		t.Fatalf("raw artifact not recorded: %v", err)
+	}
+	if artifact.ObjectKey != "tid-notify-success/perf.data" || artifact.Status != model.ArtifactStatusReady {
+		t.Fatalf("artifact=%#v, want ready raw perf.data", artifact)
+	}
+
+	var job model.AnalysisJob
+	if err := s.DB.Where("task_tid = ?", task.TID).First(&job).Error; err != nil {
+		t.Fatalf("analysis job not queued: %v", err)
+	}
+	if job.Status != model.AnalysisJobStatusPending || job.Pipeline != "perf_flamegraph" {
+		t.Fatalf("job status=%q pipeline=%q, want pending perf_flamegraph", job.Status, job.Pipeline)
+	}
+
+	var attempt model.TaskAttempt
+	if err := s.DB.Where("task_tid = ?", task.TID).First(&attempt).Error; err != nil {
+		t.Fatalf("attempt not recorded: %v", err)
+	}
+	if attempt.EndTime == nil || attempt.ExitCode != 0 || !strings.Contains(string(attempt.ArtifactKeys), "perf.data") {
+		t.Fatalf("attempt evidence not finished correctly: %#v", attempt)
+	}
+	if artifact.AttemptID != attempt.ID {
+		t.Fatalf("artifact attempt_id=%d, want %d", artifact.AttemptID, attempt.ID)
+	}
+}
+
+func TestNotifyTaskResultSuccessIsIdempotentAfterDone(t *testing.T) {
+	s := newTestAPIServer(t)
+	mustCreateRunningTask(t, s, "tid-notify-idem")
+
+	for i := 0; i < 2; i++ {
+		w := postNotify(t, s, `{"task_id":"tid-notify-idem","cos_key":"tid-notify-idem/perf.data"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("notify %d status=%d, body=%s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	var eventCount int64
+	s.DB.Model(&model.TaskStatusEvent{}).Where("tid = ?", "tid-notify-idem").Count(&eventCount)
+	if eventCount != 2 {
+		t.Fatalf("event count=%d, want 2", eventCount)
+	}
+	var artifactCount int64
+	s.DB.Model(&model.Artifact{}).Where("task_tid = ?", "tid-notify-idem").Count(&artifactCount)
+	if artifactCount != 1 {
+		t.Fatalf("artifact count=%d, want 1", artifactCount)
+	}
+	var jobCount int64
+	s.DB.Model(&model.AnalysisJob{}).Where("task_tid = ?", "tid-notify-idem").Count(&jobCount)
+	if jobCount != 1 {
+		t.Fatalf("job count=%d, want 1", jobCount)
+	}
+}
+
+func TestNotifyTaskResultErrorMarksFailedAndAttempt(t *testing.T) {
+	s := newTestAPIServer(t)
+	mustCreateRunningTask(t, s, "tid-notify-failed")
+
+	w := postNotify(t, s, `{"task_id":"tid-notify-failed","error_message":"perf failed"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200, body=%s", w.Code, w.Body.String())
+	}
+
+	var task model.HotmethodTask
+	if err := s.DB.Where("tid = ?", "tid-notify-failed").First(&task).Error; err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if task.Status != TaskStatusFailed || task.AnalysisStatus != 3 || task.EndTime == nil {
+		t.Fatalf("task=%#v, want failed with analysis_status=3 and end_time", task)
+	}
+
+	var attempt model.TaskAttempt
+	if err := s.DB.Where("task_tid = ?", task.TID).First(&attempt).Error; err != nil {
+		t.Fatalf("load attempt: %v", err)
+	}
+	if attempt.ExitCode != 1 || attempt.ErrorCode != ErrCodeTaskExecutionFailed || !strings.Contains(attempt.ErrorMessage, "perf failed") {
+		t.Fatalf("attempt=%#v, want execution failure evidence", attempt)
+	}
+}
+
+func TestNotifyTaskResultRejectsSuccessWithoutCosKey(t *testing.T) {
+	s := newTestAPIServer(t)
+	mustCreateRunningTask(t, s, "tid-notify-no-cos")
+
+	w := postNotify(t, s, `{"task_id":"tid-notify-no-cos"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400, body=%s", w.Code, w.Body.String())
+	}
+	var task model.HotmethodTask
+	if err := s.DB.Where("tid = ?", "tid-notify-no-cos").First(&task).Error; err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if task.Status != TaskStatusRunning {
+		t.Fatalf("status=%d, want running", task.Status)
+	}
+}
+
+func TestTransitionTaskStatusRecordsDefaultsAndExtra(t *testing.T) {
+	s := newTestAPIServer(t)
+	task := model.HotmethodTask{TID: "tid-transition", Name: "transition", UID: "u1", Status: TaskStatusCreated, CreateTime: time.Now()}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	end := time.Now()
+	if err := s.transitionTaskStatus(&task, TaskStatusDone, "", "", map[string]interface{}{"end_time": &end, "analysis_status": 2}); err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+
+	var got model.HotmethodTask
+	if err := s.DB.Where("tid = ?", task.TID).First(&got).Error; err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if got.Status != TaskStatusDone || got.StatusInfo != "状态迁移" || got.AnalysisStatus != 2 || got.EndTime == nil {
+		t.Fatalf("task after transition=%#v", got)
+	}
+	var event model.TaskStatusEvent
+	if err := s.DB.Where("tid = ?", task.TID).First(&event).Error; err != nil {
+		t.Fatalf("load event: %v", err)
+	}
+	if event.FromStatus != TaskStatusCreated || event.ToStatus != TaskStatusDone || event.Source != "apiserver" {
+		t.Fatalf("event=%#v, want default source and created->done", event)
+	}
+}
+
+func TestTaskReadHandlersUseUIDAndReturnEvidence(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now()
+	params, _ := util.MarshalJSONB(PerfParams{Duration: 5, Frequency: 99})
+	task := model.HotmethodTask{
+		TID:            "tid-detail",
+		Name:           "detail task",
+		Type:           TaskTypeGeneric,
+		ProfilerType:   ProfilerPerf,
+		TargetIP:       "10.0.0.1",
+		RequestParams:  params,
+		Status:         TaskStatusDone,
+		AnalysisStatus: 2,
+		UID:            "owner",
+		UserName:       "Owner",
+		CreateTime:     now,
+	}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	_ = s.DB.Create(&model.TaskStatusEvent{TID: task.TID, FromStatus: TaskStatusRunning, ToStatus: TaskStatusDone, Reason: "done", CreatedAt: now}).Error
+	_ = s.DB.Create(&model.TaskAttempt{TaskTID: task.TID, AttemptSeq: 1, Trigger: model.AttemptTriggerInitial, CreatedAt: now}).Error
+	_ = s.DB.Create(&model.Artifact{TaskTID: task.TID, Kind: model.ArtifactKindRaw, ObjectKey: task.TID + "/perf.data", Status: model.ArtifactStatusReady, CreatedAt: now}).Error
+	_ = s.DB.Create(&model.AnalysisSuggestion{TID: task.TID, Func: "main.work", Suggestion: "reduce cpu", AISuggestion: "cache hot path", Status: 1}).Error
+	_ = s.DB.Create(&model.HotmethodTask{TID: "tid-other", Name: "other", Status: TaskStatusDone, UID: "other", CreateTime: now.Add(time.Second)}).Error
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks", s.ListTasks)
+	router.GET("/api/v1/tasks/:tid", s.GetTaskDetail)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks?status=2&keyword=detail&page=1&pageSize=10", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", w.Code, w.Body.String())
+	}
+	var listResp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	data := listResp["data"].(map[string]interface{})
+	if int(data["total"].(float64)) != 1 {
+		t.Fatalf("list total=%v, want 1", data["total"])
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-detail", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", w.Code, w.Body.String())
+	}
+	var detailResp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &detailResp); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	detailData := detailResp["data"].(map[string]interface{})
+	for _, key := range []string{"task", "status_events", "attempts", "artifacts", "suggestions", "files"} {
+		if _, ok := detailData[key]; !ok {
+			t.Fatalf("detail missing %s in %#v", key, detailData)
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-detail", nil)
+	req.Header.Set("Drop-User-Uid", "other")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross-user detail status=%d, want 404", w.Code)
+	}
+}
+
+func TestDeleteAndFileHandlers(t *testing.T) {
+	s := newTestAPIServer(t)
+	task := model.HotmethodTask{TID: "tid-delete", Name: "delete", UID: "owner", CreateTime: time.Now()}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.DELETE("/api/v1/tasks/:tid", s.DeleteTask)
+	router.GET("/api/v1/cosfiles", s.ListCOSFiles)
+	router.GET("/api/v1/files/:filename", s.ServeLocalFile)
+	router.GET("/api/v1/cosfiles/view", s.ViewCOSFile)
+	router.GET("/api/v1/cosfiles/download", s.DownloadCOSFile)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/tasks/tid-delete", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/tasks/tid-delete", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("delete missing status=%d, want 404", w.Code)
+	}
+
+	cases := []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodGet, "/api/v1/cosfiles", http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/cosfiles?tid=tid-delete", http.StatusOK},
+		{http.MethodGet, "/api/v1/files/..secret", http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/files/missing.svg", http.StatusNotFound},
+		{http.MethodGet, "/api/v1/cosfiles/view", http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/cosfiles/view?key=tid/top.json", http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/cosfiles/view?key=tid/flamegraph.svg", http.StatusServiceUnavailable},
+		{http.MethodGet, "/api/v1/cosfiles/download", http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/cosfiles/download?key=tid/top.json", http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		req = httptest.NewRequest(tc.method, tc.path, nil)
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Fatalf("%s status=%d, want %d body=%s", tc.path, w.Code, tc.want, w.Body.String())
+		}
+	}
+}
+
+func TestTimelineHandlerValidationAndEffectiveWindow(t *testing.T) {
+	s := newTestAPIServer(t)
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	params, _ := util.MarshalJSONB(PerfParams{Duration: 60, Frequency: 99})
+	for i := 0; i < 2; i++ {
+		task := model.HotmethodTask{
+			TID:            []string{"child-a", "child-b"}[i],
+			Name:           "child",
+			MasterTaskTID:  "master-1",
+			RequestParams:  params,
+			Status:         TaskStatusDone,
+			AnalysisStatus: 2,
+			CreateTime:     base.Add(time.Duration(i) * time.Hour),
+		}
+		if err := s.DB.Create(&task).Error; err != nil {
+			t.Fatalf("create child: %v", err)
+		}
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks/timeline", s.GetTimeline)
+
+	cases := []struct {
+		path string
+		want int
+	}{
+		{"/api/v1/tasks/timeline", http.StatusBadRequest},
+		{"/api/v1/tasks/timeline?master_tid=master-1&at=bad", http.StatusBadRequest},
+		{"/api/v1/tasks/timeline?master_tid=master-1&at=" + urlQuery(base) + "&span=bad", http.StatusBadRequest},
+		{"/api/v1/tasks/timeline?master_tid=master-1&from=bad", http.StatusBadRequest},
+		{"/api/v1/tasks/timeline?master_tid=master-1&to=bad", http.StatusBadRequest},
+		{"/api/v1/tasks/timeline?master_tid=master-1&at=" + urlQuery(base.Add(2*time.Hour)) + "&span=30m", http.StatusOK},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Fatalf("%s status=%d, want %d body=%s", tc.path, w.Code, tc.want, w.Body.String())
+		}
+	}
+}
+
+func urlQuery(t time.Time) string {
+	return strings.ReplaceAll(t.Format(time.RFC3339), ":", "%3A")
+}
+
+func TestCreateTaskPersistsTaskOutboxAndIdempotency(t *testing.T) {
+	s := newTestAPIServer(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/tasks", s.CreateTask)
+
+	body := `{"name":"cpu task","task_type":99,"profiler_type":0,"target_ip":"127.0.0.1","duration":2}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Drop-User-Name", "Owner")
+	req.Header.Set("Idempotency-Key", "idem-create")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", w.Code, w.Body.String())
+	}
+	var first map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+	tid := first["data"].(map[string]interface{})["tid"].(string)
+
+	var task model.HotmethodTask
+	if err := s.DB.Where("tid = ?", tid).First(&task).Error; err != nil {
+		t.Fatalf("task not created: %v", err)
+	}
+	if task.Type != TaskTypeGeneric || task.ProfilerType != ProfilerPerf || task.UID != "owner" || task.UserName != "Owner" {
+		t.Fatalf("task fields not normalized/persisted: %#v", task)
+	}
+	var params PerfParams
+	if err := util.UnmarshalJSONB(task.RequestParams, &params); err != nil {
+		t.Fatalf("decode params: %v", err)
+	}
+	if params.Frequency != 99 || params.Callgraph != "fp" || params.Event != "cpu-clock" {
+		t.Fatalf("defaults not persisted: %#v", params)
+	}
+	var outbox model.Outbox
+	if err := s.DB.Where("aggregate_id = ?", tid).First(&outbox).Error; err != nil {
+		t.Fatalf("outbox not created: %v", err)
+	}
+	if outbox.Aggregate != model.OutboxAggregateTask || outbox.Event != model.OutboxEventDispatchTask {
+		t.Fatalf("outbox=%#v, want task dispatch event", outbox)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Idempotency-Key", "idem-create")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay status=%d body=%s", w.Code, w.Body.String())
+	}
+	var second map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &second)
+	data := second["data"].(map[string]interface{})
+	if data["tid"].(string) != tid || data["replayed"].(bool) != true {
+		t.Fatalf("idempotency response=%#v, want same tid replayed", data)
+	}
+}
+
+func TestCreateTaskValidationFailures(t *testing.T) {
+	s := newTestAPIServer(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/tasks", s.CreateTask)
+
+	cases := []string{
+		`{`,
+		`{"target_ip":"127.0.0.1"}`,
+		`{"name":"bad pprof","profiler_type":2,"target_ip":"127.0.0.1","duration":1}`,
+		`{"name":"bad bpf","profiler_type":3,"target_ip":"127.0.0.1","duration":1,"event":"bad"}`,
+	}
+	for _, body := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Drop-User-Uid", "owner")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("body %s status=%d, want 400 body=%s", body, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestRetryTaskCreatesChildOutboxAndRespectsOwner(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now()
+	params, _ := util.MarshalJSONB(PerfParams{Duration: 3, Frequency: 77, Callgraph: "dwarf", Event: "cpu-cycles"})
+	old := model.HotmethodTask{
+		TID:            "tid-retry-old",
+		Name:           "old",
+		Type:           TaskTypeGeneric,
+		ProfilerType:   ProfilerPerf,
+		TargetIP:       "127.0.0.1",
+		RequestParams:  params,
+		Status:         TaskStatusFailed,
+		AnalysisStatus: 3,
+		UID:            "owner",
+		UserName:       "Owner",
+		CreateTime:     now,
+	}
+	if err := s.DB.Create(&old).Error; err != nil {
+		t.Fatalf("create old task: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/tasks/:tid/retry", s.RetryTask)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/tid-retry-old/retry", nil)
+	req.Header.Set("Drop-User-Uid", "other")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross owner retry status=%d, want 404", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks/tid-retry-old/retry", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	newTID := resp["data"].(map[string]interface{})["tid"].(string)
+	var child model.HotmethodTask
+	if err := s.DB.Where("tid = ?", newTID).First(&child).Error; err != nil {
+		t.Fatalf("load child: %v", err)
+	}
+	if child.MasterTaskTID != old.TID || child.Status != TaskStatusCreated || child.Name != "old(重试)" {
+		t.Fatalf("child=%#v, want retry child", child)
+	}
+	var outboxCount int64
+	s.DB.Model(&model.Outbox{}).Where("aggregate_id = ?", newTID).Count(&outboxCount)
+	if outboxCount != 1 {
+		t.Fatalf("outbox count=%d, want 1", outboxCount)
+	}
+}
+
+func TestLocalFileAndNormalizeHelpers(t *testing.T) {
+	s := newTestAPIServer(t)
+	if err := os.MkdirAll("/tmp/drop-output", 0o755); err != nil {
+		t.Fatalf("mkdir drop-output: %v", err)
+	}
+	files := map[string]string{
+		"/tmp/drop-output/tid-local_top.json":         `{"sample_unit":"samples","sample_kind":"cpu","source_format":"folded","collector":"perf","self_time_top":[{"function":"main","value":3}]}`,
+		"/tmp/drop-output/tid-local_bpf_data.json":    `{"buckets":[{"range":"[1,2)","count":4}]}`,
+		"/tmp/drop-output/tid-local_suggestions.json": `{"suggestions":[{"function":"main","advice":"cache"}]}`,
+		"/tmp/drop-output/tid-local_flamegraph.svg":   `<svg></svg>`,
+	}
+	for path, body := range files {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		defer os.Remove(path)
+	}
+
+	listed := s.listLocalFiles("tid-local")
+	if len(listed) != len(files) {
+		t.Fatalf("local files=%d, want %d: %#v", len(listed), len(files), listed)
+	}
+	top := s.fetchLocalTopFunctions("tid-local")
+	if len(top) != 1 || top[0]["sample_unit"] != "samples" || top[0]["collector"] != "perf" {
+		t.Fatalf("top=%#v, want normalized metadata", top)
+	}
+	if bpf := s.fetchLocalBPFData("tid-local"); bpf == nil || bpf["buckets"] == nil {
+		t.Fatalf("bpf=%#v, want local bpf data", bpf)
+	}
+	if suggestions := s.fetchLocalSuggestions("tid-local"); len(suggestions) != 1 {
+		t.Fatalf("suggestions=%#v, want one", suggestions)
+	}
+
+	if got := mimeType("x.png"); got != "image/png" {
+		t.Fatalf("png mime=%q", got)
+	}
+	if got := contentDisposition("attachment", "bad\"\n名.svg"); !strings.Contains(got, "filename*=") || strings.Contains(got, "\n") {
+		t.Fatalf("content disposition not sanitized/encoded: %q", got)
+	}
+	if funcs := normalizeTopFunctions(map[string]interface{}{"top_functions": []interface{}{"skip", map[string]interface{}{"function": "f"}}}); len(funcs) != 1 {
+		t.Fatalf("normalized funcs=%#v, want one map item", funcs)
+	}
+	if suggestions := normalizeSuggestions(map[string]interface{}{"suggestions": []interface{}{"skip", map[string]interface{}{"function": "f"}}}); len(suggestions) != 1 {
+		t.Fatalf("normalized suggestions=%#v, want one map item", suggestions)
+	}
+}
+
+func TestAttemptHelpersAndAuditNoopBranches(t *testing.T) {
+	s := newTestAPIServer(t)
+	task := model.HotmethodTask{TID: "tid-attempt", TargetIP: "127.0.0.1", UID: "owner", CreateTime: time.Now()}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	s.recordTaskAttemptFailure(&task, model.AttemptTriggerRecovery, ErrCodeDependencyUnavailable, "grpc down")
+	var attempt model.TaskAttempt
+	if err := s.DB.Where("task_tid = ?", task.TID).First(&attempt).Error; err != nil {
+		t.Fatalf("load attempt: %v", err)
+	}
+	if attempt.EndTime == nil || attempt.ExitCode != 1 || attempt.ErrorCode != ErrCodeDependencyUnavailable {
+		t.Fatalf("attempt=%#v, want recorded failure", attempt)
+	}
+	s.finishTaskAttempt(0, "", "")
+	s.recordTaskStatusEvent("", 0, 1, "", "")
+	s.recordAgentAudit("", "", "", "")
+	if err := s.transitionTaskStatus(nil, TaskStatusDone, "", "", nil); err != nil {
+		t.Fatalf("nil transition should be no-op: %v", err)
+	}
+}
+
+func TestAgentHandlersAndAuditBranches(t *testing.T) {
+	s := newTestAPIServer(t)
+	stale := time.Now().Add(-time.Minute)
+	agent := model.AgentInfo{
+		Hostname: "host-a", IPAddr: "10.0.0.2", Online: true,
+		Version: "1.0.0", Environment: "test", LastSeen: stale, CreatedAt: stale, UpdatedAt: stale,
+	}
+	if err := s.DB.Create(&agent).Error; err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	s.ensureAgentAudited(&agent)
+	s.ensureAgentAudited(&agent)
+	s.markAgentOfflineIfStale(&agent)
+	if agent.Online {
+		t.Fatal("stale agent should be marked offline")
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/agents", s.ListAgents)
+	router.GET("/api/v1/agent/stat", s.StatAgent)
+	router.GET("/api/v1/agent/detail", s.GetAgentDetail)
+	router.GET("/api/v1/agents/audits", s.ListAgentAudits)
+
+	cases := []struct {
+		path string
+		want int
+	}{
+		{"/api/v1/agents", http.StatusOK},
+		{"/api/v1/agent/stat", http.StatusBadRequest},
+		{"/api/v1/agent/stat?ip=missing", http.StatusNotFound},
+		{"/api/v1/agent/stat?ip=10.0.0.2", http.StatusOK},
+		{"/api/v1/agent/detail", http.StatusBadRequest},
+		{"/api/v1/agent/detail?ip=missing", http.StatusNotFound},
+		{"/api/v1/agent/detail?ip=10.0.0.2", http.StatusOK},
+		{"/api/v1/agents/audits?limit=1", http.StatusOK},
+		{"/api/v1/agents/audits?limit=bad", http.StatusOK},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Fatalf("%s status=%d, want %d body=%s", tc.path, w.Code, tc.want, w.Body.String())
+		}
+	}
+}
+
+func TestGroupCRUDHandlers(t *testing.T) {
+	s := newTestAPIServer(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/groups", s.CreateGroup)
+	router.GET("/api/v1/groups", s.ListGroups)
+	router.GET("/api/v1/groups/:gid", s.GetGroupDetail)
+	router.PUT("/api/v1/groups/:gid", s.UpdateGroup)
+	router.DELETE("/api/v1/groups/:gid", s.DeleteGroup)
+	router.POST("/api/v1/groups/:gid/members", s.AddGroupMember)
+	router.DELETE("/api/v1/groups/:gid/members/:uid", s.RemoveGroupMember)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", strings.NewReader(`{"name":"ops"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create group status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	gid := resp["data"].(map[string]interface{})["gid"].(string)
+
+	cases := []struct {
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{http.MethodPost, "/api/v1/groups", `{}`, http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/groups", "", http.StatusOK},
+		{http.MethodGet, "/api/v1/groups/" + gid, "", http.StatusOK},
+		{http.MethodGet, "/api/v1/groups/missing", "", http.StatusNotFound},
+		{http.MethodPut, "/api/v1/groups/" + gid, `{}`, http.StatusBadRequest},
+		{http.MethodPut, "/api/v1/groups/missing", `{"name":"new"}`, http.StatusNotFound},
+		{http.MethodPut, "/api/v1/groups/" + gid, `{"name":"new","owner_id":"owner2"}`, http.StatusOK},
+		{http.MethodPost, "/api/v1/groups/missing/members", `{"uid":"u2"}`, http.StatusNotFound},
+		{http.MethodPost, "/api/v1/groups/" + gid + "/members", `{}`, http.StatusBadRequest},
+		{http.MethodPost, "/api/v1/groups/" + gid + "/members", `{"uid":"u2"}`, http.StatusOK},
+		{http.MethodPost, "/api/v1/groups/" + gid + "/members", `{"uid":"u2"}`, http.StatusOK},
+		{http.MethodDelete, "/api/v1/groups/" + gid + "/members/u2", "", http.StatusOK},
+		{http.MethodDelete, "/api/v1/groups/" + gid + "/members/u2", "", http.StatusNotFound},
+		{http.MethodDelete, "/api/v1/groups/" + gid, "", http.StatusOK},
+		{http.MethodDelete, "/api/v1/groups/" + gid, "", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		req = httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Drop-User-Uid", "owner")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Fatalf("%s %s status=%d, want %d body=%s", tc.method, tc.path, w.Code, tc.want, w.Body.String())
+		}
+	}
+}
+
+func TestScheduleHandlersAndExecution(t *testing.T) {
+	s := newTestAPIServer(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/schedule/task", s.CreateSchedule)
+	router.GET("/api/v1/schedule/tasks", s.ListSchedules)
+	router.DELETE("/api/v1/schedule/:sid", s.DeleteSchedule)
+	router.POST("/api/v1/schedule/:sid/toggle", s.ToggleSchedule)
+
+	valid := `{"name":"cron cpu","cron_expr":"*/5 * * * *","target_ip":"127.0.0.1","duration":2,"window_seconds":60}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/schedule/task", strings.NewReader(valid))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Drop-User-Name", "Owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	sid := resp["data"].(map[string]interface{})["sid"].(string)
+
+	cases := []struct {
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{http.MethodPost, "/api/v1/schedule/task", `{}`, http.StatusBadRequest},
+		{http.MethodPost, "/api/v1/schedule/task", `{"name":"bad","cron_expr":"bad","target_ip":"127.0.0.1"}`, http.StatusBadRequest},
+		{http.MethodPost, "/api/v1/schedule/task", `{"name":"overlap","cron_expr":"*/5 * * * *","target_ip":"127.0.0.1","duration":60,"window_seconds":60}`, http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/schedule/tasks", "", http.StatusOK},
+		{http.MethodPost, "/api/v1/schedule/missing/toggle", "", http.StatusNotFound},
+		{http.MethodPost, "/api/v1/schedule/" + sid + "/toggle", "", http.StatusOK},
+		{http.MethodPost, "/api/v1/schedule/" + sid + "/toggle", "", http.StatusOK},
+		{http.MethodDelete, "/api/v1/schedule/missing", "", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		req = httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Drop-User-Uid", "owner")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Fatalf("%s %s status=%d, want %d body=%s", tc.method, tc.path, w.Code, tc.want, w.Body.String())
+		}
+	}
+
+	var sch model.ScheduleTask
+	if err := s.DB.Where("sid = ?", sid).First(&sch).Error; err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+	s.executeScheduledTask(sch)
+	var childCount int64
+	s.DB.Model(&model.HotmethodTask{}).Where("master_task_tid = ?", sid).Count(&childCount)
+	if childCount != 1 {
+		t.Fatalf("scheduled child count=%d, want 1", childCount)
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/schedule/"+sid, nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete schedule status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestOutboxAndPollerCoordinatorBranches(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now().Add(-time.Minute)
+	params, _ := util.MarshalJSONB(PerfParams{Duration: 1, Frequency: 99, Callgraph: "fp", Event: "cpu-clock"})
+	task := model.HotmethodTask{
+		TID: "tid-outbox", Name: "outbox", TargetIP: "127.0.0.1", RequestParams: params,
+		Status: TaskStatusCreated, UID: "owner", CreateTime: now,
+	}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	payload, _ := util.MarshalJSONB(CreateTaskReq{Name: task.Name, TargetIP: task.TargetIP, Duration: 1, Frequency: 99, Callgraph: "fp"})
+	entries := []model.Outbox{
+		{Aggregate: model.OutboxAggregateTask, AggregateID: task.TID, Event: "unknown", Payload: payload, CreatedAt: now},
+		{Aggregate: model.OutboxAggregateTask, AggregateID: task.TID, Event: model.OutboxEventDispatchTask, Payload: []byte("{"), CreatedAt: now},
+		{Aggregate: model.OutboxAggregateTask, AggregateID: "missing", Event: model.OutboxEventDispatchTask, Payload: payload, CreatedAt: now},
+		{Aggregate: model.OutboxAggregateTask, AggregateID: task.TID, Event: model.OutboxEventDispatchTask, Payload: payload, CreatedAt: now},
+	}
+	if err := s.DB.Create(&entries).Error; err != nil {
+		t.Fatalf("create outbox entries: %v", err)
+	}
+	s.drainOutbox()
+
+	var published int64
+	s.DB.Model(&model.Outbox{}).Where("published_at IS NOT NULL").Count(&published)
+	if published != 3 {
+		t.Fatalf("published entries=%d, want 3", published)
+	}
+	var retryEntry model.Outbox
+	if err := s.DB.Where("aggregate_id = ? AND published_at IS NULL", task.TID).First(&retryEntry).Error; err != nil {
+		t.Fatalf("retry entry not retained: %v", err)
+	}
+	if retryEntry.Attempt != 1 || retryEntry.NextAttemptAt == nil || retryEntry.LastError == "" {
+		t.Fatalf("retry entry=%#v, want scheduled retry", retryEntry)
+	}
+
+	retryEntry.Attempt = 2
+	s.retryOrFailOutbox(&retryEntry, &task, "still no grpc")
+	var failed model.HotmethodTask
+	if err := s.DB.Where("tid = ?", task.TID).First(&failed).Error; err != nil {
+		t.Fatalf("load failed task: %v", err)
+	}
+	if failed.Status != TaskStatusFailed {
+		t.Fatalf("task status=%d, want failed after max outbox attempts", failed.Status)
+	}
+
+	runningStart := time.Now().Add(-2 * time.Second)
+	running := model.HotmethodTask{
+		TID: "tid-poller-running", Name: "poll running", RequestParams: params,
+		Status: TaskStatusRunning, UID: "owner", CreateTime: runningStart, BeginTime: &runningStart,
+	}
+	uploading := model.HotmethodTask{
+		TID: "tid-poller-upload", Name: "poll upload", RequestParams: params,
+		Status: TaskStatusUploading, UID: "owner", CreateTime: runningStart, BeginTime: &runningStart,
+	}
+	if err := s.DB.Create(&running).Error; err != nil {
+		t.Fatalf("create running: %v", err)
+	}
+	if err := s.DB.Create(&uploading).Error; err != nil {
+		t.Fatalf("create uploading: %v", err)
+	}
+	s.pollRunningTasks()
+
+	var gotRunning, gotUploading model.HotmethodTask
+	_ = s.DB.Where("tid = ?", running.TID).First(&gotRunning).Error
+	_ = s.DB.Where("tid = ?", uploading.TID).First(&gotUploading).Error
+	if gotRunning.Status != TaskStatusUploading {
+		t.Fatalf("running status=%d, want uploading", gotRunning.Status)
+	}
+	if gotUploading.Status != TaskStatusUploading {
+		t.Fatalf("uploading status=%d, want still uploading before deadline", gotUploading.Status)
+	}
+	if s.taskHasArtifacts("") {
+		t.Fatal("empty tid must not have artifacts")
 	}
 }
 

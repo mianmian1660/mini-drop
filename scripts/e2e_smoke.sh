@@ -15,7 +15,12 @@ json_get() {
 
 echo "[e2e] base=$BASE target=$TARGET_IP"
 
-curl -fsS "$BASE/healthz" >/tmp/mini-drop-e2e-health.json
+for _ in $(seq 1 30); do
+  if curl -fsS "$BASE/healthz" >/tmp/mini-drop-e2e-health.json; then
+    break
+  fi
+  sleep 1
+done
 grep -q '"status":"ok"' /tmp/mini-drop-e2e-health.json || fail "healthz"
 pass "healthz"
 

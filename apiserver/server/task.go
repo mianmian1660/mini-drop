@@ -425,7 +425,28 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 	endTime := time.Now()
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		if task.Status != TaskStatusDone {
-			fromStatus := task.Status
+			currentStatus := task.Status
+			if currentStatus == TaskStatusRunning {
+				if err := tx.Model(&model.HotmethodTask{}).
+					Where("tid = ?", task.TID).
+					Updates(map[string]interface{}{
+						"status":      TaskStatusUploading,
+						"status_info": "采集产物已上传，等待登记完成",
+					}).Error; err != nil {
+					return err
+				}
+				if err := tx.Create(&model.TaskStatusEvent{
+					TID:        task.TID,
+					FromStatus: TaskStatusRunning,
+					ToStatus:   TaskStatusUploading,
+					Reason:     "采集产物已上传，等待登记完成",
+					Source:     "drop_server_notify",
+					CreatedAt:  endTime,
+				}).Error; err != nil {
+					return err
+				}
+				currentStatus = TaskStatusUploading
+			}
 			if err := tx.Model(&model.HotmethodTask{}).
 				Where("tid = ?", task.TID).
 				Updates(map[string]interface{}{
@@ -437,7 +458,7 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 			}
 			if err := tx.Create(&model.TaskStatusEvent{
 				TID:        task.TID,
-				FromStatus: fromStatus,
+				FromStatus: currentStatus,
 				ToStatus:   TaskStatusDone,
 				Reason:     "采集产物已上传，任务完成",
 				Source:     "drop_server_notify",
