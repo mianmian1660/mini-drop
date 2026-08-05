@@ -24,8 +24,17 @@ import (
 // 优先查 DB，DB 为空时尝试通过 gRPC 从 drop_server 发现 Agent
 func (s *APIServer) ListAgents(c *gin.Context) {
 	var agents []model.AgentInfo
+	auth := s.AuthContext(c)
 
-	if err := s.DB.Order("last_seen DESC").Find(&agents).Error; err != nil {
+	query := s.DB.Order("last_seen DESC")
+	if !auth.IsPlatformAdmin() && auth.UID != "" {
+		if len(auth.Groups) > 0 {
+			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL OR gid IN ? OR gid = '' OR gid IS NULL)", auth.UID, auth.Groups)
+		} else {
+			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL) AND (gid = '' OR gid IS NULL)", auth.UID)
+		}
+	}
+	if err := query.Find(&agents).Error; err != nil {
 		s.Logger.Error("查询 Agent 列表失败", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code":    500,
@@ -276,6 +285,10 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 		})
 		return
 	}
+	if !s.canReadAgent(agent, s.AuthContext(c)) {
+		s.forbid(c)
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
@@ -313,6 +326,10 @@ func (s *APIServer) GetAgentDetail(c *gin.Context) {
 			"code":    404,
 			"message": "Agent 不存在: " + ip,
 		})
+		return
+	}
+	if !s.canReadAgent(agent, s.AuthContext(c)) {
+		s.forbid(c)
 		return
 	}
 

@@ -4,7 +4,7 @@
 // 职责：
 //   1. 创建统一的 axios 实例（baseURL、超时、withCredentials）
 //   2. 请求拦截器：自动从 Cookie 读取用户信息并附加到 Header
-//   3. 响应拦截器：统一处理 401 跳转登录、解包 data 字段
+//   3. 响应拦截器：统一处理 401 跳转登录、返回后端统一 envelope
 //
 // axios 语法小课堂：
 //   axios.create({...})      = 创建独立实例，互不影响
@@ -45,11 +45,11 @@ client.interceptors.request.use(
 
 // ---------- 响应拦截器 ----------
 // 统一处理：
-//   - 解包：axios 返回 response，我们只取 response.data（即后端 JSON）
+//   - 解包：axios 返回 response，我们只取 response.data（即后端统一 envelope）
 //   - 401：自动跳转登录页
 client.interceptors.response.use(
     (response) => {
-        // 直接返回 data 部分（{ code: 0, data: {...} }）
+        // 直接返回后端 envelope（{ request_id, data, error, code/message }）
         return response.data;
     },
     (error) => {

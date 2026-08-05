@@ -8,6 +8,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/mini-drop/apiserver/config"
 	"github.com/mini-drop/apiserver/middleware"
@@ -37,6 +39,7 @@ type APIServer struct {
 	Storage    storage.Storage         // 对象存储（MinIO）
 	Cron       *cron.Cron              // 定时任务调度器（W5）
 	CronJobs   map[string]cron.EntryID // SID → cron EntryID 映射（支持动态停止/删除）
+	TaskSvc    *TaskService            // 阶段 2：任务编排服务
 }
 
 // New 创建一个新的 APIServer 实例
@@ -59,6 +62,7 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 		Config: cfg,
 		Router: router,
 	}
+	s.TaskSvc = NewTaskService(s)
 
 	// 初始化对象存储（MinIO）
 	if err := s.initStorage(); err != nil {
@@ -101,6 +105,13 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 
 	s.registerRoutes()
 	return s
+}
+
+func (s *APIServer) taskService() *TaskService {
+	if s.TaskSvc == nil {
+		s.TaskSvc = NewTaskService(s)
+	}
+	return s.TaskSvc
 }
 
 // initGRPC 初始化到 drop_server 的 gRPC 连接（非阻塞，带重试）
@@ -335,19 +346,52 @@ func (s *APIServer) dispatchOutboxLoop() {
 
 // drainOutbox 领取一批未发布的 outbox 记录并逐条处理。
 func (s *APIServer) drainOutbox() {
-	var entries []model.Outbox
-	now := time.Now()
-	if err := s.DB.Where("published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", now).
-		Order("created_at ASC").
-		Limit(20).
-		Find(&entries).Error; err != nil {
-		s.Logger.Error("查询 outbox 失败", zap.Error(err))
+	entries, err := s.claimOutboxEntries(20)
+	if err != nil {
+		s.Logger.Error("领取 outbox 失败", zap.Error(err))
 		return
 	}
-
 	for i := range entries {
 		s.processOutboxEntry(&entries[i])
 	}
+}
+
+func (s *APIServer) claimOutboxEntries(limit int) ([]model.Outbox, error) {
+	var entries []model.Outbox
+	now := time.Now()
+	lockOwner := fmt.Sprintf("%d-%d", os.Getpid(), now.UnixNano())
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		query := tx.Where("published_at IS NULL AND status <> ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", model.OutboxStatusDeadLetter, now).
+			Order("created_at ASC").
+			Limit(limit)
+		if tx.Dialector.Name() == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
+		}
+		if err := query.Find(&entries).Error; err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return nil
+		}
+		ids := make([]uint, 0, len(entries))
+		for _, entry := range entries {
+			ids = append(ids, entry.ID)
+		}
+		return tx.Model(&model.Outbox{}).Where("id IN ?", ids).Updates(map[string]interface{}{
+			"status":    model.OutboxStatusProcessing,
+			"locked_at": &now,
+			"locked_by": lockOwner,
+		}).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		entries[i].Status = model.OutboxStatusProcessing
+		entries[i].LockedAt = &now
+		entries[i].LockedBy = lockOwner
+	}
+	return entries, nil
 }
 
 // processOutboxEntry 处理单条 outbox 记录。只有成功下发、内容不可恢复损坏，或
@@ -397,7 +441,7 @@ func (s *APIServer) processOutboxEntry(entry *model.Outbox) {
 
 func (s *APIServer) markOutboxPublished(entry *model.Outbox) {
 	now := time.Now()
-	if err := s.DB.Model(entry).Updates(map[string]interface{}{"published_at": &now, "next_attempt_at": nil}).Error; err != nil {
+	if err := s.DB.Model(entry).Updates(map[string]interface{}{"published_at": &now, "next_attempt_at": nil, "status": model.OutboxStatusPending, "locked_at": nil, "locked_by": ""}).Error; err != nil {
 		s.Logger.Error("标记 outbox 已发布失败", zap.Uint("id", entry.ID), zap.Error(err))
 	}
 }
@@ -408,13 +452,18 @@ func (s *APIServer) retryOrFailOutbox(entry *model.Outbox, task *model.Hotmethod
 	if nextAttempt >= maxAttempts {
 		s.finishLatestTaskAttempt(task.TID, ErrCodeDependencyUnavailable, reason, nil)
 		_ = s.transitionTaskStatus(task, TaskStatusFailed, formatErrorReason(ErrCodeDependencyUnavailable, reason), "outbox_dispatcher", nil)
-		s.markOutboxPublished(entry)
+		now := time.Now()
+		if err := s.DB.Model(entry).Updates(map[string]interface{}{
+			"attempt": nextAttempt, "last_error": reason, "status": model.OutboxStatusDeadLetter, "dead_letter_at": &now, "locked_at": nil, "locked_by": "",
+		}).Error; err != nil {
+			s.Logger.Error("标记 outbox 死信失败", zap.Uint("id", entry.ID), zap.Error(err))
+		}
 		return
 	}
 	delay := time.Duration(1<<uint(entry.Attempt)) * 2 * time.Second
 	next := time.Now().Add(delay)
 	if err := s.DB.Model(entry).Updates(map[string]interface{}{
-		"attempt": nextAttempt, "last_error": reason, "next_attempt_at": &next,
+		"attempt": nextAttempt, "last_error": reason, "next_attempt_at": &next, "status": model.OutboxStatusPending, "locked_at": nil, "locked_by": "",
 	}).Error; err != nil {
 		s.Logger.Error("更新 outbox 重试状态失败", zap.Uint("id", entry.ID), zap.Error(err))
 	}
@@ -565,6 +614,8 @@ func (s *APIServer) startAgentDiscoverer() {
 func (s *APIServer) registerRoutes() {
 	// 健康检查（不需要鉴权）
 	s.Router.GET("/healthz", s.Healthz)
+	s.Router.GET("/livez", s.Livez)
+	s.Router.GET("/readyz", s.Readyz)
 
 	// 鉴权回调（不挂 CheckLogin，这是唯一的例外）
 	s.Router.GET("/api/v1/auth/check", s.AuthCheck)
@@ -590,6 +641,9 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/tasks/:tid", s.GetTaskDetail)
 		api.DELETE("/tasks/:tid", s.DeleteTask)
 		api.POST("/tasks/:tid/retry", s.RetryTask)
+		api.POST("/tasks/:tid/cancel", s.CancelTask)
+		api.GET("/tasks/:tid/artifacts", s.ListTaskArtifacts)
+		api.GET("/tasks/:tid/artifacts/:artifact_id/download", s.DownloadTaskArtifact)
 
 		// Continuous Profiling 时间轴 (W6)
 		api.GET("/tasks/timeline", s.GetTimeline)

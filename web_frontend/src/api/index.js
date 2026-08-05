@@ -4,8 +4,8 @@
 // 把每个后端接口封装成一个函数，页面组件直接调用
 // 不用在每个组件里写 axios.get/post，统一管理
 //
-// 后端响应格式：{ code: 0, data: {...} }  成功
-//              { code: xxx, message: "..." }  失败
+// 后端响应格式：{ request_id, data, error, code }。
+// 为兼容旧页面，成功仍保留 code: 0，失败仍保留 code/message。
 // 由于 client.js 的响应拦截器已解包，这里的返回值就是上面的 JSON
 // ============================================================
 
@@ -51,6 +51,12 @@ export const tasks = {
     delete: (tid) => client.delete(`/api/v1/tasks/${tid}`),
     // 重试任务（POST /api/v1/tasks/:tid/retry）
     retry: (tid) => client.post(`/api/v1/tasks/${tid}/retry`),
+    // 取消任务（POST /api/v1/tasks/:tid/cancel）
+    cancel: (tid) => client.post(`/api/v1/tasks/${tid}/cancel`),
+    // 任务级 Artifact 元数据
+    artifacts: (tid) => client.get(`/api/v1/tasks/${tid}/artifacts`),
+    // 任务级 Artifact 短期下载链接
+    artifactDownload: (tid, artifactId) => client.get(`/api/v1/tasks/${tid}/artifacts/${artifactId}/download`),
     // Continuous Profiling 时间轴
     // 全部窗口:      tasks.timeline(masterTid)
     // 区间筛选:      tasks.timeline(masterTid, { from, to })    （RFC3339 字符串）

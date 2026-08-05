@@ -87,155 +87,16 @@ type TaskResultNotifyReq struct {
 func (s *APIServer) CreateTask(c *gin.Context) {
 	var req CreateTaskReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"code":    400,
-			"message": "请求参数错误: " + err.Error(),
-		})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "请求参数错误: "+err.Error())
 		return
 	}
-
-	// 设置默认值
-	if req.Duration == 0 {
-		req.Duration = 10
-	}
-	if req.Frequency == 0 {
-		req.Frequency = 99
-	}
-	if req.Callgraph == "" {
-		req.Callgraph = "fp"
-	}
-	if err := normalizeAndValidateCollector(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+	data, serr := s.taskService().CreateTask(req, s.AuthContext(c), c.GetHeader("Idempotency-Key"), requestIDFromGin(c))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
-	kind, _ := taskKindByID(req.TaskKind)
-	if !s.agentSupportsTaskKind(req.TargetIP, kind) {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "目标 Agent 不支持该 TaskKind: " + req.TaskKind})
-		return
-	}
-	if req.RequestID == "" {
-		if v, ok := c.Get("request_id"); ok {
-			if s, ok := v.(string); ok {
-				req.RequestID = s
-			}
-		}
-	}
-
-	uid := getRequestUIDOrDefault(c)
-	userName := getRequestUserName(c)
-
-	// A2: Idempotency-Key 去重（4.2 节）。同一用户携带相同幂等键重复提交，
-	// 直接返回已存在的任务，不重复创建、不重复下发。
-	var idempotencyKey *string
-	if raw := strings.TrimSpace(c.GetHeader("Idempotency-Key")); raw != "" {
-		idempotencyKey = &raw
-
-		var existing model.HotmethodTask
-		err := s.DB.Where("uid = ? AND idempotency_key = ?", uid, raw).First(&existing).Error
-		if err == nil {
-			c.JSON(http.StatusOK, gin.H{
-				"code": 0,
-				"data": gin.H{
-					"tid":      existing.TID,
-					"replayed": true,
-				},
-			})
-			return
-		}
-		if err != gorm.ErrRecordNotFound {
-			s.Logger.Error("查询幂等键失败", zap.String("idempotency_key", raw), zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":    500,
-				"message": "服务器内部错误",
-			})
-			return
-		}
-	}
-
-	tid := util.GenTID()
-
-	// 将性能采集参数序列化为 JSONB（只存采参，不存 Name/TargetIP 等已落列的字段）
-	paramsJSON, err := util.MarshalJSONB(PerfParams{
-		TargetPID:  req.TargetPID,
-		Duration:   req.Duration,
-		Frequency:  req.Frequency,
-		Callgraph:  req.Callgraph,
-		Event:      req.Event,
-		Subprocess: req.Subprocess,
-		PprofURL:   req.PprofURL,
-	})
-	if err != nil {
-		s.Logger.Error("序列化任务参数失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code":    500,
-			"message": "服务器内部错误",
-		})
-		return
-	}
-
-	now := time.Now()
-
-	task := &model.HotmethodTask{
-		TID:            tid,
-		Name:           req.Name,
-		TaskKind:       req.TaskKind,
-		RequestID:      req.RequestID,
-		Type:           req.TaskType,
-		ProfilerType:   req.ProfilerType,
-		TargetIP:       req.TargetIP,
-		RequestParams:  paramsJSON,
-		Status:         0, // 新建
-		StatusInfo:     "任务已创建，等待下发",
-		AnalysisStatus: 0, // 待分析
-		UID:            uid,
-		UserName:       userName,
-		IdempotencyKey: idempotencyKey,
-		CreateTime:     now,
-		DeadlineUnixMS: int64(now.Add(time.Duration(req.Duration+30) * time.Second).UnixMilli()),
-		ResourceBudget: []byte(req.ResourceBudget),
-	}
-
-	// A5: Task 和"需要下发"这件事在同一事务里落地（新复刻指南 9.6 节 Transactional
-	// Outbox），替代之前"写库后立刻在本次请求里同步调 gRPC"的非事务模式。
-	// 真正的 gRPC 下发交给后台 dispatchOutboxLoop 异步执行，HTTP 响应不用等 gRPC 往返。
-	if err := s.createTaskWithOutbox(task, req); err != nil {
-		// A2: 并发下两个携带相同幂等键的请求可能都通过了前面的查重，
-		// 只有一个能真正插入成功；另一个会撞在 (uid, idempotency_key) 唯一索引上。
-		// 这种情况下不报错，改为查出已创建成功的那条任务返回，保证"只有一个 Task"。
-		if idempotencyKey != nil && isUniqueViolation(err) {
-			var existing model.HotmethodTask
-			if lookupErr := s.DB.Where("uid = ? AND idempotency_key = ?", uid, *idempotencyKey).First(&existing).Error; lookupErr == nil {
-				c.JSON(http.StatusOK, gin.H{
-					"code": 0,
-					"data": gin.H{
-						"tid":      existing.TID,
-						"replayed": true,
-					},
-				})
-				return
-			}
-		}
-		s.Logger.Error("创建任务失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code":    500,
-			"message": "创建任务失败: " + err.Error(),
-		})
-		return
-	}
-	s.recordTaskStatusEvent(task.TID, -1, TaskStatusCreated, "任务已创建，等待下发", "apiserver")
-
-	s.Logger.Info("任务创建成功",
-		zap.String("tid", tid),
-		zap.String("target_ip", req.TargetIP),
-		zap.String("name", req.Name),
-	)
-
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{
-			"tid": tid,
-		},
-	})
+	s.Logger.Info("任务创建成功", zap.String("tid", data["tid"].(string)), zap.String("target_ip", req.TargetIP), zap.String("name", req.Name))
+	s.RespondOK(c, data)
 }
 
 // createTaskWithOutbox 在同一事务内写入 HotmethodTask 和对应的 Outbox 下发记录（A5，
@@ -251,6 +112,7 @@ func (s *APIServer) createTaskWithOutbox(task *model.HotmethodTask, req CreateTa
 		AggregateID: task.TID,
 		Event:       model.OutboxEventDispatchTask,
 		Payload:     payload,
+		Status:      model.OutboxStatusPending,
 		CreatedAt:   time.Now(),
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
@@ -671,9 +533,13 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 		query = query.Where("status = ?", status)
 	}
 
-	// 按用户筛选（权限控制）
-	if uid := getRequestUID(c); uid != "" {
-		query = query.Where("uid = ?", uid)
+	auth := s.AuthContext(c)
+	if !auth.IsPlatformAdmin() {
+		visibleUIDs := s.visibleOwnerUIDs(auth)
+		if len(visibleUIDs) == 0 {
+			visibleUIDs = []string{auth.UID}
+		}
+		query = query.Where("uid IN ?", visibleUIDs)
 	}
 
 	query.Count(&total)
@@ -695,14 +561,11 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 		tasks = []model.HotmethodTask{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{
-			"tasks":    tasks,
-			"total":    total,
-			"page":     page,
-			"pageSize": pageSize,
-		},
+	s.RespondOK(c, gin.H{
+		"tasks":    tasks,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
 	})
 }
 
@@ -714,14 +577,14 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 // 避免向未授权用户泄露 tid 是否存在。
 func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	tid := c.Param("tid")
-	uid := getRequestUID(c)
 
 	var task model.HotmethodTask
-	if err := s.DB.Where("tid = ? AND uid = ?", tid, uid).First(&task).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{
-			"code":    404,
-			"message": "任务不存在: " + tid,
-		})
+	if err := s.DB.Where("tid = ?", tid).First(&task).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "任务不存在: "+tid)
+		return
+	}
+	if !s.canReadOwner(task.UID, s.AuthContext(c)) {
+		s.forbid(c)
 		return
 	}
 
@@ -777,10 +640,7 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	result["artifacts"] = artifacts
 	result["files"] = files
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": result,
-	})
+	s.RespondOK(c, result)
 }
 
 func taskDetailResponse(task model.HotmethodTask) gin.H {
@@ -1018,31 +878,32 @@ func (s *APIServer) fetchArtifacts(tid string) []model.Artifact {
 // A4: 加 uid 过滤，防止越权删除他人任务。
 func (s *APIServer) DeleteTask(c *gin.Context) {
 	tid := c.Param("tid")
-	uid := getRequestUID(c)
+	auth := s.AuthContext(c)
+
+	var task model.HotmethodTask
+	if err := s.DB.Where("tid = ?", tid).First(&task).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "任务不存在或已删除: "+tid)
+		return
+	}
+	if !s.canManageOwner(task.UID, auth) {
+		s.forbid(c)
+		return
+	}
 
 	// 使用 GORM 软删除
-	result := s.DB.Where("tid = ? AND uid = ?", tid, uid).Delete(&model.HotmethodTask{})
+	result := s.DB.Where("tid = ?", tid).Delete(&model.HotmethodTask{})
 	if result.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code":    500,
-			"message": "删除任务失败: " + result.Error.Error(),
-		})
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "删除任务失败")
 		return
 	}
 	if result.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{
-			"code":    404,
-			"message": "任务不存在或已删除: " + tid,
-		})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "任务不存在或已删除: "+tid)
 		return
 	}
 
 	s.Logger.Info("任务已删除", zap.String("tid", tid))
 
-	c.JSON(http.StatusOK, gin.H{
-		"code":    0,
-		"message": "任务已删除",
-	})
+	s.RespondOK(c, gin.H{"message": "任务已删除"})
 }
 
 // RetryTask 重试失败的任务（用同参数重新创建）
@@ -1052,91 +913,45 @@ func (s *APIServer) DeleteTask(c *gin.Context) {
 // 是同一类"按 tid 直查，不校验 uid"的漏洞，放着不管等于没修完，顺手一起补上。
 func (s *APIServer) RetryTask(c *gin.Context) {
 	tid := c.Param("tid")
-	uid := getRequestUID(c)
-
-	// 查找原任务
-	var oldTask model.HotmethodTask
-	if err := s.DB.Unscoped().Where("tid = ? AND uid = ?", tid, uid).First(&oldTask).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{
-			"code":    404,
-			"message": "原任务不存在: " + tid,
-		})
+	data, serr := s.taskService().RetryTask(tid, s.AuthContext(c))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
-
-	// 用相同参数创建新任务
-	newTID := util.GenTID()
-	now := time.Now()
-
-	newTask := model.HotmethodTask{
-		TID:            newTID,
-		Name:           oldTask.Name + "(重试)",
-		TaskKind:       oldTask.TaskKind,
-		RequestID:      oldTask.RequestID,
-		Type:           oldTask.Type,
-		ProfilerType:   oldTask.ProfilerType,
-		TargetIP:       oldTask.TargetIP,
-		RequestParams:  oldTask.RequestParams,
-		Status:         0,
-		StatusInfo:     "重试任务，等待下发",
-		AnalysisStatus: 0,
-		UID:            oldTask.UID,
-		UserName:       oldTask.UserName,
-		CreateTime:     now,
-		MasterTaskTID:  tid, // 记录父任务
-		ResourceBudget: oldTask.ResourceBudget,
-	}
-
-	// 从原任务的 request_params 重建采集参数，构造下发用的请求体
-	var oldParams PerfParams
-	if err := util.UnmarshalJSONB(oldTask.RequestParams, &oldParams); err != nil {
-		s.Logger.Warn("解析原任务参数失败，使用默认值", zap.Error(err))
-	}
-	req := CreateTaskReq{
-		Name:           newTask.Name,
-		TaskKind:       newTask.TaskKind,
-		RequestID:      newTask.RequestID,
-		TaskType:       newTask.Type,
-		ProfilerType:   newTask.ProfilerType,
-		TargetIP:       newTask.TargetIP,
-		TargetPID:      oldParams.TargetPID,
-		Duration:       oldParams.Duration,
-		Frequency:      oldParams.Frequency,
-		Callgraph:      oldParams.Callgraph,
-		Event:          oldParams.Event,
-		Subprocess:     oldParams.Subprocess,
-		PprofURL:       oldParams.PprofURL,
-		ResourceBudget: json.RawMessage(newTask.ResourceBudget),
-	}
-	if err := normalizeAndValidateCollector(&req); err == nil {
-		newTask.TaskKind = req.TaskKind
-		newTask.Type = req.TaskType
-		newTask.ProfilerType = req.ProfilerType
-		newTask.DeadlineUnixMS = int64(now.Add(time.Duration(req.Duration+30) * time.Second).UnixMilli())
-	}
-
-	// A5: 同事务写 Task + Outbox，下发交给后台 dispatchOutboxLoop 异步执行
-	if err := s.createTaskWithOutbox(&newTask, req); err != nil {
-		s.Logger.Error("重试任务创建失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code":    500,
-			"message": "重试任务创建失败: " + err.Error(),
-		})
-		return
-	}
-	s.recordTaskStatusEvent(newTask.TID, -1, TaskStatusCreated, "重试任务已创建，等待下发", "apiserver")
 
 	s.Logger.Info("任务重试成功",
 		zap.String("old_tid", tid),
-		zap.String("new_tid", newTID),
+		zap.String("new_tid", data["tid"].(string)),
 	)
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{
-			"tid": newTID,
-		},
-	})
+	s.RespondOK(c, data)
+}
+
+func (s *APIServer) CancelTask(c *gin.Context) {
+	data, serr := s.taskService().CancelTask(c.Param("tid"), s.AuthContext(c))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
+		return
+	}
+	s.RespondOK(c, data)
+}
+
+func (s *APIServer) ListTaskArtifacts(c *gin.Context) {
+	data, serr := s.taskService().ListArtifacts(c.Param("tid"), s.AuthContext(c))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
+		return
+	}
+	s.RespondOK(c, data)
+}
+
+func (s *APIServer) DownloadTaskArtifact(c *gin.Context) {
+	data, serr := s.taskService().DownloadArtifact(c.Param("tid"), c.Param("artifact_id"), s.AuthContext(c))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
+		return
+	}
+	s.RespondOK(c, data)
 }
 
 // ListCOSFiles 列出任务产物文件并提供签名下载链接
@@ -1145,10 +960,11 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 func (s *APIServer) ListCOSFiles(c *gin.Context) {
 	tid := c.Query("tid")
 	if tid == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"code":    400,
-			"message": "缺少 tid 参数",
-		})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "缺少 tid 参数")
+		return
+	}
+	if _, serr := s.taskService().requireReadableTask(tid, s.AuthContext(c)); serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
 
@@ -1161,10 +977,7 @@ func (s *APIServer) ListCOSFiles(c *gin.Context) {
 		files, err = s.listTaskFiles(tid)
 		if err != nil {
 			s.Logger.Error("列出任务文件失败", zap.String("tid", tid), zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":    500,
-				"message": "列出文件失败: " + err.Error(),
-			})
+			s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "列出文件失败")
 			return
 		}
 	} else {
@@ -1185,10 +998,7 @@ func (s *APIServer) ListCOSFiles(c *gin.Context) {
 		response["notice"] = notice
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": response,
-	})
+	s.RespondOK(c, response)
 }
 
 // listLocalFiles 列出本地输出目录中的产物文件（MinIO 降级方案）
@@ -1245,14 +1055,21 @@ func (s *APIServer) ServeLocalFile(c *gin.Context) {
 
 	// 安全检查：防止目录穿越
 	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "非法路径"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "非法路径")
+		return
+	}
+	if tid := strings.SplitN(filename, "_", 2)[0]; tid == "" {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "非法文件名")
+		return
+	} else if _, serr := s.taskService().requireReadableTask(tid, s.AuthContext(c)); serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
 
 	localPath := filepath.Join("/tmp/drop-output", filename)
 
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "文件不存在: " + filename})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在: "+filename)
 		return
 	}
 
@@ -1283,19 +1100,23 @@ func (s *APIServer) ServeLocalFile(c *gin.Context) {
 func (s *APIServer) ViewCOSFile(c *gin.Context) {
 	key := c.Query("key")
 	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 key 参数"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "缺少 key 参数")
 		return
 	}
 	if strings.Contains(key, "..") || strings.Contains(key, "\\") || strings.HasPrefix(key, "/") {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "非法对象路径"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "非法对象路径")
 		return
 	}
 	if filepath.Ext(key) != ".svg" {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "仅支持查看 SVG 可视化产物"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "仅支持查看 SVG 可视化产物")
+		return
+	}
+	if _, serr := s.taskService().requireReadableTask(objectKeyTID(key), s.AuthContext(c)); serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
 	if !s.StorageConnected() {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"code": 503, "message": "对象存储未连接"})
+		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接")
 		return
 	}
 
@@ -1304,7 +1125,7 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 
 	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, key)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "文件不存在: " + key})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在")
 		return
 	}
 	defer reader.Close()
@@ -1322,15 +1143,19 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 	key := c.Query("key")
 	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 key 参数"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "缺少 key 参数")
 		return
 	}
 	if strings.Contains(key, "..") || strings.Contains(key, "\\") || strings.HasPrefix(key, "/") {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "非法对象路径"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "非法对象路径")
+		return
+	}
+	if _, serr := s.taskService().requireReadableTask(objectKeyTID(key), s.AuthContext(c)); serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
 	if !s.StorageConnected() {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"code": 503, "message": "对象存储未连接"})
+		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接")
 		return
 	}
 
@@ -1339,7 +1164,7 @@ func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 
 	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, key)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "文件不存在: " + key})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在")
 		return
 	}
 	defer reader.Close()
@@ -1378,6 +1203,20 @@ func contentDisposition(disposition string, filename string) string {
 	asciiName := strings.NewReplacer("\\", "_", "\"", "_", "\r", "_", "\n", "_").Replace(filename)
 	escapedName := url.PathEscape(filename)
 	return fmt.Sprintf("%s; filename=\"%s\"; filename*=UTF-8''%s", disposition, asciiName, escapedName)
+}
+
+func objectKeyTID(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	if idx := strings.Index(key, "/"); idx > 0 {
+		return key[:idx]
+	}
+	if idx := strings.Index(key, "_"); idx > 0 {
+		return key[:idx]
+	}
+	return ""
 }
 
 // listTaskFiles 列出指定 tid 下的所有产物文件，并生成签名下载 URL

@@ -5,8 +5,11 @@ BEGIN
     ALTER TABLE hotmethod_tasks ADD COLUMN IF NOT EXISTS request_id varchar(64);
     ALTER TABLE hotmethod_tasks ADD COLUMN IF NOT EXISTS deadline_unix_ms bigint DEFAULT 0;
     ALTER TABLE hotmethod_tasks ADD COLUMN IF NOT EXISTS resource_budget jsonb;
+    ALTER TABLE hotmethod_tasks ADD COLUMN IF NOT EXISTS cancel_requested boolean DEFAULT false;
+    ALTER TABLE hotmethod_tasks ADD COLUMN IF NOT EXISTS canceled_at timestamptz;
     CREATE INDEX IF NOT EXISTS idx_hotmethod_tasks_task_kind ON hotmethod_tasks(task_kind);
     CREATE INDEX IF NOT EXISTS idx_hotmethod_tasks_request_id ON hotmethod_tasks(request_id);
+    CREATE INDEX IF NOT EXISTS idx_hotmethod_tasks_cancel_requested ON hotmethod_tasks(cancel_requested);
   END IF;
 
   IF to_regclass('public.agent_infos') IS NOT NULL THEN
@@ -39,5 +42,13 @@ BEGIN
 
   IF to_regclass('public.schedule_tasks') IS NOT NULL THEN
     ALTER TABLE schedule_tasks ADD COLUMN IF NOT EXISTS task_kind varchar(64);
+  END IF;
+
+  IF to_regclass('public.outboxes') IS NOT NULL THEN
+    ALTER TABLE outboxes ADD COLUMN IF NOT EXISTS status varchar(32) DEFAULT 'pending';
+    ALTER TABLE outboxes ADD COLUMN IF NOT EXISTS locked_at timestamptz;
+    ALTER TABLE outboxes ADD COLUMN IF NOT EXISTS locked_by varchar(128);
+    ALTER TABLE outboxes ADD COLUMN IF NOT EXISTS dead_letter_at timestamptz;
+    CREATE INDEX IF NOT EXISTS idx_outbox_claim_v2 ON outboxes(status, next_attempt_at, locked_at, created_at);
   END IF;
 END $$;

@@ -6,41 +6,101 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+
+	"github.com/mini-drop/apiserver/model"
 )
 
 // Healthz 健康检查端点
 // GET /healthz
 // 返回服务状态（Kubernetes/Docker 用这个判断服务是否存活）
 func (s *APIServer) Healthz(c *gin.Context) {
-	// 顺便检查数据库连通性
+	checks := s.readinessChecks()
+	status := "ok"
+	if checks["db"] != "ok" {
+		status = "unhealthy"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"request_id": requestIDFromGin(c),
+		"status":     status,
+		"service":    "apiserver",
+		"ready":      status == "ok",
+		"checks":     checks,
+	})
+}
+
+func (s *APIServer) Livez(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"request_id": requestIDFromGin(c),
+		"status":     "ok",
+		"service":    "apiserver",
+	})
+}
+
+func (s *APIServer) Readyz(c *gin.Context) {
+	checks := s.readinessChecks()
+	status := http.StatusOK
+	ready := true
+	for _, key := range []string{"db", "storage", "grpc", "migration", "outbox"} {
+		if checks[key] != "ok" {
+			ready = false
+			status = http.StatusServiceUnavailable
+		}
+	}
+	c.JSON(status, gin.H{
+		"request_id": requestIDFromGin(c),
+		"status":     map[bool]string{true: "ready", false: "not_ready"}[ready],
+		"ready":      ready,
+		"checks":     checks,
+	})
+}
+
+func (s *APIServer) readinessChecks() map[string]string {
+	checks := map[string]string{"db": "ok", "storage": "ok", "grpc": "ok", "migration": "ok", "outbox": "ok"}
 	sqlDB, err := s.DB.DB()
 	if err != nil {
 		s.Logger.Error("健康检查：获取数据库连接失败", zap.Error(err))
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"status": "unhealthy",
-			"reason": "数据库连接不可用",
-		})
-		return
+		checks["db"] = "unavailable"
+		return checks
 	}
 
 	if err := sqlDB.Ping(); err != nil {
 		s.Logger.Error("健康检查：数据库 Ping 失败", zap.Error(err))
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"status": "unhealthy",
-			"reason": "数据库 Ping 失败",
-		})
-		return
+		checks["db"] = "unavailable"
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
-		"service": "apiserver",
-	})
+	if !s.StorageConnected() {
+		checks["storage"] = "unavailable"
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if _, err := s.Storage.ListObjects(ctx, s.Config.Storage.Bucket, "__readyz__/"); err != nil {
+			checks["storage"] = "unavailable"
+		}
+		cancel()
+	}
+	if !s.GrpcConnected() {
+		checks["grpc"] = "unavailable"
+	}
+	if latest, err := model.LatestMigrationVersion(); err != nil {
+		checks["migration"] = "unknown"
+	} else if latest != "" {
+		var count int64
+		if err := s.DB.Model(&model.SchemaMigration{}).Where("version = ?", latest).Count(&count).Error; err != nil || count == 0 {
+			checks["migration"] = "outdated"
+		}
+	}
+	var deadLetters int64
+	if err := s.DB.Model(&model.Outbox{}).Where("status = ?", model.OutboxStatusDeadLetter).Count(&deadLetters).Error; err != nil {
+		checks["outbox"] = "unknown"
+	} else if deadLetters > 0 {
+		checks["outbox"] = "has_dead_letters"
+	}
+	return checks
 }
 
 // AuthCheck 鉴权回调
@@ -54,22 +114,18 @@ func (s *APIServer) Healthz(c *gin.Context) {
 func (s *APIServer) AuthCheck(c *gin.Context) {
 	uid := getRequestUID(c)
 	if uid == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"code":    401,
-			"message": "未登录：请求未携带 Drop-User-Uid",
-		})
+		s.RespondHTTPError(c, http.StatusUnauthorized, ErrCodeAuthForbidden, "未登录：请求未携带 Drop-User-Uid")
 		return
 	}
 
 	userName := getRequestUserName(c)
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{
-			"uid":       uid,
-			"user_name": userName,
-			"location":  "", // 生产环境用于 OAuth 跳转
-		},
+	s.RespondOK(c, gin.H{
+		"uid":       uid,
+		"user_name": userName,
+		"role":      s.AuthContext(c).Role,
+		"groups":    s.AuthContext(c).Groups,
+		"location":  "", // 生产环境用于 OAuth 跳转
 	})
 }
 
@@ -89,8 +145,11 @@ func (s *APIServer) CheckLogin(c *gin.Context) {
 	uid := getRequestUID(c)
 	if uid == "" {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-			"code":    401,
-			"message": "未登录：请求未携带 Drop-User-Uid",
+			"request_id": requestIDFromGin(c),
+			"data":       nil,
+			"error":      APIError{Code: ErrCodeAuthForbidden, Message: "未登录：请求未携带 Drop-User-Uid", Retryable: false, Stage: "auth"},
+			"code":       http.StatusUnauthorized,
+			"message":    "未登录：请求未携带 Drop-User-Uid",
 		})
 		return
 	}
@@ -103,14 +162,13 @@ func (s *APIServer) GetCurrentUser(c *gin.Context) {
 	uid := getRequestUIDOrDefault(c)
 	userName := getRequestUserName(c)
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{
-			"uid":       uid,
-			"user_name": userName,
-			"name":      userName,
-			"groups":    []string{},
-		},
+	auth := s.AuthContext(c)
+	s.RespondOK(c, gin.H{
+		"uid":       uid,
+		"user_name": userName,
+		"name":      userName,
+		"role":      auth.Role,
+		"groups":    auth.Groups,
 	})
 }
 

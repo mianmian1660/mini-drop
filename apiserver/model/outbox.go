@@ -20,6 +20,13 @@ const (
 	OutboxEventDispatchTask = "dispatch_task"
 )
 
+// Outbox 状态：pending 等待领取、processing 已被当前进程领取、dead_letter 达到重试上限。
+const (
+	OutboxStatusPending    = "pending"
+	OutboxStatusProcessing = "processing"
+	OutboxStatusDeadLetter = "dead_letter"
+)
+
 // Outbox — 事务性发件箱记录
 type Outbox struct {
 	ID            uint       `gorm:"primaryKey" json:"id"`
@@ -27,9 +34,13 @@ type Outbox struct {
 	AggregateID   string     `gorm:"column:aggregate_id;size:64;index" json:"aggregate_id"` // 关联的 HotmethodTask.TID
 	Event         string     `gorm:"column:event;size:64" json:"event"`                     // 事件类型，如 "dispatch_task"
 	Payload       []byte     `gorm:"column:payload;type:jsonb" json:"payload"`              // 下发所需的完整参数（序列化后的 CreateTaskReq）
+	Status        string     `gorm:"column:status;size:32;default:pending;index:idx_outbox_claim" json:"status"`
 	Attempt       int        `gorm:"column:attempt;default:0" json:"attempt"`
 	LastError     string     `gorm:"column:last_error;size:1024" json:"last_error"`
 	NextAttemptAt *time.Time `gorm:"column:next_attempt_at;index:idx_outbox_unpublished" json:"next_attempt_at"`
+	LockedAt      *time.Time `gorm:"column:locked_at;index:idx_outbox_claim" json:"locked_at"`
+	LockedBy      string     `gorm:"column:locked_by;size:128" json:"locked_by"`
+	DeadLetterAt  *time.Time `gorm:"column:dead_letter_at" json:"dead_letter_at"`
 	PublishedAt   *time.Time `gorm:"column:published_at;index:idx_outbox_unpublished" json:"published_at"` // NULL = 尚未发布（待处理）
 	CreatedAt     time.Time  `gorm:"column:created_at;index:idx_outbox_unpublished" json:"created_at"`
 }

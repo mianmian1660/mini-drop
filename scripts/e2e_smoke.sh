@@ -69,6 +69,7 @@ create_resp="$(curl -fsS -X POST "$BASE/api/v1/tasks" \
   -d "{\"name\":\"e2e smoke cpu\",\"task_type\":0,\"profiler_type\":0,\"target_ip\":\"$TARGET_IP\",\"target_pid\":0,\"duration\":2,\"frequency\":49,\"callgraph\":\"fp\",\"event\":\"cpu-cycles\"}")"
 tid="$(printf '%s' "$create_resp" | json_get "d['data']['tid']")"
 test -n "$tid" || fail "create normal task"
+test "$(printf '%s' "$create_resp" | json_get "'request_id' in d and d.get('error') is None and d.get('code') == 0")" = "True" || fail "create response has unified envelope"
 pass "create normal task $tid"
 
 idempotency_key="e2e-${tid}"
@@ -87,8 +88,15 @@ test "$(printf '%s' "$idem_second" | json_get "d['data']['tid']")" = "$idem_tid"
 test "$(printf '%s' "$idem_second" | json_get "d['data'].get('replayed', False)")" = "True" || fail "idempotency key marks replay"
 pass "idempotency key"
 
+cancel_resp="$(curl -fsS -X POST "$BASE/api/v1/tasks/$idem_tid/cancel" \
+  -H "Drop-User-Uid: $AUTH_UID" -H "Drop-User-Name: $AUTH_NAME")"
+test "$(printf '%s' "$cancel_resp" | json_get "d['data']['status']")" = "5" || fail "cancel created task returns canceled"
+test "$(printf '%s' "$cancel_resp" | json_get "d.get('error') is None and d.get('code') == 0")" = "True" || fail "cancel response has unified envelope"
+pass "cancel created task"
+
 unauth_code="$(curl -s -o /tmp/mini-drop-e2e-unauth.json -w '%{http_code}' "$BASE/api/v1/tasks")"
 test "$unauth_code" = "401" || fail "unauthenticated request rejected"
+test "$(cat /tmp/mini-drop-e2e-unauth.json | json_get "d['error']['code'] == 'AUTH_FORBIDDEN' and 'request_id' in d")" = "True" || fail "unauthenticated response has structured error"
 pass "authentication required"
 
 detail_resp="$(curl -fsS -H "Drop-User-Uid: $AUTH_UID" -H "Drop-User-Name: $AUTH_NAME" "$BASE/api/v1/tasks/$tid")"
@@ -118,6 +126,7 @@ bad_code="$(curl -s -o /tmp/mini-drop-e2e-bad.json -w '%{http_code}' -X POST "$B
   -H "Drop-User-Name: $AUTH_NAME" \
   -d "{\"target_ip\":\"$TARGET_IP\"}")"
 test "$bad_code" = "400" || fail "invalid create returns 400"
+test "$(cat /tmp/mini-drop-e2e-bad.json | json_get "d['error']['code'] == 'TASK_INVALID_ARGUMENT'")" = "True" || fail "invalid create returns structured error"
 pass "invalid create returns 400"
 
 missing_code="$(curl -s -o /tmp/mini-drop-e2e-missing.json -w '%{http_code}' \

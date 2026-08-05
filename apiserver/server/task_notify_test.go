@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +41,26 @@ func newTestAPIServer(t *testing.T) *APIServer {
 		Cron:     cron.New(),
 		CronJobs: map[string]cron.EntryID{},
 	}
+}
+
+type fakeStorage struct{}
+
+func (fakeStorage) EnsureBucket(context.Context, string) error { return nil }
+func (fakeStorage) PutObject(context.Context, string, string, io.Reader, int64, string) error {
+	return nil
+}
+func (fakeStorage) GetObject(context.Context, string, string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("ok")), nil
+}
+func (fakeStorage) PresignedGetURL(context.Context, string, string, time.Duration) (string, error) {
+	return "http://example.test/signed", nil
+}
+func (fakeStorage) ListObjects(context.Context, string, string) ([]storage.FileInfo, error) {
+	return []storage.FileInfo{}, nil
+}
+func (fakeStorage) DeleteObject(context.Context, string, string) error { return nil }
+func (fakeStorage) ObjectExists(context.Context, string, string) (bool, error) {
+	return true, nil
 }
 
 func postNotify(t *testing.T, s *APIServer, body string) *httptest.ResponseRecorder {
@@ -367,8 +390,8 @@ func TestTaskReadHandlersUseUIDAndReturnEvidence(t *testing.T) {
 	req.Header.Set("Drop-User-Uid", "other")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("cross-user detail status=%d, want 404", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("cross-user detail status=%d, want 403", w.Code)
 	}
 }
 
@@ -377,6 +400,14 @@ func TestDeleteAndFileHandlers(t *testing.T) {
 	task := model.HotmethodTask{TID: "tid-delete", Name: "delete", UID: "owner", CreateTime: time.Now()}
 	if err := s.DB.Create(&task).Error; err != nil {
 		t.Fatalf("create task: %v", err)
+	}
+	fileTask := model.HotmethodTask{TID: "tid-files", Name: "files", UID: "owner", CreateTime: time.Now()}
+	if err := s.DB.Create(&fileTask).Error; err != nil {
+		t.Fatalf("create file task: %v", err)
+	}
+	legacyKeyTask := model.HotmethodTask{TID: "tid", Name: "legacy key", UID: "owner", CreateTime: time.Now()}
+	if err := s.DB.Create(&legacyKeyTask).Error; err != nil {
+		t.Fatalf("create legacy key task: %v", err)
 	}
 
 	gin.SetMode(gin.TestMode)
@@ -409,7 +440,7 @@ func TestDeleteAndFileHandlers(t *testing.T) {
 		want   int
 	}{
 		{http.MethodGet, "/api/v1/cosfiles", http.StatusBadRequest},
-		{http.MethodGet, "/api/v1/cosfiles?tid=tid-delete", http.StatusOK},
+		{http.MethodGet, "/api/v1/cosfiles?tid=tid-files", http.StatusOK},
 		{http.MethodGet, "/api/v1/files/..secret", http.StatusBadRequest},
 		{http.MethodGet, "/api/v1/files/missing.svg", http.StatusNotFound},
 		{http.MethodGet, "/api/v1/cosfiles/view", http.StatusBadRequest},
@@ -420,11 +451,140 @@ func TestDeleteAndFileHandlers(t *testing.T) {
 	}
 	for _, tc := range cases {
 		req = httptest.NewRequest(tc.method, tc.path, nil)
+		req.Header.Set("Drop-User-Uid", "owner")
 		w = httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 		if w.Code != tc.want {
 			t.Fatalf("%s status=%d, want %d body=%s", tc.path, w.Code, tc.want, w.Body.String())
 		}
+	}
+}
+
+func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = fakeStorage{}
+	now := time.Now()
+	task := model.HotmethodTask{
+		TID: "tid-stage2", Name: "stage2", Status: TaskStatusRunning, UID: "owner", UserName: "Owner",
+		TargetIP: "127.0.0.1", CreateTime: now, BeginTime: &now,
+	}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, err := s.startTaskAttempt(&task, model.AttemptTriggerInitial); err != nil {
+		t.Fatalf("create attempt: %v", err)
+	}
+	if err := s.DB.Create(&model.Artifact{
+		TaskTID: task.TID, Kind: model.ArtifactKindRaw, ObjectKey: task.TID + "/perf.data",
+		Size: 123, SHA256: "abc", Status: model.ArtifactStatusReady, CreatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/v1/tasks/:tid/cancel", s.CancelTask)
+	router.GET("/api/v1/tasks/:tid/artifacts", s.ListTaskArtifacts)
+	router.GET("/api/v1/tasks/:tid/artifacts/:artifact_id/download", s.DownloadTaskArtifact)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/tid-stage2/cancel", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Drop-User-Role", "Viewer")
+	req.Header.Set("X-Request-ID", "rid-stage2")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `"request_id":"rid-stage2"`) || !strings.Contains(w.Body.String(), `"error"`) {
+		t.Fatalf("viewer cancel response status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-stage2/artifacts", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("X-Request-ID", "rid-artifacts")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list artifacts status=%d body=%s", w.Code, w.Body.String())
+	}
+	var artifactResp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &artifactResp); err != nil {
+		t.Fatalf("decode artifacts: %v", err)
+	}
+	if artifactResp["request_id"] != "rid-artifacts" || artifactResp["error"] != nil || artifactResp["code"].(float64) != 0 {
+		t.Fatalf("unexpected unified response: %#v", artifactResp)
+	}
+	artifacts := artifactResp["data"].(map[string]interface{})["artifacts"].([]interface{})
+	firstArtifact := artifacts[0].(map[string]interface{})
+	if _, ok := firstArtifact["object_key"]; ok {
+		t.Fatalf("artifact API must not expose object_key: %#v", firstArtifact)
+	}
+
+	artifactID := int(firstArtifact["id"].(float64))
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-stage2/artifacts/"+strconv.Itoa(artifactID)+"/download", nil)
+	req.Header.Set("Drop-User-Uid", "other")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("cross user artifact download status=%d, want 403", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-stage2/artifacts/"+strconv.Itoa(artifactID)+"/download", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "http://example.test/signed") {
+		t.Fatalf("owner artifact download status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks/tid-stage2/cancel", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cancel status=%d body=%s", w.Code, w.Body.String())
+	}
+	var canceled model.HotmethodTask
+	if err := s.DB.Where("tid = ?", task.TID).First(&canceled).Error; err != nil {
+		t.Fatalf("load canceled task: %v", err)
+	}
+	if canceled.Status != TaskStatusCanceled || !canceled.CancelRequested || canceled.CanceledAt == nil {
+		t.Fatalf("task after cancel=%#v", canceled)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks/tid-stage2/cancel", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "already_terminal") {
+		t.Fatalf("idempotent cancel status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestStage2HealthEndpoints(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = fakeStorage{}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/livez", s.Livez)
+	router.GET("/readyz", s.Readyz)
+	router.GET("/healthz", s.Healthz)
+
+	req := httptest.NewRequest(http.MethodGet, "/livez", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"ok"`) {
+		t.Fatalf("livez status=%d body=%s", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"checks"`) {
+		t.Fatalf("healthz status=%d body=%s", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"grpc":"unavailable"`) {
+		t.Fatalf("readyz status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -591,8 +751,8 @@ func TestRetryTaskCreatesChildOutboxAndRespectsOwner(t *testing.T) {
 	req.Header.Set("Drop-User-Uid", "other")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("cross owner retry status=%d, want 404", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("cross owner retry status=%d, want 403", w.Code)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks/tid-retry-old/retry", nil)
@@ -785,6 +945,9 @@ func TestGroupCRUDHandlers(t *testing.T) {
 		req = httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Drop-User-Uid", "owner")
+		if strings.Contains(tc.path, gid) && (strings.Contains(tc.path, "/members") || tc.method == http.MethodDelete) {
+			req.Header.Set("Drop-User-Role", "PlatformAdmin")
+		}
 		w = httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 		if w.Code != tc.want {
@@ -854,6 +1017,7 @@ func TestScheduleHandlersAndExecution(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodDelete, "/api/v1/schedule/"+sid, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

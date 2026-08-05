@@ -23,6 +23,24 @@ func (SchemaMigration) TableName() string {
 	return "schema_migrations"
 }
 
+func LatestMigrationVersion() (string, error) {
+	entries, err := migrationFiles.ReadDir("migrations")
+	if err != nil {
+		return "", err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			names = append(names, strings.TrimSuffix(entry.Name(), ".sql"))
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return "", nil
+	}
+	return names[len(names)-1], nil
+}
+
 func RunMigrations(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("db is nil")

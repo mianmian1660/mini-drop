@@ -36,13 +36,17 @@ type AddMemberReq struct {
 // POST /api/v1/groups
 // ----------------------------------------------------------
 func (s *APIServer) CreateGroup(c *gin.Context) {
+	if !s.AuthContext(c).CanWrite() {
+		s.forbid(c)
+		return
+	}
 	var req CreateGroupReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "参数错误: " + err.Error()})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误: "+err.Error())
 		return
 	}
 
-	uid := getRequestUIDOrDefault(c)
+	uid := s.AuthContext(c).UID
 
 	gid := "grp-" + util.GenTID()[4:] // grp-20260619-a1b2c3d4
 
@@ -54,7 +58,7 @@ func (s *APIServer) CreateGroup(c *gin.Context) {
 
 	if err := s.DB.Create(group).Error; err != nil {
 		s.Logger.Error("创建组失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "创建组失败"})
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "创建组失败")
 		return
 	}
 
@@ -63,7 +67,7 @@ func (s *APIServer) CreateGroup(c *gin.Context) {
 	s.DB.Create(member)
 
 	s.Logger.Info("用户组已创建", zap.String("gid", gid), zap.String("name", req.Name))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": group})
+	s.RespondOK(c, group)
 }
 
 // ----------------------------------------------------------
@@ -71,10 +75,27 @@ func (s *APIServer) CreateGroup(c *gin.Context) {
 // GET /api/v1/groups
 // ----------------------------------------------------------
 func (s *APIServer) ListGroups(c *gin.Context) {
+	auth := s.AuthContext(c)
 	var groups []model.Group
-	if err := s.DB.Order("created_at DESC").Find(&groups).Error; err != nil {
+	query := s.DB.Order("created_at DESC")
+	if !auth.IsPlatformAdmin() {
+		visible := auth.Groups
+		if len(visible) == 0 {
+			var memberships []model.GroupMember
+			_ = s.DB.Where("uid = ?", auth.UID).Find(&memberships).Error
+			for _, member := range memberships {
+				visible = append(visible, member.GID)
+			}
+		}
+		if len(visible) == 0 {
+			query = query.Where("owner_id = ?", auth.UID)
+		} else {
+			query = query.Where("owner_id = ? OR gid IN ?", auth.UID, visible)
+		}
+	}
+	if err := query.Find(&groups).Error; err != nil {
 		s.Logger.Error("查询组列表失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询失败"})
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询失败")
 		return
 	}
 
@@ -82,10 +103,7 @@ func (s *APIServer) ListGroups(c *gin.Context) {
 		groups = []model.Group{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{"groups": groups, "total": len(groups)},
-	})
+	s.RespondOK(c, gin.H{"groups": groups, "total": len(groups)})
 }
 
 // ----------------------------------------------------------
@@ -97,7 +115,11 @@ func (s *APIServer) GetGroupDetail(c *gin.Context) {
 
 	var group model.Group
 	if err := s.DB.Where("gid = ?", gid).First(&group).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "组不存在: " + gid})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "组不存在: "+gid)
+		return
+	}
+	if !s.canReadGroup(group, s.AuthContext(c)) {
+		s.forbid(c)
 		return
 	}
 
@@ -108,12 +130,9 @@ func (s *APIServer) GetGroupDetail(c *gin.Context) {
 		members = []model.GroupMember{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{
-			"group":   group,
-			"members": members,
-		},
+	s.RespondOK(c, gin.H{
+		"group":   group,
+		"members": members,
 	})
 }
 
@@ -126,7 +145,16 @@ func (s *APIServer) UpdateGroup(c *gin.Context) {
 
 	var req UpdateGroupReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "参数错误"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误")
+		return
+	}
+	var group model.Group
+	if err := s.DB.Where("gid = ?", gid).First(&group).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "组不存在: "+gid)
+		return
+	}
+	if !s.canManageGroup(group, s.AuthContext(c)) {
+		s.forbid(c)
 		return
 	}
 
@@ -139,18 +167,18 @@ func (s *APIServer) UpdateGroup(c *gin.Context) {
 	}
 
 	if len(updates) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "无更新内容"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "无更新内容")
 		return
 	}
 
 	result := s.DB.Model(&model.Group{}).Where("gid = ?", gid).Updates(updates)
 	if result.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "组不存在: " + gid})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "组不存在: "+gid)
 		return
 	}
 
 	s.Logger.Info("用户组已更新", zap.String("gid", gid))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "更新成功"})
+	s.RespondOK(c, gin.H{"message": "更新成功"})
 }
 
 // ----------------------------------------------------------
@@ -159,6 +187,15 @@ func (s *APIServer) UpdateGroup(c *gin.Context) {
 // ----------------------------------------------------------
 func (s *APIServer) DeleteGroup(c *gin.Context) {
 	gid := c.Param("gid")
+	var group model.Group
+	if err := s.DB.Where("gid = ?", gid).First(&group).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "组不存在: "+gid)
+		return
+	}
+	if !s.canManageGroup(group, s.AuthContext(c)) {
+		s.forbid(c)
+		return
+	}
 
 	// 删除组成员关系
 	s.DB.Where("gid = ?", gid).Delete(&model.GroupMember{})
@@ -166,12 +203,12 @@ func (s *APIServer) DeleteGroup(c *gin.Context) {
 	// 删除组
 	result := s.DB.Where("gid = ?", gid).Delete(&model.Group{})
 	if result.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "组不存在: " + gid})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "组不存在: "+gid)
 		return
 	}
 
 	s.Logger.Info("用户组已删除", zap.String("gid", gid))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "组已删除"})
+	s.RespondOK(c, gin.H{"message": "组已删除"})
 }
 
 // ----------------------------------------------------------
@@ -183,14 +220,18 @@ func (s *APIServer) AddGroupMember(c *gin.Context) {
 
 	var req AddMemberReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "参数错误"})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误")
 		return
 	}
 
 	// 检查组是否存在
 	var group model.Group
 	if err := s.DB.Where("gid = ?", gid).First(&group).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "组不存在: " + gid})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "组不存在: "+gid)
+		return
+	}
+	if !s.canManageGroup(group, s.AuthContext(c)) {
+		s.forbid(c)
 		return
 	}
 
@@ -199,12 +240,12 @@ func (s *APIServer) AddGroupMember(c *gin.Context) {
 	if err := s.DB.Where("gid = ? AND uid = ?", gid, req.UID).
 		FirstOrCreate(member).Error; err != nil {
 		s.Logger.Error("添加成员失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "添加成员失败"})
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "添加成员失败")
 		return
 	}
 
 	s.Logger.Info("组成员已添加", zap.String("gid", gid), zap.String("uid", req.UID))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "成员已添加"})
+	s.RespondOK(c, gin.H{"message": "成员已添加"})
 }
 
 // ----------------------------------------------------------
@@ -214,13 +255,22 @@ func (s *APIServer) AddGroupMember(c *gin.Context) {
 func (s *APIServer) RemoveGroupMember(c *gin.Context) {
 	gid := c.Param("gid")
 	uid := c.Param("uid")
+	var group model.Group
+	if err := s.DB.Where("gid = ?", gid).First(&group).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "组不存在: "+gid)
+		return
+	}
+	if !s.canManageGroup(group, s.AuthContext(c)) {
+		s.forbid(c)
+		return
+	}
 
 	result := s.DB.Where("gid = ? AND uid = ?", gid, uid).Delete(&model.GroupMember{})
 	if result.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "成员不存在"})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "成员不存在")
 		return
 	}
 
 	s.Logger.Info("组成员已移除", zap.String("gid", gid), zap.String("uid", uid))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "成员已移除"})
+	s.RespondOK(c, gin.H{"message": "成员已移除"})
 }

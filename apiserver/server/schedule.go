@@ -161,16 +161,21 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 // POST /api/v1/schedule/task
 // ----------------------------------------------------------
 func (s *APIServer) CreateSchedule(c *gin.Context) {
+	auth := s.AuthContext(c)
+	if !auth.CanWrite() {
+		s.forbid(c)
+		return
+	}
 	var req CreateScheduleReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "参数错误: " + err.Error()})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误: "+err.Error())
 		return
 	}
 
 	// 验证 cron 表达式（标准 5 字段：分 时 日 月 周）
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	if _, err := parser.Parse(req.CronExpr); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "Cron 表达式无效: " + err.Error()})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "Cron 表达式无效: "+err.Error())
 		return
 	}
 
@@ -189,12 +194,12 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 		Duration: req.Duration, Frequency: req.Frequency, Callgraph: req.Callgraph, Event: req.Event, PprofURL: req.PprofURL,
 	}
 	if err := normalizeAndValidateCollector(&collectorReq); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, err.Error())
 		return
 	}
 	kind, _ := taskKindByID(collectorReq.TaskKind)
 	if !s.agentSupportsTaskKind(req.TargetIP, kind) {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "目标 Agent 不支持该 TaskKind: " + collectorReq.TaskKind})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeAgentIncompatible, "目标 Agent 不支持该 TaskKind: "+collectorReq.TaskKind)
 		return
 	}
 	req.TaskKind, req.TaskType, req.ProfilerType = collectorReq.TaskKind, collectorReq.TaskType, collectorReq.ProfilerType
@@ -203,19 +208,13 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 	// 窗口校验：持续采集的每次采样必须在窗口周期内结束，否则相邻窗口会重叠，
 	// "回溯任意窗口"的语义就不成立了。
 	if req.WindowSeconds > 0 && req.Duration >= req.WindowSeconds {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"code": 400,
-			"message": fmt.Sprintf(
-				"采样时长(%ds)需小于窗口周期(%ds)，否则相邻窗口会重叠",
-				req.Duration, req.WindowSeconds,
-			),
-		})
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, fmt.Sprintf("采样时长(%ds)需小于窗口周期(%ds)，否则相邻窗口会重叠", req.Duration, req.WindowSeconds))
 		return
 	}
 
 	sid := "sch-" + util.GenTID()[4:]
-	uid := getRequestUIDOrDefault(c)
-	userName := getRequestUserName(c)
+	uid := auth.UID
+	userName := auth.Name
 
 	// 序列化采集参数
 	paramsJSON, _ := util.MarshalJSONB(PerfParams{
@@ -247,7 +246,7 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 
 	if err := s.DB.Create(sch).Error; err != nil {
 		s.Logger.Error("创建定时任务失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "创建定时任务失败"})
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "创建定时任务失败")
 		return
 	}
 
@@ -255,7 +254,7 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 	s.addCronJob(*sch)
 
 	s.Logger.Info("定时任务已创建", zap.String("sid", sid), zap.String("cron", req.CronExpr))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": sch})
+	s.RespondOK(c, sch)
 }
 
 // ----------------------------------------------------------
@@ -263,10 +262,19 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 // GET /api/v1/schedule/tasks
 // ----------------------------------------------------------
 func (s *APIServer) ListSchedules(c *gin.Context) {
+	auth := s.AuthContext(c)
 	var schedules []model.ScheduleTask
-	if err := s.DB.Order("created_at DESC").Find(&schedules).Error; err != nil {
+	query := s.DB.Order("created_at DESC")
+	if !auth.IsPlatformAdmin() {
+		visibleUIDs := s.visibleOwnerUIDs(auth)
+		if len(visibleUIDs) == 0 {
+			visibleUIDs = []string{auth.UID}
+		}
+		query = query.Where("uid IN ?", visibleUIDs)
+	}
+	if err := query.Find(&schedules).Error; err != nil {
 		s.Logger.Error("查询定时任务失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询失败"})
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询失败")
 		return
 	}
 
@@ -274,10 +282,7 @@ func (s *APIServer) ListSchedules(c *gin.Context) {
 		schedules = []model.ScheduleTask{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{"schedules": schedules, "total": len(schedules)},
-	})
+	s.RespondOK(c, gin.H{"schedules": schedules, "total": len(schedules)})
 }
 
 // ----------------------------------------------------------
@@ -287,9 +292,18 @@ func (s *APIServer) ListSchedules(c *gin.Context) {
 func (s *APIServer) DeleteSchedule(c *gin.Context) {
 	sid := c.Param("sid")
 
+	var sch model.ScheduleTask
+	if err := s.DB.Where("sid = ?", sid).First(&sch).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "定时任务不存在: "+sid)
+		return
+	}
+	if !s.canManageOwner(sch.UID, s.AuthContext(c)) {
+		s.forbid(c)
+		return
+	}
 	result := s.DB.Where("sid = ?", sid).Delete(&model.ScheduleTask{})
 	if result.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "定时任务不存在: " + sid})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "定时任务不存在: "+sid)
 		return
 	}
 
@@ -297,7 +311,7 @@ func (s *APIServer) DeleteSchedule(c *gin.Context) {
 	s.removeCronJob(sid)
 
 	s.Logger.Info("定时任务已删除并停止", zap.String("sid", sid))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "定时任务已删除并停止"})
+	s.RespondOK(c, gin.H{"message": "定时任务已删除并停止"})
 }
 
 // ----------------------------------------------------------
@@ -309,7 +323,11 @@ func (s *APIServer) ToggleSchedule(c *gin.Context) {
 
 	var sch model.ScheduleTask
 	if err := s.DB.Unscoped().Where("sid = ?", sid).First(&sch).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "定时任务不存在: " + sid})
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "定时任务不存在: "+sid)
+		return
+	}
+	if !s.canManageOwner(sch.UID, s.AuthContext(c)) {
+		s.forbid(c)
 		return
 	}
 
@@ -329,8 +347,5 @@ func (s *APIServer) ToggleSchedule(c *gin.Context) {
 		zap.Bool("enabled", newEnabled),
 	)
 
-	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": gin.H{"sid": sid, "enabled": newEnabled},
-	})
+	s.RespondOK(c, gin.H{"sid": sid, "enabled": newEnabled})
 }

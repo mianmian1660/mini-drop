@@ -33,6 +33,8 @@
 - 增加取消接口：`POST /api/v1/tasks/:tid/cancel` 幂等实现，终态任务返回当前状态，运行中任务写取消事件并下发取消指令。
 - Readiness/liveness 分离：liveness 只看进程，readiness 检查 DB、storage、gRPC、migration version、队列恢复状态。
 
+完成记录（2026-08-05）：阶段 2 已按兼容方式落地。后端新增 TaskService、统一 `{request_id,data,error}` 响应并保留旧 `code/message`，接入 Header/Cookie 开发期 RBAC、任务级 Artifact 列表与短期下载、幂等取消接口、Outbox claim/retry/dead-letter 元数据、`/livez`/`/readyz`/`/healthz` 健康检查。旧 `/cosfiles` 和前端 API 保持兼容但补充鉴权。验收通过 `make verify`，覆盖 e2e、C++ build、Go/Python/React 测试、coverage 55.8% 和 `git diff --check`。
+
 ### 阶段 3：C++ Server 与 Agent 可靠执行
 
 - Server 队列持久化/可恢复：从 DB queued/outbox 重建目标队列，支持 priority、deadline、去重、最大队列长度、取消标记。

@@ -16,6 +16,7 @@ const (
 	TaskStatusDone      = 2
 	TaskStatusFailed    = 3
 	TaskStatusUploading = 4
+	TaskStatusCanceled  = 5
 )
 
 func (s *APIServer) transitionTaskStatus(task *model.HotmethodTask, toStatus int, reason string, source string, extra map[string]interface{}) error {
