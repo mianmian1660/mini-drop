@@ -22,9 +22,14 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ControlClient interface {
+	// CreateTask：创建一个新采集任务
 	CreateTask(ctx context.Context, in *CreateTaskRequest, opts ...grpc.CallOption) (*CreateTaskResponse, error)
+	// FetchData：获取某个任务的结果数据
 	FetchData(ctx context.Context, in *FetchDataRequest, opts ...grpc.CallOption) (*FetchDataResponse, error)
+	// StatAgent：查询某台机器上 Agent 的资源占用情况
 	StatAgent(ctx context.Context, in *StatAgentRequest, opts ...grpc.CallOption) (*StatAgentResponse, error)
+	// CancelTask：取消尚未派发或正在运行的任务
+	CancelTask(ctx context.Context, in *CancelTaskRequest, opts ...grpc.CallOption) (*CancelTaskResponse, error)
 }
 
 type controlClient struct {
@@ -62,13 +67,27 @@ func (c *controlClient) StatAgent(ctx context.Context, in *StatAgentRequest, opt
 	return out, nil
 }
 
+func (c *controlClient) CancelTask(ctx context.Context, in *CancelTaskRequest, opts ...grpc.CallOption) (*CancelTaskResponse, error) {
+	out := new(CancelTaskResponse)
+	err := c.cc.Invoke(ctx, "/control.Control/CancelTask", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility
 type ControlServer interface {
+	// CreateTask：创建一个新采集任务
 	CreateTask(context.Context, *CreateTaskRequest) (*CreateTaskResponse, error)
+	// FetchData：获取某个任务的结果数据
 	FetchData(context.Context, *FetchDataRequest) (*FetchDataResponse, error)
+	// StatAgent：查询某台机器上 Agent 的资源占用情况
 	StatAgent(context.Context, *StatAgentRequest) (*StatAgentResponse, error)
+	// CancelTask：取消尚未派发或正在运行的任务
+	CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -84,6 +103,9 @@ func (UnimplementedControlServer) FetchData(context.Context, *FetchDataRequest) 
 }
 func (UnimplementedControlServer) StatAgent(context.Context, *StatAgentRequest) (*StatAgentResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method StatAgent not implemented")
+}
+func (UnimplementedControlServer) CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CancelTask not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 
@@ -152,6 +174,24 @@ func _Control_StatAgent_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_CancelTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelTaskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).CancelTask(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/control.Control/CancelTask",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).CancelTask(ctx, req.(*CancelTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -170,6 +210,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StatAgent",
 			Handler:    _Control_StatAgent_Handler,
+		},
+		{
+			MethodName: "CancelTask",
+			Handler:    _Control_CancelTask_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

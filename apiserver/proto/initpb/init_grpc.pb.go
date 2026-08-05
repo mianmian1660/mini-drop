@@ -22,7 +22,9 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type InitAgentInfoClient interface {
+	// RegisterAgent：Agent 向 Server 报到
 	RegisterAgent(ctx context.Context, in *RegisterAgentRequest, opts ...grpc.CallOption) (*RegisterAgentResponse, error)
+	// FetchConfig：获取配置（主要是对象存储的钥匙）
 	FetchConfig(ctx context.Context, in *FetchConfigRequest, opts ...grpc.CallOption) (*FetchConfigResponse, error)
 }
 
@@ -56,7 +58,9 @@ func (c *initAgentInfoClient) FetchConfig(ctx context.Context, in *FetchConfigRe
 // All implementations must embed UnimplementedInitAgentInfoServer
 // for forward compatibility
 type InitAgentInfoServer interface {
+	// RegisterAgent：Agent 向 Server 报到
 	RegisterAgent(context.Context, *RegisterAgentRequest) (*RegisterAgentResponse, error)
+	// FetchConfig：获取配置（主要是对象存储的钥匙）
 	FetchConfig(context.Context, *FetchConfigRequest) (*FetchConfigResponse, error)
 	mustEmbedUnimplementedInitAgentInfoServer()
 }

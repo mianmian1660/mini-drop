@@ -23,6 +23,9 @@ service Control {
   
   // StatAgent：查询某台机器上 Agent 的资源占用情况
   rpc StatAgent(StatAgentRequest) returns (StatAgentResponse);
+
+  // CancelTask：取消尚未派发或正在运行的任务
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 }
 
 // ---------- CreateTask ----------
@@ -62,4 +65,27 @@ message StatAgentResponse {
   uint64 memoryKb    = 4;  // Agent 当前内存占用（KB）
   uint64 readKbPerS  = 5;  // 每秒磁盘读
   uint64 writeKbPerS = 6;  // 每秒磁盘写
+  string agent_id    = 7;
+  string hostname    = 8;
+  string version     = 9;
+  string platform    = 10;
+  repeated string capabilities = 11;
+  repeated string labels = 12;
+  string resource_budget = 13;
+  bool online = 14;
+  int64 last_seen_unix_ms = 15;
+}
+
+// ---------- CancelTask ----------
+message CancelTaskRequest {
+  string targetIP = 1;
+  string taskID   = 2;
+  uint64 attempt_id = 3;
+}
+
+message CancelTaskResponse {
+  int32  code = 1;
+  string msg  = 2;
+  bool canceled = 3;
+  bool already_terminal = 4;
 }

@@ -110,6 +110,10 @@ namespace drop_agent
         cfg.hostname = json_get_string(content, "hostname");
         cfg.uid = json_get_string(content, "uid");
         cfg.agentVersion = json_get_string(content, "agentVersion");
+        cfg.platform = json_get_string(content, "platform");
+        cfg.capabilities = json_get_string_array(content, "capabilities");
+        cfg.labels = json_get_string_array(content, "labels");
+        cfg.resourceBudget = json_get_string(content, "resourceBudget");
         cfg.serverAddrs = json_get_string_array(content, "serverAddrs");
 
         string interval = json_get_string(content, "heartbeatIntervalSec");
@@ -127,6 +131,19 @@ namespace drop_agent
             cfg.uid = "agent-001";
         if (cfg.agentVersion.empty())
             cfg.agentVersion = "1.0.0";
+        if (cfg.platform.empty())
+            cfg.platform = "linux/amd64";
+        if (cfg.capabilities.empty())
+        {
+            cfg.capabilities.push_back("perf_cpu");
+            cfg.capabilities.push_back("go_pprof");
+            cfg.capabilities.push_back("ebpf_io");
+            cfg.capabilities.push_back("ebpf_sched");
+        }
+        if (cfg.labels.empty())
+            cfg.labels.push_back("local");
+        if (cfg.resourceBudget.empty())
+            cfg.resourceBudget = "{}";
         if (cfg.heartbeatIntervalSec == 0)
             cfg.heartbeatIntervalSec = 5;
         if (cfg.registerTimeoutSec == 0)
@@ -136,6 +153,8 @@ namespace drop_agent
         cout << "[config]   hostname=" << cfg.hostname << endl;
         cout << "[config]   uid=" << cfg.uid << endl;
         cout << "[config]   version=" << cfg.agentVersion << endl;
+        cout << "[config]   platform=" << cfg.platform << endl;
+        cout << "[config]   capabilities=" << cfg.capabilities.size() << " 个" << endl;
         cout << "[config]   serverAddrs=" << cfg.serverAddrs.size() << " 个" << endl;
         for (const auto &addr : cfg.serverAddrs)
             cout << "[config]     - " << addr << endl;
@@ -149,6 +168,10 @@ namespace drop_agent
         cfg.hostname = "demo-host";
         cfg.uid = "agent-001";
         cfg.agentVersion = "1.0.0";
+        cfg.platform = "linux/amd64";
+        cfg.capabilities = {"perf_cpu", "go_pprof", "ebpf_io", "ebpf_sched"};
+        cfg.labels = {"local"};
+        cfg.resourceBudget = "{}";
         cfg.serverAddrs.push_back(serverAddr);
         cfg.heartbeatIntervalSec = 5;
         cfg.registerTimeoutSec = 10;

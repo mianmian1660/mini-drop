@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace drop
 {
@@ -16,6 +17,9 @@ namespace drop
 
     /// 执行 shell 命令并返回标准输出（最多 maxLen 字节）
     std::string shell_exec(const std::string &cmd, size_t maxLen = 4096);
+
+    /// 使用 argv 执行外部命令并返回标准输出/错误，避免 shell 注入。
+    int exec_capture(const std::vector<std::string> &argv, std::string *output, size_t maxLen = 4096);
 
     /// 读取文件全部内容（二进制安全）
     std::string read_file_content(const std::string &path);

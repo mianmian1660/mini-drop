@@ -51,13 +51,31 @@ namespace drop_server
             cout << "[server]   生成默认 TID: " << taskID << endl;
         }
 
+        EnqueueResult enqueueResult;
+        size_t queueSize = 0;
         {
             lock_guard<mutex> lock(tasks_mutex);
-            tasks_[request->targetip()].push(taskDesc);
-            cout << "[server] 任务入队: taskID=" << taskID
-                 << " targetIP=" << request->targetip()
-                 << " 队列长度=" << tasks_[request->targetip()].size() << endl;
+            enqueueResult = enqueue_task_locked(request->targetip(), taskDesc);
+            auto it = tasks_.find(request->targetip());
+            if (it != tasks_.end())
+                queueSize = it->second.size();
         }
+        if (!enqueueResult.ok)
+        {
+            response->set_taskid(taskID);
+            response->set_code(429);
+            response->set_msg(enqueueResult.message);
+            cout << "[server] 任务拒绝: taskID=" << taskID
+                 << " targetIP=" << request->targetip()
+                 << " reason=" << enqueueResult.message << endl;
+            return grpc::Status::OK;
+        }
+
+        cout << "[server] 任务入队: taskID=" << taskID
+             << " attemptID=" << taskDesc.attempt_id()
+             << " targetIP=" << request->targetip()
+             << " duplicate=" << (enqueueResult.duplicate ? "true" : "false")
+             << " 队列长度=" << queueSize << endl;
 
         response->set_taskid(taskID);
         response->set_code(0);
@@ -94,6 +112,19 @@ namespace drop_server
                     response->set_msg("ok");
                     response->set_cpupercent(info.lastSelfPstats.cpupercent());
                     response->set_memorykb(info.lastSelfPstats.rsskb());
+                    response->set_readkbpers(info.lastSelfPstats.readkbpers());
+                    response->set_writekbpers(info.lastSelfPstats.writekbpers());
+                    response->set_agent_id(info.agentID);
+                    response->set_hostname(info.hostname);
+                    response->set_version(info.version);
+                    response->set_platform(info.platform);
+                    response->set_resource_budget(info.resourceBudget);
+                    response->set_online(info.online);
+                    response->set_last_seen_unix_ms(info.lastSeenUnixMs);
+                    for (const auto &capability : info.capabilities)
+                        response->add_capabilities(capability);
+                    for (const auto &label : info.labels)
+                        response->add_labels(label);
 
                     cout << "[server] StatAgent: ip=" << targetIP
                          << " host=" << info.hostname
@@ -107,6 +138,29 @@ namespace drop_server
         // 未找到该 IP
         response->set_code(404);
         response->set_msg("agent not found: " + targetIP);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status ControlServiceImpl::CancelTask(
+        grpc::ServerContext * /*context*/,
+        const control::CancelTaskRequest *request,
+        control::CancelTaskResponse *response)
+    {
+        bool canceled = false;
+        {
+            lock_guard<mutex> lock(tasks_mutex);
+            canceled = cancel_task_locked(request->targetip(), request->taskid(), request->attempt_id());
+        }
+
+        response->set_code(0);
+        response->set_msg(canceled ? "queued task canceled" : "task not queued or already delivered");
+        response->set_canceled(canceled);
+        response->set_already_terminal(false);
+
+        cout << "[server] CancelTask: taskID=" << request->taskid()
+             << " attemptID=" << request->attempt_id()
+             << " targetIP=" << request->targetip()
+             << " canceled=" << (canceled ? "true" : "false") << endl;
         return grpc::Status::OK;
     }
 

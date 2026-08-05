@@ -22,6 +22,10 @@ namespace drop_server
         grpc::Status StatAgent(grpc::ServerContext *context,
                                const control::StatAgentRequest *request,
                                control::StatAgentResponse *response) override;
+
+        grpc::Status CancelTask(grpc::ServerContext *context,
+                                const control::CancelTaskRequest *request,
+                                control::CancelTaskResponse *response) override;
     };
 
 } // namespace drop_server

@@ -55,7 +55,13 @@ namespace drop_server
         string body = "{";
         body += "\"task_id\":\"" + json_escape(result.taskid()) + "\",";
         body += "\"error_message\":\"" + json_escape(result.errormessage()) + "\",";
-        body += "\"cos_key\":\"" + json_escape(result.coskey()) + "\"";
+        body += "\"cos_key\":\"" + json_escape(result.coskey()) + "\",";
+        body += "\"attempt_id\":" + to_string(result.attempt_id()) + ",";
+        body += "\"artifact_size\":" + to_string(result.artifact_size()) + ",";
+        body += "\"artifact_sha256\":\"" + json_escape(result.artifact_sha256()) + "\",";
+        body += "\"manifest_key\":\"" + json_escape(result.manifest_key()) + "\",";
+        body += "\"error_code\":\"" + json_escape(result.error_code()) + "\",";
+        body += "\"partial\":" + string(result.partial() ? "true" : "false");
         body += "}";
 
         pid_t pid = fork();

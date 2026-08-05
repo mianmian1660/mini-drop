@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/mini-drop/apiserver/model"
+	pb_control "github.com/mini-drop/apiserver/proto/control"
 	"github.com/mini-drop/apiserver/util"
 )
 
@@ -218,7 +219,23 @@ func (svc *TaskService) CancelTask(tid string, auth AuthContext) (gin.H, *Servic
 		Where("aggregate = ? AND aggregate_id = ? AND event = ? AND published_at IS NULL", model.OutboxAggregateTask, task.TID, model.OutboxEventDispatchTask).
 		Updates(map[string]interface{}{"published_at": &now, "status": model.OutboxStatusPending, "last_error": "任务已取消，跳过下发"}).Error
 	if s.GrpcConnected() {
-		s.Logger.Info("任务取消：当前 proto 无取消 RPC，已记录取消意图", zap.String("tid", task.TID))
+		var attempt model.TaskAttempt
+		_ = s.DB.Where("task_tid = ?", task.TID).Order("attempt_seq DESC").First(&attempt).Error
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := s.ControlCli.CancelTask(ctx, &pb_control.CancelTaskRequest{
+			TargetIP:  task.TargetIP,
+			TaskID:    task.TID,
+			AttemptId: uint64(attempt.ID),
+		})
+		cancel()
+		if err != nil {
+			s.Logger.Warn("任务取消：通知 drop_server 失败，已保留 DB 取消意图", zap.String("tid", task.TID), zap.Error(err))
+		} else {
+			s.Logger.Info("任务取消：drop_server 已接收取消意图",
+				zap.String("tid", task.TID),
+				zap.Bool("queued_canceled", resp.GetCanceled()),
+				zap.String("msg", resp.GetMsg()))
+		}
 	}
 	return gin.H{"tid": task.TID, "status": TaskStatusCanceled, "cancel_requested": true}, nil
 }

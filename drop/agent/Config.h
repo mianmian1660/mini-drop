@@ -24,6 +24,10 @@ namespace drop_agent
         std::string hostname;
         std::string uid;
         std::string agentVersion;
+        std::string platform;
+        std::vector<std::string> capabilities;
+        std::vector<std::string> labels;
+        std::string resourceBudget;
 
         // 多 Server 故障转移列表（按优先级顺序尝试）
         std::vector<std::string> serverAddrs;

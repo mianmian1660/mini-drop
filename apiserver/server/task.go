@@ -77,9 +77,15 @@ const (
 
 // TaskResultNotifyReq 是 drop_server 完成采集后回调 apiserver 的内部请求体。
 type TaskResultNotifyReq struct {
-	TaskID       string `json:"task_id" binding:"required"`
-	ErrorMessage string `json:"error_message"`
-	CosKey       string `json:"cos_key"`
+	TaskID         string `json:"task_id" binding:"required"`
+	ErrorMessage   string `json:"error_message"`
+	CosKey         string `json:"cos_key"`
+	AttemptID      uint   `json:"attempt_id"`
+	ArtifactSize   int64  `json:"artifact_size"`
+	ArtifactSHA256 string `json:"artifact_sha256"`
+	ManifestKey    string `json:"manifest_key"`
+	ErrorCode      string `json:"error_code"`
+	Partial        bool   `json:"partial"`
 }
 
 // CreateTask 创建性能采集任务
@@ -243,12 +249,16 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 
 	if strings.TrimSpace(req.ErrorMessage) != "" {
 		endTime := time.Now()
-		s.finishLatestTaskAttempt(task.TID, ErrCodeTaskExecutionFailed, req.ErrorMessage, nil)
+		errorCode := req.ErrorCode
+		if errorCode == "" {
+			errorCode = ErrCodeTaskExecutionFailed
+		}
+		s.finishTaskAttemptForNotify(task.TID, req.AttemptID, errorCode, req.ErrorMessage, nil, 0)
 		if task.Status != TaskStatusFailed {
 			_ = s.transitionTaskStatus(
 				&task,
 				TaskStatusFailed,
-				formatErrorReason(ErrCodeTaskExecutionFailed, req.ErrorMessage),
+				formatErrorReason(errorCode, req.ErrorMessage),
 				"drop_server_notify",
 				map[string]interface{}{"end_time": &endTime, "analysis_status": 3},
 			)
@@ -320,14 +330,33 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 				return err
 			}
 		}
-		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, 0); err != nil {
+		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, req.ArtifactSize); err != nil {
 			return err
 		}
 		var artifact model.Artifact
 		if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ?", task.TID, model.ArtifactKindRaw, req.CosKey).First(&artifact).Error; err == nil {
-			return s.finishLatestTaskAttemptTx(tx, task.TID, "", "", []string{req.CosKey}, artifact.ID)
+			updates := map[string]interface{}{}
+			if req.ArtifactSize > 0 {
+				updates["size"] = req.ArtifactSize
+			}
+			if req.ArtifactSHA256 != "" {
+				updates["sha256"] = req.ArtifactSHA256
+				updates["hash"] = "sha256:" + req.ArtifactSHA256
+			}
+			if req.ManifestKey != "" {
+				updates["manifest_key"] = req.ManifestKey
+			}
+			if req.Partial {
+				updates["status"] = model.ArtifactStatusUploading
+			}
+			if len(updates) > 0 {
+				if err := tx.Model(&artifact).Updates(updates).Error; err != nil {
+					return err
+				}
+			}
+			return s.finishTaskAttemptForNotifyTx(tx, task.TID, req.AttemptID, "", "", []string{req.CosKey}, artifact.ID)
 		}
-		return s.finishLatestTaskAttemptTx(tx, task.TID, "", "", []string{req.CosKey}, 0)
+		return s.finishTaskAttemptForNotifyTx(tx, task.TID, req.AttemptID, "", "", []string{req.CosKey}, 0)
 	})
 	if err != nil {
 		s.Logger.Error("处理采集结果通知失败",

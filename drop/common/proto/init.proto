@@ -28,6 +28,11 @@ message RegisterAgentRequest {
   string ipAddr       = 2;  // IP 地址
   string uid          = 3;  // Agent 唯一 ID
   string agentVersion = 4;  // 版本号
+  string agent_id     = 5;  // 稳定 Agent ID，新字段；兼容旧 uid
+  string platform     = 6;
+  repeated string capabilities = 7;
+  repeated string labels = 8;
+  string resource_budget = 9;
 }
 
 message RegisterAgentResponse {

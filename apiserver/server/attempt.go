@@ -89,3 +89,42 @@ func (s *APIServer) finishLatestTaskAttemptTx(tx *gorm.DB, tid, errorCode, messa
 	}
 	return tx.Model(&attempt).Updates(updates).Error
 }
+
+func (s *APIServer) finishTaskAttemptForNotify(tid string, attemptID uint, errorCode, message string, keys []string, artifactID uint) {
+	_ = s.DB.Transaction(func(tx *gorm.DB) error {
+		return s.finishTaskAttemptForNotifyTx(tx, tid, attemptID, errorCode, message, keys, artifactID)
+	})
+}
+
+func (s *APIServer) finishTaskAttemptForNotifyTx(tx *gorm.DB, tid string, attemptID uint, errorCode, message string, keys []string, artifactID uint) error {
+	if attemptID == 0 {
+		return s.finishLatestTaskAttemptTx(tx, tid, errorCode, message, keys, artifactID)
+	}
+	var attempt model.TaskAttempt
+	if err := tx.Where("id = ? AND task_tid = ?", attemptID, tid).First(&attempt).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return s.finishLatestTaskAttemptTx(tx, tid, errorCode, message, keys, artifactID)
+		}
+		return err
+	}
+	now := time.Now()
+	updates := map[string]interface{}{"end_time": &now, "error_code": errorCode, "error_message": message}
+	if errorCode == "" {
+		updates["exit_code"] = 0
+	} else {
+		updates["exit_code"] = 1
+	}
+	if len(keys) > 0 {
+		encoded, err := json.Marshal(keys)
+		if err != nil {
+			return err
+		}
+		updates["artifact_keys"] = encoded
+		if artifactID != 0 {
+			if err := tx.Model(&model.Artifact{}).Where("id = ?", artifactID).Update("attempt_id", attempt.ID).Error; err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Model(&attempt).Updates(updates).Error
+}

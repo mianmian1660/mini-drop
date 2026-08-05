@@ -46,6 +46,8 @@
 - 对象存储最小权限：Agent 不持有长期 MinIO/COS secret，改为任务前缀短期上传凭证或受控上传代理。
 - 容器目标解析：支持容器名/ID 到宿主 PID、namespace、路径映射的二次校验，防止 PID 重用和越权采样。
 
+完成记录（2026-08-05）：阶段 3 已按现有 demo 架构兼容落地。C++ Server 队列升级为带 `attempt_id`、priority、deadline、入队时间和取消标记的元数据队列，支持快照恢复、重复下发去重、过期/取消/已完成 attempt 派发过滤，并新增 `CancelTask` gRPC。Agent 注册和心跳上报稳定 `agent_id`、platform、capabilities、labels、resource_budget、running/completed attempts；Runner 生命周期统一输出 Validate/Prepare/Start/Monitor/Collect/Upload 日志，产物上传改为 argv API，采集成功后生成 raw artifact 的 size、sha256 和 manifest。apiserver 兼容接收扩展后的 `NotifyResult`，按 `task_id + attempt_id + object_key` 幂等登记 Artifact、Attempt 和 AnalysisJob，并在取消时同步跳过未发布 outbox、尽力通知 drop_server。
+
 ### 阶段 4：Analyzer 生产化
 
 - 统一 Analyzer 接口：每个分析器实现 `validate/prepare/analyze/build_manifest/cleanup`，声明输入格式、最大大小、超时、输出 artifact 和可重试性。

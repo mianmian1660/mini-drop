@@ -34,19 +34,23 @@ type UserInfo struct {
 // AgentInfo — Agent 表（记录所有接入的 Agent）
 // ----------------------------------------------------------
 type AgentInfo struct {
-	ID           uint      `gorm:"primaryKey" json:"id"`
-	Hostname     string    `gorm:"column:hostname;size:256" json:"hostname"`
-	IPAddr       string    `gorm:"column:ip_addr;size:45;index" json:"ip_addr"`
-	Online       bool      `gorm:"column:online;default:false" json:"online"`
-	UID          string    `gorm:"column:uid;size:64" json:"uid"`
-	GID          string    `gorm:"column:gid;size:64" json:"gid"`
-	Version      string    `gorm:"column:version;size:32" json:"version"`
-	Environment  string    `gorm:"column:environment;size:64" json:"environment"`
-	Capabilities []byte    `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
-	SupportedOS  string    `gorm:"column:supported_os;size:64" json:"supported_os"`
-	LastSeen     time.Time `gorm:"column:last_seen" json:"last_seen"`
-	CreatedAt    time.Time `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	Hostname       string    `gorm:"column:hostname;size:256" json:"hostname"`
+	IPAddr         string    `gorm:"column:ip_addr;size:45;index" json:"ip_addr"`
+	Online         bool      `gorm:"column:online;default:false" json:"online"`
+	AgentID        string    `gorm:"column:agent_id;size:128;index" json:"agent_id"`
+	UID            string    `gorm:"column:uid;size:64" json:"uid"`
+	GID            string    `gorm:"column:gid;size:64" json:"gid"`
+	Version        string    `gorm:"column:version;size:32" json:"version"`
+	Environment    string    `gorm:"column:environment;size:64" json:"environment"`
+	Capabilities   []byte    `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
+	Labels         []byte    `gorm:"column:labels;type:jsonb" json:"labels"`
+	ResourceBudget []byte    `gorm:"column:resource_budget;type:jsonb" json:"resource_budget"`
+	SupportedOS    string    `gorm:"column:supported_os;size:64" json:"supported_os"`
+	Status         string    `gorm:"column:status;size:32;default:online" json:"status"`
+	LastSeen       time.Time `gorm:"column:last_seen" json:"last_seen"`
+	CreatedAt      time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 // ----------------------------------------------------------

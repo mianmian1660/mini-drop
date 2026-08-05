@@ -15,12 +15,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
 	"github.com/mini-drop/apiserver/config"
 	"github.com/mini-drop/apiserver/model"
 	"github.com/mini-drop/apiserver/pkg/storage"
+	pb_control "github.com/mini-drop/apiserver/proto/control"
 	"github.com/mini-drop/apiserver/util"
 )
 
@@ -63,6 +65,27 @@ func (fakeStorage) ObjectExists(context.Context, string, string) (bool, error) {
 	return true, nil
 }
 
+type fakeControlClient struct {
+	cancelReq *pb_control.CancelTaskRequest
+}
+
+func (f *fakeControlClient) CreateTask(context.Context, *pb_control.CreateTaskRequest, ...grpc.CallOption) (*pb_control.CreateTaskResponse, error) {
+	return &pb_control.CreateTaskResponse{Code: 0, Msg: "ok"}, nil
+}
+
+func (f *fakeControlClient) FetchData(context.Context, *pb_control.FetchDataRequest, ...grpc.CallOption) (*pb_control.FetchDataResponse, error) {
+	return &pb_control.FetchDataResponse{Code: 0}, nil
+}
+
+func (f *fakeControlClient) StatAgent(context.Context, *pb_control.StatAgentRequest, ...grpc.CallOption) (*pb_control.StatAgentResponse, error) {
+	return &pb_control.StatAgentResponse{Code: 404, Msg: "not found"}, nil
+}
+
+func (f *fakeControlClient) CancelTask(_ context.Context, req *pb_control.CancelTaskRequest, _ ...grpc.CallOption) (*pb_control.CancelTaskResponse, error) {
+	f.cancelReq = req
+	return &pb_control.CancelTaskResponse{Code: 0, Msg: "queued task canceled", Canceled: true}, nil
+}
+
 func postNotify(t *testing.T, s *APIServer, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -73,6 +96,31 @@ func postNotify(t *testing.T, s *APIServer, body string) *httptest.ResponseRecor
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w
+}
+
+func TestAgentMetadataFromStatIncludesStage3Fields(t *testing.T) {
+	resp := &pb_control.StatAgentResponse{
+		Code:           0,
+		AgentId:        "agent-stable-1",
+		Hostname:       "demo-host",
+		Version:        "1.2.3",
+		Platform:       "linux/amd64",
+		Capabilities:   []string{"perf_cpu", "go_pprof"},
+		Labels:         []string{"local"},
+		ResourceBudget: `{"cpu":1}`,
+		Online:         true,
+		LastSeenUnixMs: time.Date(2026, 8, 5, 1, 2, 3, 0, time.UTC).UnixMilli(),
+	}
+	updates := agentMetadataFromStat(resp)
+	if updates["agent_id"] != "agent-stable-1" || updates["hostname"] != "demo-host" || updates["version"] != "1.2.3" || updates["supported_os"] != "linux/amd64" || updates["status"] != "online" {
+		t.Fatalf("metadata updates missing identity fields: %#v", updates)
+	}
+	if !strings.Contains(string(updates["capabilities"].([]byte)), "perf_cpu") || !strings.Contains(string(updates["labels"].([]byte)), "local") || string(updates["resource_budget"].([]byte)) != `{"cpu":1}` {
+		t.Fatalf("metadata updates missing json fields: %#v", updates)
+	}
+	if !updates["last_seen"].(time.Time).Equal(time.Date(2026, 8, 5, 1, 2, 3, 0, time.UTC)) {
+		t.Fatalf("last_seen=%v, want stat timestamp", updates["last_seen"])
+	}
 }
 
 func mustCreateRunningTask(t *testing.T, s *APIServer, tid string) model.HotmethodTask {
@@ -248,6 +296,47 @@ func TestNotifyTaskResultSuccessIsIdempotentAfterDone(t *testing.T) {
 	s.DB.Model(&model.AnalysisJob{}).Where("task_tid = ?", "tid-notify-idem").Count(&jobCount)
 	if jobCount != 1 {
 		t.Fatalf("job count=%d, want 1", jobCount)
+	}
+}
+
+func TestNotifyTaskResultPersistsAttemptArtifactMetadataIdempotently(t *testing.T) {
+	s := newTestAPIServer(t)
+	task := mustCreateRunningTask(t, s, "tid-notify-meta")
+	var attempt model.TaskAttempt
+	if err := s.DB.Where("task_tid = ?", task.TID).First(&attempt).Error; err != nil {
+		t.Fatalf("load attempt: %v", err)
+	}
+
+	body := `{"task_id":"tid-notify-meta","cos_key":"tid-notify-meta/perf.data","attempt_id":` + strconv.Itoa(int(attempt.ID)) + `,"artifact_size":4096,"artifact_sha256":"abc123","manifest_key":"tid-notify-meta/manifest.json"}`
+	for i := 0; i < 2; i++ {
+		w := postNotify(t, s, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("notify %d status=%d body=%s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	var artifact model.Artifact
+	if err := s.DB.Where("task_tid = ? AND object_key = ?", task.TID, task.TID+"/perf.data").First(&artifact).Error; err != nil {
+		t.Fatalf("load artifact: %v", err)
+	}
+	if artifact.AttemptID != attempt.ID || artifact.Size != 4096 || artifact.SHA256 != "abc123" || artifact.Hash != "sha256:abc123" || artifact.ManifestKey != task.TID+"/manifest.json" {
+		t.Fatalf("artifact metadata=%#v, want attempt/size/sha256/manifest", artifact)
+	}
+	var artifactCount int64
+	s.DB.Model(&model.Artifact{}).Where("task_tid = ?", task.TID).Count(&artifactCount)
+	if artifactCount != 1 {
+		t.Fatalf("artifact count=%d, want 1 after replay", artifactCount)
+	}
+	var jobCount int64
+	s.DB.Model(&model.AnalysisJob{}).Where("task_tid = ?", task.TID).Count(&jobCount)
+	if jobCount != 1 {
+		t.Fatalf("job count=%d, want 1 after replay", jobCount)
+	}
+	if err := s.DB.Where("id = ?", attempt.ID).First(&attempt).Error; err != nil {
+		t.Fatalf("reload attempt: %v", err)
+	}
+	if attempt.EndTime == nil || attempt.ExitCode != 0 || !strings.Contains(string(attempt.ArtifactKeys), "perf.data") {
+		t.Fatalf("attempt evidence=%#v, want completed with artifact key", attempt)
 	}
 }
 
@@ -463,6 +552,8 @@ func TestDeleteAndFileHandlers(t *testing.T) {
 func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 	s := newTestAPIServer(t)
 	s.Storage = fakeStorage{}
+	fakeControl := &fakeControlClient{}
+	s.ControlCli = fakeControl
 	now := time.Now()
 	task := model.HotmethodTask{
 		TID: "tid-stage2", Name: "stage2", Status: TaskStatusRunning, UID: "owner", UserName: "Owner",
@@ -473,6 +564,16 @@ func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 	}
 	if _, err := s.startTaskAttempt(&task, model.AttemptTriggerInitial); err != nil {
 		t.Fatalf("create attempt: %v", err)
+	}
+	var attempt model.TaskAttempt
+	if err := s.DB.Where("task_tid = ?", task.TID).First(&attempt).Error; err != nil {
+		t.Fatalf("load attempt: %v", err)
+	}
+	if err := s.DB.Create(&model.Outbox{
+		Aggregate: model.OutboxAggregateTask, AggregateID: task.TID, Event: model.OutboxEventDispatchTask,
+		Payload: []byte(`{"name":"stage2"}`), Status: model.OutboxStatusPending, CreatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("create outbox: %v", err)
 	}
 	if err := s.DB.Create(&model.Artifact{
 		TaskTID: task.TID, Kind: model.ArtifactKindRaw, ObjectKey: task.TID + "/perf.data",
@@ -548,6 +649,16 @@ func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 	}
 	if canceled.Status != TaskStatusCanceled || !canceled.CancelRequested || canceled.CanceledAt == nil {
 		t.Fatalf("task after cancel=%#v", canceled)
+	}
+	if fakeControl.cancelReq == nil || fakeControl.cancelReq.GetTaskID() != task.TID || fakeControl.cancelReq.GetAttemptId() != uint64(attempt.ID) {
+		t.Fatalf("cancel rpc req=%#v, want task and latest attempt", fakeControl.cancelReq)
+	}
+	var outbox model.Outbox
+	if err := s.DB.Where("aggregate_id = ?", task.TID).First(&outbox).Error; err != nil {
+		t.Fatalf("load outbox: %v", err)
+	}
+	if outbox.PublishedAt == nil || !strings.Contains(outbox.LastError, "任务已取消") {
+		t.Fatalf("outbox after cancel=%#v, want published skip", outbox)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks/tid-stage2/cancel", nil)

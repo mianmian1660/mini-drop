@@ -33,6 +33,13 @@ message HealthCheckRequest {
   string agentVersion      = 4;  // Agent 版本号
   common.PidStats selfPstats     = 5;  // Agent 自己的资源占用
   common.PidStats childrenPstats = 6;  // Agent 的子进程的资源占用
+  string agent_id          = 7;  // 稳定 Agent ID，新字段；兼容旧 uid
+  string platform          = 8;  // linux/amd64 等运行平台
+  repeated string capabilities = 9;  // 支持的 TaskKind/采集器能力
+  repeated string labels   = 10; // 调度标签
+  string resource_budget   = 11; // JSON 编码的资源预算
+  repeated common.AttemptStatus running_attempts = 12;
+  repeated common.AttemptStatus completed_attempts = 13;
 }
 
 // ----------------------------------------------------------

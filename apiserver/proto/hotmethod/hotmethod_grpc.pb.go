@@ -23,7 +23,9 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type HotmethodClient interface {
+	// Collect：Server → Agent，"去采集这个"
 	Collect(ctx context.Context, in *Target, opts ...grpc.CallOption) (*empty.Empty, error)
+	// NotifyResult：Agent → Server，"采集完了，结果是这个"
 	NotifyResult(ctx context.Context, in *TaskResult, opts ...grpc.CallOption) (*empty.Empty, error)
 }
 
@@ -57,7 +59,9 @@ func (c *hotmethodClient) NotifyResult(ctx context.Context, in *TaskResult, opts
 // All implementations must embed UnimplementedHotmethodServer
 // for forward compatibility
 type HotmethodServer interface {
+	// Collect：Server → Agent，"去采集这个"
 	Collect(context.Context, *Target) (*empty.Empty, error)
+	// NotifyResult：Agent → Server，"采集完了，结果是这个"
 	NotifyResult(context.Context, *TaskResult) (*empty.Empty, error)
 	mustEmbedUnimplementedHotmethodServer()
 }

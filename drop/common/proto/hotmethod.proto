@@ -89,6 +89,12 @@ message TaskResult {
   string cosKey         = 4;  // 大文件上传到存储后的 key（路径）
   repeated common.PidStats selfPstats     = 5;  // Agent 自身资源历史
   repeated common.PidStats childrenPstats = 6;  // 子进程资源历史
+  uint64 attempt_id     = 7;  // 本次执行尝试 ID
+  int64 artifact_size   = 8;  // raw artifact 大小
+  string artifact_sha256 = 9; // raw artifact sha256
+  string manifest_key   = 10; // manifest.json 对象 key
+  string error_code     = 11; // 稳定错误码
+  bool partial          = 12; // 是否为部分产物
 }
 
 // ----------------------------------------------------------

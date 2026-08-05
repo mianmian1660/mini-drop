@@ -17,6 +17,7 @@ import (
 
 	"github.com/mini-drop/apiserver/model"
 	pb "github.com/mini-drop/apiserver/proto/control"
+	"github.com/mini-drop/apiserver/util"
 )
 
 // ListAgents 获取 Agent 列表
@@ -81,6 +82,42 @@ func (s *APIServer) ListAgents(c *gin.Context) {
 	})
 }
 
+func agentMetadataFromStat(resp *pb.StatAgentResponse) map[string]interface{} {
+	now := time.Now()
+	capabilities, _ := util.MarshalJSONB(resp.GetCapabilities())
+	labels, _ := util.MarshalJSONB(resp.GetLabels())
+	resourceBudget := []byte(resp.GetResourceBudget())
+	if len(resourceBudget) == 0 {
+		resourceBudget = []byte(`{}`)
+	}
+	lastSeen := now
+	if resp.GetLastSeenUnixMs() > 0 {
+		lastSeen = time.UnixMilli(resp.GetLastSeenUnixMs())
+	}
+	status := "online"
+	if !resp.GetOnline() {
+		status = "offline"
+	}
+	updates := map[string]interface{}{
+		"online":          resp.GetOnline(),
+		"uid":             "",
+		"last_seen":       lastSeen,
+		"version":         resp.GetVersion(),
+		"supported_os":    resp.GetPlatform(),
+		"capabilities":    capabilities,
+		"labels":          labels,
+		"resource_budget": resourceBudget,
+		"status":          status,
+	}
+	if resp.GetHostname() != "" {
+		updates["hostname"] = resp.GetHostname()
+	}
+	if resp.GetAgentId() != "" {
+		updates["agent_id"] = resp.GetAgentId()
+	}
+	return updates
+}
+
 // refreshAgentStatus 通过 gRPC StatAgent 更新单个 Agent 的在线状态
 func (s *APIServer) refreshAgentStatus(agent *model.AgentInfo) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -103,11 +140,10 @@ func (s *APIServer) refreshAgentStatus(agent *model.AgentInfo) {
 		// Agent 在线 → 更新状态
 		if !agent.Online {
 			agent.Online = true
-			s.DB.Model(agent).Update("online", true)
 			s.recordAgentAudit(agent.IPAddr, agent.Hostname, "recovered", "gRPC StatAgent 成功，Agent 恢复在线")
 		}
-		agent.LastSeen = time.Now()
-		s.DB.Model(agent).Update("last_seen", time.Now())
+		updates := agentMetadataFromStat(resp)
+		s.DB.Model(agent).Updates(updates)
 	}
 }
 
@@ -182,13 +218,27 @@ func (s *APIServer) discoverAgents() []model.AgentInfo {
 		if resp.GetCode() == 0 {
 			// Agent 存在！写入 DB 并添加到结果
 			now := time.Now()
+			capabilities, _ := util.MarshalJSONB(resp.GetCapabilities())
+			labels, _ := util.MarshalJSONB(resp.GetLabels())
 			agent := model.AgentInfo{
-				Hostname:    ip, // 暂时用 IP 作为主机名
-				IPAddr:      ip,
-				Online:      true,
-				Version:     "1.0.0",
-				Environment: "production",
-				LastSeen:    now,
+				Hostname:       ip, // 暂时用 IP 作为主机名
+				IPAddr:         ip,
+				Online:         true,
+				AgentID:        resp.GetAgentId(),
+				Version:        resp.GetVersion(),
+				Environment:    "production",
+				Capabilities:   capabilities,
+				Labels:         labels,
+				ResourceBudget: []byte(resp.GetResourceBudget()),
+				SupportedOS:    resp.GetPlatform(),
+				Status:         "online",
+				LastSeen:       now,
+			}
+			if resp.GetHostname() != "" {
+				agent.Hostname = resp.GetHostname()
+			}
+			if len(agent.ResourceBudget) == 0 {
+				agent.ResourceBudget = []byte(`{}`)
 			}
 
 			// Upsert：如果已存在则更新，否则创建
@@ -199,10 +249,7 @@ func (s *APIServer) discoverAgents() []model.AgentInfo {
 				if !existing.Online {
 					s.recordAgentAudit(existing.IPAddr, existing.Hostname, "recovered", "自动发现探测成功，Agent 恢复在线")
 				}
-				s.DB.Model(&existing).Updates(map[string]interface{}{
-					"online":    true,
-					"last_seen": now,
-				})
+				s.DB.Model(&existing).Updates(agentMetadataFromStat(resp))
 				existing.Online = true
 				existing.LastSeen = now
 				discovered = append(discovered, existing)
@@ -251,24 +298,28 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 				if !agent.Online {
 					s.recordAgentAudit(agent.IPAddr, agent.Hostname, "recovered", "实时资源查询成功，Agent 恢复在线")
 				}
-				agent.Online = true
-				agent.LastSeen = time.Now()
-				s.DB.Save(&agent)
+				s.DB.Model(&agent).Updates(agentMetadataFromStat(resp))
+				_ = s.DB.Where("ip_addr = ?", ip).First(&agent).Error
 			}
 
 			c.JSON(http.StatusOK, gin.H{
 				"code": 0,
 				"data": gin.H{
-					"hostname":       agent.Hostname,
-					"ip_addr":        ip,
-					"online":         true,
-					"version":        agent.Version,
-					"environment":    agent.Environment,
-					"last_seen":      agent.LastSeen,
-					"cpu_percent":    resp.GetCpuPercent(),
-					"memory_kb":      resp.GetMemoryKb(),
-					"read_kb_per_s":  resp.GetReadKbPerS(),
-					"write_kb_per_s": resp.GetWriteKbPerS(),
+					"hostname":        agent.Hostname,
+					"ip_addr":         ip,
+					"online":          true,
+					"version":         agent.Version,
+					"environment":     agent.Environment,
+					"supported_os":    agent.SupportedOS,
+					"capabilities":    agent.Capabilities,
+					"labels":          agent.Labels,
+					"resource_budget": agent.ResourceBudget,
+					"status":          agent.Status,
+					"last_seen":       agent.LastSeen,
+					"cpu_percent":     resp.GetCpuPercent(),
+					"memory_kb":       resp.GetMemoryKb(),
+					"read_kb_per_s":   resp.GetReadKbPerS(),
+					"write_kb_per_s":  resp.GetWriteKbPerS(),
 				},
 			})
 			return
@@ -293,16 +344,21 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": gin.H{
-			"hostname":       agent.Hostname,
-			"ip_addr":        agent.IPAddr,
-			"online":         agent.Online,
-			"version":        agent.Version,
-			"environment":    agent.Environment,
-			"last_seen":      agent.LastSeen,
-			"cpu_percent":    0.0,
-			"memory_kb":      0,
-			"read_kb_per_s":  0.0,
-			"write_kb_per_s": 0.0,
+			"hostname":        agent.Hostname,
+			"ip_addr":         agent.IPAddr,
+			"online":          agent.Online,
+			"version":         agent.Version,
+			"environment":     agent.Environment,
+			"supported_os":    agent.SupportedOS,
+			"capabilities":    agent.Capabilities,
+			"labels":          agent.Labels,
+			"resource_budget": agent.ResourceBudget,
+			"status":          agent.Status,
+			"last_seen":       agent.LastSeen,
+			"cpu_percent":     0.0,
+			"memory_kb":       0,
+			"read_kb_per_s":   0.0,
+			"write_kb_per_s":  0.0,
 		},
 	})
 }
@@ -354,12 +410,10 @@ func (s *APIServer) GetAgentDetail(c *gin.Context) {
 			}
 			agent.Online = true
 			agent.LastSeen = time.Now()
-			if err := s.DB.Model(&agent).Updates(map[string]interface{}{
-				"online":    true,
-				"last_seen": agent.LastSeen,
-			}).Error; err != nil {
+			if err := s.DB.Model(&agent).Updates(agentMetadataFromStat(resp)).Error; err != nil {
 				s.Logger.Warn("更新 Agent 详情心跳失败", zap.String("ip", ip), zap.Error(err))
 			}
+			_ = s.DB.Where("ip_addr = ?", ip).First(&agent).Error
 			stat = gin.H{
 				"cpu_percent":    resp.GetCpuPercent(),
 				"memory_kb":      resp.GetMemoryKb(),

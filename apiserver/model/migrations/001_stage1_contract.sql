@@ -13,8 +13,13 @@ BEGIN
   END IF;
 
   IF to_regclass('public.agent_infos') IS NOT NULL THEN
+    ALTER TABLE agent_infos ADD COLUMN IF NOT EXISTS agent_id varchar(128);
     ALTER TABLE agent_infos ADD COLUMN IF NOT EXISTS capabilities jsonb;
+    ALTER TABLE agent_infos ADD COLUMN IF NOT EXISTS labels jsonb;
+    ALTER TABLE agent_infos ADD COLUMN IF NOT EXISTS resource_budget jsonb;
     ALTER TABLE agent_infos ADD COLUMN IF NOT EXISTS supported_os varchar(64);
+    ALTER TABLE agent_infos ADD COLUMN IF NOT EXISTS status varchar(32) DEFAULT 'online';
+    CREATE INDEX IF NOT EXISTS idx_agent_infos_agent_id ON agent_infos(agent_id);
   END IF;
 
   IF to_regclass('public.task_status_events') IS NOT NULL THEN

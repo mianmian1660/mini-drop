@@ -121,7 +121,7 @@ int main(int argc, char **argv)
 
             {
                 lock_guard<mutex> lock(tasks_mutex);
-                tasks_["127.0.0.1"].push(taskDesc);
+                (void)enqueue_task_locked("127.0.0.1", taskDesc);
             }
             cout << "[server] demo 任务已入队: taskID=" << taskID
                  << " targetIP=127.0.0.1" << endl; });

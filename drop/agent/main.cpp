@@ -32,10 +32,12 @@
 #include <atomic>
 #include <csignal>
 #include <fstream>
+#include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <sys/stat.h>
 
 #include <grpcpp/grpcpp.h>
@@ -60,6 +62,65 @@ static bool file_exists(const string &path)
     return stat(path.c_str(), &st) == 0;
 }
 
+static int64_t file_size(const string &path)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0)
+        return 0;
+    return static_cast<int64_t>(st.st_size);
+}
+
+static string json_escape_local(const string &s)
+{
+    string out;
+    out.reserve(s.size());
+    for (char c : s)
+    {
+        if (c == '"' || c == '\\')
+            out += '\\';
+        if (c == '\n')
+        {
+            out += "\\n";
+            continue;
+        }
+        out += c;
+    }
+    return out;
+}
+
+static string sha256_file(const string &path)
+{
+    string output;
+    int ret = drop::exec_capture({"sha256sum", path}, &output, 512);
+    if (ret != 0 || output.empty())
+        return "";
+    size_t space = output.find(' ');
+    return space == string::npos ? output : output.substr(0, space);
+}
+
+static bool write_manifest_file(const hotmethod::TaskDesc &task,
+                                const string &rawKey,
+                                const string &rawPath,
+                                const string &sha256,
+                                const string &manifestPath,
+                                bool partial)
+{
+    ofstream out(manifestPath, ios::trunc);
+    if (!out.is_open())
+        return false;
+    out << "{";
+    out << "\"task_id\":\"" << json_escape_local(task.taskid()) << "\",";
+    out << "\"attempt_id\":" << task.attempt_id() << ",";
+    out << "\"task_kind\":\"" << json_escape_local(task.task_kind()) << "\",";
+    out << "\"raw_key\":\"" << json_escape_local(rawKey) << "\",";
+    out << "\"raw_file\":\"" << json_escape_local(rawPath) << "\",";
+    out << "\"size\":" << file_size(rawPath) << ",";
+    out << "\"sha256\":\"" << json_escape_local(sha256) << "\",";
+    out << "\"partial\":" << (partial ? "true" : "false");
+    out << "}\n";
+    return true;
+}
+
 // ============================================================
 // 多 Server 故障转移：遍历 serverAddrs 列表，注册到第一个可用 Server
 // ============================================================
@@ -82,6 +143,13 @@ static shared_ptr<grpc::Channel> connect_to_server(
         req.set_ipaddr("127.0.0.1");
         req.set_uid(cfg.uid);
         req.set_agentversion(cfg.agentVersion);
+        req.set_agent_id(cfg.uid);
+        req.set_platform(cfg.platform);
+        for (const auto &capability : cfg.capabilities)
+            req.add_capabilities(capability);
+        for (const auto &label : cfg.labels)
+            req.add_labels(label);
+        req.set_resource_budget(cfg.resourceBudget);
 
         initpb::RegisterAgentResponse resp;
         ClientContext ctx;
@@ -356,42 +424,119 @@ static string get_error_message(int resultCode, const string &profilerName,
     }
 }
 
+static string get_error_code(int resultCode, const string &profilerName)
+{
+    if (resultCode == 0)
+        return "";
+    if (resultCode == -3)
+        return "TASK_TIMEOUT";
+    if (resultCode == -4)
+        return "TARGET_NOT_FOUND";
+    if (resultCode == -6)
+        return "ARTIFACT_MISSING";
+    if (profilerName.find("eBPF") != string::npos)
+        return "EBPF_UNAVAILABLE";
+    if (profilerName.find("pprof") != string::npos)
+        return "PPROF_UNAVAILABLE";
+    return "TASK_EXECUTION_FAILED";
+}
+
+struct RunnerOutcome
+{
+    int resultCode = 0;
+    string profilerName;
+    string outputPath;
+    bool partial = false;
+};
+
+class Runner
+{
+public:
+    Runner(uint32_t profilerType, const hotmethod::TaskDesc &task, string outputPath)
+        : profilerType_(profilerType), task_(task), outputPath_(std::move(outputPath)) {}
+
+    RunnerOutcome Run()
+    {
+        cout << "[runner] stage=Validate taskID=" << task_.taskid()
+             << " attemptID=" << task_.attempt_id() << endl;
+        RunnerOutcome out;
+        out.outputPath = outputPath_;
+        if (task_.taskid().empty())
+        {
+            out.resultCode = -1;
+            out.profilerName = "unknown";
+            return out;
+        }
+        if (task_.deadline_unix_ms() > 0)
+        {
+            int64_t nowMs = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+            if (task_.deadline_unix_ms() <= nowMs)
+            {
+                out.resultCode = -3;
+                out.profilerName = "deadline";
+                return out;
+            }
+        }
+
+        cout << "[runner] stage=Prepare taskID=" << task_.taskid() << endl;
+        cout << "[runner] stage=Start taskID=" << task_.taskid() << endl;
+        auto profilerResult = run_profiler(profilerType_, task_, outputPath_, "");
+        out.resultCode = profilerResult.first;
+        out.profilerName = profilerResult.second;
+        cout << "[runner] stage=Monitor taskID=" << task_.taskid()
+             << " resultCode=" << out.resultCode << endl;
+        out.outputPath = ResolveOutputPath();
+        out.partial = out.resultCode != 0 && file_exists(out.outputPath);
+        cout << "[runner] stage=Collect taskID=" << task_.taskid()
+             << " outputPath=" << out.outputPath
+             << " partial=" << (out.partial ? "true" : "false") << endl;
+        return out;
+    }
+
+private:
+    string ResolveOutputPath() const
+    {
+        if (file_exists(outputPath_))
+            return outputPath_;
+        if (file_exists(outputPath_ + ".collapsed"))
+            return outputPath_ + ".collapsed";
+        if (file_exists(outputPath_ + ".pb.gz"))
+            return outputPath_ + ".pb.gz";
+        if (file_exists(outputPath_ + ".bpf"))
+            return outputPath_ + ".bpf";
+        return outputPath_;
+    }
+
+    uint32_t profilerType_;
+    const hotmethod::TaskDesc &task_;
+    string outputPath_;
+};
+
 // ============================================================
 // 采集后处理：读取输出文件 → 上传 MinIO → 构建 TaskResult
 // ============================================================
 static hotmethod::TaskResult build_task_result(
     const hotmethod::TaskDesc &task,
-    int resultCode,
-    const string &profilerName,
-    const string &outputPath,
+    const RunnerOutcome &outcome,
     const common::CosConfig &cosConfig,
     const common::PidStats &selfPs,
     const vector<common::PidStats> &childrenPs)
 {
     hotmethod::TaskResult taskResult;
     taskResult.set_taskid(task.taskid());
+    taskResult.set_attempt_id(task.attempt_id());
+    taskResult.set_partial(outcome.partial);
 
-    string errorMsg = get_error_message(resultCode, profilerName, task);
+    string errorMsg = get_error_message(outcome.resultCode, outcome.profilerName, task);
     if (!errorMsg.empty())
     {
         taskResult.set_errormessage(errorMsg);
+        taskResult.set_error_code(get_error_code(outcome.resultCode, outcome.profilerName));
     }
 
-    if (resultCode == 0)
+    if (outcome.resultCode == 0 || outcome.partial)
     {
-        // 检查实际输出文件（不同采集器后缀不同）
-        string actualPath = outputPath;
-        if (!file_exists(actualPath))
-        {
-            // 尝试带后缀的变体
-            if (file_exists(outputPath + ".collapsed"))
-                actualPath = outputPath + ".collapsed";
-            else if (file_exists(outputPath + ".pb.gz"))
-                actualPath = outputPath + ".pb.gz";
-            else if (file_exists(outputPath + ".bpf"))
-                actualPath = outputPath + ".bpf";
-        }
-
+        string actualPath = outcome.outputPath;
         string fileContent = drop::read_file_content(actualPath);
         if (!fileContent.empty())
         {
@@ -402,20 +547,42 @@ static hotmethod::TaskResult build_task_result(
 
             // 使用标准路径 {tid}/perf.data，与 analysis 的下载路径一致
             string remoteKey = task.taskid() + "/perf.data";
-            if (drop::upload_to_minio(cosConfig, actualPath, remoteKey))
+            string manifestKey = task.taskid() + "/manifest.json";
+            string sha256 = sha256_file(actualPath);
+            string manifestPath = "/tmp/" + task.taskid() + "_manifest.json";
+            bool manifestWritten = write_manifest_file(task, remoteKey, actualPath, sha256, manifestPath, outcome.partial);
+
+            cout << "[runner] stage=Upload taskID=" << task.taskid()
+                 << " rawKey=" << remoteKey
+                 << " manifestKey=" << manifestKey
+                 << " sha256=" << sha256 << endl;
+            bool rawUploaded = drop::upload_to_minio(cosConfig, actualPath, remoteKey);
+            bool manifestUploaded = manifestWritten && drop::upload_to_minio(cosConfig, manifestPath, manifestKey);
+            if (rawUploaded)
                 taskResult.set_coskey(remoteKey);
+            if (manifestUploaded)
+                taskResult.set_manifest_key(manifestKey);
+            if (!rawUploaded)
+            {
+                taskResult.set_errormessage("产物上传失败，Agent 将保留本地文件等待人工/后续补偿: " + actualPath);
+                taskResult.set_error_code("ARTIFACT_UPLOAD_FAILED");
+                taskResult.set_partial(true);
+            }
+            taskResult.set_artifact_size(file_size(actualPath));
+            taskResult.set_artifact_sha256(sha256);
 
             auto *file = taskResult.mutable_file();
             file->set_name(fileName);
             file->set_content(fileContent);
             file->set_size(fileContent.size());
-            cout << "[agent] 采集成功，采集器=" << profilerName
+            cout << "[agent] 采集成功，采集器=" << outcome.profilerName
                  << " 文件=" << fileName
                  << " 大小=" << fileContent.size() << " bytes" << endl;
         }
         else
         {
-            taskResult.set_errormessage(profilerName + " 采集完成但无法读取输出文件: " + actualPath);
+            taskResult.set_errormessage(outcome.profilerName + " 采集完成但无法读取输出文件: " + actualPath);
+            taskResult.set_error_code("ARTIFACT_MISSING");
         }
     }
 
@@ -487,6 +654,8 @@ int main(int argc, char **argv)
 
     // 心跳间隔转换为毫秒
     uint32_t intervalMs = cfg.heartbeatIntervalSec * 1000;
+    vector<common::AttemptStatus> runningAttempts;
+    vector<common::AttemptStatus> completedAttempts;
 
     while (agent_running)
     {
@@ -500,9 +669,20 @@ int main(int argc, char **argv)
         req.set_ipaddr("127.0.0.1");
         req.set_uid(cfg.uid);
         req.set_agentversion(cfg.agentVersion);
+        req.set_agent_id(cfg.uid);
+        req.set_platform(cfg.platform);
+        for (const auto &capability : cfg.capabilities)
+            req.add_capabilities(capability);
+        for (const auto &label : cfg.labels)
+            req.add_labels(label);
+        req.set_resource_budget(cfg.resourceBudget);
         *req.mutable_selfpstats() = selfPs;
         if (!childrenPs.empty())
             *req.mutable_childrenpstats() = childrenPs[0];
+        for (const auto &attempt : runningAttempts)
+            *req.add_running_attempts() = attempt;
+        for (const auto &attempt : completedAttempts)
+            *req.add_completed_attempts() = attempt;
 
         cout << "[agent] 自监控: CPU=" << selfPs.cpupercent()
              << "% RSS=" << selfPs.rsskb() << "KB"
@@ -549,13 +729,17 @@ int main(int argc, char **argv)
 
             // 输出文件路径（统一前缀，不同采集器加不同后缀）
             string outputPath = "/tmp/" + to_string(ptype) + "_" + task.taskid() + "_output";
-            auto profilerResult = run_profiler(ptype, task, outputPath, "");
-            int resultCode = profilerResult.first;
-            string profilerName = profilerResult.second;
+            common::AttemptStatus currentAttempt;
+            currentAttempt.set_taskid(task.taskid());
+            currentAttempt.set_attempt_id(task.attempt_id());
+            runningAttempts.push_back(currentAttempt);
+
+            Runner runner(ptype, task, outputPath);
+            RunnerOutcome outcome = runner.Run();
 
             // 构建结果
             hotmethod::TaskResult taskResult = build_task_result(
-                task, resultCode, profilerName, outputPath,
+                task, outcome,
                 cosConfig, selfPs, childrenPs);
 
             // 上报
@@ -566,7 +750,7 @@ int main(int argc, char **argv)
             if (notifyStatus.ok())
             {
                 cout << "[agent] NotifyResult 上报成功: taskID=" << task.taskid()
-                     << " profiler=" << profilerName
+                     << " profiler=" << outcome.profilerName
                      << " error=\"" << taskResult.errormessage() << "\""
                      << " cosKey=" << taskResult.coskey() << endl;
             }
@@ -574,6 +758,17 @@ int main(int argc, char **argv)
             {
                 cerr << "[agent] NotifyResult 上报失败: " << notifyStatus.error_message() << endl;
             }
+
+            runningAttempts.erase(remove_if(runningAttempts.begin(), runningAttempts.end(),
+                                            [&](const common::AttemptStatus &attempt)
+                                            {
+                                                return attempt.taskid() == task.taskid() &&
+                                                       attempt.attempt_id() == task.attempt_id();
+                                            }),
+                                  runningAttempts.end());
+            completedAttempts.push_back(currentAttempt);
+            if (completedAttempts.size() > 50)
+                completedAttempts.erase(completedAttempts.begin());
         }
 
     sleep_and_continue:
