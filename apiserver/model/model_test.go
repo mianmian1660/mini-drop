@@ -121,3 +121,22 @@ func TestOutboxRetryFields(t *testing.T) {
 		t.Fatal("outbox must retain retry state until publication")
 	}
 }
+
+func TestStage1ContractFields(t *testing.T) {
+	task := HotmethodTask{TID: "t1", TaskKind: "perf_cpu", RequestID: "rid-1", DeadlineUnixMS: 123, ResourceBudget: []byte(`{"cpu":1}`)}
+	if task.TaskKind != "perf_cpu" || task.RequestID != "rid-1" || task.DeadlineUnixMS != 123 || len(task.ResourceBudget) == 0 {
+		t.Fatal("task must retain stage1 contract fields")
+	}
+	event := TaskStatusEvent{TID: "t1", Sequence: 2, AttemptID: 7, SourceModule: "apiserver", Payload: []byte(`{"stage":"done"}`)}
+	if event.Sequence != 2 || event.AttemptID != 7 || event.SourceModule == "" || len(event.Payload) == 0 {
+		t.Fatal("task event must retain sequence, attempt, source module and payload")
+	}
+	artifact := Artifact{TaskTID: "t1", ETag: "etag", Hash: "sha256:abc", ManifestKey: "t1/manifest.json", Retention: "default"}
+	if artifact.ETag == "" || artifact.Hash == "" || artifact.ManifestKey == "" || artifact.Retention == "" {
+		t.Fatal("artifact must retain stage1 integrity and retention fields")
+	}
+	job := AnalysisJob{TaskTID: "t1", MaxAttempts: 3, LastError: "retry", InputArtifactIDs: []byte(`[1]`), OutputArtifactIDs: []byte(`[2]`)}
+	if job.MaxAttempts != 3 || job.LastError == "" || len(job.InputArtifactIDs) == 0 || len(job.OutputArtifactIDs) == 0 {
+		t.Fatal("analysis job must retain retry and artifact id fields")
+	}
+}

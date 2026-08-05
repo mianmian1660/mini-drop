@@ -453,10 +453,11 @@ func (s *APIServer) reconcileOrphanedTasks() {
 		}
 
 		req := CreateTaskReq{
-			Name: task.Name, TaskType: task.Type, ProfilerType: task.ProfilerType,
+			Name: task.Name, TaskKind: task.TaskKind, RequestID: task.RequestID, TaskType: task.Type, ProfilerType: task.ProfilerType,
 			TargetIP: task.TargetIP, TargetPID: params.TargetPID, Duration: params.Duration,
 			Frequency: params.Frequency, Callgraph: params.Callgraph, Event: params.Event,
 			Subprocess: params.Subprocess, PprofURL: params.PprofURL,
+			ResourceBudget: task.ResourceBudget,
 		}
 
 		if s.GrpcConnected() {
@@ -583,6 +584,7 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/agent/stat", s.StatAgent)
 
 		// 任务管理
+		api.GET("/task-kinds", s.ListTaskKinds)
 		api.POST("/tasks", s.CreateTask)
 		api.GET("/tasks", s.ListTasks)
 		api.GET("/tasks/:tid", s.GetTaskDetail)
@@ -616,6 +618,6 @@ func (s *APIServer) registerRoutes() {
 	}
 
 	s.Logger.Info("路由注册完成",
-		zap.Int("api_count", 24),
+		zap.Int("api_count", 25),
 	)
 }

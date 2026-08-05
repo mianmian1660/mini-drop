@@ -15,6 +15,29 @@ json_get() {
 
 echo "[e2e] base=$BASE target=$TARGET_IP"
 
+if ! curl -fsS "$BASE/healthz" >/tmp/mini-drop-e2e-health.json 2>/dev/null; then
+  if [[ "${BASE:-}" == "http://127.0.0.1:8191" ]] && command -v docker >/dev/null 2>&1; then
+    container_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mini-drop-project-apiserver-1 2>/dev/null || true)"
+    if [[ -n "$container_ip" ]]; then
+      fallback_base="http://${container_ip}:8191"
+      if curl -fsS "$fallback_base/healthz" >/tmp/mini-drop-e2e-health.json 2>/dev/null; then
+        BASE="$fallback_base"
+        echo "[e2e] fallback base=$BASE"
+      fi
+    fi
+  fi
+  if [[ "${BASE:-}" == "http://127.0.0.1:8191" ]]; then
+    for ip in $(seq 2 30); do
+      fallback_base="http://172.18.0.${ip}:8191"
+      if curl -fsS -m 1 "$fallback_base/healthz" >/tmp/mini-drop-e2e-health.json 2>/dev/null; then
+        BASE="$fallback_base"
+        echo "[e2e] fallback base=$BASE"
+        break
+      fi
+    done
+  fi
+fi
+
 for _ in $(seq 1 30); do
   if curl -fsS "$BASE/healthz" >/tmp/mini-drop-e2e-health.json; then
     break

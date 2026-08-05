@@ -62,17 +62,23 @@ func main() {
 	}
 	logger.Info("数据库连接成功")
 
-	// ---------- 4. 自动建表 ----------
+	// ---------- 4. 数据库迁移 ----------
+	if err := model.RunMigrations(db); err != nil {
+		logger.Fatal("数据库 SQL 迁移失败", zap.Error(err))
+	}
+	logger.Info("数据库 SQL 迁移完成")
+
+	// ---------- 5. 自动建表 ----------
 	if err := model.AutoMigrate(db); err != nil {
 		logger.Fatal("数据库迁移失败", zap.Error(err))
 	}
 	logger.Info("数据库迁移完成（业务表与审计表已就绪）")
 
-	// ---------- 5. 初始化 HTTP 服务 ----------
+	// ---------- 6. 初始化 HTTP 服务 ----------
 	srv := server.New(db, logger, cfg)
 	defer srv.Close() // 程序退出时关闭 gRPC 连接
 
-	// ---------- 6. 启动 ----------
+	// ---------- 7. 启动 ----------
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	logger.Info("apiserver 启动中...", zap.String("addr", addr))
 

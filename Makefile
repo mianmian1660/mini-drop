@@ -82,7 +82,5 @@ coverage:
 e2e:
 	bash scripts/e2e_smoke.sh
 
-verify: test coverage
-	sleep 3
-	$(MAKE) e2e
+verify: e2e test coverage
 	git diff --check

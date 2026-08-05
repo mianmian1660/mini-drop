@@ -38,6 +38,10 @@ type Artifact struct {
 	ObjectKey   string    `gorm:"column:object_key;size:512;uniqueIndex:uidx_artifacts_task_kind_key,priority:3" json:"object_key"` // 如 "tid/perf.data"
 	Size        int64     `gorm:"column:size" json:"size"`
 	SHA256      string    `gorm:"column:sha256;size:64" json:"sha256"`
+	ETag        string    `gorm:"column:etag;size:128" json:"etag"`
+	Hash        string    `gorm:"column:hash;size:128" json:"hash"`
+	ManifestKey string    `gorm:"column:manifest_key;size:512" json:"manifest_key"`
+	Retention   string    `gorm:"column:retention;size:64" json:"retention"`
 	ContentType string    `gorm:"column:content_type;size:128" json:"content_type"`
 	Status      string    `gorm:"column:status;size:32;default:ready" json:"status"`
 	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`

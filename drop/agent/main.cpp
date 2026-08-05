@@ -538,6 +538,10 @@ int main(int argc, char **argv)
             uint32_t ptype = task.profilertype();
 
             cout << "[agent] 收到任务! taskID=" << task.taskid()
+                 << " taskKind=" << task.task_kind()
+                 << " requestID=" << task.request_id()
+                 << " attemptID=" << task.attempt_id()
+                 << " deadlineUnixMs=" << task.deadline_unix_ms()
                  << " profilerType=" << ptype
                  << " pid=" << task.sampleargv().pid()
                  << " hz=" << task.sampleargv().hz()

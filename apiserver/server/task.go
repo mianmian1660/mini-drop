@@ -35,18 +35,21 @@ import (
 
 // CreateTaskReq 创建任务请求体
 type CreateTaskReq struct {
-	Name          string `json:"name" binding:"required"`
-	TaskType      uint32 `json:"task_type"`     // 0=通用 1=Java 2=Tracing
-	ProfilerType  uint32 `json:"profiler_type"` // 0=perf 1=async-profiler 2=pprof
-	TargetIP      string `json:"target_ip" binding:"required"`
-	TargetPID     int32  `json:"target_pid"`
-	Duration      uint64 `json:"duration"`  // 采集秒数
-	Frequency     uint32 `json:"frequency"` // 采样频率 Hz
-	Callgraph     string `json:"callgraph"` // fp / dwarf / lbr
-	Event         string `json:"event"`     // cpu-cycles / cache-misses
-	Subprocess    bool   `json:"subprocess"`
-	ContainerName string `json:"container_name"`
-	PprofURL      string `json:"pprof_url"`
+	Name           string          `json:"name" binding:"required"`
+	TaskKind       string          `json:"task_kind"`
+	RequestID      string          `json:"request_id"`
+	TaskType       uint32          `json:"task_type"`     // 0=通用 1=Java 2=Tracing
+	ProfilerType   uint32          `json:"profiler_type"` // 0=perf 1=async-profiler 2=pprof
+	TargetIP       string          `json:"target_ip" binding:"required"`
+	TargetPID      int32           `json:"target_pid"`
+	Duration       uint64          `json:"duration"`  // 采集秒数
+	Frequency      uint32          `json:"frequency"` // 采样频率 Hz
+	Callgraph      string          `json:"callgraph"` // fp / dwarf / lbr
+	Event          string          `json:"event"`     // cpu-cycles / cache-misses
+	Subprocess     bool            `json:"subprocess"`
+	ContainerName  string          `json:"container_name"`
+	PprofURL       string          `json:"pprof_url"`
+	ResourceBudget json.RawMessage `json:"resource_budget,omitempty"`
 }
 
 // PerfParams 性能采集参数，会被序列化为 JSONB 存入 request_params 字段
@@ -71,55 +74,6 @@ const (
 	TaskTypePprof   uint32 = 2
 	TaskTypeBPF     uint32 = 5
 )
-
-// normalizeAndValidateCollector keeps the public REST contract and the agent
-// contract aligned.  In particular it prevents pprof/Java jobs from silently
-// being persisted as generic perf jobs and analysed by the wrong pipeline.
-func normalizeAndValidateCollector(req *CreateTaskReq) error {
-	switch req.ProfilerType {
-	case ProfilerPerf:
-		req.TaskType = TaskTypeGeneric
-		if req.Event == "" {
-			req.Event = "cpu-clock"
-		}
-	case ProfilerAsync:
-		req.TaskType = TaskTypeJava
-		if req.TargetPID <= 0 {
-			return fmt.Errorf("async-profiler 必须指定 Java 目标 PID")
-		}
-		if req.Event == "" {
-			req.Event = "cpu"
-		}
-	case ProfilerPprof:
-		req.TaskType = TaskTypePprof
-		// Compatibility: old jobs stored a full endpoint in event.
-		if req.PprofURL == "" && (strings.HasPrefix(req.Event, "http://") || strings.HasPrefix(req.Event, "https://")) {
-			req.PprofURL = req.Event
-		}
-		parsed, err := url.ParseRequestURI(req.PprofURL)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-			return fmt.Errorf("pprof_url 必须是可访问的 http/https 完整 URL")
-		}
-		req.Event = ""
-	case ProfilerBPF:
-		req.TaskType = TaskTypeBPF
-		if req.Event == "" {
-			req.Event = "cpu"
-		}
-		if req.Event != "cpu" && req.Event != "io" && req.Event != "sched" {
-			return fmt.Errorf("eBPF event 仅支持 cpu、io 或 sched")
-		}
-	default:
-		return fmt.Errorf("不支持的 profiler_type=%d", req.ProfilerType)
-	}
-	if req.Duration == 0 || req.Duration > 3600 {
-		return fmt.Errorf("采样时长需为 1-3600 秒")
-	}
-	if req.Frequency == 0 || req.Frequency > 10000 {
-		return fmt.Errorf("采样频率需为 1-10000 Hz")
-	}
-	return nil
-}
 
 // TaskResultNotifyReq 是 drop_server 完成采集后回调 apiserver 的内部请求体。
 type TaskResultNotifyReq struct {
@@ -153,6 +107,18 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 	if err := normalizeAndValidateCollector(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
+	}
+	kind, _ := taskKindByID(req.TaskKind)
+	if !s.agentSupportsTaskKind(req.TargetIP, kind) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "目标 Agent 不支持该 TaskKind: " + req.TaskKind})
+		return
+	}
+	if req.RequestID == "" {
+		if v, ok := c.Get("request_id"); ok {
+			if s, ok := v.(string); ok {
+				req.RequestID = s
+			}
+		}
 	}
 
 	uid := getRequestUIDOrDefault(c)
@@ -212,6 +178,8 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 	task := &model.HotmethodTask{
 		TID:            tid,
 		Name:           req.Name,
+		TaskKind:       req.TaskKind,
+		RequestID:      req.RequestID,
 		Type:           req.TaskType,
 		ProfilerType:   req.ProfilerType,
 		TargetIP:       req.TargetIP,
@@ -223,6 +191,8 @@ func (s *APIServer) CreateTask(c *gin.Context) {
 		UserName:       userName,
 		IdempotencyKey: idempotencyKey,
 		CreateTime:     now,
+		DeadlineUnixMS: int64(now.Add(time.Duration(req.Duration+30) * time.Second).UnixMilli()),
+		ResourceBudget: []byte(req.ResourceBudget),
 	}
 
 	// A5: Task 和"需要下发"这件事在同一事务里落地（新复刻指南 9.6 节 Transactional
@@ -319,14 +289,29 @@ func (s *APIServer) dispatchTask(task *model.HotmethodTask, req CreateTaskReq, t
 
 	// 构建 TaskDesc
 	taskDesc := &pb_hotmethod.TaskDesc{
-		TaskID:        task.TID,
-		TaskType:      req.TaskType,
-		ProfilerType:  req.ProfilerType,
-		SampleArgv:    recordArgv,
-		ContainerName: req.ContainerName,
-		PprofUrl:      req.PprofURL,
-		TimeoutSec:    uint32(req.Duration + 30), // 多给 30s 上传时间
-		CosConfig:     cosCfg,
+		TaskID:         task.TID,
+		RequestId:      req.RequestID,
+		AttemptId:      uint64(attempt.ID),
+		DeadlineUnixMs: task.DeadlineUnixMS,
+		TaskKind:       req.TaskKind,
+		TaskType:       req.TaskType,
+		ProfilerType:   req.ProfilerType,
+		SampleArgv:     recordArgv,
+		ContainerName:  req.ContainerName,
+		PprofUrl:       req.PprofURL,
+		TimeoutSec:     uint32(req.Duration + 30), // 多给 30s 上传时间
+		CosConfig:      cosCfg,
+	}
+	if len(req.ResourceBudget) > 0 {
+		taskDesc.ResourceBudget = string(req.ResourceBudget)
+	}
+	switch req.ProfilerType {
+	case ProfilerPprof:
+		taskDesc.Payload = &pb_hotmethod.TaskDesc_PprofPayload{PprofPayload: &pb_hotmethod.PprofPayload{Url: req.PprofURL, Duration: req.Duration}}
+	case ProfilerBPF:
+		taskDesc.Payload = &pb_hotmethod.TaskDesc_EbpfPayload{EbpfPayload: &pb_hotmethod.EBpfPayload{Mode: req.Event, Duration: req.Duration, Pid: req.TargetPID}}
+	default:
+		taskDesc.Payload = &pb_hotmethod.TaskDesc_PerfPayload{PerfPayload: &pb_hotmethod.PerfPayload{Argv: recordArgv}}
 	}
 
 	// 构建 CreateTaskRequest
@@ -436,12 +421,15 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 					return err
 				}
 				if err := tx.Create(&model.TaskStatusEvent{
-					TID:        task.TID,
-					FromStatus: TaskStatusRunning,
-					ToStatus:   TaskStatusUploading,
-					Reason:     "采集产物已上传，等待登记完成",
-					Source:     "drop_server_notify",
-					CreatedAt:  endTime,
+					TID:          task.TID,
+					FromStatus:   TaskStatusRunning,
+					ToStatus:     TaskStatusUploading,
+					Reason:       "采集产物已上传，等待登记完成",
+					Source:       "drop_server_notify",
+					Sequence:     nextTaskEventSequenceTx(tx, task.TID),
+					SourceModule: "drop_server_notify",
+					Payload:      []byte(fmt.Sprintf(`{"cos_key":%q}`, req.CosKey)),
+					CreatedAt:    endTime,
 				}).Error; err != nil {
 					return err
 				}
@@ -457,12 +445,15 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 				return err
 			}
 			if err := tx.Create(&model.TaskStatusEvent{
-				TID:        task.TID,
-				FromStatus: currentStatus,
-				ToStatus:   TaskStatusDone,
-				Reason:     "采集产物已上传，任务完成",
-				Source:     "drop_server_notify",
-				CreatedAt:  endTime,
+				TID:          task.TID,
+				FromStatus:   currentStatus,
+				ToStatus:     TaskStatusDone,
+				Reason:       "采集产物已上传，任务完成",
+				Source:       "drop_server_notify",
+				Sequence:     nextTaskEventSequenceTx(tx, task.TID),
+				SourceModule: "drop_server_notify",
+				Payload:      []byte(fmt.Sprintf(`{"cos_key":%q}`, req.CosKey)),
+				CreatedAt:    endTime,
 			}).Error; err != nil {
 				return err
 			}
@@ -529,13 +520,28 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey st
 		return err
 	}
 
+	pipeline := analysisPipelineForObject(objectKey)
+	var task model.HotmethodTask
+	if err := tx.Where("tid = ?", tid).First(&task).Error; err == nil && task.TaskKind != "" {
+		if kind, ok := taskKindByID(task.TaskKind); ok && kind.AnalysisPipeline != "" {
+			pipeline = kind.AnalysisPipeline
+		}
+	}
+	inputArtifactIDs := []uint{}
+	var savedArtifact model.Artifact
+	if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ?", tid, model.ArtifactKindRaw, objectKey).First(&savedArtifact).Error; err == nil {
+		inputArtifactIDs = append(inputArtifactIDs, savedArtifact.ID)
+	}
+	inputArtifactJSON, _ := util.MarshalJSONB(inputArtifactIDs)
 	job := model.AnalysisJob{
-		TaskTID:   tid,
-		Pipeline:  analysisPipelineForObject(objectKey),
-		Status:    model.AnalysisJobStatusPending,
-		Attempt:   0,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		TaskTID:          tid,
+		Pipeline:         pipeline,
+		Status:           model.AnalysisJobStatusPending,
+		Attempt:          0,
+		MaxAttempts:      3,
+		InputArtifactIDs: inputArtifactJSON,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
 	}
 	if err := tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "task_tid"}},
@@ -1065,6 +1071,8 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 	newTask := model.HotmethodTask{
 		TID:            newTID,
 		Name:           oldTask.Name + "(重试)",
+		TaskKind:       oldTask.TaskKind,
+		RequestID:      oldTask.RequestID,
 		Type:           oldTask.Type,
 		ProfilerType:   oldTask.ProfilerType,
 		TargetIP:       oldTask.TargetIP,
@@ -1076,6 +1084,7 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 		UserName:       oldTask.UserName,
 		CreateTime:     now,
 		MasterTaskTID:  tid, // 记录父任务
+		ResourceBudget: oldTask.ResourceBudget,
 	}
 
 	// 从原任务的 request_params 重建采集参数，构造下发用的请求体
@@ -1084,17 +1093,26 @@ func (s *APIServer) RetryTask(c *gin.Context) {
 		s.Logger.Warn("解析原任务参数失败，使用默认值", zap.Error(err))
 	}
 	req := CreateTaskReq{
-		Name:         newTask.Name,
-		TaskType:     newTask.Type,
-		ProfilerType: newTask.ProfilerType,
-		TargetIP:     newTask.TargetIP,
-		TargetPID:    oldParams.TargetPID,
-		Duration:     oldParams.Duration,
-		Frequency:    oldParams.Frequency,
-		Callgraph:    oldParams.Callgraph,
-		Event:        oldParams.Event,
-		Subprocess:   oldParams.Subprocess,
-		PprofURL:     oldParams.PprofURL,
+		Name:           newTask.Name,
+		TaskKind:       newTask.TaskKind,
+		RequestID:      newTask.RequestID,
+		TaskType:       newTask.Type,
+		ProfilerType:   newTask.ProfilerType,
+		TargetIP:       newTask.TargetIP,
+		TargetPID:      oldParams.TargetPID,
+		Duration:       oldParams.Duration,
+		Frequency:      oldParams.Frequency,
+		Callgraph:      oldParams.Callgraph,
+		Event:          oldParams.Event,
+		Subprocess:     oldParams.Subprocess,
+		PprofURL:       oldParams.PprofURL,
+		ResourceBudget: json.RawMessage(newTask.ResourceBudget),
+	}
+	if err := normalizeAndValidateCollector(&req); err == nil {
+		newTask.TaskKind = req.TaskKind
+		newTask.Type = req.TaskType
+		newTask.ProfilerType = req.ProfilerType
+		newTask.DeadlineUnixMS = int64(now.Add(time.Duration(req.Duration+30) * time.Second).UnixMilli())
 	}
 
 	// A5: 同事务写 Task + Outbox，下发交给后台 dispatchOutboxLoop 异步执行

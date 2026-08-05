@@ -22,6 +22,7 @@ import (
 type CreateScheduleReq struct {
 	Name         string `json:"name" binding:"required"`
 	CronExpr     string `json:"cron_expr" binding:"required"` // 如 "*/5 * * * *"
+	TaskKind     string `json:"task_kind"`
 	TaskType     uint32 `json:"task_type"`
 	ProfilerType uint32 `json:"profiler_type"`
 	TargetIP     string `json:"target_ip" binding:"required"`
@@ -110,6 +111,7 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 	task := &model.HotmethodTask{
 		TID:            tid,
 		Name:           sch.Name + " (定时)",
+		TaskKind:       sch.TaskKind,
 		Type:           sch.TaskType,
 		ProfilerType:   sch.ProfilerType,
 		TargetIP:       sch.TargetIP,
@@ -121,10 +123,12 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 		UserName:       sch.UserName,
 		MasterTaskTID:  sch.SID,
 		CreateTime:     now,
+		DeadlineUnixMS: int64(now.Add(time.Duration(params.Duration+30) * time.Second).UnixMilli()),
 	}
 
 	req := CreateTaskReq{
 		Name:         task.Name,
+		TaskKind:     sch.TaskKind,
 		TaskType:     sch.TaskType,
 		ProfilerType: sch.ProfilerType,
 		TargetIP:     sch.TargetIP,
@@ -181,14 +185,20 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 		req.Callgraph = "fp"
 	}
 	collectorReq := CreateTaskReq{
-		TaskType: req.TaskType, ProfilerType: req.ProfilerType, TargetPID: req.TargetPID,
+		TaskKind: req.TaskKind, TaskType: req.TaskType, ProfilerType: req.ProfilerType, TargetPID: req.TargetPID,
 		Duration: req.Duration, Frequency: req.Frequency, Callgraph: req.Callgraph, Event: req.Event, PprofURL: req.PprofURL,
 	}
 	if err := normalizeAndValidateCollector(&collectorReq); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
-	req.TaskType, req.Event, req.PprofURL = collectorReq.TaskType, collectorReq.Event, collectorReq.PprofURL
+	kind, _ := taskKindByID(collectorReq.TaskKind)
+	if !s.agentSupportsTaskKind(req.TargetIP, kind) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "目标 Agent 不支持该 TaskKind: " + collectorReq.TaskKind})
+		return
+	}
+	req.TaskKind, req.TaskType, req.ProfilerType = collectorReq.TaskKind, collectorReq.TaskType, collectorReq.ProfilerType
+	req.Event, req.PprofURL = collectorReq.Event, collectorReq.PprofURL
 
 	// 窗口校验：持续采集的每次采样必须在窗口周期内结束，否则相邻窗口会重叠，
 	// "回溯任意窗口"的语义就不成立了。
@@ -223,6 +233,7 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 		SID:           sid,
 		Name:          req.Name,
 		CronExpr:      req.CronExpr,
+		TaskKind:      req.TaskKind,
 		TaskType:      req.TaskType,
 		ProfilerType:  req.ProfilerType,
 		TargetIP:      req.TargetIP,

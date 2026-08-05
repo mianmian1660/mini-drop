@@ -988,3 +988,50 @@ func TestNormalizePprofURL(t *testing.T) {
 		t.Fatalf("legacy URL was not normalized: %#v", base)
 	}
 }
+
+func TestTaskKindDefinitionsCoverCurrentCollectors(t *testing.T) {
+	kinds := taskKindDefinitions()
+	seen := map[string]TaskKindDefinition{}
+	for _, kind := range kinds {
+		seen[kind.ID] = kind
+		if kind.Runner == "" || kind.AnalysisPipeline == "" || kind.MaxDuration == 0 || len(kind.Schema) == 0 {
+			t.Fatalf("task kind missing required metadata: %#v", kind)
+		}
+	}
+	for _, id := range []string{TaskKindPerfCPU, TaskKindAsyncProfilerJava, TaskKindGoPprof, TaskKindEBPFCPU, TaskKindEBPFIO, TaskKindEBPFSched} {
+		if _, ok := seen[id]; !ok {
+			t.Fatalf("missing task kind %s", id)
+		}
+	}
+	if seen[TaskKindEBPFIO].AnalysisPipeline != "bpf_histogram" {
+		t.Fatalf("eBPF IO pipeline=%q, want bpf_histogram", seen[TaskKindEBPFIO].AnalysisPipeline)
+	}
+}
+
+func TestTaskKindNormalizesLegacyProfilerRequest(t *testing.T) {
+	req := CreateTaskReq{ProfilerType: ProfilerBPF, Event: "io", Duration: 10, Frequency: 1}
+	if err := normalizeAndValidateCollector(&req); err != nil {
+		t.Fatalf("normalize legacy ebpf io: %v", err)
+	}
+	if req.TaskKind != TaskKindEBPFIO || req.TaskType != TaskTypeBPF || req.ProfilerType != ProfilerBPF {
+		t.Fatalf("normalized request=%#v, want ebpf io task kind and bpf types", req)
+	}
+}
+
+func TestAgentCapabilityMatchingIsConservative(t *testing.T) {
+	s := newTestAPIServer(t)
+	kind, _ := taskKindByID(TaskKindGoPprof)
+	if !s.agentSupportsTaskKind("127.0.0.1", kind) {
+		t.Fatal("missing agent capability data should allow current demo collectors")
+	}
+	if err := s.DB.Create(&model.AgentInfo{IPAddr: "10.0.0.9", Hostname: "agent-1", Capabilities: []byte(`["perf"]`)}).Error; err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	if s.agentSupportsTaskKind("10.0.0.9", kind) {
+		t.Fatal("agent with explicit perf-only capabilities must not match pprof")
+	}
+	perfKind, _ := taskKindByID(TaskKindPerfCPU)
+	if !s.agentSupportsTaskKind("10.0.0.9", perfKind) {
+		t.Fatal("agent with perf capability should match perf task kind")
+	}
+}

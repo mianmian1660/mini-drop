@@ -34,17 +34,19 @@ type UserInfo struct {
 // AgentInfo — Agent 表（记录所有接入的 Agent）
 // ----------------------------------------------------------
 type AgentInfo struct {
-	ID          uint      `gorm:"primaryKey" json:"id"`
-	Hostname    string    `gorm:"column:hostname;size:256" json:"hostname"`
-	IPAddr      string    `gorm:"column:ip_addr;size:45;index" json:"ip_addr"`
-	Online      bool      `gorm:"column:online;default:false" json:"online"`
-	UID         string    `gorm:"column:uid;size:64" json:"uid"`
-	GID         string    `gorm:"column:gid;size:64" json:"gid"`
-	Version     string    `gorm:"column:version;size:32" json:"version"`
-	Environment string    `gorm:"column:environment;size:64" json:"environment"`
-	LastSeen    time.Time `gorm:"column:last_seen" json:"last_seen"`
-	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	Hostname     string    `gorm:"column:hostname;size:256" json:"hostname"`
+	IPAddr       string    `gorm:"column:ip_addr;size:45;index" json:"ip_addr"`
+	Online       bool      `gorm:"column:online;default:false" json:"online"`
+	UID          string    `gorm:"column:uid;size:64" json:"uid"`
+	GID          string    `gorm:"column:gid;size:64" json:"gid"`
+	Version      string    `gorm:"column:version;size:32" json:"version"`
+	Environment  string    `gorm:"column:environment;size:64" json:"environment"`
+	Capabilities []byte    `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
+	SupportedOS  string    `gorm:"column:supported_os;size:64" json:"supported_os"`
+	LastSeen     time.Time `gorm:"column:last_seen" json:"last_seen"`
+	CreatedAt    time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 // ----------------------------------------------------------
@@ -66,6 +68,8 @@ type HotmethodTask struct {
 	ID           uint   `gorm:"primaryKey" json:"id"`
 	TID          string `gorm:"column:tid;uniqueIndex;size:64" json:"tid"`
 	Name         string `gorm:"column:name;size:256" json:"name"`
+	TaskKind     string `gorm:"column:task_kind;size:64;index" json:"task_kind"`
+	RequestID    string `gorm:"column:request_id;size:64;index" json:"request_id"`
 	Type         uint32 `gorm:"column:type;default:0" json:"type"`
 	ProfilerType uint32 `gorm:"column:profiler_type;default:0" json:"profiler_type"`
 	// TargetIP 参与 A5 新增的 idx_tasks_target_status 联合索引（target_ip, status, create_time），
@@ -86,11 +90,13 @@ type HotmethodTask struct {
 	// 重复请求会命中已有任务而不是新建一条（新复刻指南 4.2 节）。
 	IdempotencyKey *string `gorm:"column:idempotency_key;size:128;uniqueIndex:idx_task_uid_idempotency" json:"idempotency_key,omitempty"`
 	// CreateTime 同时是 idx_tasks_uid_created 和 idx_tasks_target_status 两个联合索引的最后一列。
-	CreateTime    time.Time      `gorm:"column:create_time;index:idx_tasks_uid_created,priority:2;index:idx_tasks_target_status,priority:3" json:"create_time"`
-	BeginTime     *time.Time     `gorm:"column:begin_time" json:"begin_time"`
-	EndTime       *time.Time     `gorm:"column:end_time" json:"end_time"`
-	MasterTaskTID string         `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
-	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	CreateTime     time.Time      `gorm:"column:create_time;index:idx_tasks_uid_created,priority:2;index:idx_tasks_target_status,priority:3" json:"create_time"`
+	BeginTime      *time.Time     `gorm:"column:begin_time" json:"begin_time"`
+	EndTime        *time.Time     `gorm:"column:end_time" json:"end_time"`
+	MasterTaskTID  string         `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
+	DeadlineUnixMS int64          `gorm:"column:deadline_unix_ms" json:"deadline_unix_ms"`
+	ResourceBudget []byte         `gorm:"column:resource_budget;type:jsonb" json:"resource_budget"`
+	DeletedAt      gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
 }
 
 // ----------------------------------------------------------
@@ -100,12 +106,16 @@ type TaskStatusEvent struct {
 	ID uint `gorm:"primaryKey" json:"id"`
 	// TID 原有单列 index 保留，再加入 A5 新增的 idx_task_events_tid_created 联合索引，
 	// 支持 fetchTaskStatusEvents 里"按 tid 过滤 + 按时间排序"的查询模式（9.4 节）。
-	TID        string    `gorm:"column:tid;size:64;index;index:idx_task_events_tid_created,priority:1" json:"tid"`
-	FromStatus int       `gorm:"column:from_status" json:"from_status"`
-	ToStatus   int       `gorm:"column:to_status" json:"to_status"`
-	Reason     string    `gorm:"column:reason;size:1024" json:"reason"`
-	Source     string    `gorm:"column:source;size:64" json:"source"`
-	CreatedAt  time.Time `gorm:"column:created_at;index:idx_task_events_tid_created,priority:2" json:"created_at"`
+	TID          string    `gorm:"column:tid;size:64;index;index:idx_task_events_tid_created,priority:1" json:"tid"`
+	FromStatus   int       `gorm:"column:from_status" json:"from_status"`
+	ToStatus     int       `gorm:"column:to_status" json:"to_status"`
+	Reason       string    `gorm:"column:reason;size:1024" json:"reason"`
+	Source       string    `gorm:"column:source;size:64" json:"source"`
+	Sequence     int64     `gorm:"column:sequence;index" json:"sequence"`
+	AttemptID    uint      `gorm:"column:attempt_id;index" json:"attempt_id"`
+	SourceModule string    `gorm:"column:source_module;size:64" json:"source_module"`
+	Payload      []byte    `gorm:"column:payload;type:jsonb" json:"payload"`
+	CreatedAt    time.Time `gorm:"column:created_at;index:idx_task_events_tid_created,priority:2" json:"created_at"`
 }
 
 // ----------------------------------------------------------
@@ -161,6 +171,7 @@ type ScheduleTask struct {
 	SID           string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
 	Name          string         `gorm:"column:name;size:256" json:"name"`
 	CronExpr      string         `gorm:"column:cron_expr;size:128" json:"cron_expr"` // cron 表达式
+	TaskKind      string         `gorm:"column:task_kind;size:64" json:"task_kind"`
 	TaskType      uint32         `gorm:"column:task_type;default:0" json:"task_type"`
 	ProfilerType  uint32         `gorm:"column:profiler_type;default:0" json:"profiler_type"`
 	TargetIP      string         `gorm:"column:target_ip;size:45" json:"target_ip"`
@@ -200,5 +211,6 @@ func AutoMigrate(db *gorm.DB) error {
 		&Artifact{},
 		&AnalysisJob{},
 		&Outbox{},
+		&SchemaMigration{},
 	)
 }

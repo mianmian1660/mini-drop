@@ -39,6 +39,17 @@ message TaskDesc {
   common.CosConfig cosConfig = 8;  // 上传结果的存储配置
   string  scriptContent = 9;  // 脚本内容（ScriptExec 类型任务用）
   string  pprofUrl      = 10; // Go pprof 完整 profile URL（profilerType=2）
+  string  request_id    = 11; // API 请求 ID，用于日志串联
+  uint64  attempt_id    = 12; // 本次执行尝试 ID
+  int64   deadline_unix_ms = 13; // 任务截止时间（毫秒时间戳）
+  string  resource_budget = 14; // JSON 编码的资源预算
+  string  task_kind     = 15; // TaskKind 单一契约 ID
+  string  error_code    = 16; // 下发前已知的稳定错误码（可选）
+  oneof payload {
+    PerfPayload perf_payload = 17;
+    PprofPayload pprof_payload = 18;
+    EBpfPayload ebpf_payload = 19;
+  }
 }
 
 // ----------------------------------------------------------
@@ -51,6 +62,21 @@ message RecordArgv {
   string callgraph = 4;  // 调用图方式：fp(帧指针) / dwarf / lbr
   bool   subprocess = 5; // 是否包含子进程
   string event     = 6;  // 采样事件：cpu-cycles / cache-misses / ...
+}
+
+message PerfPayload {
+  RecordArgv argv = 1;
+}
+
+message PprofPayload {
+  string url = 1;
+  uint64 duration = 2;
+}
+
+message EBpfPayload {
+  string mode = 1;
+  uint64 duration = 2;
+  int32 pid = 3;
 }
 
 // ----------------------------------------------------------

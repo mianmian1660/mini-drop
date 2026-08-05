@@ -35,6 +35,10 @@ export const agents = {
     stat: (ip) => client.get('/api/v1/agent/stat', { params: { ip } }),
 };
 
+export const taskKinds = {
+    list: () => client.get('/api/v1/task-kinds'),
+};
+
 // ---------- 任务 ----------
 export const tasks = {
     // 创建任务（POST /api/v1/tasks）

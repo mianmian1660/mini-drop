@@ -1,12 +1,6 @@
-// ============================================================
-// components/CreateTaskModal.js — 新建任务弹窗（完整版）
-// 支持: 4种采集器 + eBPF模式 + 持续采集(Continuous Profiling)
-// task_type 根据 profiler_type + event 自动推导
-// ============================================================
-
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { tasks, agents, schedules } from '../api';
+import { tasks, agents, schedules, taskKinds } from '../api';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15, 23, 42, 0.45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '48px 16px 24px', overflowY: 'auto' },
@@ -22,7 +16,6 @@ const S = {
     err: { color: '#f44336', fontSize: 13, marginTop: 12 },
     ok: { color: '#4caf50', fontSize: 13, marginTop: 12 },
     hint: { fontSize: 11, color: '#888', marginTop: 2, marginBottom: 8 },
-    collectorGuide: { margin: '0 0 14px', padding: '10px 12px', border: '1px solid #cfe0ff', borderRadius: 6, background: '#f4f8ff', color: '#344054', fontSize: 12, lineHeight: 1.65 },
     chk: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
     presetBtn: (active) => ({
         padding: '4px 10px', fontSize: 12, borderRadius: 4, cursor: 'pointer',
@@ -30,16 +23,6 @@ const S = {
     }),
 };
 
-function deriveTaskType(pt, ev) {
-    if (pt === 1) return 1;
-    if (pt === 2) return 2;
-    if (pt === 3) return 5;
-    return 0;
-}
-
-// 窗口预设：cron 周期 + 采样时长(留 buffer 防止相邻窗口重叠) + 低频采样率。
-// 频率取质数，参考 parca-agent 19Hz 的设计——低频满足常驻开销要求，
-// 质数避免和应用自身周期性行为（定时器/GC）产生拍频共振。
 const WINDOW_PRESETS = [
     { label: '5 分钟窗口(默认)', cron: '*/5 * * * *', windowSeconds: 300, duration: 290, frequency: 19 },
     { label: '1 分钟窗口', cron: '*/1 * * * *', windowSeconds: 60, duration: 50, frequency: 19 },
@@ -47,10 +30,24 @@ const WINDOW_PRESETS = [
     { label: '30 分钟窗口', cron: '*/30 * * * *', windowSeconds: 1800, duration: 1740, frequency: 19 },
 ];
 
+function valuesFromKind(kind) {
+    const out = {};
+    (kind?.schema || []).forEach(field => {
+        if (field.default !== undefined) out[field.name] = field.default;
+    });
+    return { ...(kind?.default || {}), ...out };
+}
+
+function coerceField(field, value) {
+    if (field.type === 'number') return parseInt(value, 10) || 0;
+    if (field.type === 'boolean') return Boolean(value);
+    return String(value ?? '');
+}
+
 export default function CreateTaskModal({ onClose, onSuccess }) {
     const [f, setF] = useState({
-        name: '', target_ip: '', target_pid: '', duration: 10, frequency: 99,
-        profiler_type: 0, callgraph: 'fp', event: 'cpu-clock', pprof_url: '',
+        name: '', target_ip: '', task_kind: '', target_pid: 0, duration: 10, frequency: 99,
+        callgraph: 'fp', event: 'cpu-clock', pprof_url: '',
         continuous: false, cron_expr: '*/5 * * * *', window_seconds: 300,
     });
     const [sub, setSub] = useState(false);
@@ -59,7 +56,9 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
     const [cid, setCid] = useState('');
     const [isSch, setIsSch] = useState(false);
     const [agentList, setAgentList] = useState([]);
+    const [kindList, setKindList] = useState([]);
     const [aload, setAload] = useState(true);
+    const [kload, setKload] = useState(true);
 
     useEffect(() => {
         agents.list().then(r => {
@@ -67,21 +66,34 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 const list = r.data?.agents || [];
                 setAgentList(list);
                 const on = list.filter(a => a.online);
-                if (on.length > 0)
-                    setF(p => p.target_ip ? p : ({ ...p, target_ip: on[0].ip_addr }));
+                if (on.length > 0) setF(p => p.target_ip ? p : ({ ...p, target_ip: on[0].ip_addr }));
             }
         }).catch(() => { }).finally(() => setAload(false));
+
+        taskKinds.list().then(r => {
+            if (r.code !== 0) throw new Error(r.message || '加载 TaskKind 失败');
+            const list = r.data?.task_kinds || [];
+            setKindList(list);
+            if (list.length > 0) {
+                setF(p => {
+                    const kind = list.find(k => k.id === p.task_kind) || list[0];
+                    return { ...p, task_kind: kind.id, ...valuesFromKind(kind) };
+                });
+            }
+        }).catch(e => setErr(e.message || '任务类型元数据加载失败')).finally(() => setKload(false));
     }, []);
 
+    const selectedKind = useMemo(
+        () => kindList.find(k => k.id === f.task_kind) || null,
+        [kindList, f.task_kind],
+    );
+
     const up = (k, v) => setF(p => {
-        const n = { ...p, [k]: v };
-        if (k === 'profiler_type') {
-            if (v === 0) n.event = 'cpu-clock';
-            if (v === 3) n.event = p.event === 'io' || p.event === 'sched' ? p.event : 'cpu';
-            if (v === 1) n.event = 'cpu';
-            if (v === 2) n.event = '';
+        if (k === 'task_kind') {
+            const kind = kindList.find(item => item.id === v);
+            return { ...p, task_kind: v, ...valuesFromKind(kind) };
         }
-        // 首次勾选持续采集时，自动套用默认窗口预设（低频常驻），避免沿用一次性任务的 99Hz/10s
+        const n = { ...p, [k]: v };
         if (k === 'continuous' && v === true && !p.continuous) {
             const preset = WINDOW_PRESETS[0];
             n.cron_expr = preset.cron;
@@ -92,7 +104,6 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
         return n;
     });
 
-    // 应用一个窗口预设：同时设定 cron 周期、采样时长、采样频率，保证"时长 < 周期"恒成立
     const applyWindowPreset = (preset) => setF(p => ({
         ...p,
         cron_expr: preset.cron,
@@ -101,59 +112,86 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
         window_seconds: preset.windowSeconds,
     }));
 
+    const renderField = (field) => {
+        const value = f[field.name] ?? field.default ?? '';
+        if (field.type === 'select') {
+            return (
+                <select style={S.select} value={value} onChange={e => up(field.name, e.target.value)}>
+                    {(field.options || []).map(option => <option key={option} value={option}>{option}</option>)}
+                </select>
+            );
+        }
+        if (field.type === 'boolean') {
+            return (
+                <label style={S.chk}>
+                    <input type="checkbox" checked={Boolean(value)} onChange={e => up(field.name, e.target.checked)} />
+                    <span>{field.label}</span>
+                </label>
+            );
+        }
+        return (
+            <input
+                style={S.input}
+                type={field.type === 'url' ? 'url' : field.type}
+                min={field.min}
+                max={field.max}
+                placeholder={field.placeholder || ''}
+                value={value}
+                onChange={e => up(field.name, coerceField(field, e.target.value))}
+            />
+        );
+    };
+
     const submit = async () => {
         if (!f.name.trim()) { setErr('请输入任务名称'); return; }
         if (!f.target_ip) { setErr('请选择目标 Agent'); return; }
-        const pid = parseInt(f.target_pid) || 0;
-        const dur = parseInt(f.duration) || 10;
-        const hz = parseInt(f.frequency) || 99;
-        if (dur < 1 || dur > 3600) { setErr('时长需为 1-3600s'); return; }
+        if (!selectedKind) { setErr('请选择任务类型'); return; }
+        const dur = parseInt(f.duration, 10) || 10;
+        if (dur < 1 || dur > selectedKind.max_duration) { setErr(`时长需为 1-${selectedKind.max_duration}s`); return; }
         if (f.continuous && !f.cron_expr) { setErr('请输入 cron 表达式'); return; }
         if (f.continuous && f.window_seconds && dur >= f.window_seconds) {
             setErr(`采样时长(${dur}s)需小于窗口周期(${f.window_seconds}s)，否则相邻窗口会重叠`);
             return;
         }
-        if (f.profiler_type === 1 && pid <= 0) { setErr('async-profiler 必须填写正在运行的 Java 进程 PID'); return; }
-        if (f.profiler_type === 2 && !/^https?:\/\/.+/.test(f.pprof_url.trim())) { setErr('请输入可访问的 http/https pprof Profile URL'); return; }
+        for (const field of selectedKind.schema || []) {
+            const value = f[field.name];
+            if (field.required && (value === '' || value === undefined || value === null || value === 0 && field.min > 0)) {
+                setErr(`请填写${field.label}`);
+                return;
+            }
+        }
 
         setSub(true); setErr(''); setOk('');
-        const tt = deriveTaskType(f.profiler_type, f.event);
+        const payload = {
+            name: f.name.trim(),
+            target_ip: f.target_ip,
+            task_kind: f.task_kind,
+            target_pid: parseInt(f.target_pid, 10) || 0,
+            duration: dur,
+            frequency: parseInt(f.frequency, 10) || 99,
+            callgraph: f.callgraph,
+            event: f.event,
+            subprocess: Boolean(f.subprocess),
+            pprof_url: String(f.pprof_url || '').trim(),
+        };
 
         try {
             if (f.continuous) {
-                const r = await schedules.create({
-                    name: f.name.trim(), cron_expr: f.cron_expr, task_type: tt,
-                    profiler_type: f.profiler_type, target_ip: f.target_ip,
-                    target_pid: pid, duration: dur, frequency: hz,
-                    callgraph: f.callgraph, event: f.event, pprof_url: f.pprof_url.trim(),
-                    window_seconds: f.window_seconds,
-                });
+                const r = await schedules.create({ ...payload, cron_expr: f.cron_expr, window_seconds: f.window_seconds });
                 if (r.code === 0) {
                     setCid(r.data?.sid || ''); setIsSch(true); setOk('持续采集已创建！');
                     setTimeout(() => onSuccess?.(), 3000);
-                }
-                else setErr(r.message || '创建失败');
+                } else setErr(r.message || '创建失败');
             } else {
-                const r = await tasks.create({
-                    name: f.name.trim(), target_ip: f.target_ip, target_pid: pid,
-                    duration: dur, frequency: hz, task_type: tt,
-                    profiler_type: f.profiler_type, callgraph: f.callgraph, event: f.event, pprof_url: f.pprof_url.trim(),
-                });
+                const r = await tasks.create(payload);
                 if (r.code === 0) {
                     setCid(r.data?.tid || ''); setIsSch(false); setOk('任务创建成功！');
                     setTimeout(() => onSuccess?.(), 2000);
-                }
-                else setErr(r.message || '创建失败');
+                } else setErr(r.message || '创建失败');
             }
         } catch (e) { setErr('请求失败: ' + (e.message || '无法连接后端')); }
         finally { setSub(false); }
     };
-
-    const modeLabel = f.profiler_type === 3
-        ? (f.event === 'io' ? 'IO延迟直方图' : f.event === 'sched' ? '调度延迟直方图' : 'eBPF CPU火焰图')
-        : f.profiler_type === 1 ? 'Java async-profiler'
-            : f.profiler_type === 2 ? 'Go pprof'
-                : 'perf CPU火焰图';
 
     return (
         <div style={S.overlay} onClick={onClose}>
@@ -161,104 +199,74 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 <div style={S.header}>
                     <div>
                         <h3 style={S.title}>新建采样任务</h3>
-                        <div style={S.hint}>选择 Agent 和采集器后提交，任务会自动进入状态流转。</div>
+                        <div style={S.hint}>任务类型与参数由后端 TaskKind 契约加载。</div>
                     </div>
                     <button style={S.close} onClick={onClose} disabled={sub} aria-label="关闭">×</button>
                 </div>
 
-            <div style={S.collectorGuide}>
-                <strong>采集器填写说明：</strong>
-                perf 采集 CPU 栈，PID 留空表示整机；async-profiler 仅用于 Java，必须填写 Java PID；
-                Go pprof 不需要 PID，必须填写 Agent 能访问的完整 <code>/debug/pprof/profile</code> URL；
-                eBPF 需要 Agent 的内核追踪权限。
-            </div>
-
-            <div style={{ marginBottom: 16 }}>
-                <label style={S.label}>目标 Agent *</label>
-                {aload ? <p style={{ fontSize: 12, color: '#999' }}>加载中...</p>
-                    : agentList.length === 0 ? <p style={{ fontSize: 12, color: '#f44' }}>⚠️ 没有在线 Agent</p>
-                        : <select style={S.select} value={f.target_ip} onChange={e => up('target_ip', e.target.value)}>
-                            <option value="">-- 选择 Agent --</option>
-                            {agentList.map(a => <option key={a.ip_addr} value={a.ip_addr}>{a.hostname} ({a.ip_addr}) {a.online ? '🟢' : '🔴'}</option>)}
-                        </select>}
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-                <div><label style={S.label}>任务名称 *</label><input style={S.input} placeholder="CPU采样-nginx" value={f.name} onChange={e => up('name', e.target.value)} /></div>
-                <div><label style={S.label}>{f.profiler_type === 1 ? 'Java 目标 PID *' : f.profiler_type === 2 ? '目标 PID（pprof 不需要）' : '目标 PID（留空=整机）'}</label><input style={S.input} type="number" placeholder={f.profiler_type === 1 ? '必须填写 Java PID' : '留空'} value={f.target_pid} onChange={e => up('target_pid', e.target.value)} disabled={f.profiler_type === 2} /></div>
-                <div><label style={S.label}>采样时长（秒）</label><input style={S.input} type="number" value={f.duration} onChange={e => up('duration', e.target.value)} /></div>
-                <div><label style={S.label}>采样频率（Hz）</label><input style={S.input} type="number" value={f.frequency} onChange={e => up('frequency', e.target.value)} /></div>
-                <div>
-                    <label style={S.label}>采集器类型</label>
-                    <select style={S.select} value={f.profiler_type} onChange={e => up('profiler_type', parseInt(e.target.value))}>
-                        <option value={0}>perf (CPU采样)</option>
-                        <option value={1}>async-profiler (Java)</option>
-                        <option value={2}>pprof (Go)</option>
-                        <option value={3}>eBPF (内核探针)</option>
-                    </select>
+                <div style={{ marginBottom: 16 }}>
+                    <label style={S.label}>目标 Agent *</label>
+                    {aload ? <p style={{ fontSize: 12, color: '#999' }}>加载中...</p>
+                        : agentList.length === 0 ? <p style={{ fontSize: 12, color: '#f44' }}>没有在线 Agent</p>
+                            : <select style={S.select} value={f.target_ip} onChange={e => up('target_ip', e.target.value)}>
+                                <option value="">-- 选择 Agent --</option>
+                                {agentList.map(a => <option key={a.ip_addr} value={a.ip_addr}>{a.hostname} ({a.ip_addr}) {a.online ? '在线' : '离线'}</option>)}
+                            </select>}
                 </div>
-                <div>
-                    <label style={S.label}>{f.profiler_type === 3 ? 'eBPF 追踪模式' : f.profiler_type === 1 ? '采样事件' : f.profiler_type === 2 ? 'pprof Profile URL *' : '调用图模式'}</label>
-                    {f.profiler_type === 3 ? (
-                        <select style={S.select} value={f.event} onChange={e => up('event', e.target.value)}>
-                            <option value="cpu">CPU 性能分析 (火焰图)</option>
-                            <option value="io">IO 延迟分布 (直方图)</option>
-                            <option value="sched">调度延迟分布 (直方图)</option>
-                        </select>
-                    ) : f.profiler_type === 1 ? (
-                        <select style={S.select} value={f.event} onChange={e => up('event', e.target.value)}><option value="cpu">CPU</option><option value="wall">Wall clock</option><option value="alloc">Allocation</option></select>
-                    ) : f.profiler_type === 2 ? (
-                        <input style={S.input} type="url" placeholder="http://127.0.0.1:6060/debug/pprof/profile" value={f.pprof_url} onChange={e => up('pprof_url', e.target.value)} />
-                    ) : (
-                        <select style={S.select} value={f.callgraph} onChange={e => up('callgraph', e.target.value)}>
-                            <option value="fp">fp (frame pointer)</option>
-                            <option value="dwarf">dwarf (DWARF)</option>
-                            <option value="lbr">lbr (LBR)</option>
-                        </select>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                    <div><label style={S.label}>任务名称 *</label><input style={S.input} placeholder="CPU采样-nginx" value={f.name} onChange={e => up('name', e.target.value)} /></div>
+                    <div>
+                        <label style={S.label}>任务类型</label>
+                        {kload ? <p style={{ fontSize: 12, color: '#999' }}>加载中...</p> : (
+                            <select style={S.select} value={f.task_kind} onChange={e => up('task_kind', e.target.value)}>
+                                {kindList.map(kind => <option key={kind.id} value={kind.id}>{kind.display_name}</option>)}
+                            </select>
+                        )}
+                    </div>
+                    {(selectedKind?.schema || []).map(field => (
+                        <div key={field.name}>
+                            {field.type !== 'boolean' && <label style={S.label}>{field.label}{field.required ? ' *' : ''}</label>}
+                            {renderField(field)}
+                        </div>
+                    ))}
+                </div>
+
+                <p style={S.hint}>将生成: {selectedKind?.display_name || '未选择任务类型'}</p>
+
+                <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
+                    <label style={S.chk}>
+                        <input type="checkbox" checked={f.continuous} onChange={e => up('continuous', e.target.checked)} />
+                        <span style={{ fontWeight: 'bold', fontSize: 14 }}>持续采集 (Continuous Profiling)</span>
+                    </label>
+                    {f.continuous && (
+                        <div>
+                            <label style={S.label}>持续采集窗口预设</label>
+                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+                                {WINDOW_PRESETS.map(p => (
+                                    <button key={p.cron} style={S.presetBtn(f.cron_expr === p.cron && f.window_seconds === p.windowSeconds)}
+                                        onClick={() => applyWindowPreset(p)}>{p.label}</button>
+                                ))}
+                            </div>
+                            <label style={S.label}>Cron 周期</label>
+                            <input style={S.input} value={f.cron_expr} onChange={e => up('cron_expr', e.target.value)} placeholder="*/5 * * * *" />
+                            <p style={S.hint}>窗口时长 {f.duration}s / 采样频率 {f.frequency}Hz。</p>
+                        </div>
                     )}
                 </div>
-            </div>
 
-            <p style={S.hint}>📌 将生成: {modeLabel}{f.profiler_type === 1 ? '。请填写与 Agent 共享 PID 命名空间、正在运行的 Java 进程 PID。' : f.profiler_type === 2 ? '。请填写 Agent 能访问的完整 /debug/pprof/profile URL；本地 demo 使用 http://127.0.0.1:6060/debug/pprof/profile。' : ''}</p>
+                {err && <p style={S.err}>{err}</p>}
+                {ok && <div style={S.ok}>{ok} {cid && (isSch
+                    ? <Link to="/timeline" style={{ color: '#4a6cf7', fontWeight: 'bold' }}>去时间轴 (SID: {cid})</Link>
+                    : <Link to={`/task/result?tid=${cid}`} style={{ color: '#4a6cf7', fontWeight: 'bold' }}>查看任务 {cid}</Link>)}
+                </div>}
 
-            {/* 持续采集 */}
-            <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
-                <label style={S.chk}>
-                    <input type="checkbox" checked={f.continuous} onChange={e => up('continuous', e.target.checked)} />
-                    <span style={{ fontWeight: 'bold', fontSize: 14 }}>🔄 持续采集 (Continuous Profiling)</span>
-                </label>
-                <p style={S.hint}>自动定时采集，可在"时间轴"页面回溯历史</p>
-                {f.continuous && (
-                    <div>
-                        <label style={S.label}>持续采集窗口预设</label>
-                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-                            {WINDOW_PRESETS.map(p => (
-                                <button key={p.cron} style={S.presetBtn(f.cron_expr === p.cron && f.window_seconds === p.windowSeconds)}
-                                    onClick={() => applyWindowPreset(p)}>{p.label}</button>
-                            ))}
-                        </div>
-                        <label style={S.label}>Cron 周期</label>
-                        <input style={S.input} value={f.cron_expr} onChange={e => up('cron_expr', e.target.value)} placeholder="*/5 * * * *" />
-                        <p style={S.hint}>
-                            窗口时长 {f.duration}s / 采样频率 {f.frequency}Hz（低频常驻，参考 parca-agent 设计）。
-                            自定义 cron 时请自行保证「采样时长 &lt; 窗口周期」，否则相邻窗口会重叠，后端也会拒绝创建。
-                        </p>
-                    </div>
-                )}
-            </div>
-
-            {err && <p style={S.err}>❌ {err}</p>}
-            {ok && <div style={S.ok}>✅ {ok} {cid && (isSch
-                ? <Link to="/timeline" style={{ color: '#4a6cf7', fontWeight: 'bold' }}>去时间轴 → (SID: {cid})</Link>
-                : <Link to={`/task/result?tid=${cid}`} style={{ color: '#4a6cf7', fontWeight: 'bold' }}>查看任务 → {cid}</Link>)}
-            </div>}
-
-            <div style={{ marginTop: 16, display: 'flex', gap: 10 }}>
-                <button style={{ ...S.btn, opacity: sub ? 0.6 : 1 }} onClick={submit} disabled={sub}>
-                    {sub ? '提交中...' : f.continuous ? '创建持续采集' : '提交任务'}
-                </button>
-                <button style={{ ...S.btn, background: '#999' }} onClick={onClose} disabled={sub}>取消</button>
-            </div>
+                <div style={{ marginTop: 16, display: 'flex', gap: 10 }}>
+                    <button style={{ ...S.btn, opacity: sub ? 0.6 : 1 }} onClick={submit} disabled={sub || kload}>
+                        {sub ? '提交中...' : f.continuous ? '创建持续采集' : '提交任务'}
+                    </button>
+                    <button style={{ ...S.btn, background: '#999' }} onClick={onClose} disabled={sub}>取消</button>
+                </div>
             </div>
         </div>
     );

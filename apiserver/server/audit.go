@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"time"
 
 	"go.uber.org/zap"
@@ -41,13 +42,18 @@ func (s *APIServer) transitionTaskStatus(task *model.HotmethodTask, toStatus int
 		if err := tx.Model(task).Updates(updates).Error; err != nil {
 			return err
 		}
+		sequence := nextTaskEventSequenceTx(tx, task.TID)
+		payload, _ := json.Marshal(extra)
 		return tx.Create(&model.TaskStatusEvent{
-			TID:        task.TID,
-			FromStatus: fromStatus,
-			ToStatus:   toStatus,
-			Reason:     reason,
-			Source:     source,
-			CreatedAt:  time.Now(),
+			TID:          task.TID,
+			FromStatus:   fromStatus,
+			ToStatus:     toStatus,
+			Reason:       reason,
+			Source:       source,
+			Sequence:     sequence,
+			SourceModule: source,
+			Payload:      payload,
+			CreatedAt:    time.Now(),
 		}).Error
 	})
 	if err != nil {
@@ -83,16 +89,27 @@ func (s *APIServer) recordTaskStatusEvent(tid string, fromStatus int, toStatus i
 	if source == "" {
 		source = "apiserver"
 	}
-	if err := s.DB.Create(&model.TaskStatusEvent{
-		TID:        tid,
-		FromStatus: fromStatus,
-		ToStatus:   toStatus,
-		Reason:     reason,
-		Source:     source,
-		CreatedAt:  time.Now(),
-	}).Error; err != nil {
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		return tx.Create(&model.TaskStatusEvent{
+			TID:          tid,
+			FromStatus:   fromStatus,
+			ToStatus:     toStatus,
+			Reason:       reason,
+			Source:       source,
+			Sequence:     nextTaskEventSequenceTx(tx, tid),
+			SourceModule: source,
+			CreatedAt:    time.Now(),
+		}).Error
+	})
+	if err != nil {
 		s.Logger.Warn("记录任务状态事件失败", zap.String("tid", tid), zap.Error(err))
 	}
+}
+
+func nextTaskEventSequenceTx(tx *gorm.DB, tid string) int64 {
+	var maxSeq int64
+	_ = tx.Model(&model.TaskStatusEvent{}).Where("tid = ?", tid).Select("COALESCE(MAX(sequence), 0)").Scan(&maxSeq).Error
+	return maxSeq + 1
 }
 
 func (s *APIServer) recordAgentAudit(ip string, hostname string, event string, reason string) {
