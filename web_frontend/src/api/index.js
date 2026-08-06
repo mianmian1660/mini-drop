@@ -79,6 +79,13 @@ export const tasks = {
     // GET /api/v1/tasks/timeline?master_tid=xxx&from=&to=&at=&span=
     timeline: (masterTid, { from, to, at, span, status, task_kind, has_result } = {}) =>
         client.get('/api/v1/tasks/timeline', { params: { master_tid: masterTid, from, to, at, span, status, task_kind, has_result } }),
+    // 热点函数对比（基线 vs 对比），数据取两侧的 top.json
+    // threshold 单位是百分点，|差值| 小于它的函数视为噪声滤掉，缺省 1
+    // GET /api/v1/tasks/diff?baseline_tid=&compare_tid=&threshold=
+    diff: (baselineTid, compareTid, threshold) =>
+        client.get('/api/v1/tasks/diff', {
+            params: { baseline_tid: baselineTid, compare_tid: compareTid, threshold },
+        }),
 };
 
 // ---------- 分析结果 ----------

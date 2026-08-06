@@ -12,10 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1855,6 +1857,214 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			"total":      len(timeline),
 			"points":     timeline,
 			"trends":     trends,
+		},
+	})
+}
+
+// ============================================================
+// GetTaskDiff — 两个任务的热点函数对比（基线 vs 对比）
+// GET /api/v1/tasks/diff?baseline_tid=X&compare_tid=Y&threshold=1
+//
+// 数据来自两侧的 {tid}/top.json。perf、pprof、async-profiler、eBPF-CPU
+// 四种采集器都会产出该文件，所以对比不挑采集器；eBPF 直方图任务只有
+// bpf_data.json，没有可比的函数列表，会被明确拒绝而不是返回一张空表。
+//
+// 口径：按 percentage 比较而不是原始 samples——两次采集的时长和频率可能不同，
+// 绝对采样数不可比，百分比才是归一化的。两侧原始值一并返回，方便前端同时
+// 展示"基线值 / 对比值 / 差值"三个数。
+//
+// 已知限制：top.json 只保留各自 Top20，因此 direction 为 baseline_only /
+// compare_only 的准确含义是"没进入对方的 Top20"，不代表该函数在对方那次采集
+// 里不存在。
+// ============================================================
+
+// DiffEntry 描述一个函数在两次采集之间的占比变化。
+type DiffEntry struct {
+	Function           string  `json:"function"`
+	BaselinePercentage float64 `json:"baseline_percentage"`
+	ComparePercentage  float64 `json:"compare_percentage"`
+	DeltaPercentage    float64 `json:"delta_percentage"`
+	BaselineSamples    float64 `json:"baseline_samples"`
+	CompareSamples     float64 `json:"compare_samples"`
+	// up=对比侧更热 down=对比侧更冷 compare_only/baseline_only=只进了一侧的 Top20
+	Direction string `json:"direction"`
+}
+
+// topEntryFloat 取 top.json 一条记录里的数值字段；JSON 数字统一解码为 float64。
+func topEntryFloat(m map[string]interface{}, key string) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	return 0
+}
+
+// diffTopFunctions 把两侧 TopN 按函数名对齐并算差值。
+// 纯函数，不碰 DB/存储，便于单测覆盖各种边界。
+// threshold 单位是百分点，|delta| 小于它的条目视为噪声滤掉。
+func diffTopFunctions(baseline, compare []map[string]interface{}, threshold float64) []DiffEntry {
+	type side struct{ percentage, samples float64 }
+
+	index := func(items []map[string]interface{}) map[string]side {
+		out := make(map[string]side, len(items))
+		for _, m := range items {
+			name, _ := m["function"].(string)
+			if name == "" {
+				continue
+			}
+			// 同名函数重复出现时保留占比更高的一条
+			s := side{topEntryFloat(m, "percentage"), topEntryFloat(m, "samples")}
+			if prev, exists := out[name]; !exists || s.percentage > prev.percentage {
+				out[name] = s
+			}
+		}
+		return out
+	}
+
+	baseIdx, cmpIdx := index(baseline), index(compare)
+
+	entries := make([]DiffEntry, 0, len(baseIdx)+len(cmpIdx))
+	seen := make(map[string]struct{}, len(baseIdx)+len(cmpIdx))
+	appendEntry := func(name string) {
+		if _, done := seen[name]; done {
+			return
+		}
+		seen[name] = struct{}{}
+
+		b, inBase := baseIdx[name]
+		cmp, inCmp := cmpIdx[name]
+		delta := cmp.percentage - b.percentage
+		if math.Abs(delta) < threshold {
+			return
+		}
+
+		direction := "up"
+		switch {
+		case !inBase:
+			direction = "compare_only"
+		case !inCmp:
+			direction = "baseline_only"
+		case delta < 0:
+			direction = "down"
+		}
+
+		entries = append(entries, DiffEntry{
+			Function:           name,
+			BaselinePercentage: b.percentage,
+			ComparePercentage:  cmp.percentage,
+			DeltaPercentage:    math.Round(delta*100) / 100,
+			BaselineSamples:    b.samples,
+			CompareSamples:     cmp.samples,
+			Direction:          direction,
+		})
+	}
+
+	for name := range baseIdx {
+		appendEntry(name)
+	}
+	for name := range cmpIdx {
+		appendEntry(name)
+	}
+
+	// 变化最大的排最前；差值相同时按函数名排序，保证输出稳定、可断言
+	sort.Slice(entries, func(i, j int) bool {
+		di, dj := math.Abs(entries[i].DeltaPercentage), math.Abs(entries[j].DeltaPercentage)
+		if di != dj {
+			return di > dj
+		}
+		return entries[i].Function < entries[j].Function
+	})
+	return entries
+}
+
+func (s *APIServer) GetTaskDiff(c *gin.Context) {
+	baselineTID := strings.TrimSpace(c.Query("baseline_tid"))
+	compareTID := strings.TrimSpace(c.Query("compare_tid"))
+	if baselineTID == "" || compareTID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 baseline_tid 或 compare_tid 参数"})
+		return
+	}
+
+	threshold := 1.0
+	if raw := strings.TrimSpace(c.Query("threshold")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "threshold 需为非负数（单位：百分点）"})
+			return
+		}
+		threshold = v
+	}
+
+	loadTask := func(tid, field string) (*model.HotmethodTask, bool) {
+		var t model.HotmethodTask
+		err := s.DB.Where("tid = ? AND deleted_at IS NULL", tid).First(&t).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": field + " 对应的任务不存在: " + tid})
+			return nil, false
+		}
+		if err != nil {
+			s.Logger.Error("查询对比任务失败", zap.String("tid", tid), zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "查询失败"})
+			return nil, false
+		}
+		return &t, true
+	}
+
+	baselineTask, ok := loadTask(baselineTID, "baseline_tid")
+	if !ok {
+		return
+	}
+	compareTask, ok := loadTask(compareTID, "compare_tid")
+	if !ok {
+		return
+	}
+
+	// 缺产物时说明是哪一侧、为什么缺，而不是回空表让用户自己猜
+	fetchSide := func(t *model.HotmethodTask, field string) ([]map[string]interface{}, bool) {
+		top := s.fetchTopFunctions(t.TID)
+		if len(top) > 0 {
+			return top, true
+		}
+		reason := "没有可对比的热点函数产物（top.json）"
+		if t.AnalysisStatus < 2 {
+			reason = "分析尚未完成（analysis_status=" + strconv.Itoa(t.AnalysisStatus) + "）"
+		} else if t.ProfilerType == ProfilerBPF {
+			reason = "eBPF 直方图任务产出的是延迟分布而非函数列表，无法做热点对比"
+		}
+		c.JSON(http.StatusConflict, gin.H{
+			"code":    409,
+			"message": field + "（" + t.TID + "）" + reason,
+		})
+		return nil, false
+	}
+
+	baselineTop, ok := fetchSide(baselineTask, "baseline_tid")
+	if !ok {
+		return
+	}
+	compareTop, ok := fetchSide(compareTask, "compare_tid")
+	if !ok {
+		return
+	}
+
+	entries := diffTopFunctions(baselineTop, compareTop, threshold)
+
+	brief := func(t *model.HotmethodTask) gin.H {
+		return gin.H{
+			"tid":           t.TID,
+			"name":          t.Name,
+			"profiler_type": t.ProfilerType,
+			"create_time":   t.CreateTime,
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"data": gin.H{
+			"baseline":  brief(baselineTask),
+			"compare":   brief(compareTask),
+			"threshold": threshold,
+			"total":     len(entries),
+			"functions": entries,
 		},
 	})
 }

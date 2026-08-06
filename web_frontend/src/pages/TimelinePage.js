@@ -53,6 +53,7 @@ export default function TimelinePage() {
     const [error, setError] = useState('');
     const [atInput, setAtInput] = useState('');       // datetime-local 输入值
     const [spanInput, setSpanInput] = useState('30m'); // 回溯时刻前后取多长区间
+    const [baselineTid, setBaselineTid] = useState(''); // 已选作对比基线的窗口
     const [queryMode, setQueryMode] = useState('list'); // 'list' 全部窗口 | 'at' 按时刻回溯 | 'range' 时间区间
     const [fromInput, setFromInput] = useState('');   // 自定义区间起点（datetime-local）
     const [toInput, setToInput] = useState('');       // 自定义区间终点（datetime-local）
@@ -359,10 +360,29 @@ export default function TimelinePage() {
                                         {p.task_kind && <span style={{ marginLeft: 6, fontSize: 11, color: '#666' }}>{p.task_kind}</span>}
                                         {p.has_result && <span style={{ marginLeft: 6, fontSize: 11, color: '#4caf50' }}>✅ 有结果</span>}
                                     </div>
-                                    <Link to={p.result_url || `/task/result?tid=${p.tid}`}
-                                        style={{ color: '#4a6cf7', fontSize: 13, fontWeight: 'bold', textDecoration: 'none' }}>
-                                        查看详情 →
-                                    </Link>
+                                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                        {/* 只有分析完成的窗口才有 top.json，没有产物的窗口不给对比入口 */}
+                                        {p.has_result && (baselineTid === p.tid ? (
+                                            <button style={{ ...S.btnSm, background: '#4a6cf7', color: '#fff', marginRight: 0 }}
+                                                onClick={() => setBaselineTid('')}>
+                                                ★ 基线（点击取消）
+                                            </button>
+                                        ) : baselineTid ? (
+                                            <Link to={`/task/diff?baseline=${baselineTid}&compare=${p.tid}`}
+                                                style={{ ...S.btnSm, marginRight: 0, textDecoration: 'none', background: '#e8f0ff', color: '#4a6cf7' }}>
+                                                与基线对比
+                                            </Link>
+                                        ) : (
+                                            <button style={{ ...S.btnSm, marginRight: 0 }}
+                                                onClick={() => setBaselineTid(p.tid)}>
+                                                设为基线
+                                            </button>
+                                        ))}
+                                        <Link to={p.result_url || `/task/result?tid=${p.tid}`}
+                                            style={{ color: '#4a6cf7', fontSize: 13, fontWeight: 'bold', textDecoration: 'none' }}>
+                                            查看详情 →
+                                        </Link>
+                                    </div>
                                 </div>
                                 <div style={{ fontSize: 11, color: '#999', marginTop: 4 }}>
                                     窗口 {new Date(p.window_start || p.create_time).toLocaleString('zh-CN')}

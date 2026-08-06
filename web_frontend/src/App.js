@@ -20,6 +20,7 @@ import HomePage from './pages/HomePage';
 import TaskListPage from './pages/TaskListPage';
 import TaskResultPage from './pages/TaskResultPage';
 import TimelinePage from './pages/TimelinePage';
+import TaskDiffPage from './pages/TaskDiffPage';
 import LoginPage from './pages/LoginPage';
 
 // ============================================================
@@ -138,6 +139,7 @@ export default function App() {
                 <Route path="/tasks" element={<TaskListPage />} />
                 <Route path="/task/result" element={<TaskResultPage />} />
                 <Route path="/timeline" element={<TimelinePage />} />
+                <Route path="/task/diff" element={<TaskDiffPage />} />
                 <Route path="/login" element={<LoginPage onLoginSuccess={handleLoginSuccess} />} />
             </Routes>
         </div>
