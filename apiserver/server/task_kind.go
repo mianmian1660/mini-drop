@@ -115,7 +115,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 		},
 		{
 			ID: TaskKindEBPFCPU, Name: "ebpf_cpu", DisplayName: "eBPF CPU 火焰图",
-			Runner: "bpftrace", AnalysisPipeline: "perf_flamegraph",
+			Runner: "bpftrace", AnalysisPipeline: "bpf_histogram",
 			Capabilities: []string{"ebpf", "bpftrace"}, SupportedOS: []string{"linux"},
 			Default:     mergeDefaults(commonDefaults, map[string]interface{}{"event": "cpu", "frequency": 1}),
 			Schema:      commonFields,
@@ -355,6 +355,25 @@ func (s *APIServer) agentSupportsTaskKind(targetIP string, kind TaskKindDefiniti
 	}
 	if capSet[kind.ID] || capSet[kind.Runner] {
 		return true
+	}
+	if isEBPFTaskKind(kind.ID) && hasEBPFCapability(capSet) {
+		return true
+	}
+	return false
+}
+
+func isEBPFTaskKind(kindID string) bool {
+	return kindID == TaskKindEBPFCPU || kindID == TaskKindEBPFIO || kindID == TaskKindEBPFSched
+}
+
+func hasEBPFCapability(capSet map[string]bool) bool {
+	if capSet["ebpf"] || capSet["bpftrace"] {
+		return true
+	}
+	for cap := range capSet {
+		if strings.HasPrefix(cap, "ebpf_") {
+			return true
+		}
 	}
 	return false
 }

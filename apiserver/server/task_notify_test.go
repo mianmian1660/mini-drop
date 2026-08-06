@@ -1528,8 +1528,10 @@ func TestTaskKindDefinitionsCoverCurrentCollectors(t *testing.T) {
 			t.Fatalf("missing task kind %s", id)
 		}
 	}
-	if seen[TaskKindEBPFIO].AnalysisPipeline != "bpf_histogram" {
-		t.Fatalf("eBPF IO pipeline=%q, want bpf_histogram", seen[TaskKindEBPFIO].AnalysisPipeline)
+	for _, id := range []string{TaskKindEBPFCPU, TaskKindEBPFIO, TaskKindEBPFSched} {
+		if seen[id].AnalysisPipeline != "bpf_histogram" {
+			t.Fatalf("%s pipeline=%q, want bpf_histogram", id, seen[id].AnalysisPipeline)
+		}
 	}
 	if seen[TaskKindPythonPySpy].Enabled || seen[TaskKindJavaHeap].Enabled {
 		t.Fatalf("stage6 extension collectors should be declared but disabled by default")
@@ -1581,5 +1583,16 @@ func TestAgentCapabilityMatchingIsConservative(t *testing.T) {
 	perfKind, _ := taskKindByID(TaskKindPerfCPU)
 	if !s.agentSupportsTaskKind("10.0.0.9", perfKind) {
 		t.Fatal("agent with perf capability should match perf task kind")
+	}
+
+	if err := s.DB.Create(&model.AgentInfo{IPAddr: "10.0.0.10", Hostname: "legacy-ebpf", Capabilities: []byte(`["ebpf_io","ebpf_sched"]`)}).Error; err != nil {
+		t.Fatalf("create legacy ebpf agent: %v", err)
+	}
+	ebpfCPUKind, _ := taskKindByID(TaskKindEBPFCPU)
+	if !s.agentSupportsTaskKind("10.0.0.10", ebpfCPUKind) {
+		t.Fatal("agent with legacy ebpf_io/ebpf_sched capabilities should match ebpf_cpu")
+	}
+	if s.agentSupportsTaskKind("10.0.0.9", ebpfCPUKind) {
+		t.Fatal("agent with explicit perf-only capabilities must not match ebpf_cpu")
 	}
 }
