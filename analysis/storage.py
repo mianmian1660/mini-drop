@@ -84,6 +84,11 @@ class Storage(abc.ABC):
         ...
 
     @abc.abstractmethod
+    def stat_object(self, bucket: str, key: str) -> Optional[int]:
+        """获取文件大小（字节），文件不存在或获取失败返回 None"""
+        ...
+
+    @abc.abstractmethod
     def delete_object(self, bucket: str, key: str) -> bool:
         """删除文件"""
         ...
@@ -219,6 +224,16 @@ class MinIOStorage(Storage):
             return True
         except S3Error:
             return False
+
+    # ---------- stat_object ----------
+    def stat_object(self, bucket: str, key: str) -> Optional[int]:
+        """获取文件大小（字节）"""
+        try:
+            info = self.client.stat_object(bucket, key)
+            return info.size
+        except S3Error as e:
+            print(f"[storage] 获取文件信息失败: {bucket}/{key} - {e}", file=sys.stderr)
+            return None
 
     # ---------- delete_object ----------
     def delete_object(self, bucket: str, key: str) -> bool:

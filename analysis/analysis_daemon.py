@@ -28,7 +28,7 @@ PG_DSN = os.environ.get(
 )
 
 
-def record_result_artifacts(conn, tid: str, outputs, manifest=None):
+def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None, bucket=None):
     """Persist analyzer outputs as Artifact metadata without storing URLs."""
     keys = [value for value in (outputs or []) if isinstance(value, str) and value.startswith(tid + "/")]
     if manifest and f"{tid}/manifest.json" not in keys:
@@ -46,15 +46,18 @@ def record_result_artifacts(conn, tid: str, outputs, manifest=None):
         name = key.rsplit("/", 1)[-1]
         kind = "MANIFEST" if name == "manifest.json" else "RESULT" if name.endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE"
         content_type = "application/json" if name.endswith(".json") else "image/svg+xml" if name.endswith(".svg") else "text/markdown" if name.endswith(".md") else "application/octet-stream"
+        size = 0
+        if storage is not None and bucket:
+            size = storage.stat_object(bucket, key) or 0
         cur.execute(
             """
-            INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, 'ready', NOW())
+            INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, size, created_at)
+            VALUES (%s, %s, %s, %s, %s, 'ready', %s, NOW())
             ON CONFLICT (task_tid, kind, object_key) DO UPDATE
-            SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status
+            SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status, size = EXCLUDED.size
             RETURNING id
             """,
-            (tid, attempt_id, kind, key, content_type),
+            (tid, attempt_id, kind, key, content_type, size),
         )
         row = cur.fetchone()
         if row:
@@ -157,9 +160,10 @@ def _upload_manifest(storage_cfg: dict, bucket: str, tid: str, manifest: dict) -
 
 
 def finalize_success_tx(conn, lease_client, job, tid: str, result: dict,
-                        analyzer_version: str):
+                        analyzer_version: str, storage=None, bucket=None):
     manifest = result.get("manifest") or {}
-    artifact_ids = record_result_artifacts(conn, tid, result.get("outputs", []), manifest=manifest)
+    artifact_ids = record_result_artifacts(conn, tid, result.get("outputs", []), manifest=manifest,
+                                           storage=storage, bucket=bucket)
     if not lease_client.complete(
         job.id,
         analyzer_version,
@@ -256,7 +260,11 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
             if manifest_key:
                 result.setdefault("outputs", []).append(manifest_key)
 
-        finalize_success_tx(conn, lease_client, job, tid, result, analyzer_version)
+        storage_for_sizes, storage_ok = hm._connect_storage(storage_cfg)
+        if not storage_ok:
+            storage_for_sizes = None
+        finalize_success_tx(conn, lease_client, job, tid, result, analyzer_version,
+                            storage=storage_for_sizes, bucket=bucket)
         conn.commit()
 
         log_event("analysis_succeeded", **common,

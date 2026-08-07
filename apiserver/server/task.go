@@ -706,9 +706,14 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	if len(suggestions) > 0 {
 		result["suggestions"] = suggestions
 	}
+	publicArtifacts := make([]gin.H, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		publicArtifacts = append(publicArtifacts, publicArtifact(artifact))
+	}
+
 	result["status_events"] = statusEvents
 	result["attempts"] = attempts
-	result["artifacts"] = artifacts
+	result["artifacts"] = publicArtifacts
 	result["files"] = files
 
 	return result
