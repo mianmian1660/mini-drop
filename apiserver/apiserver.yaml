@@ -48,3 +48,11 @@ security:
 # 可观测性配置
 observability:
   metrics_enabled: true
+
+# 持续 Profiling 查询代理。v1 通过 Mini-Drop apiserver 访问 Parca，前端不直连 Parca。
+profile:
+  enabled: false
+  parca_url: ""       # 例如 http://localhost:7070；未配置时持续画像页面显示空态
+  parca_grpc_addr: "parca:7070"
+  parca_ui_url: "http://localhost:7070"
+  timeout_sec: 5

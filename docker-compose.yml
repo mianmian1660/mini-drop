@@ -79,6 +79,62 @@ services:
       /bin/sh -c " mc alias set myminio http://minio:9000 drop dropdrop; mc mb --ignore-existing myminio/drop-data; mc anonymous set public myminio/drop-data; echo 'MinIO init: bucket=drop-data, policy=public'; "
 
   # ========================================================
+  # parca — 持续 Profiling 存储与查询服务
+  # ========================================================
+  parca:
+    image: ghcr.io/parca-dev/parca:v0.28.0
+    user: "0:0"
+    command:
+      - /parca
+      - --config-path=/etc/parca/parca.yaml
+      - --http-address=:7070
+      - --enable-persistence
+      - --storage-path=/var/lib/parca
+      - --log-level=info
+    ports:
+      - "7070:7070"
+    volumes:
+      - ./deploy/parca/parca.yaml:/etc/parca/parca.yaml:ro
+      - parcadata:/var/lib/parca
+
+  # ========================================================
+  # parca-agent — 本机持续 Profiling Agent（WSL 下 best-effort）
+  # ========================================================
+  parca_agent:
+    image: ghcr.io/parca-dev/parca-agent:v0.49.0
+    command:
+      - --node=mini-drop-local
+      - --remote-store-address=127.0.0.1:7070
+      - --remote-store-insecure
+      - --metadata-external-labels=job=hotmethod,env=development,instance=127.0.0.1,node=mini-drop-local
+      - --debuginfo-upload-disable
+      - --log-level=info
+    restart: "no"
+    network_mode: host
+    privileged: true
+    pid: host
+    security_opt:
+      - apparmor:unconfined
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - PERFMON
+      - BPF
+      - SYS_RESOURCE
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+      - /sys/kernel/tracing:/sys/kernel/tracing:rw
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      - /proc:/host/proc:ro
+    depends_on:
+      parca:
+        condition: service_started
+
+  # ========================================================
   # drop_server — C++ 调度中心
   # 接收心跳、派发任务、收结果
   # ========================================================
@@ -148,6 +204,10 @@ services:
       MINI_DROP_ENV: "development"
       ALLOW_INSECURE_TRANSPORT: "true"
       METRICS_ENABLED: "true"
+      PROFILE_ENABLED: "true"
+      PARCA_URL: "http://parca:7070"
+      PARCA_GRPC_ADDR: "parca:7070"
+      PARCA_UI_URL: "http://localhost:7070"
       S3_ENDPOINT: "minio:9000" # MinIO 地址（Docker 内部网络）
       S3_PUBLIC_ENDPOINT: "localhost:9000" # 浏览器访问地址（预签名 URL 用）
       S3_ACCESS_KEY: "drop"
@@ -160,6 +220,8 @@ services:
       minio:
         condition: service_healthy
       drop_server:
+        condition: service_started
+      parca:
         condition: service_started
     healthcheck:
       test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:8191/healthz >/dev/null 2>&1" ]
@@ -211,3 +273,4 @@ services:
 volumes:
   pgdata:
   miniodata:
+  parcadata:

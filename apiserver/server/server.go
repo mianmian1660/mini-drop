@@ -43,6 +43,7 @@ type APIServer struct {
 	Cron       *cron.Cron              // 定时任务调度器（W5）
 	CronJobs   map[string]cron.EntryID // SID → cron EntryID 映射（支持动态停止/删除）
 	TaskSvc    *TaskService            // 阶段 2：任务编排服务
+	ProfileCli ProfileClient           // Continuous Profiling 查询客户端（Parca adapter）
 }
 
 // New 创建一个新的 APIServer 实例
@@ -66,6 +67,7 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 		Router: router,
 	}
 	s.TaskSvc = NewTaskService(s)
+	s.ProfileCli = NewHTTPProfileClient(cfg.Profile)
 
 	// 初始化对象存储（MinIO）
 	if err := s.initStorage(); err != nil {
@@ -696,6 +698,13 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/tasks/timeline", s.GetTimeline)
 		api.GET("/tasks/diff", s.GetTaskDiff)
 
+		// Continuous Profiling 查询（Parca adapter）
+		api.GET("/profile/targets", s.ListProfileTargets)
+		api.GET("/profile/query", s.GetProfileFlamegraph)
+		api.GET("/profile/flamegraph", s.GetProfileFlamegraph)
+		api.GET("/profile/topn", s.GetProfileTopN)
+		api.GET("/profile/diff", s.GetProfileDiff)
+
 		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)
 		api.GET("/cosfiles/view", s.ViewCOSFile)
@@ -720,6 +729,6 @@ func (s *APIServer) registerRoutes() {
 	}
 
 	s.Logger.Info("路由注册完成",
-		zap.Int("api_count", 25),
+		zap.Int("api_count", 30),
 	)
 }
