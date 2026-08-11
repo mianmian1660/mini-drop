@@ -66,12 +66,20 @@ def _which(cmd: str) -> bool:
 # ----------------------------------------------------------
 # run_perf_script — 把 perf.data 转成可读文本
 # ----------------------------------------------------------
-def run_perf_script(perf_data_path: str) -> str:
+def run_perf_script(perf_data_path: str, kallsyms_path: str = None) -> str:
     """
-    执行: perf script -i <perf_data_path>
+    执行: perf script -i <perf_data_path> [--kallsyms=<kallsyms_path>]
 
     参数:
         perf_data_path: perf.data 文件路径
+        kallsyms_path:  Agent 采集时快照的 /proc/kallsyms。
+
+            为什么必须由 Agent 传过来：读取 /proc/kallsyms 里的真实内核地址需要
+            CAP_SYSLOG，仅 kptr_restrict=0 是不够的。analysis 容器不是特权容器，
+            它本地的 /proc/kallsyms 地址全是 0，perf 认不出来，内核帧只会显示
+            [unknown]。Agent 是特权容器，读得到真实地址，所以由它快照上传。
+
+            传 None 时退回旧行为（perf 自行寻找 kallsyms），内核符号大概率解析不出来。
 
     返回:
         perf script 的标准输出（调用栈文本）
@@ -80,16 +88,25 @@ def run_perf_script(perf_data_path: str) -> str:
         subprocess.CalledProcessError: perf 命令失败
         FileNotFoundError: perf 未安装
     """
-    print(f"[flamegraph] 执行 perf script -F {PERF_SCRIPT_FIELDS} -i {perf_data_path} ...", file=sys.stderr)
+    cmd = ["perf", "script", "-F", PERF_SCRIPT_FIELDS, "-i", perf_data_path]
+    if kallsyms_path and os.path.exists(kallsyms_path):
+        # perf 会主动校验该路径，文件不存在会直接报 "Invalid file"，
+        # 所以这里先确认存在再拼，避免把一次可降级的缺失变成硬失败。
+        cmd += [f"--kallsyms={kallsyms_path}"]
+    else:
+        print("[flamegraph] 警告: 未提供 kallsyms 快照，内核符号可能无法解析",
+              file=sys.stderr)
+
+    print(f"[flamegraph] 执行 {' '.join(cmd)} ...", file=sys.stderr)
     result = subprocess.run(
-        ["perf", "script", "-F", PERF_SCRIPT_FIELDS, "-i", perf_data_path],
+        cmd,
         capture_output=True, text=True,
         timeout=120  # 大文件可能较慢
     )
     if result.returncode != 0:
         error_msg = result.stderr.strip() or "perf script 返回非零退出码"
         raise subprocess.CalledProcessError(
-            result.returncode, ["perf", "script", "-F", PERF_SCRIPT_FIELDS, "-i", perf_data_path],
+            result.returncode, cmd,
             output=result.stdout, stderr=result.stderr
         )
 
@@ -192,7 +209,8 @@ def run_flamegraph(folded_stacks: str, title: str = "Flame Graph",
 def generate_flamegraph(perf_data_path: str,
                         title: str = "CPU Flame Graph",
                         width: int = 1200,
-                        colors: str = "hot") -> str:
+                        colors: str = "hot",
+                        kallsyms_path: str = None) -> str:
     """
     一键生成火焰图 SVG：perf.data → SVG
     支持两种输入：
@@ -224,7 +242,7 @@ def generate_flamegraph(perf_data_path: str,
     print(f"[flamegraph] 输入: {perf_data_path}", file=sys.stderr)
 
     # 智能检测：如果文件内容已经是折叠栈格式（含分号分隔），跳过 perf script
-    folded = _detect_and_fold(perf_data_path)
+    folded = _detect_and_fold(perf_data_path, kallsyms_path)
 
     # 步骤 3: flamegraph
     svg = run_flamegraph(folded, title=title, width=width, colors=colors)
@@ -233,7 +251,7 @@ def generate_flamegraph(perf_data_path: str,
     return svg
 
 
-def _detect_and_fold(perf_data_path: str) -> str:
+def _detect_and_fold(perf_data_path: str, kallsyms_path: str = None) -> str:
     """智能折叠：检测输入格式，自动选择处理方式"""
     try:
         with open(perf_data_path, 'r', errors='replace') as f:
@@ -256,7 +274,7 @@ def _detect_and_fold(perf_data_path: str) -> str:
         pass
 
     # 标准 perf.data 流程
-    script_output = run_perf_script(perf_data_path)
+    script_output = run_perf_script(perf_data_path, kallsyms_path)
     return run_stackcollapse(script_output)
 
 

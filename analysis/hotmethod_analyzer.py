@@ -353,6 +353,38 @@ def _download_perf_data(storage, bucket: str, tid: str,
         return False
 
 
+def _download_kallsyms(storage, bucket: str, tid: str,
+                       local_path: str):
+    """
+    下载 Agent 采集时快照的 /proc/kallsyms
+
+    没有它内核帧只会显示 [unknown]：analysis 不是特权容器，读本地
+    /proc/kallsyms 拿到的地址全是 0（需要 CAP_SYSLOG），perf 无法用。
+
+    返回: 本地路径（成功）或 None（缺失/失败，调用方应降级而非报错）
+    """
+    if storage is None:
+        return None
+
+    key = f"{tid}/kallsyms"
+    try:
+        if not storage.object_exists(bucket, key):
+            print(f"[analysis] 无 kallsyms 快照（{key}），内核符号将无法解析",
+                  file=sys.stderr)
+            return None
+        data = storage.get_object(bucket, key)
+        if not data:
+            return None
+        with open(local_path, "wb") as f:
+            f.write(data)
+        print(f"[analysis] 下载 kallsyms → {local_path} ({len(data)} bytes)",
+              file=sys.stderr)
+        return local_path
+    except Exception as e:
+        print(f"[analysis] 下载 kallsyms 失败（降级继续）: {e}", file=sys.stderr)
+        return None
+
+
 def _upload_output(storage, bucket: str, tid: str,
                    filename: str, content, content_type: str = "application/octet-stream") -> str:
     """
@@ -493,13 +525,20 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
         print(f"[analysis] 错误: 找不到 perf.data，无法生成火焰图", file=sys.stderr)
         return outputs
 
+    # --- 2b. 获取 kallsyms 快照（缺失则降级，内核符号显示为 [unknown]）---
+    local_kallsyms = None
+    if storage_ok:
+        local_kallsyms = _download_kallsyms(
+            storage, bucket, tid, f"/tmp/{tid}_kallsyms")
+
     # --- 3. 生成火焰图 SVG ---
     task_name = task.get("name", tid)
     title = f"CPU Flame Graph: {task_name}"
 
     print(f"[analysis] 开始生成火焰图 ...", file=sys.stderr)
     try:
-        svg_content = generate_flamegraph(local_perf, title=title)
+        svg_content = generate_flamegraph(local_perf, title=title,
+                                          kallsyms_path=local_kallsyms)
     except Exception as e:
         exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
                    f"火焰图生成失败: {e}",
