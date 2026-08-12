@@ -14,7 +14,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	parcapb "github.com/mini-drop/apiserver/proto/parca/query/v1alpha1"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gorm.io/gorm"
 
 	"github.com/mini-drop/apiserver/config"
@@ -26,10 +30,16 @@ type ProfileClient interface {
 	Flamegraph(context.Context, ProfileQuery) (ProfileFlamegraph, error)
 	TopN(context.Context, ProfileQuery) (ProfileTopN, error)
 	Diff(context.Context, ProfileDiffQuery) (ProfileDiff, error)
+	LabelValues(context.Context, ProfileQuery, string) (ProfileLabelValues, error)
 }
 
 type ProfileStatusClient interface {
-	TargetStatus(context.Context, ProfileTarget) string
+	TargetStatus(context.Context, ProfileTarget) ProfileTargetStatus
+}
+
+type ProfileTargetStatus struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
 
 type ProfileTarget struct {
@@ -40,6 +50,8 @@ type ProfileTarget struct {
 	Environment        string                 `json:"environment"`
 	Labels             map[string]interface{} `json:"labels"`
 	ParcaUIURL         string                 `json:"parca_ui_url"`
+	ParcaQueryURL      string                 `json:"parca_query_url"`
+	ParcaError         string                 `json:"parca_error,omitempty"`
 	PprofScrapeStatus  string                 `json:"pprof_scrape_status"`
 	PprofScrapeMessage string                 `json:"pprof_scrape_message"`
 	PprofScrapeTargets []string               `json:"pprof_scrape_targets"`
@@ -58,6 +70,7 @@ type ProfileQuery struct {
 	To          time.Time              `json:"to"`
 	ProfileType string                 `json:"profile_type"`
 	Labels      map[string]interface{} `json:"labels"`
+	Filters     map[string]interface{} `json:"filters"`
 }
 
 type ProfileDiffQuery struct {
@@ -70,6 +83,7 @@ type ProfileDiffQuery struct {
 	CompareTo   time.Time              `json:"compare_to"`
 	ProfileType string                 `json:"profile_type"`
 	Labels      map[string]interface{} `json:"labels"`
+	Filters     map[string]interface{} `json:"filters"`
 }
 
 type ProfileNode struct {
@@ -87,6 +101,8 @@ type ProfileFlamegraph struct {
 	Empty       bool          `json:"empty"`
 	Message     string        `json:"message"`
 	Source      string        `json:"source"`
+	ParcaURL    string        `json:"parca_url,omitempty"`
+	Query       string        `json:"query,omitempty"`
 	GeneratedAt time.Time     `json:"generated_at"`
 }
 
@@ -104,7 +120,19 @@ type ProfileTopN struct {
 	Empty       bool             `json:"empty"`
 	Message     string           `json:"message"`
 	Source      string           `json:"source"`
+	ParcaURL    string           `json:"parca_url,omitempty"`
+	Query       string           `json:"query,omitempty"`
 	GeneratedAt time.Time        `json:"generated_at"`
+}
+
+type ProfileLabelValues struct {
+	Label       string    `json:"label"`
+	Values      []string  `json:"values"`
+	Available   bool      `json:"available"`
+	Message     string    `json:"message,omitempty"`
+	Source      string    `json:"source"`
+	Query       string    `json:"query,omitempty"`
+	GeneratedAt time.Time `json:"generated_at"`
 }
 
 type ProfileDiffItem struct {
@@ -125,16 +153,19 @@ type ProfileDiff struct {
 
 type parcaProfileClient struct {
 	baseURL      string
+	uiURL        string
 	grpcAddr     string
 	timeout      time.Duration
 	enabled      bool
 	client       *http.Client
 	cpuProfileID string
+	dialOptions  []grpc.DialOption
 }
 
 var errProfileUnavailable = errors.New("profile dependency unavailable")
 
-const defaultCPUProfileType = "process_cpu:samples:count:cpu:nanoseconds"
+const defaultCPUProfileType = "parca_agent:samples:count:cpu:nanoseconds:delta"
+const processCPUProfileType = "process_cpu:samples:count:cpu:nanoseconds:delta"
 
 func NewHTTPProfileClient(cfg config.ProfileConfig) ProfileClient {
 	timeout := time.Duration(cfg.TimeoutSec) * time.Second
@@ -145,11 +176,16 @@ func NewHTTPProfileClient(cfg config.ProfileConfig) ProfileClient {
 	if baseURL == "" && strings.TrimSpace(cfg.ParcaGRPCAddr) != "" {
 		baseURL = "http://" + strings.TrimSpace(cfg.ParcaGRPCAddr)
 	}
+	uiURL := strings.TrimRight(strings.TrimSpace(cfg.ParcaUIURL), "/")
+	if uiURL == "" {
+		uiURL = baseURL
+	}
 	return &parcaProfileClient{
 		baseURL:      baseURL,
+		uiURL:        uiURL,
 		grpcAddr:     strings.TrimSpace(cfg.ParcaGRPCAddr),
 		timeout:      timeout,
-		enabled:      cfg.Enabled && baseURL != "",
+		enabled:      cfg.Enabled && (baseURL != "" || strings.TrimSpace(cfg.ParcaGRPCAddr) != ""),
 		client:       &http.Client{Timeout: timeout},
 		cpuProfileID: defaultCPUProfileType,
 	}
@@ -159,14 +195,17 @@ func (c *parcaProfileClient) Flamegraph(ctx context.Context, q ProfileQuery) (Pr
 	if c == nil || !c.enabled {
 		return emptyFlamegraph("Parca 未配置，持续画像暂无数据"), nil
 	}
-	var response parcaQueryResponse
-	if err := c.queryReport(ctx, q, "REPORT_TYPE_FLAMEGRAPH_TABLE", &response); err != nil {
-		if c.isGatewayFallback(err) {
-			return emptyFlamegraph("Parca Server 已启动，但当前版本未暴露 Mini-Drop 可直接读取的 JSON profile gateway；WSL 下 parca-agent 也可能因 eBPF 限制无样本。请先查看 Parca UI 或在真实 Linux 上验证完整火焰图。"), nil
-		}
+	query, err := c.queryString(ctx, q)
+	if err != nil {
 		return ProfileFlamegraph{}, err
 	}
-	out := response.toMiniDropFlamegraph()
+	response, err := c.queryFlamegraph(ctx, q, query)
+	if err != nil {
+		return ProfileFlamegraph{}, err
+	}
+	out := parcaFlamegraphResponseToMiniDrop(response)
+	out.Query = query
+	out.ParcaURL = c.queryURL(q, query)
 	return out, nil
 }
 
@@ -174,14 +213,17 @@ func (c *parcaProfileClient) TopN(ctx context.Context, q ProfileQuery) (ProfileT
 	if c == nil || !c.enabled {
 		return emptyTopN("Parca 未配置，持续画像暂无数据"), nil
 	}
-	var response parcaQueryResponse
-	if err := c.queryReport(ctx, q, "REPORT_TYPE_TOP", &response); err != nil {
-		if c.isGatewayFallback(err) {
-			return emptyTopN("Parca Server 已启动，但当前版本未暴露 Mini-Drop 可直接读取的 JSON profile gateway；WSL 下 parca-agent 也可能因 eBPF 限制无样本。请先查看 Parca UI 或在真实 Linux 上验证完整 TopN。"), nil
-		}
+	query, err := c.queryString(ctx, q)
+	if err != nil {
 		return ProfileTopN{}, err
 	}
-	out := response.toMiniDropTopN()
+	response, err := c.queryTop(ctx, q, query)
+	if err != nil {
+		return ProfileTopN{}, err
+	}
+	out := parcaTopResponseToMiniDrop(response)
+	out.Query = query
+	out.ParcaURL = c.queryURL(q, query)
 	return out, nil
 }
 
@@ -189,53 +231,99 @@ func (c *parcaProfileClient) Diff(ctx context.Context, q ProfileDiffQuery) (Prof
 	if c == nil || !c.enabled {
 		return ProfileDiff{Empty: true, Message: "Parca 未配置，持续画像暂无数据", Source: "mini-drop", GeneratedAt: time.Now()}, nil
 	}
-	base, err := c.TopN(ctx, ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo, ProfileType: q.ProfileType, Labels: q.Labels})
+	base, err := c.TopN(ctx, ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters})
 	if err != nil {
 		return ProfileDiff{}, err
 	}
-	compare, err := c.TopN(ctx, ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo, ProfileType: q.ProfileType, Labels: q.Labels})
+	compare, err := c.TopN(ctx, ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters})
 	if err != nil {
 		return ProfileDiff{}, err
 	}
 	return diffTopN(base, compare), nil
 }
 
-func (c *parcaProfileClient) TargetStatus(ctx context.Context, target ProfileTarget) string {
+func (c *parcaProfileClient) LabelValues(ctx context.Context, q ProfileQuery, label string) (ProfileLabelValues, error) {
+	label = strings.TrimSpace(label)
+	out := ProfileLabelValues{
+		Label:       label,
+		Values:      []string{},
+		Source:      "parca",
+		Query:       parcaQueryLabelSelector(ProfileQuery{Labels: q.Labels}),
+		GeneratedAt: time.Now(),
+	}
 	if c == nil || !c.enabled {
-		return "unconfigured"
+		out.Message = "Parca 未配置，暂无可用过滤标签"
+		return out, nil
 	}
-	if ok, err := c.hasProfileData(ctx); err != nil {
-		return "unknown"
-	} else if !ok {
-		return "offline"
+	if !isAllowedProfileFilterLabel(label) {
+		out.Message = "不支持的 profile 过滤标签: " + label
+		return out, nil
 	}
-	to := time.Now()
-	from := to.Add(-30 * time.Minute)
-	values := url.Values{}
-	query, err := c.queryString(ctx, ProfileQuery{
-		Host:        target.IP,
-		Service:     target.ServiceName,
-		From:        from,
-		To:          to,
-		ProfileType: "cpu",
-		Labels:      target.Labels,
+	profileType, err := c.parcaProfileType(ctx, q.ProfileType, q.From, q.To)
+	if err != nil {
+		return ProfileLabelValues{}, err
+	}
+	client, closeConn, err := c.queryService(ctx)
+	if err != nil {
+		return ProfileLabelValues{}, err
+	}
+	defer closeConn()
+	baseSelector := parcaQueryLabelSelector(ProfileQuery{Labels: q.Labels})
+	labelsOut, err := client.Labels(ctx, &parcapb.LabelsRequest{
+		Start:       timestampOrNil(q.From),
+		End:         timestampOrNil(q.To),
+		ProfileType: profileType,
 	})
 	if err != nil {
-		return "unknown"
+		return ProfileLabelValues{}, fmt.Errorf("%w: Parca Labels: %v", errProfileUnavailable, err)
 	}
-	values.Set("query", query)
-	values.Set("start", from.Format(time.RFC3339))
-	values.Set("end", to.Format(time.RFC3339))
-	values.Set("limit", "1")
-	values.Set("step", "60s")
-	var out parcaQueryRangeResponse
-	if err := c.getJSON(ctx, "/profiles/query_range", values, &out); err != nil {
-		return "unknown"
+	if !stringSliceContains(labelsOut.GetLabelNames(), label) {
+		out.Message = "当前数据源没有 " + label + " 标签，只能查看主机级 profile"
+		return out, nil
 	}
-	if out.hasSamples() {
-		return "online"
+	values, err := client.Values(ctx, &parcapb.ValuesRequest{
+		LabelName:   label,
+		Match:       []string{baseSelector},
+		Start:       timestampOrNil(q.From),
+		End:         timestampOrNil(q.To),
+		ProfileType: profileType,
+	})
+	if err != nil {
+		return ProfileLabelValues{}, fmt.Errorf("%w: Parca Values: %v", errProfileUnavailable, err)
 	}
-	return "offline"
+	out.Values = uniqueSortedStrings(values.GetLabelValues())
+	out.Available = true
+	return out, nil
+}
+
+func (c *parcaProfileClient) TargetStatus(ctx context.Context, target ProfileTarget) ProfileTargetStatus {
+	if c == nil || !c.enabled {
+		return ProfileTargetStatus{Status: "unconfigured"}
+	}
+	status, err := c.targetSampleStatus(ctx, target)
+	if err != nil {
+		msg := err.Error()
+		if errors.Is(err, errProfileUnavailable) {
+			return ProfileTargetStatus{Status: "parca_unreachable", Error: msg}
+		}
+		return ProfileTargetStatus{Status: "query_unsupported", Error: msg}
+	}
+	return ProfileTargetStatus{Status: status}
+}
+
+func (c *parcaProfileClient) queryURL(q ProfileQuery, query string) string {
+	if c == nil || c.baseURL == "" {
+		return ""
+	}
+	if query == "" {
+		query = defaultCPUProfileType + parcaQueryLabelSelector(q)
+	}
+	values := url.Values{}
+	values.Set("expression_a", query)
+	values.Set("from_a", q.From.Format(time.RFC3339))
+	values.Set("to_a", q.To.Format(time.RFC3339))
+	values.Set("time_selection_a", "custom")
+	return c.uiURL + "/?" + values.Encode()
 }
 
 func (c *parcaProfileClient) queryReport(ctx context.Context, q ProfileQuery, reportType string, dst *parcaQueryResponse) error {
@@ -260,7 +348,7 @@ func (c *parcaProfileClient) queryString(ctx context.Context, q ProfileQuery) (s
 	if err != nil {
 		return "", err
 	}
-	return profileType + profileLabelSelector(q), nil
+	return profileType + parcaQueryLabelSelector(q), nil
 }
 
 func (c *parcaProfileClient) parcaProfileType(ctx context.Context, profileType string, from, to time.Time) (string, error) {
@@ -275,33 +363,31 @@ func (c *parcaProfileClient) parcaProfileType(ctx context.Context, profileType s
 }
 
 func (c *parcaProfileClient) discoverCPUProfileType(ctx context.Context, from, to time.Time) (string, error) {
-	values := url.Values{}
-	if !from.IsZero() {
-		values.Set("start", from.Format(time.RFC3339))
-	}
-	if !to.IsZero() {
-		values.Set("end", to.Format(time.RFC3339))
-	}
-	var out struct {
-		Types []struct {
-			Name       string `json:"name"`
-			SampleType string `json:"sampleType"`
-			SampleUnit string `json:"sampleUnit"`
-			PeriodType string `json:"periodType"`
-			PeriodUnit string `json:"periodUnit"`
-		} `json:"types"`
-	}
-	if err := c.getJSON(ctx, "/profiles/types", values, &out); err != nil {
+	client, closeConn, err := c.queryService(ctx)
+	if err != nil {
 		return c.cpuProfileID, nil
 	}
-	for _, typ := range out.Types {
-		if typ.Name == c.cpuProfileID {
-			return typ.Name, nil
-		}
+	defer closeConn()
+	out, err := client.ProfileTypes(ctx, &parcapb.ProfileTypesRequest{
+		Start: timestampOrNil(from),
+		End:   timestampOrNil(to),
+	})
+	if err != nil {
+		return c.cpuProfileID, nil
 	}
-	for _, typ := range out.Types {
-		id := typ.Name
-		blob := strings.ToLower(strings.Join([]string{typ.Name, typ.SampleType, typ.SampleUnit, typ.PeriodType, typ.PeriodUnit}, ":"))
+	available := map[string]bool{}
+	for _, typ := range out.GetTypes() {
+		id := parcaProfileTypeID(typ)
+		available[id] = true
+	}
+	if available[c.cpuProfileID] {
+		return c.cpuProfileID, nil
+	}
+	if available[processCPUProfileType] {
+		return processCPUProfileType, nil
+	}
+	for id := range available {
+		blob := strings.ToLower(id)
 		if strings.Contains(blob, "cpu") && strings.TrimSpace(id) != "" {
 			return id, nil
 		}
@@ -309,20 +395,229 @@ func (c *parcaProfileClient) discoverCPUProfileType(ctx context.Context, from, t
 	return c.cpuProfileID, nil
 }
 
+func parcaProfileTypeID(typ *parcapb.ProfileType) string {
+	if typ == nil {
+		return ""
+	}
+	parts := []string{typ.GetName(), typ.GetSampleType(), typ.GetSampleUnit(), typ.GetPeriodType(), typ.GetPeriodUnit()}
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			return strings.TrimSpace(typ.GetName())
+		}
+	}
+	id := strings.Join(parts, ":")
+	if typ.GetDelta() {
+		id += ":delta"
+	}
+	return id
+}
+
 func (c *parcaProfileClient) hasProfileData(ctx context.Context) (bool, error) {
-	var out map[string]json.RawMessage
-	if err := c.getJSON(ctx, "/profiles/has_profile_data", nil, &out); err != nil {
+	client, closeConn, err := c.queryService(ctx)
+	if err != nil {
 		return false, err
 	}
-	for _, key := range []string{"hasData", "has_data"} {
-		if raw, ok := out[key]; ok {
-			var value bool
-			if err := json.Unmarshal(raw, &value); err == nil {
-				return value, nil
+	defer closeConn()
+	out, err := client.ProfileTypes(ctx, &parcapb.ProfileTypesRequest{})
+	if err != nil {
+		return false, fmt.Errorf("%w: Parca ProfileTypes: %v", errProfileUnavailable, err)
+	}
+	return len(out.GetTypes()) > 0, nil
+}
+
+func (c *parcaProfileClient) queryTop(ctx context.Context, q ProfileQuery, query string) (*parcapb.QueryResponse, error) {
+	client, closeConn, err := c.queryService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+	out, err := client.Query(ctx, &parcapb.QueryRequest{
+		Mode: parcapb.QueryRequest_MODE_MERGE,
+		Options: &parcapb.QueryRequest_Merge{Merge: &parcapb.MergeProfile{
+			Query: query,
+			Start: timestampOrNil(q.From),
+			End:   timestampOrNil(q.To),
+		}},
+		ReportType:        parcapb.QueryRequest_REPORT_TYPE_TOP,
+		NodeTrimThreshold: 0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: Parca Query: %v", errProfileUnavailable, err)
+	}
+	return out, nil
+}
+
+func (c *parcaProfileClient) queryFlamegraph(ctx context.Context, q ProfileQuery, query string) (*parcapb.QueryResponse, error) {
+	client, closeConn, err := c.queryService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+	out, err := client.Query(ctx, &parcapb.QueryRequest{
+		Mode: parcapb.QueryRequest_MODE_MERGE,
+		Options: &parcapb.QueryRequest_Merge{Merge: &parcapb.MergeProfile{
+			Query: query,
+			Start: timestampOrNil(q.From),
+			End:   timestampOrNil(q.To),
+		}},
+		ReportType:        parcapb.QueryRequest_REPORT_TYPE_FLAMEGRAPH_TABLE,
+		NodeTrimThreshold: 0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: Parca Flamegraph Query: %v", errProfileUnavailable, err)
+	}
+	return out, nil
+}
+
+func (c *parcaProfileClient) targetSampleStatus(ctx context.Context, target ProfileTarget) (string, error) {
+	labels := mergeProfileLabels(target, target.Labels)
+	instance := labelString(labels, "instance")
+	if instance == "" {
+		instance = target.IP
+	}
+	profileType, err := c.parcaProfileType(ctx, "cpu", time.Now().Add(-30*time.Minute), time.Now())
+	if err != nil {
+		return "", err
+	}
+	client, closeConn, err := c.queryService(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer closeConn()
+	job := firstNonEmpty(labelString(labels, "job"), target.ServiceName, "hotmethod")
+	jobs, err := client.Values(ctx, &parcapb.ValuesRequest{
+		LabelName:   "job",
+		Start:       timestamppb.New(time.Now().Add(-30 * time.Minute)),
+		End:         timestamppb.Now(),
+		ProfileType: profileType,
+	})
+	if err != nil {
+		return "", fmt.Errorf("%w: Parca Values: %v", errProfileUnavailable, err)
+	}
+	if !stringSliceContains(jobs.GetLabelValues(), job) {
+		return "online_no_samples", nil
+	}
+	instances, err := client.Values(ctx, &parcapb.ValuesRequest{
+		LabelName:   "instance",
+		Start:       timestamppb.New(time.Now().Add(-30 * time.Minute)),
+		End:         timestamppb.Now(),
+		ProfileType: profileType,
+	})
+	if err != nil {
+		return "", fmt.Errorf("%w: Parca Values: %v", errProfileUnavailable, err)
+	}
+	if stringSliceContains(instances.GetLabelValues(), instance) {
+		return "online_with_samples", nil
+	}
+	labelsOut, err := client.Labels(ctx, &parcapb.LabelsRequest{
+		Start:       timestamppb.New(time.Now().Add(-30 * time.Minute)),
+		End:         timestamppb.Now(),
+		ProfileType: profileType,
+	})
+	if err != nil {
+		return "", fmt.Errorf("%w: Parca Labels: %v", errProfileUnavailable, err)
+	}
+	if len(labelsOut.GetLabelNames()) == 0 {
+		return "online_no_samples", nil
+	}
+	return "online_no_samples", nil
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *parcaProfileClient) queryService(ctx context.Context) (parcapb.QueryServiceClient, func(), error) {
+	addr := strings.TrimSpace(c.grpcAddr)
+	if addr == "" {
+		return nil, func() {}, fmt.Errorf("%w: Parca gRPC address empty", errProfileUnavailable)
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock()}
+	opts = append(opts, c.dialOptions...)
+	conn, err := grpc.DialContext(dialCtx, addr, opts...)
+	cancel()
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("%w: Parca gRPC %s: %v", errProfileUnavailable, addr, err)
+	}
+	return parcapb.NewQueryServiceClient(conn), func() { _ = conn.Close() }, nil
+}
+
+func timestampOrNil(t time.Time) *timestamppb.Timestamp {
+	if t.IsZero() {
+		return nil
+	}
+	return timestamppb.New(t)
+}
+
+type parcaTargetsResponse struct {
+	Targets map[string]struct {
+		Targets []parcaTarget `json:"targets"`
+	} `json:"targets"`
+}
+
+type parcaTarget struct {
+	Labels struct {
+		Labels []parcaLabel `json:"labels"`
+	} `json:"labels"`
+	DiscoveredLabels struct {
+		Labels []parcaLabel `json:"labels"`
+	} `json:"discoveredLabels"`
+	Health    string `json:"health"`
+	LastError string `json:"lastError"`
+}
+
+type parcaLabel struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+func (c *parcaProfileClient) targets(ctx context.Context) (parcaTargetsResponse, error) {
+	var out parcaTargetsResponse
+	err := c.getJSON(ctx, "/api/targets", nil, &out)
+	return out, err
+}
+
+func parcaTargetsContain(resp parcaTargetsResponse, labels map[string]interface{}) bool {
+	if len(resp.Targets) == 0 {
+		return false
+	}
+	required := map[string]string{}
+	for _, key := range []string{"job", "instance"} {
+		if value := strings.TrimSpace(fmt.Sprint(labels[key])); value != "" && value != "<nil>" {
+			required[key] = value
+		}
+	}
+	if len(required) == 0 {
+		return false
+	}
+	for _, group := range resp.Targets {
+		for _, target := range group.Targets {
+			if target.Health != "" && target.Health != "HEALTH_GOOD" {
+				continue
+			}
+			actual := map[string]string{}
+			for _, label := range target.Labels.Labels {
+				actual[label.Name] = label.Value
+			}
+			matches := true
+			for key, want := range required {
+				if actual[key] != want {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				return true
 			}
 		}
 	}
-	return false, nil
+	return false
 }
 
 func (c *parcaProfileClient) getJSON(ctx context.Context, path string, values url.Values, dst interface{}) error {
@@ -357,7 +652,10 @@ func (c *parcaProfileClient) isGatewayFallback(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "Parca JSON 不兼容") || strings.Contains(msg, "invalid character '<'")
+	return strings.Contains(msg, "Parca JSON 不兼容") ||
+		strings.Contains(msg, "invalid character '<'") ||
+		strings.Contains(msg, "Parca HTTP 404") ||
+		strings.Contains(msg, "Parca HTTP 405")
 }
 
 func (s *APIServer) ListProfileTargets(c *gin.Context) {
@@ -418,6 +716,24 @@ func (s *APIServer) GetProfileDiff(c *gin.Context) {
 	s.RespondOK(c, data)
 }
 
+func (s *APIServer) GetProfileLabelValues(c *gin.Context) {
+	q, ok := s.profileQueryFromRequest(c)
+	if !ok {
+		return
+	}
+	label := strings.TrimSpace(c.Query("label"))
+	if label == "" {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "label 不能为空")
+		return
+	}
+	data, err := s.profileClient().LabelValues(c.Request.Context(), q, label)
+	if err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	}
+	s.RespondOK(c, data)
+}
+
 func (s *APIServer) profileClient() ProfileClient {
 	if s.ProfileCli != nil {
 		return s.ProfileCli
@@ -447,6 +763,7 @@ func (s *APIServer) profileQueryFromRequest(c *gin.Context) (ProfileQuery, bool)
 		To:          to,
 		ProfileType: strings.ToLower(strings.TrimSpace(c.DefaultQuery("profile_type", "cpu"))),
 		Labels:      parseProfileLabels(c.Query("labels")),
+		Filters:     parseProfileFilters(c.Query("filters")),
 	}
 	if !s.validateProfileQuery(c, &q) {
 		return ProfileQuery{}, false
@@ -482,16 +799,17 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 		CompareTo:   compareTo,
 		ProfileType: strings.ToLower(strings.TrimSpace(c.DefaultQuery("profile_type", "cpu"))),
 		Labels:      parseProfileLabels(c.Query("labels")),
+		Filters:     parseProfileFilters(c.Query("filters")),
 	}
 	if !baseFrom.Before(baseTo) || !compareFrom.Before(compareTo) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "对比时间范围不合法")
 		return ProfileDiffQuery{}, false
 	}
-	pq := ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, Labels: q.Labels}
+	pq := ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters}
 	if !s.validateProfileQuery(c, &pq) {
 		return ProfileDiffQuery{}, false
 	}
-	q.Host, q.TargetID, q.Service = pq.Host, pq.TargetID, pq.Service
+	q.Host, q.TargetID, q.Service, q.Labels, q.Filters = pq.Host, pq.TargetID, pq.Service, pq.Labels, pq.Filters
 	return q, true
 }
 
@@ -522,6 +840,7 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) bool {
 		q.Service = target.ServiceName
 	}
 	q.Labels = mergeProfileLabels(target, q.Labels)
+	q.Filters = sanitizeProfileFilters(q.Filters)
 	return true
 }
 
@@ -544,7 +863,11 @@ func (s *APIServer) respondReservedProfileType(c *gin.Context, profileType strin
 
 func (s *APIServer) respondProfileDependencyError(c *gin.Context, err error) {
 	s.Logger.Warn("持续画像依赖查询失败", zap.Error(err))
-	s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, err.Error())
+	msg := err.Error()
+	if strings.Contains(msg, "connection refused") || strings.Contains(msg, "no such host") || strings.Contains(msg, "i/o timeout") {
+		msg = "Parca Server 不可达，持续 profiling 暂无数据: " + msg
+	}
+	s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, msg)
 }
 
 func parseProfileTime(c *gin.Context, name string, fallback time.Time) (time.Time, bool) {
@@ -579,6 +902,16 @@ func parseProfileLabels(raw string) map[string]interface{} {
 	}
 	_ = json.Unmarshal([]byte(raw), &labels)
 	return labels
+}
+
+func parseProfileFilters(raw string) map[string]interface{} {
+	filters := map[string]interface{}{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return filters
+	}
+	_ = json.Unmarshal([]byte(raw), &filters)
+	return filters
 }
 
 func (s *APIServer) resolveProfileTarget(auth AuthContext, targetID, host string) (ProfileTarget, error) {
@@ -616,14 +949,13 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 			continue
 		}
 		lastSeen := agent.LastSeen
-		labels := map[string]interface{}{}
-		_ = util.UnmarshalJSONB(agent.Labels, &labels)
+		labels := profileLabelsFromAgent(agent.Labels)
 		target := &ProfileTarget{
 			ID:               profileTargetID(agent.IPAddr, "hotmethod"),
 			Hostname:         firstNonEmpty(agent.Hostname, agent.IPAddr),
 			IP:               agent.IPAddr,
 			ServiceName:      "hotmethod",
-			Environment:      firstNonEmpty(agent.Environment, "production"),
+			Environment:      firstNonEmpty(labelString(labels, "env"), s.defaultProfileEnvironment()),
 			Labels:           labels,
 			ParcaUIURL:       s.parcaUIURL(),
 			ParcaAgentStatus: s.defaultParcaStatus(),
@@ -632,7 +964,8 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 			DropAgentOnline:  agent.Online,
 		}
 		target.Labels = mergeProfileLabels(*target, labels)
-		byIP[target.IP] = target
+		target.ParcaQueryURL = s.parcaQueryURL(*target)
+		byIP[profileTargetKey(agent)] = target
 	}
 
 	var recentTasks []model.HotmethodTask
@@ -656,7 +989,7 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 			continue
 		}
 		seenTaskTargets[task.TargetIP] = true
-		if target, ok := byIP[task.TargetIP]; ok {
+		if target, ok := findProfileTargetByIP(byIP, task.TargetIP); ok {
 			lastAt := task.CreateTime
 			target.LastProfileAt = &lastAt
 			continue
@@ -667,7 +1000,7 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 			Hostname:         task.TargetIP,
 			IP:               task.TargetIP,
 			ServiceName:      "hotmethod",
-			Environment:      "production",
+			Environment:      s.defaultProfileEnvironment(),
 			Labels:           map[string]interface{}{},
 			ParcaUIURL:       s.parcaUIURL(),
 			ParcaAgentStatus: s.defaultParcaStatus(),
@@ -675,13 +1008,16 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 			LastProfileAt:    &lastAt,
 		}
 		byIP[task.TargetIP].Labels = mergeProfileLabels(*byIP[task.TargetIP], byIP[task.TargetIP].Labels)
+		byIP[task.TargetIP].ParcaQueryURL = s.parcaQueryURL(*byIP[task.TargetIP])
 	}
 
 	if statusClient, ok := s.profileClient().(ProfileStatusClient); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(profileTimeoutSec(s))*time.Second)
 		defer cancel()
 		for _, target := range byIP {
-			target.ParcaAgentStatus = statusClient.TargetStatus(ctx, *target)
+			status := statusClient.TargetStatus(ctx, *target)
+			target.ParcaAgentStatus = status.Status
+			target.ParcaError = status.Error
 		}
 	}
 	s.attachLocalPprofScrapeStatus(byIP)
@@ -702,8 +1038,27 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 	return out, nil
 }
 
+func profileTargetKey(agent model.AgentInfo) string {
+	if strings.TrimSpace(agent.AgentID) != "" {
+		return "agent:" + strings.TrimSpace(agent.AgentID)
+	}
+	return "ip:" + strings.TrimSpace(agent.IPAddr)
+}
+
+func findProfileTargetByIP(targets map[string]*ProfileTarget, ip string) (*ProfileTarget, bool) {
+	for _, target := range targets {
+		if target.IP == ip {
+			return target, true
+		}
+	}
+	return nil, false
+}
+
 func (s *APIServer) defaultParcaStatus() string {
-	if s == nil || s.Config == nil || !s.Config.Profile.Enabled || strings.TrimSpace(s.Config.Profile.ParcaURL) == "" {
+	if s == nil || s.Config == nil || !s.Config.Profile.Enabled {
+		return "unconfigured"
+	}
+	if strings.TrimSpace(s.Config.Profile.ParcaURL) == "" && strings.TrimSpace(s.Config.Profile.ParcaGRPCAddr) == "" {
 		return "unconfigured"
 	}
 	return "unknown"
@@ -714,6 +1069,28 @@ func (s *APIServer) parcaUIURL() string {
 		return ""
 	}
 	return strings.TrimRight(strings.TrimSpace(s.Config.Profile.ParcaUIURL), "/")
+}
+
+func (s *APIServer) parcaQueryURL(target ProfileTarget) string {
+	base := s.parcaUIURL()
+	if base == "" {
+		return ""
+	}
+	q := ProfileQuery{
+		Host:        target.IP,
+		Service:     target.ServiceName,
+		From:        time.Now().Add(-30 * time.Minute),
+		To:          time.Now(),
+		ProfileType: "cpu",
+		Labels:      target.Labels,
+	}
+	query := defaultCPUProfileType + parcaQueryLabelSelector(q)
+	values := url.Values{}
+	values.Set("expression_a", query)
+	values.Set("from_a", q.From.Format(time.RFC3339))
+	values.Set("to_a", q.To.Format(time.RFC3339))
+	values.Set("time_selection_a", "custom")
+	return base + "/?" + values.Encode()
 }
 
 func profileTargetID(ip, service string) string {
@@ -731,6 +1108,11 @@ func profileQueryValues(q ProfileQuery) url.Values {
 	if len(q.Labels) > 0 {
 		if b, err := json.Marshal(q.Labels); err == nil {
 			values.Set("labels", string(b))
+		}
+	}
+	if len(q.Filters) > 0 {
+		if b, err := json.Marshal(q.Filters); err == nil {
+			values.Set("filters", string(b))
 		}
 	}
 	return values
@@ -870,6 +1252,194 @@ func (r parcaQueryResponse) toMiniDropTopN() ProfileTopN {
 	return out
 }
 
+func parcaTopResponseToMiniDrop(r *parcapb.QueryResponse) ProfileTopN {
+	out := ProfileTopN{
+		Items:       []ProfileTopItem{},
+		Total:       float64(r.GetTotal()),
+		Unit:        "samples",
+		Source:      "parca",
+		GeneratedAt: time.Now(),
+	}
+	top := r.GetTop()
+	if top == nil {
+		out.Empty = true
+		out.Message = "Parca gRPC 未返回 TopN 数据；当前时间段可能没有样本"
+		return out
+	}
+	if top.GetUnit() != "" {
+		out.Unit = top.GetUnit()
+	}
+	for _, node := range top.GetList() {
+		out.Items = append(out.Items, ProfileTopItem{
+			Name:  parcaPBNodeName(node.GetMeta()),
+			Value: float64(node.GetCumulative()),
+			Self:  float64(node.GetFlat()),
+			Unit:  out.Unit,
+		})
+	}
+	sort.Slice(out.Items, func(i, j int) bool {
+		return out.Items[i].Value > out.Items[j].Value
+	})
+	normalizeTopN(&out)
+	return out
+}
+
+func parcaFlamegraphResponseToMiniDrop(r *parcapb.QueryResponse) ProfileFlamegraph {
+	out := ProfileFlamegraph{
+		Nodes:       []ProfileNode{},
+		Total:       float64(r.GetTotal()),
+		Unit:        "samples",
+		Source:      "parca",
+		GeneratedAt: time.Now(),
+	}
+	fg := r.GetFlamegraph()
+	if fg == nil || fg.GetRoot() == nil {
+		out.Empty = true
+		out.Message = "Parca gRPC 未返回火焰图数据；当前时间段可能没有样本"
+		return out
+	}
+	if fg.GetUnit() != "" {
+		out.Unit = fg.GetUnit()
+	}
+	if out.Total == 0 {
+		out.Total = float64(fg.GetUntrimmedTotal())
+	}
+	if out.Total == 0 {
+		out.Total = float64(fg.GetTotal())
+	}
+	if out.Total == 0 {
+		out.Total = float64(fg.GetRoot().GetCumulative())
+	}
+	for i, child := range fg.GetRoot().GetChildren() {
+		out.Nodes = append(out.Nodes, parcaPBFlamegraphNodeToProfileNode(child, fg, fmt.Sprintf("fg-%d", i)))
+	}
+	normalizeFlamegraph(&out)
+	return out
+}
+
+func parcaPBFlamegraphNodeToProfileNode(node *parcapb.FlamegraphNode, fg *parcapb.Flamegraph, id string) ProfileNode {
+	children := make([]ProfileNode, 0, len(node.GetChildren()))
+	var childTotal float64
+	for i, child := range node.GetChildren() {
+		out := parcaPBFlamegraphNodeToProfileNode(child, fg, fmt.Sprintf("%s-%d", id, i))
+		childTotal += out.Value
+		children = append(children, out)
+	}
+	value := float64(node.GetCumulative())
+	self := value - childTotal
+	if self < 0 {
+		self = 0
+	}
+	return ProfileNode{
+		ID:       id,
+		Name:     parcaPBFlamegraphNodeName(node.GetMeta(), fg),
+		Value:    value,
+		Self:     self,
+		Children: children,
+	}
+}
+
+func parcaPBFlamegraphNodeName(meta *parcapb.TopNodeMeta, fg *parcapb.Flamegraph) string {
+	if meta == nil {
+		return "unknown"
+	}
+	if fg == nil {
+		return parcaPBNodeNameWithStringTable(meta, nil)
+	}
+	if name := parcaPBNodeNameWithStringTable(meta, fg.GetStringTable()); name != "unknown" {
+		return name
+	}
+	location := parcaPBLocationByIndex(fg.GetLocations(), meta.GetLocationIndex())
+	if location == nil {
+		return "unknown"
+	}
+	for _, line := range location.GetLines() {
+		fn := parcaPBFunctionByIndex(fg.GetFunction(), line.GetFunctionIndex())
+		if fn == nil {
+			continue
+		}
+		if name := parcaPBFunctionName(fn, fg.GetStringTable()); name != "" {
+			return name
+		}
+	}
+	if mapping := parcaPBMappingByIndex(fg.GetMapping(), location.GetMappingIndex()); mapping != nil {
+		if name := firstNonEmpty(mapping.GetFile(), stringTableValue(fg.GetStringTable(), mapping.GetFileStringIndex())); name != "" {
+			return name
+		}
+	}
+	return "unknown"
+}
+
+func parcaPBNodeName(meta *parcapb.TopNodeMeta) string {
+	return parcaPBNodeNameWithStringTable(meta, nil)
+}
+
+func parcaPBNodeNameWithStringTable(meta *parcapb.TopNodeMeta, stringTable []string) string {
+	if meta == nil {
+		return "unknown"
+	}
+	if fn := meta.GetFunction(); fn != nil {
+		if name := parcaPBFunctionName(fn, stringTable); name != "" {
+			return name
+		}
+	}
+	if mapping := meta.GetMapping(); mapping != nil && mapping.GetFile() != "" {
+		return mapping.GetFile()
+	} else if mapping := meta.GetMapping(); mapping != nil {
+		if name := stringTableValue(stringTable, mapping.GetFileStringIndex()); name != "" {
+			return name
+		}
+	}
+	return "unknown"
+}
+
+func parcaPBFunctionName(fn *parcapb.Function, stringTable []string) string {
+	if fn == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		fn.GetName(),
+		fn.GetSystemName(),
+		fn.GetFilename(),
+		stringTableValue(stringTable, fn.GetNameStringIndex()),
+		stringTableValue(stringTable, fn.GetSystemNameStringIndex()),
+		stringTableValue(stringTable, fn.GetFilenameStringIndex()),
+	)
+}
+
+func parcaPBLocationByIndex(values []*parcapb.Location, index uint32) *parcapb.Location {
+	if index == 0 {
+		return nil
+	}
+	i := int(index - 1)
+	if i >= 0 && i < len(values) {
+		return values[i]
+	}
+	return nil
+}
+
+func parcaPBFunctionByIndex(values []*parcapb.Function, index uint32) *parcapb.Function {
+	if index == 0 {
+		return nil
+	}
+	i := int(index - 1)
+	if i >= 0 && i < len(values) {
+		return values[i]
+	}
+	return nil
+}
+
+func parcaPBMappingByIndex(values []*parcapb.Mapping, index uint32) *parcapb.Mapping {
+	if index == 0 {
+		return nil
+	}
+	i := int(index - 1)
+	if i >= 0 && i < len(values) {
+		return values[i]
+	}
+	return nil
+}
+
 func parcaFlamegraphNodeToProfileNode(node parcaFlamegraphNode, stringTable []string, id string) ProfileNode {
 	children := make([]ProfileNode, 0, len(node.Children))
 	var childTotal float64
@@ -959,6 +1529,100 @@ func profileLabelSelector(q ProfileQuery) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
+func parcaQueryLabelSelector(q ProfileQuery) string {
+	labels := map[string]interface{}{}
+	if value := labelString(q.Labels, "job"); value != "" {
+		labels["job"] = value
+	} else if strings.TrimSpace(q.Service) != "" {
+		labels["job"] = strings.TrimSpace(q.Service)
+	}
+	if value := labelString(q.Labels, "instance"); value != "" {
+		labels["instance"] = value
+	} else if strings.TrimSpace(q.Host) != "" {
+		labels["instance"] = strings.TrimSpace(q.Host)
+	}
+	for key, value := range sanitizeProfileFilters(q.Filters) {
+		labels[key] = value
+	}
+	if len(labels) == 0 {
+		return profileLabelSelector(q)
+	}
+	return profileLabelSelector(ProfileQuery{Labels: labels})
+}
+
+func sanitizeProfileFilters(filters map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for key, value := range filters {
+		key = strings.TrimSpace(key)
+		valueString := strings.TrimSpace(fmt.Sprint(value))
+		if !isAllowedProfileFilterLabel(key) || valueString == "" || valueString == "<nil>" {
+			continue
+		}
+		out[key] = valueString
+	}
+	return out
+}
+
+func isAllowedProfileFilterLabel(label string) bool {
+	switch strings.TrimSpace(label) {
+	case "comm", "thread_name", "thread_id", "cpu":
+		return true
+	default:
+		return false
+	}
+}
+
+func uniqueSortedStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func labelString(labels map[string]interface{}, key string) string {
+	value := strings.TrimSpace(fmt.Sprint(labels[key]))
+	if value == "" || value == "<nil>" {
+		return ""
+	}
+	return value
+}
+
+func profileLabelsFromAgent(raw []byte) map[string]interface{} {
+	labels := map[string]interface{}{}
+	if len(raw) == 0 {
+		return labels
+	}
+	if err := util.UnmarshalJSONB(raw, &labels); err == nil {
+		return labels
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return labels
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if key, val, ok := strings.Cut(value, "="); ok {
+			key = strings.TrimSpace(key)
+			val = strings.TrimSpace(val)
+			if key != "" && val != "" {
+				labels[key] = val
+			}
+		}
+	}
+	return labels
+}
+
 func mergeProfileLabels(target ProfileTarget, explicit map[string]interface{}) map[string]interface{} {
 	labels := map[string]interface{}{}
 	for k, v := range target.Labels {
@@ -967,7 +1631,11 @@ func mergeProfileLabels(target ProfileTarget, explicit map[string]interface{}) m
 		}
 	}
 	for k, v := range explicit {
-		if strings.TrimSpace(k) != "" && fmt.Sprint(v) != "" {
+		key := strings.TrimSpace(k)
+		if key == "job" || key == "instance" {
+			continue
+		}
+		if key != "" && fmt.Sprint(v) != "" {
 			labels[k] = v
 		}
 	}
@@ -991,6 +1659,16 @@ func profileTimeoutSec(s *APIServer) int {
 		return s.Config.Profile.TimeoutSec
 	}
 	return 5
+}
+
+func (s *APIServer) defaultProfileEnvironment() string {
+	if s != nil && s.Config != nil {
+		env := strings.TrimSpace(s.Config.Security.Environment)
+		if env != "" {
+			return env
+		}
+	}
+	return "development"
 }
 
 func (s *APIServer) attachLocalPprofScrapeStatus(targets map[string]*ProfileTarget) {
