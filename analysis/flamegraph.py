@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 from typing import Optional
 
@@ -210,7 +211,8 @@ def generate_flamegraph(perf_data_path: str,
                         title: str = "CPU Flame Graph",
                         width: int = 1200,
                         colors: str = "hot",
-                        kallsyms_path: str = None) -> str:
+                        kallsyms_path: str = None,
+                        symbol_archive: str = None) -> str:
     """
     一键生成火焰图 SVG：perf.data → SVG
     支持两种输入：
@@ -227,6 +229,8 @@ def generate_flamegraph(perf_data_path: str,
         title:          火焰图标题
         width:          SVG 宽度
         colors:         配色方案
+        kallsyms_path:  Agent 快照的 /proc/kallsyms，解析内核符号用
+        symbol_archive: Agent 打包的 build-id 符号缓存，解析用户态符号用
 
     返回:
         SVG 字符串
@@ -241,6 +245,9 @@ def generate_flamegraph(perf_data_path: str,
     print(f"[flamegraph] ===== 开始生成火焰图 =====", file=sys.stderr)
     print(f"[flamegraph] 输入: {perf_data_path}", file=sys.stderr)
 
+    # 必须在 perf script 之前解包：perf 是在解析时才去 build-id 缓存里找符号的
+    _install_symbol_archive(symbol_archive)
+
     # 智能检测：如果文件内容已经是折叠栈格式（含分号分隔），跳过 perf script
     folded = _detect_and_fold(perf_data_path, kallsyms_path)
 
@@ -249,6 +256,51 @@ def generate_flamegraph(perf_data_path: str,
 
     print(f"[flamegraph] ===== 火焰图生成完毕 =====", file=sys.stderr)
     return svg
+
+
+def _install_symbol_archive(archive_path: str) -> bool:
+    """
+    把 Agent 传来的 build-id 符号缓存解开到本地，供 perf script 查符号
+
+    perf 解析用户态地址时会去 $HOME/.debug/.build-id 下按 build-id 找对应
+    二进制。analysis 容器里没有被采集进程的二进制，所以要靠 Agent 打包传来。
+
+    实测要点（2026-08-13 容器内验证）：
+      - `perf archive` 子命令在镜像里不存在，Agent 侧改用 tar 打包，这里对应解包
+      - perf record 会自动填充该缓存，无需额外 buildid-cache 操作
+      - strip 过的二进制解包后仍解析不出符号，属已知局限
+
+    解包失败只降级不抛异常——用户态符号显示为 [模块名]，但内核符号和
+    火焰图本身仍然可用。
+
+    返回: True=已解开, False=跳过或失败
+    """
+    if not archive_path or not os.path.exists(archive_path):
+        print("[flamegraph] 警告: 未提供符号包，用户态符号可能无法解析",
+              file=sys.stderr)
+        return False
+
+    buildid_dir = os.path.join(os.path.expanduser("~"), ".debug")
+    try:
+        os.makedirs(buildid_dir, exist_ok=True)
+        with tarfile.open(archive_path, "r:gz") as tar:
+            # 逐个校验成员路径，拒绝 ../ 或绝对路径逃逸出 buildid_dir。
+            # 符号包来自 Agent，但仍按不可信输入处理。
+            safe = []
+            for member in tar.getmembers():
+                target = os.path.realpath(os.path.join(buildid_dir, member.name))
+                if target == buildid_dir or target.startswith(buildid_dir + os.sep):
+                    safe.append(member)
+                else:
+                    print(f"[flamegraph] 跳过越界的符号包条目: {member.name}",
+                          file=sys.stderr)
+            tar.extractall(buildid_dir, members=safe)
+        print(f"[flamegraph] 符号包已解开到 {buildid_dir}（{len(safe)} 个条目）",
+              file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"[flamegraph] 解开符号包失败（降级继续）: {e}", file=sys.stderr)
+        return False
 
 
 def _detect_and_fold(perf_data_path: str, kallsyms_path: str = None) -> str:

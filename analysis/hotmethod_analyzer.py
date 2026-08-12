@@ -385,6 +385,41 @@ def _download_kallsyms(storage, bucket: str, tid: str,
         return None
 
 
+def _download_symbol_archive(storage, bucket: str, tid: str,
+                             local_path: str):
+    """
+    下载 Agent 打包的 build-id 符号缓存（用户态符号）
+
+    没有它用户态帧只会显示 [模块名]：analysis 容器里没有被采集进程的
+    二进制文件，perf 无法从中读取符号表。Agent 侧把 perf 的 build-id
+    缓存打成 tar 传过来，解开后 perf script 就能解析。
+
+    注意：strip 过的二进制即使传过来也解析不出符号，这是已知局限。
+
+    返回: 本地路径（成功）或 None（缺失/失败，调用方应降级而非报错）
+    """
+    if storage is None:
+        return None
+
+    key = f"{tid}/symbols.tar.gz"
+    try:
+        if not storage.object_exists(bucket, key):
+            print(f"[analysis] 无符号包（{key}），用户态符号将无法解析",
+                  file=sys.stderr)
+            return None
+        data = storage.get_object(bucket, key)
+        if not data:
+            return None
+        with open(local_path, "wb") as f:
+            f.write(data)
+        print(f"[analysis] 下载符号包 → {local_path} ({len(data)} bytes)",
+              file=sys.stderr)
+        return local_path
+    except Exception as e:
+        print(f"[analysis] 下载符号包失败（降级继续）: {e}", file=sys.stderr)
+        return None
+
+
 def _upload_output(storage, bucket: str, tid: str,
                    filename: str, content, content_type: str = "application/octet-stream") -> str:
     """
@@ -531,6 +566,12 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
         local_kallsyms = _download_kallsyms(
             storage, bucket, tid, f"/tmp/{tid}_kallsyms")
 
+    # --- 2c. 获取用户态符号包（缺失则降级，用户态帧显示为 [模块名]）---
+    local_symbols = None
+    if storage_ok:
+        local_symbols = _download_symbol_archive(
+            storage, bucket, tid, f"/tmp/{tid}_symbols.tar.gz")
+
     # --- 3. 生成火焰图 SVG ---
     task_name = task.get("name", tid)
     title = f"CPU Flame Graph: {task_name}"
@@ -538,7 +579,8 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     print(f"[analysis] 开始生成火焰图 ...", file=sys.stderr)
     try:
         svg_content = generate_flamegraph(local_perf, title=title,
-                                          kallsyms_path=local_kallsyms)
+                                          kallsyms_path=local_kallsyms,
+                                          symbol_archive=local_symbols)
     except Exception as e:
         exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
                    f"火焰图生成失败: {e}",

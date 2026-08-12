@@ -266,6 +266,16 @@ perf buildid-list -i perf.data
 | 二 | 对 `pprof_demo` 采集一次，TopN 中出现 `main.burnCPU` 等真实 Go 函数名 |
 | 三 | 连续两次对同一目标采集，第二次的 `symbols/check` 返回空 `missing` 列表（证明去重生效） |
 
+### 9.1 阶段一实际验收结果（2026-08-12）
+
+**结论：通过。** 整机（`target_pid=0`，`perf record -a`）采集一次 15 秒 CPU 样本，前端 TopN 表格中不再出现任何 `[[kernel.kallsyms]]` 条目，内核帧全部替换为真实函数名，例如 `pv_native_safe_halt`（98.3%，虚拟机空闲占比高属正常）、`do_user_addr_fault`、`_raw_spin_unlock_irqrestore`、`dput`、`do_writepages`、`rcu_do_batch`、`__alloc_pages`、`__pte_offset_map_lock`、`seq_putc`、`rb_next`、`__d_lookup`。
+
+TopN 中仍存在的方括号条目（`[libseccomp.so.2.5.3]` `[perl]` `[runc]` `[containerd-shim-runc-v2]` `[apiserver]` `[containerd]` `[dockerd]` `[libc.so.6]` `[perf-6064.map]`）均为**用户态符号未解析**，属于阶段二/三范围，不是阶段一遗留问题。
+
+**验收过程中发现并修复一处遗漏**：最初实现只把 `kallsyms_path` 接进了 `generate_flamegraph()`（生成 SVG 的路径），漏接了 `get_folded_stacks()`（生成 TopN/建议/`folded.txt` 的路径）——`get_folded_stacks()` 的函数签名当时根本没有 `kallsyms_path` 参数。现象是同一次分析里 `perf script` 被调用两次，一次带 `--kallsyms=`（SVG 用，正确）、一次不带（TopN 用，仍解析失败），最终建议引擎插入的还是 `[[kernel.kallsyms]]`。修复：给 `get_folded_stacks()` 加 `kallsyms_path` 参数并透传给 `_detect_and_fold()`，调用点同步传入 `local_kallsyms`。
+
+**教训**：给一个"内核符号"需求接线时，实际有两条独立的消费路径（SVG 生成 / TopN 生成），各自调用一次 `perf script`，参数必须两处都接，只测 SVG 或只测 TopN 都无法发现另一条路径的遗漏。
+
 ---
 
 ## 10. 前置验证实验（动手前必做）

@@ -164,6 +164,53 @@ static bool snapshot_kallsyms(const string &outPath)
     return true;
 }
 
+// ============================================================
+// archive_perf_symbols — 打包 perf 的 build-id 符号缓存供 analysis 使用
+// ============================================================
+// 解决用户态符号问题：perf.data 里只有地址和 DSO 路径，要翻译成函数名
+// 必须能读到那些二进制本身。analysis 容器里没有被采集进程的二进制，
+// 所以由 Agent 把符号打包传过去。
+//
+// 为什么不用 `perf archive`：该子命令是一个独立的 shell 脚本，实测在
+// 我们的镜像里没有随 perf 一起打包（报 "'archive' is not a perf-command"）。
+// 而它本质上只是把 build-id 缓存目录打成 tar，所以这里直接用 tar 实现，
+// 不依赖那个脚本是否存在。
+//
+// perf record 会自动填充 $HOME/.debug/.build-id，无需额外调 buildid-cache。
+//
+// 注意：strip 过的二进制即使打包过去也解析不出符号，这是已知且接受的局限。
+//
+// 返回 true 表示已生成 outPath。
+static bool archive_perf_symbols(const string &outPath)
+{
+    const char *home = ::getenv("HOME");
+    string buildidDir = (home && *home) ? string(home) + "/.debug" : "/root/.debug";
+
+    // 缓存目录不存在或为空，说明这次采集没留下任何符号，不必打包
+    struct stat st;
+    if (::stat(buildidDir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+    {
+        cout << "[agent] build-id 缓存目录不存在(" << buildidDir
+             << ")，跳过符号打包，用户态符号将无法解析" << endl;
+        return false;
+    }
+
+    // 用 gzip 而非 bzip2：gzip 在各镜像里更普遍，少一个外部依赖
+    string output;
+    int rc = drop::exec_capture({"tar", "czf", outPath, "-C", buildidDir, "."}, &output);
+    if (rc != 0)
+    {
+        cout << "[agent] 符号打包失败(rc=" << rc << "): " << output << endl;
+        return false;
+    }
+    if (::stat(outPath.c_str(), &st) != 0 || st.st_size == 0)
+    {
+        cout << "[agent] 符号包为空，跳过上传" << endl;
+        return false;
+    }
+    return true;
+}
+
 static bool write_manifest_file(const hotmethod::TaskDesc &task,
                                 const string &rawKey,
                                 const string &rawPath,
@@ -640,6 +687,24 @@ static hotmethod::TaskResult build_task_result(
                 else
                     cout << "[agent] kallsyms 上传失败，内核符号将无法解析" << endl;
                 ::remove(kallsymsPath.c_str());
+            }
+
+            // 用户态符号包：只有 perf 采集器产出 perf.data，其余采集器
+            // (async-profiler / pprof / eBPF) 不经过 perf script，打包纯属浪费。
+            if (task.profilertype() == 0)
+            {
+                string symbolsPath = "/tmp/" + task.taskid() + "_symbols.tar.gz";
+                string symbolsKey = task.taskid() + "/symbols.tar.gz";
+                if (archive_perf_symbols(symbolsPath))
+                {
+                    if (drop::upload_to_minio(cosConfig, symbolsPath, symbolsKey))
+                        cout << "[runner] stage=Upload taskID=" << task.taskid()
+                             << " symbolsKey=" << symbolsKey
+                             << " size=" << file_size(symbolsPath) << endl;
+                    else
+                        cout << "[agent] 符号包上传失败，用户态符号将无法解析" << endl;
+                    ::remove(symbolsPath.c_str());
+                }
             }
 
             if (rawUploaded)
