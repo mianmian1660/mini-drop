@@ -15,14 +15,15 @@ import (
 
 // Config 是全局配置结构体，包含所有运行时配置
 type Config struct {
-	Server        ServerConfig        `mapstructure:"server"`
-	Database      DatabaseConfig      `mapstructure:"database"`
-	GRPC          GRPCConfig          `mapstructure:"grpc"`
-	Storage       StorageConfig       `mapstructure:"storage"`
-	Log           LogConfig           `mapstructure:"log"`
-	Security      SecurityConfig      `mapstructure:"security"`
-	Observability ObservabilityConfig `mapstructure:"observability"`
-	Profile       ProfileConfig       `mapstructure:"profile"`
+	Server         ServerConfig         `mapstructure:"server"`
+	Database       DatabaseConfig       `mapstructure:"database"`
+	GRPC           GRPCConfig           `mapstructure:"grpc"`
+	Storage        StorageConfig        `mapstructure:"storage"`
+	Log            LogConfig            `mapstructure:"log"`
+	Security       SecurityConfig       `mapstructure:"security"`
+	Observability  ObservabilityConfig  `mapstructure:"observability"`
+	Profile        ProfileConfig        `mapstructure:"profile"`
+	AgentDiscovery AgentDiscoveryConfig `mapstructure:"agent_discovery"`
 }
 
 // ServerConfig HTTP 服务配置
@@ -87,6 +88,14 @@ type ProfileConfig struct {
 	TimeoutSec    int    `mapstructure:"timeout_sec"`
 }
 
+// AgentDiscoveryConfig 控制 apiserver 主动探测哪些 Agent IP。
+// ExtraIPs 使用逗号分隔，适合通过环境变量 AGENT_DISCOVERY_EXTRA_IPS
+// 放入公网服务器地址，例如 111.230.29.115。这里不保存 SSH 密码，也不负责部署，
+// 只是在 drop_agent 已经连上 drop_server 后，帮助首页把远端主机发现出来。
+type AgentDiscoveryConfig struct {
+	ExtraIPs string `mapstructure:"extra_ips"`
+}
+
 // Load 加载配置文件并返回 Config 结构体
 // 优先使用环境变量覆盖 YAML 中的值
 func Load(configPath string) (*Config, error) {
@@ -144,6 +153,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("profile.parca_grpc_addr", "parca:7070")
 	v.SetDefault("profile.parca_ui_url", "http://localhost:7070")
 	v.SetDefault("profile.timeout_sec", 5)
+	v.SetDefault("agent_discovery.extra_ips", "")
 
 	// 环境变量覆盖（优先级最高）
 	// PG_DSN → database.dsn
@@ -204,6 +214,9 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envProfileTimeout := os.Getenv("PROFILE_TIMEOUT_SEC"); envProfileTimeout != "" {
 		v.Set("profile.timeout_sec", envProfileTimeout)
+	}
+	if envAgentDiscoveryIPs := os.Getenv("AGENT_DISCOVERY_EXTRA_IPS"); envAgentDiscoveryIPs != "" {
+		v.Set("agent_discovery.extra_ips", envAgentDiscoveryIPs)
 	}
 
 	if err := v.Unmarshal(cfg); err != nil {

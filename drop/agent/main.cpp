@@ -103,7 +103,10 @@ static bool write_manifest_file(const hotmethod::TaskDesc &task,
                                 const string &rawPath,
                                 const string &sha256,
                                 const string &manifestPath,
-                                bool partial)
+                                bool partial,
+                                const string &collector,
+                                const string &contentType,
+                                int resultCode)
 {
     ofstream out(manifestPath, ios::trunc);
     if (!out.is_open())
@@ -112,8 +115,14 @@ static bool write_manifest_file(const hotmethod::TaskDesc &task,
     out << "\"task_id\":\"" << json_escape_local(task.taskid()) << "\",";
     out << "\"attempt_id\":" << task.attempt_id() << ",";
     out << "\"task_kind\":\"" << json_escape_local(task.task_kind()) << "\",";
+    out << "\"collector\":\"" << json_escape_local(collector) << "\",";
+    out << "\"object_key\":\"" << json_escape_local(rawKey) << "\",";
     out << "\"raw_key\":\"" << json_escape_local(rawKey) << "\",";
     out << "\"raw_file\":\"" << json_escape_local(rawPath) << "\",";
+    out << "\"local_path\":\"" << json_escape_local(rawPath) << "\",";
+    out << "\"content_type\":\"" << json_escape_local(contentType) << "\",";
+    out << "\"sample_event\":\"" << json_escape_local(task.sampleargv().event()) << "\",";
+    out << "\"result_code\":" << resultCode << ",";
     out << "\"size\":" << file_size(rawPath) << ",";
     out << "\"sha256\":\"" << json_escape_local(sha256) << "\",";
     out << "\"partial\":" << (partial ? "true" : "false");
@@ -140,7 +149,7 @@ static shared_ptr<grpc::Channel> connect_to_server(
 
         initpb::RegisterAgentRequest req;
         req.set_hostname(cfg.hostname);
-        req.set_ipaddr("127.0.0.1");
+        req.set_ipaddr(cfg.ipAddr);
         req.set_uid(cfg.uid);
         req.set_agentversion(cfg.agentVersion);
         req.set_agent_id(cfg.uid);
@@ -419,7 +428,16 @@ static string get_error_message(int resultCode, const string &profilerName,
     case -2:
     case -5:
         if (profilerName == "eBPF")
-            return "eBPF 采集失败：请确认 bpftrace/tracefs 权限可用，并在采集窗口内制造 IO 或调度负载，resultCode=" + to_string(resultCode);
+        {
+            string event = task.sampleargv().event();
+            if (event.empty())
+                event = "cpu";
+            if (resultCode == -5)
+                return "eBPF 采集失败：BPFTRACE_UNAVAILABLE，请确认 Agent 容器内已安装 bpftrace，resultCode=" + to_string(resultCode);
+            if (event == "cpu")
+                return "eBPF CPU 采集失败：NO_EBPF_SAMPLES，请提高采样频率/加长 duration，或确认 kstack/ustack 权限可用，resultCode=" + to_string(resultCode);
+            return "eBPF 采集失败：NO_EBPF_SAMPLES，请确认 bpftrace/tracefs 权限可用，并在采集窗口内制造 " + event + " 负载，resultCode=" + to_string(resultCode);
+        }
         return profilerName + " 进程异常, resultCode=" + to_string(resultCode);
     default:
         return profilerName + " 采集失败, exitCode=" + to_string(resultCode);
@@ -437,7 +455,13 @@ static string get_error_code(int resultCode, const string &profilerName)
     if (resultCode == -6)
         return "ARTIFACT_MISSING";
     if (profilerName.find("eBPF") != string::npos)
+    {
+        if (resultCode == -2)
+            return "NO_EBPF_SAMPLES";
+        if (resultCode == -5)
+            return "BPFTRACE_UNAVAILABLE";
         return "EBPF_UNAVAILABLE";
+    }
     if (profilerName.find("pprof") != string::npos)
         return "PPROF_UNAVAILABLE";
     return "TASK_EXECUTION_FAILED";
@@ -448,6 +472,8 @@ struct RunnerOutcome
     int resultCode = 0;
     string profilerName;
     string outputPath;
+    string remoteKey;
+    string contentType;
     bool partial = false;
 };
 
@@ -492,6 +518,8 @@ public:
         cout << "[runner] stage=Collect taskID=" << task_.taskid()
              << " outputPath=" << out.outputPath
              << " partial=" << (out.partial ? "true" : "false") << endl;
+        out.remoteKey = RemoteKeyFor(out.outputPath, out.profilerName);
+        out.contentType = ContentTypeFor(out.outputPath, out.profilerName);
         return out;
     }
 
@@ -506,7 +534,30 @@ private:
             return outputPath_ + ".pb.gz";
         if (file_exists(outputPath_ + ".bpf"))
             return outputPath_ + ".bpf";
+        if (file_exists(outputPath_ + ".bpf.raw"))
+            return outputPath_ + ".bpf.raw";
         return outputPath_;
+    }
+
+    string RemoteKeyFor(const string &path, const string &profilerName) const
+    {
+        string tid = task_.taskid();
+        if (profilerName.find("eBPF") != string::npos || path.find(".bpf") != string::npos)
+            return tid + "/raw.bpf";
+        if (profilerName.find("async-profiler") != string::npos || path.find(".collapsed") != string::npos)
+            return tid + "/profile.collapsed";
+        if (profilerName.find("pprof") != string::npos || path.find(".pb.gz") != string::npos)
+            return tid + "/profile.pb.gz";
+        return tid + "/perf.data";
+    }
+
+    string ContentTypeFor(const string &path, const string &profilerName) const
+    {
+        if (profilerName.find("eBPF") != string::npos || path.find(".bpf") != string::npos || path.find(".collapsed") != string::npos)
+            return "text/plain; charset=utf-8";
+        if (profilerName.find("pprof") != string::npos || path.find(".pb.gz") != string::npos)
+            return "application/gzip";
+        return "application/octet-stream";
     }
 
     uint32_t profilerType_;
@@ -547,12 +598,12 @@ static hotmethod::TaskResult build_task_result(
             if (slashPos != string::npos)
                 fileName = fileName.substr(slashPos + 1);
 
-            // 使用标准路径 {tid}/perf.data，与 analysis 的下载路径一致
-            string remoteKey = task.taskid() + "/perf.data";
+            string remoteKey = outcome.remoteKey.empty() ? task.taskid() + "/perf.data" : outcome.remoteKey;
             string manifestKey = task.taskid() + "/manifest.json";
             string sha256 = sha256_file(actualPath);
             string manifestPath = "/tmp/" + task.taskid() + "_manifest.json";
-            bool manifestWritten = write_manifest_file(task, remoteKey, actualPath, sha256, manifestPath, outcome.partial);
+            bool manifestWritten = write_manifest_file(task, remoteKey, actualPath, sha256, manifestPath, outcome.partial,
+                                                       outcome.profilerName, outcome.contentType, outcome.resultCode);
 
             cout << "[runner] stage=Upload taskID=" << task.taskid()
                  << " rawKey=" << remoteKey
@@ -583,7 +634,21 @@ static hotmethod::TaskResult build_task_result(
         }
         else
         {
-            taskResult.set_errormessage(outcome.profilerName + " 采集完成但无法读取输出文件: " + actualPath);
+            string detail;
+            struct stat st;
+            if (stat(actualPath.c_str(), &st) != 0)
+                detail = " (stat: " + string(strerror(errno)) + ")";
+            else
+                detail = " (size=" + to_string(static_cast<long long>(st.st_size)) + ")";
+            string rawPath = actualPath + ".raw";
+            string rawContent = drop::read_file_content(rawPath);
+            if (!rawContent.empty())
+            {
+                if (rawContent.size() > 600)
+                    rawContent = rawContent.substr(rawContent.size() - 600);
+                detail += " bpftrace_raw_tail=\"" + json_escape_local(rawContent) + "\"";
+            }
+            taskResult.set_errormessage(outcome.profilerName + " 采集完成但无法读取输出文件: " + actualPath + detail);
             taskResult.set_error_code("ARTIFACT_MISSING");
         }
     }
@@ -636,6 +701,7 @@ int main(int argc, char **argv)
 
     cout << "[agent] drop_agent 启动 (W5 多采集器)" << endl;
     cout << "[agent] hostname=" << cfg.hostname
+         << " ip=" << cfg.ipAddr
          << " uid=" << cfg.uid
          << " version=" << cfg.agentVersion << endl;
 
@@ -668,7 +734,7 @@ int main(int argc, char **argv)
         // 填心跳
         healthcheck::HealthCheckRequest req;
         req.set_hostname(cfg.hostname);
-        req.set_ipaddr("127.0.0.1");
+        req.set_ipaddr(cfg.ipAddr);
         req.set_uid(cfg.uid);
         req.set_agentversion(cfg.agentVersion);
         req.set_agent_id(cfg.uid);

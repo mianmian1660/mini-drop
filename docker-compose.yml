@@ -98,18 +98,23 @@ services:
       - parcadata:/var/lib/parca
 
   # ========================================================
-  # parca-agent — 本机持续 Profiling Agent（WSL 下 best-effort）
+  # parca-agent — 本机持续 Profiling Agent（真实 Linux 下可选开启）
+  # 远端主机请单独运行 parca-agent，并使用：
+  # --remote-store-address=<中心IP>:7070 --remote-store-insecure
+  # --metadata-external-labels=job=hotmethod;env=development;instance=<远端IP>;node=<远端hostname>
   # ========================================================
   parca_agent:
     image: ghcr.io/parca-dev/parca-agent:v0.49.0
+    profiles:
+      - host-parca-agent
     command:
       - --node=mini-drop-local
       - --remote-store-address=127.0.0.1:7070
       - --remote-store-insecure
-      - --metadata-external-labels=job=hotmethod,env=development,instance=127.0.0.1,node=mini-drop-local
-      - --debuginfo-upload-disable
+      - --remote-store-use-v2-schema=false
+      - --metadata-external-labels=job=hotmethod;env=development;instance=127.0.0.1;node=mini-drop-local
       - --log-level=info
-    restart: "no"
+    restart: unless-stopped
     network_mode: host
     privileged: true
     pid: host
@@ -126,6 +131,7 @@ services:
         soft: -1
         hard: -1
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - /sys/kernel/debug:/sys/kernel/debug:rw
       - /sys/kernel/tracing:/sys/kernel/tracing:rw
       - /sys/fs/bpf:/sys/fs/bpf:rw
@@ -162,6 +168,7 @@ services:
     command: ./drop_agent localhost:50051 # network_mode=host 时用 localhost 访问 drop_server
     environment:
       DROP_PERF_BIN: "/usr/local/bin/perf-real"
+      DROP_AGENT_IP: "127.0.0.1"
     network_mode: host # 使用宿主机网络（需要 perf 权限）
     privileged: true # 特权模式（perf 需要）
     pid: host # 使用宿主机 PID 命名空间
@@ -208,6 +215,7 @@ services:
       PARCA_URL: "http://parca:7070"
       PARCA_GRPC_ADDR: "parca:7070"
       PARCA_UI_URL: "http://localhost:7070"
+      AGENT_DISCOVERY_EXTRA_IPS: "111.230.29.115" # 远端 drop_agent 自报该 IP 后，首页会显示独立远程主机
       S3_ENDPOINT: "minio:9000" # MinIO 地址（Docker 内部网络）
       S3_PUBLIC_ENDPOINT: "localhost:9000" # 浏览器访问地址（预签名 URL 用）
       S3_ACCESS_KEY: "drop"

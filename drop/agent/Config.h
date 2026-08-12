@@ -22,6 +22,7 @@ namespace drop_agent
     {
         // Agent 身份
         std::string hostname;
+        std::string ipAddr;
         std::string uid;
         std::string agentVersion;
         std::string platform;

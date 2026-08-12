@@ -591,15 +591,29 @@ func (s *APIServer) startAgentDiscoverer() {
 			continue
 		}
 
-		// 获取 DB 中已有的 Agent IP 列表
+		// 获取 DB 中已有的 Agent 身份。
+		// 远程 Agent 早期可能因隧道/host network 被记录成 127.0.0.1；
+		// 如果 hostname/agent_id 里带有 111-230-29-115 这类云主机标识，
+		// 也提取成候选 IP 探测，让 Agent 修正 DROP_AGENT_IP 后可以自动“长出”远程主机行。
 		var agents []model.AgentInfo
-		if err := s.DB.Select("ip_addr").Find(&agents).Error; err != nil {
+		if err := s.DB.Select("ip_addr, hostname, agent_id").Find(&agents).Error; err != nil {
 			continue
 		}
 
 		ips := map[string]bool{"127.0.0.1": true}
 		for _, a := range agents {
 			ips[a.IPAddr] = true
+			for _, ip := range candidateIPsFromAgentIdentity(a) {
+				ips[ip] = true
+			}
+		}
+		// 额外发现 IP 由部署/演示环境显式配置。它解决的是“数据库里还没有远端行”
+		// 的冷启动问题：只要远端 drop_agent 已用 DROP_AGENT_IP=公网 IP 注册，
+		// 这里就会主动向 drop_server 查询该 IP，并把它写成独立主机行。
+		configuredIPs := map[string]bool{}
+		for _, ip := range s.configuredAgentDiscoveryIPs() {
+			ips[ip] = true
+			configuredIPs[ip] = true
 		}
 
 		for ip := range ips {
@@ -614,34 +628,23 @@ func (s *APIServer) startAgentDiscoverer() {
 				if s.DB.Where("ip_addr = ?", ip).First(&existing).Error == nil && existing.Online {
 					s.DB.Model(&existing).Update("online", false)
 					s.recordAgentAudit(existing.IPAddr, existing.Hostname, "offline", "30s 自动发现探测失败，判定 Agent 离线")
+				} else if configuredIPs[ip] {
+					s.ensureAgentDiscoveryPlaceholder(ip)
 				}
 				continue
 			}
 
-			// Agent 在线 → 更新或创建
-			var existing model.AgentInfo
-			result := s.DB.Where("ip_addr = ?", ip).First(&existing)
-			now := time.Now()
-			if result.Error == nil {
-				if !existing.Online {
-					s.recordAgentAudit(existing.IPAddr, existing.Hostname, "recovered", "30s 自动发现探测成功，Agent 恢复在线")
-				}
-				s.DB.Model(&existing).Updates(map[string]interface{}{
-					"online":    true,
-					"last_seen": now,
-				})
-			} else {
-				agent := model.AgentInfo{
-					Hostname:    ip,
-					IPAddr:      ip,
-					Online:      true,
-					Version:     "1.0.0",
-					Environment: "production",
-					LastSeen:    now,
-				}
-				s.DB.Create(&agent)
+			// Agent 在线 → 按 agent_id 优先 upsert，避免本机和远程同为 127.0.0.1 时互相覆盖。
+			agent, wasOffline, err := s.upsertAgentFromStat(ip, resp)
+			if err != nil {
+				s.Logger.Warn("自动发现 Agent 写库失败", zap.String("ip", ip), zap.Error(err))
+				continue
+			}
+			if wasOffline {
+				s.recordAgentAudit(agent.IPAddr, agent.Hostname, "recovered", "30s 自动发现探测成功，Agent 恢复在线")
+			} else if agent.CreatedAt.Equal(agent.UpdatedAt) {
 				s.recordAgentAudit(agent.IPAddr, agent.Hostname, "registered", "30s 自动发现发现新 Agent")
-				s.Logger.Info("自动发现新 Agent", zap.String("ip", ip))
+				s.Logger.Info("自动发现新 Agent", zap.String("ip", ip), zap.String("agent_id", agent.AgentID))
 			}
 		}
 	}
@@ -704,6 +707,7 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/profile/flamegraph", s.GetProfileFlamegraph)
 		api.GET("/profile/topn", s.GetProfileTopN)
 		api.GET("/profile/diff", s.GetProfileDiff)
+		api.GET("/profile/label-values", s.GetProfileLabelValues)
 
 		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)

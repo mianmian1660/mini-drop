@@ -46,6 +46,7 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("GRPC_MTLS_KEY_FILE", "/certs/client.key")
 	t.Setenv("GRPC_MTLS_CA_FILE", "/certs/ca.crt")
 	t.Setenv("METRICS_ENABLED", "false")
+	t.Setenv("AGENT_DISCOVERY_EXTRA_IPS", "111.230.29.115,10.0.0.9")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -75,6 +76,9 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if cfg.Observability.MetricsEnabled {
 		t.Fatalf("metrics override should disable metrics")
+	}
+	if cfg.AgentDiscovery.ExtraIPs != "111.230.29.115,10.0.0.9" {
+		t.Fatalf("agent discovery extra ips = %q", cfg.AgentDiscovery.ExtraIPs)
 	}
 }
 

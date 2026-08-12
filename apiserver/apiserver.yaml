@@ -56,3 +56,9 @@ profile:
   parca_grpc_addr: "parca:7070"
   parca_ui_url: "http://localhost:7070"
   timeout_sec: 5
+
+# Agent 主动发现配置。
+# extra_ips 使用逗号分隔，只写远端 Agent 自报的 IP，不包含 SSH 用户名或密码。
+# 远端 drop_agent 需要同时设置 DROP_AGENT_IP 为同一个地址，首页才能稳定显示远程主机行。
+agent_discovery:
+  extra_ips: ""
