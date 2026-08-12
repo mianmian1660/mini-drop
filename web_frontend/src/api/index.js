@@ -94,6 +94,7 @@ export const profiles = {
     flamegraph: (params = {}) => client.get('/api/v1/profile/flamegraph', { params }),
     topn: (params = {}) => client.get('/api/v1/profile/topn', { params }),
     diff: (params = {}) => client.get('/api/v1/profile/diff', { params }),
+    labelValues: (params = {}) => client.get('/api/v1/profile/label-values', { params }),
 };
 
 // ---------- 分析结果 ----------

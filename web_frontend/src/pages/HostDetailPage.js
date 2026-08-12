@@ -1,27 +1,32 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { select } from 'd3-selection';
-import { flamegraph as createFlamegraph } from 'd3-flame-graph';
-import 'd3-flame-graph/dist/d3-flamegraph.css';
 import { agents, profiles, schedules, tasks } from '../api';
 import CreateTaskModal from '../components/CreateTaskModal';
+import ContinuousProfilingPanel from '../components/ContinuousProfilingPanel';
 import Pagination from '../components/Pagination';
 import TimelineChart, { statusColor } from '../components/TimelineChart';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
+import { formatMetricValue, metricColumnLabel } from '../utils/profileMetrics';
 
 const S = {
-    container: { maxWidth: 1280, margin: '0 auto', padding: 24, fontFamily: 'Arial, sans-serif', color: '#202124' },
-    pageHead: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-end', marginBottom: 18 },
+    container: { maxWidth: 1320, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
+    pageHead: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-end', marginBottom: 12 },
     eyebrow: { margin: '0 0 6px 0', color: '#667085', fontSize: 13 },
-    title: { margin: 0, fontSize: 28, lineHeight: 1.2 },
+    title: { margin: 0, fontSize: 28, lineHeight: 1.2, letterSpacing: 0 },
     actions: { display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' },
-    card: { background: '#fff', borderRadius: 8, padding: 20, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 3px rgba(16,24,40,0.08)' },
-    contextGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10 },
-    contextItem: { background: '#f8fafc', border: '1px solid #edf0f3', borderRadius: 6, padding: 12 },
+    card: { background: '#fff', borderRadius: 8, padding: 20, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
+    contextDetails: { background: '#fff', border: '1px solid #eaecf0', borderRadius: 8, marginBottom: 14 },
+    contextSummary: { cursor: 'pointer', padding: '12px 14px', display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'center', color: '#667085', fontSize: 13, listStyle: 'none' },
+    contextSummaryMain: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 },
+    contextSummaryTitle: { color: '#111827', fontSize: 14, fontWeight: 700 },
+    contextSummaryText: { color: '#475467', fontSize: 13, lineHeight: 1.4 },
+    contextGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: '14px 28px', padding: '14px', borderTop: '1px solid #f2f4f7' },
+    contextItem: { minWidth: 0 },
+    contextItemWide: { gridColumn: '1 / -1' },
     contextLabel: { color: '#667085', fontSize: 12, marginBottom: 5 },
-    contextValue: { color: '#111827', fontSize: 14, fontWeight: 700, wordBreak: 'break-word' },
-    tabBar: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 },
-    tab: (active) => ({ padding: '9px 14px', borderRadius: 6, border: active ? '1px solid #315efb' : '1px solid #d0d7de', background: active ? '#eef2ff' : '#fff', color: active ? '#315efb' : '#475467', cursor: 'pointer', fontSize: 14, fontWeight: 700 }),
+    contextValue: { color: '#111827', fontSize: 14, fontWeight: 650, wordBreak: 'break-word', lineHeight: 1.45 },
+    tabBar: { display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 16, borderBottom: '1px solid #e5e7eb' },
+    tab: (active) => ({ padding: '10px 0 11px', borderRadius: 0, border: 'none', borderBottom: active ? '2px solid #315efb' : '2px solid transparent', background: 'transparent', color: active ? '#315efb' : '#667085', cursor: 'pointer', fontSize: 14, fontWeight: 700 }),
     grid: { display: 'grid', gridTemplateColumns: 'minmax(280px, 0.8fr) minmax(420px, 1.2fr)', gap: 16 },
     sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 },
     sectionTitle: { margin: 0, fontSize: 18 },
@@ -210,7 +215,7 @@ export default function HostDetailPage() {
             </div>
 
             <HostContext target={target} activeTab={activeTab} />
-            {!dropOnline && <div style={S.warn}>drop_agent 当前不可用，按需采样暂不可创建；持续 profiling 仍可进入查看。</div>}
+            {!dropOnline && <DropAgentNotice target={target} activeTab={activeTab} />}
 
             <div style={S.tabBar}>
                 {tabs.map(tab => <button key={tab.id} style={S.tab(activeTab === tab.id)} onClick={() => setTab(tab.id)}>{tab.label}</button>)}
@@ -254,24 +259,56 @@ export default function HostDetailPage() {
 }
 
 function HostContext({ target, activeTab }) {
+    const parcaText = statusLabel(String(target.parca_agent_status || 'unknown'), 'parca');
+    const summary = [
+        target.hostname || target.ip || '-',
+        target.ip || '-',
+        target.service_name || '-',
+        `parca_agent ${parcaText}`,
+    ].join(' · ');
     return (
-        <section style={S.card}>
+        <details style={S.contextDetails}>
+            <summary style={S.contextSummary}>
+                <span style={S.contextSummaryMain}>
+                    <span style={S.contextSummaryTitle}>主机上下文</span>
+                    <span style={S.contextSummaryText}>{summary}</span>
+                </span>
+                <span style={S.subtle}>详情</span>
+            </summary>
             <div style={S.contextGrid}>
                 <ContextItem label="host" value={target.hostname || '-'} />
                 <ContextItem label="ip" value={target.ip || '-'} />
                 <ContextItem label="service" value={target.service_name || '-'} />
                 <ContextItem label="environment" value={target.environment || '-'} />
-                <ContextItem label="drop_agent" value={<StatusPill value={target.drop_agent_status} />} />
-                <ContextItem label="parca_agent" value={<StatusPill value={target.parca_agent_status} />} />
+                <ContextItem label="按需采样 drop_agent" value={<StatusPill value={target.drop_agent_status} kind="drop" />} />
+                <ContextItem label="持续 profiling parca_agent" value={<StatusPill value={target.parca_agent_status} kind="parca" />} />
                 <ContextItem label="time range" value={activeTab === 'profiling' ? 'Tab 内选择' : '当前主机上下文'} />
-                <ContextItem label="labels" value={labelSummary(target.labels)} />
+                <ContextItem label="labels" value={labelSummary(target.labels)} wide />
             </div>
-        </section>
+        </details>
+    );
+}
+
+function DropAgentNotice({ target, activeTab }) {
+    const parcaReady = isParcaAgentReady(target?.parca_agent_status);
+    if (activeTab === 'profiling' && parcaReady) {
+        return (
+            <div style={S.info}>
+                drop_agent 离线只影响按需采样创建；当前持续 profiling 来自 parca_agent，仍可查看整机 CPU 占用时长。
+            </div>
+        );
+    }
+    return (
+        <div style={S.warn}>
+            drop_agent 离线，暂不能新建按需采样；持续 profiling 是否可看取决于 parca_agent 状态。
+        </div>
     );
 }
 
 function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks: taskItems, schedules: scheduleItems, profileSummary, onRefresh, onTab }) {
-    const profilingMsg = profileSummary?.empty ? (profileSummary.message || '无持续 profiling 数据') : `${profileSummary?.items?.length || 0} 个热点函数`;
+    const profilingMsg = profileSummary?.empty
+        ? (profileSummary.message || '无持续 profiling 数据')
+        : `${profileSummary?.items?.length || 0} 个热点函数 · ${formatMetricValue(profileSummary?.total, profileSummary?.unit)}`;
     return (
         <>
             <section style={S.card}>
@@ -518,119 +555,7 @@ function TimelineResult({ points, baselineTid, setBaselineTid }) {
 }
 
 function HostProfilingPanel({ target }) {
-    const [range, setRange] = useState('30m');
-    const [profileType, setProfileType] = useState('cpu');
-    const [flamegraph, setFlamegraph] = useState(null);
-    const [topn, setTopn] = useState(null);
-    const [querying, setQuerying] = useState(false);
-    const [error, setError] = useState('');
-    const timeWindow = useMemo(() => makeTimeWindow(range), [range]);
-    const labelSelector = labelSelectorForTarget(target);
-    const parcaUIURL = target.parca_ui_url || 'http://localhost:7070';
-    const pprofScrapeStatus = target.pprof_scrape_status || 'unknown';
-    const parcaAgentStatusText = target.parca_agent_status === 'online'
-        ? 'online'
-        : 'WSL/eBPF 不可用或未接入';
-    const pprofScrapeTargets = Array.isArray(target.pprof_scrape_targets) && target.pprof_scrape_targets.length > 0
-        ? target.pprof_scrape_targets.join(' / ')
-        : 'parca:7070 / pprof_demo:6060';
-    const nativeStatus = querying && !flamegraph && !topn
-        ? '查询中'
-        : (flamegraph?.empty || topn?.empty) ? '待接入 gRPC/Connect' : 'ready';
-    const pprofStatusText = pprofScrapeStatus === 'available' ? 'available' : pprofScrapeStatus;
-    const pprofMessage = pprofScrapeStatus === 'available'
-        ? 'Parca 已在 scrape 标准 Go pprof，可在外部 UI 查询 {job="pprof_demo"}。'
-        : (target.pprof_scrape_message || 'Parca/pprof scrape 当前不可确认。');
-
-    const refresh = useCallback(async () => {
-        setQuerying(true);
-        setError('');
-        const params = {
-            target_id: target.id,
-            host: target.ip,
-            service: target.service_name || 'hotmethod',
-            from: timeWindow.from,
-            to: timeWindow.to,
-            profile_type: profileType,
-            labels: JSON.stringify(target.labels || {}),
-        };
-        try {
-            const [fgRes, topRes] = await Promise.all([profiles.flamegraph(params), profiles.topn(params)]);
-            if (fgRes.code === 0) setFlamegraph(fgRes.data);
-            if (topRes.code === 0) setTopn(topRes.data);
-            if (fgRes.code !== 0) setError(fgRes.message || '加载火焰图失败');
-            if (topRes.code !== 0) setError(topRes.message || '加载 TopN 失败');
-        } catch (err) {
-            setFlamegraph(null);
-            setTopn(null);
-            setError(err?.message || '持续 profiling 查询失败');
-        } finally {
-            setQuerying(false);
-        }
-    }, [target, timeWindow, profileType]);
-
-    useEffect(() => { refresh(); }, [refresh]);
-
-    return (
-        <>
-            <section style={S.card}>
-                <div style={S.sectionHead}>
-                    <div>
-                        <h3 style={S.sectionTitle}>持续 profiling</h3>
-                        <div style={{ ...S.subtle, marginTop: 4 }}>Mini-Drop 原生视图为主；Parca 作为外部数据源入口。</div>
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                        <a href={parcaUIURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Parca UI</a>
-                        <button style={S.btnSecondary} onClick={refresh} disabled={querying}>{querying ? '查询中' : '刷新'}</button>
-                    </div>
-                </div>
-                <div style={S.statusBar}>
-                    <ProfileStatusChip label="pprof scrape" value={pprofStatusText} tone={pprofScrapeStatus === 'available' ? 'success' : 'info'} />
-                    <ProfileStatusChip label="eBPF agent" value={parcaAgentStatusText} tone={target.parca_agent_status === 'online' ? 'success' : 'muted'} />
-                    <ProfileStatusChip label="Mini-Drop 原生查询" value={nativeStatus} tone={nativeStatus === 'ready' ? 'success' : 'info'} />
-                </div>
-                <div style={pprofScrapeStatus === 'available' ? S.success : S.info}>
-                    {pprofMessage}
-                </div>
-                <div style={S.toolbar}>
-                    <select style={S.select} value={range} onChange={e => setRange(e.target.value)}>
-                        <option value="15m">最近 15 分钟</option>
-                        <option value="30m">最近 30 分钟</option>
-                        <option value="1h">最近 1 小时</option>
-                        <option value="6h">最近 6 小时</option>
-                    </select>
-                    <select style={S.select} value={profileType} onChange={e => setProfileType(e.target.value)}>
-                        <option value="cpu">CPU</option>
-                        <option value="memory">Memory</option>
-                    </select>
-                    <input style={{ ...S.input, minWidth: 360 }} value={labelSelector} readOnly />
-                </div>
-                <div style={S.contextGrid}>
-                    <ContextItem label="time range" value={`${formatTime(timeWindow.from)} - ${formatTime(timeWindow.to)}`} />
-                    <ContextItem label="label selector" value={labelSelector} />
-                    <ContextItem label="scrape targets" value={pprofScrapeTargets} />
-                    <ContextItem label="推荐查询" value='{job="pprof_demo"} 或 {job="parca"}' />
-                </div>
-            </section>
-            {error && <div style={S.error}>{error}</div>}
-            <div style={S.grid}>
-                <section style={S.card}>
-                    <div style={S.sectionHead}>
-                        <h3 style={S.sectionTitle}>火焰图</h3>
-                        <span style={S.subtle}>{flamegraph?.source || 'mini-drop'} · {flamegraph?.unit || 'samples'}</span>
-                    </div>
-                    <FlamegraphView data={flamegraph} loading={querying} parcaUIURL={parcaUIURL} />
-                </section>
-                <section style={S.card}>
-                    <div style={S.sectionHead}>
-                        <h3 style={S.sectionTitle}>TopN Self/Total</h3>
-                        <span style={S.subtle}>{topn?.items?.length || 0} functions</span>
-                    </div>
-                    <TopNTable data={topn} loading={querying} parcaUIURL={parcaUIURL} />
-                </section>
-            </div>
-        </>
-    );
+    return <ContinuousProfilingPanel target={target} />;
 }
 
 function AgentLogsPanel({ audits, detailLoading, onRefresh }) {
@@ -690,87 +615,6 @@ function TaskTable({ tasks: taskItems, compact = false }) {
     );
 }
 
-function FlamegraphView({ data, loading, parcaUIURL }) {
-    if (loading && !data) return <div style={S.empty}>正在查询持续 profiling...</div>;
-    if (!data || data.empty || !Array.isArray(data.nodes) || data.nodes.length === 0) {
-        return <ProfileEmptyState parcaUIURL={parcaUIURL} />;
-    }
-    return <InteractiveFlamegraph data={data} />;
-}
-
-function InteractiveFlamegraph({ data }) {
-    const graphRef = useRef(null);
-    const [renderError, setRenderError] = useState('');
-
-    useEffect(() => {
-        if (!graphRef.current) return undefined;
-        const root = miniDropToD3Flamegraph(data);
-        const selection = select(graphRef.current);
-        selection.selectAll('*').remove();
-        setRenderError('');
-        try {
-            const chart = createFlamegraph()
-                .width(Math.max(graphRef.current.clientWidth || 760, 760))
-                .cellHeight(18)
-                .transitionDuration(150)
-                .minFrameSize(3)
-                .sort(true)
-                .title('');
-            selection.datum(root).call(chart);
-        } catch (err) {
-            setRenderError(err?.message || '火焰图渲染失败');
-        }
-        return () => {
-            selection.selectAll('*').remove();
-        };
-    }, [data]);
-
-    return (
-        <>
-            <div ref={graphRef} style={S.flameGraphBox} />
-            {renderError && <div style={S.warn}>火焰图渲染失败，已显示下方摘要：{renderError}</div>}
-            <div style={S.fallbackTitle}>热点摘要</div>
-            <FlamegraphRows data={data} />
-        </>
-    );
-}
-
-function FlamegraphRows({ data }) {
-    const rows = flattenNodes(data.nodes).slice(0, 24);
-    const max = Math.max(...rows.map(row => row.value), 1);
-    return (
-        <div style={S.flameWrap}>
-            {rows.map((row, index) => (
-                <div key={`${row.name}-${index}`} style={{ ...S.flameRow, paddingLeft: Math.min(row.depth * 18, 90) }}>
-                    <span title={row.name}>{truncate(row.name, 34)}</span>
-                    <div style={S.barTrack}><div style={{ ...S.bar, width: `${Math.max(4, (row.value / max) * 100)}%`, background: barColor(row.depth) }} /></div>
-                    <strong>{formatMetric(row.value, 1)}</strong>
-                </div>
-            ))}
-        </div>
-    );
-}
-
-function miniDropToD3Flamegraph(data) {
-    return {
-        name: 'root',
-        value: Number(data?.total || sumNodeValues(data?.nodes || [])) || 1,
-        children: (data?.nodes || []).map(toD3Node),
-    };
-}
-
-function toD3Node(node) {
-    return {
-        name: node.name || 'unknown',
-        value: Number(node.value || 0),
-        children: (node.children || []).map(toD3Node),
-    };
-}
-
-function sumNodeValues(nodes) {
-    return nodes.reduce((sum, node) => sum + Number(node.value || 0), 0);
-}
-
 function TopNTable({ data, loading, compact = false, parcaUIURL }) {
     if (loading && !data) return <div style={S.empty}>正在查询 TopN...</div>;
     const items = data?.items || [];
@@ -780,14 +624,18 @@ function TopNTable({ data, loading, compact = false, parcaUIURL }) {
     return (
         <table style={S.table}>
             <thead>
-                <tr><th style={S.th}>函数</th><th style={S.th}>Total</th><th style={S.th}>Self</th></tr>
+                <tr>
+                    <th style={S.th}>函数</th>
+                    <th style={S.th}>{metricColumnLabel(data.unit, '累计占用时长')}</th>
+                    <th style={S.th}>{metricColumnLabel(data.unit, '自身占用时长')}</th>
+                </tr>
             </thead>
             <tbody>
                 {items.slice(0, compact ? 5 : 14).map((item, index) => (
                     <tr key={`${item.name}-${index}`}>
                         <td style={S.td} title={item.name}>{truncate(item.name, compact ? 44 : 36)}</td>
-                        <td style={S.td}>{formatMetric(item.value, 1)} {item.unit || data.unit || ''}</td>
-                        <td style={S.td}>{formatMetric(item.self, 1)}</td>
+                        <td style={S.td}>{formatMetricValue(item.value, item.unit || data.unit)}</td>
+                        <td style={S.td}>{formatMetricValue(item.self, item.unit || data.unit)}</td>
                     </tr>
                 ))}
             </tbody>
@@ -799,31 +647,16 @@ function ProfileEmptyState({ parcaUIURL, compact = false }) {
     return (
         <div style={S.empty}>
             <div style={{ fontWeight: 700, color: '#475467', marginBottom: 6 }}>
-                Parca 已可采 pprof，Mini-Drop 原生转换待接入
+                暂无持续 profiling 样本
             </div>
             {!compact && (
                 <div style={{ ...S.subtle, marginBottom: 12 }}>
-                    当前 WSL 环境下可先在 Parca UI 查询 <strong>{'{job="pprof_demo"}'}</strong>。
+                    请切换时间范围或打开持续 profiling 标签页查看详情。
                 </div>
             )}
             {parcaUIURL && (
-                <a href={parcaUIURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Parca UI</a>
+                <a href={parcaUIURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Parca 查询</a>
             )}
-        </div>
-    );
-}
-
-function ProfileStatusChip({ label, value, tone = 'info' }) {
-    const colors = {
-        success: { border: '#abefc6', background: '#ecfdf3', color: '#067647' },
-        info: { border: '#bfdbfe', background: '#eff6ff', color: '#175cd3' },
-        muted: { border: '#e5e7eb', background: '#f8fafc', color: '#475467' },
-    };
-    const color = colors[tone] || colors.info;
-    return (
-        <div style={{ ...S.statusChip, borderColor: color.border, background: color.background }}>
-            <span style={S.statusChipLabel}>{label}</span>
-            <span style={{ ...S.statusChipValue, color: color.color }}>{value || '-'}</span>
         </div>
     );
 }
@@ -832,44 +665,39 @@ function MessagePage({ message }) {
     return <div style={S.container}><div style={S.error}>{message}</div><Link to="/" style={S.btnSecondary}>返回主机列表</Link></div>;
 }
 
-function ContextItem({ label, value }) {
-    return <div style={S.contextItem}><div style={S.contextLabel}>{label}</div><div style={S.contextValue}>{value}</div></div>;
+function ContextItem({ label, value, wide = false }) {
+    return <div style={wide ? { ...S.contextItem, ...S.contextItemWide } : S.contextItem}><div style={S.contextLabel}>{label}</div><div style={S.contextValue}>{value}</div></div>;
 }
 
 function Metric({ label, value }) {
     return <div style={S.metric}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value}</div></div>;
 }
 
-function StatusPill({ value }) {
+function StatusPill({ value, kind = '' }) {
     const status = String(value || 'unknown');
-    const color = status === 'online' ? '#16a34a' : status === 'offline' ? '#dc2626' : status === 'unconfigured' ? '#64748b' : '#7c3aed';
-    return <span style={{ ...S.badge, background: color, color: '#fff' }}>{status}</span>;
+    const color = isParcaAgentReady(status) ? '#16a34a' : status === 'offline' ? '#dc2626' : status === 'unconfigured' ? '#64748b' : '#7c3aed';
+    return <span style={{ ...S.badge, background: color, color: '#fff' }}>{statusLabel(status, kind)}</span>;
 }
 
-function makeTimeWindow(range) {
-    const to = new Date();
-    const minutes = { '15m': 15, '30m': 30, '1h': 60, '6h': 360 }[range] || 30;
-    const from = new Date(to.getTime() - minutes * 60 * 1000);
-    return { from: from.toISOString(), to: to.toISOString() };
+function isParcaAgentReady(status) {
+    return status === 'online' || status === 'online_with_samples';
 }
 
-function flattenNodes(nodes, depth = 0) {
-    return nodes.flatMap(node => [{ ...node, depth }, ...flattenNodes(node.children || [], depth + 1)]);
+function statusLabel(status, kind = '') {
+    if (status === 'online_with_samples') return '有样本';
+    if (status === 'online_no_samples') return '在线无样本';
+    if (status === 'online') return '在线';
+    if (status === 'offline') return kind === 'drop' ? '离线（仅影响按需采样）' : '离线';
+    if (status === 'unconfigured') return '未配置';
+    if (status === 'parca_unreachable') return 'Parca 不可达';
+    if (status === 'query_unsupported') return '查询不兼容';
+    return status || '未知';
 }
 
 function labelSummary(labels) {
     const entries = Object.entries(labels || {});
     if (entries.length === 0) return 'node/job/env/instance 待接入';
     return entries.slice(0, 4).map(([k, v]) => `${k}=${v}`).join(', ');
-}
-
-function labelSelectorForTarget(target) {
-    const labels = { ...(target.labels || {}) };
-    if (!labels.node && target.hostname) labels.node = target.hostname;
-    if (!labels.instance && target.ip) labels.instance = target.ip;
-    if (!labels.job && target.service_name) labels.job = target.service_name;
-    if (!labels.env && target.environment) labels.env = target.environment;
-    return `{${Object.entries(labels).map(([k, v]) => `${k}="${v}"`).join(', ')}}`;
 }
 
 function formatTime(value) {
@@ -894,10 +722,6 @@ function formatMemory(kb) {
 function truncate(value, limit) {
     const text = String(value || '-');
     return text.length > limit ? `${text.slice(0, limit - 1)}...` : text;
-}
-
-function barColor(depth) {
-    return ['#2f6fed', '#18a058', '#d97706', '#7c3aed', '#c2410c'][depth % 5];
 }
 
 function auditName(event) {

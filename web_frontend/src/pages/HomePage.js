@@ -71,7 +71,7 @@ export default function HomePage() {
     }, [targets, keyword]);
 
     const onlineDropAgents = targets.filter(t => t.drop_agent_status === 'online').length;
-    const parcaReady = targets.filter(t => t.parca_agent_status === 'online').length;
+    const ebpfReady = targets.filter(t => isParcaAgentReady(t.parca_agent_status)).length;
     const pprofScrapeReady = targets.filter(t => t.pprof_scrape_status === 'available').length;
 
     if (loading) {
@@ -92,7 +92,7 @@ export default function HomePage() {
                 <Metric label="可观测对象" value={targets.length} />
                 <Metric label="drop_agent 在线" value={`${onlineDropAgents}/${targets.length}`} />
                 <Metric label="pprof scrape 可用" value={`${pprofScrapeReady}/${targets.length}`} />
-                <Metric label="eBPF agent 在线" value={`${parcaReady}/${targets.length}`} />
+                <Metric label="eBPF profiling 可用" value={`${ebpfReady}/${targets.length}`} />
             </div>
 
             {error && <div style={styles.error}>{error}</div>}
@@ -119,7 +119,7 @@ export default function HomePage() {
                                 <th style={styles.th}>服务</th>
                                 <th style={styles.th}>环境</th>
                                 <th style={styles.th}>drop_agent</th>
-                                <th style={styles.th}>parca_agent</th>
+                                <th style={styles.th}>eBPF profiling</th>
                                 <th style={styles.th}>最近活动</th>
                                 <th style={styles.th}>操作</th>
                             </tr>
@@ -155,6 +155,10 @@ export default function HomePage() {
     );
 }
 
+function isParcaAgentReady(status) {
+    return status === 'online' || status === 'online_with_samples';
+}
+
 function Metric({ label, value }) {
     return (
         <div style={styles.metric}>
@@ -166,7 +170,7 @@ function Metric({ label, value }) {
 
 function StatusPill({ value }) {
     const status = String(value || 'unknown');
-    const color = status === 'online'
+    const color = isParcaAgentReady(status)
         ? '#16a34a'
         : status === 'offline'
             ? '#dc2626'
