@@ -353,6 +353,54 @@ def _download_perf_data(storage, bucket: str, tid: str,
         return False
 
 
+def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
+    suffixes = suffixes or []
+    keys = []
+    if conn is None:
+        return keys
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT object_key FROM artifacts WHERE task_tid = %s AND kind = 'RAW' ORDER BY created_at DESC, id DESC",
+            (tid,),
+        )
+        for row in cur.fetchall():
+            key = row[0]
+            if not key:
+                continue
+            lowered = key.lower()
+            if not suffixes or any(lowered.endswith(suffix) for suffix in suffixes):
+                keys.append(key)
+        cur.close()
+    except Exception as e:
+        print(f"[analysis] 读取 RAW artifact 元数据失败: {e}", file=sys.stderr)
+    return keys
+
+
+def _download_first_existing(storage, bucket: str, keys: list, local_path: str, label: str) -> bool:
+    if storage is None:
+        return False
+    seen = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            if hasattr(storage, "object_exists") and not storage.object_exists(bucket, key):
+                print(f"[analysis] MinIO 上不存在 {key}", file=sys.stderr)
+                continue
+            data = storage.get_object(bucket, key)
+            if not data:
+                continue
+            with open(local_path, "wb") as f:
+                f.write(data)
+            print(f"[analysis] 下载 {label}: {key} → {local_path} ({len(data)} bytes)", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"[analysis] 下载 {label} 失败 key={key}: {e}", file=sys.stderr)
+    return False
+
+
 def _upload_output(storage, bucket: str, tid: str,
                    filename: str, content, content_type: str = "application/octet-stream") -> str:
     """
@@ -1004,16 +1052,9 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
     has_data = False
 
     if storage_ok:
-        try:
-            key = f"{tid}/perf.data"
-            data = storage.get_object(bucket, key)
-            if data:
-                with open(local_bpf, 'wb') as f:
-                    f.write(data)
-                if os.path.exists(local_bpf) and os.path.getsize(local_bpf) > 0:
-                    has_data = True
-        except Exception as e:
-            print(f"[analysis] MinIO 下载 bpf 数据失败: {e}", file=sys.stderr)
+        keys = _raw_artifact_keys(conn, tid, suffixes=["raw.bpf", ".bpf", "perf.data", ".txt"])
+        keys.extend([f"{tid}/raw.bpf", f"{tid}/perf.data"])
+        has_data = _download_first_existing(storage, bucket, keys, local_bpf, "eBPF raw")
 
     if not has_data:
         print(f"[analysis] 错误: 找不到 eBPF 数据文件", file=sys.stderr)

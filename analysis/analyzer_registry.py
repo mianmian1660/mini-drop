@@ -131,7 +131,7 @@ def build_default_registry() -> AnalyzerRegistry:
         LegacyFunctionAnalyzer(
             name="ebpf",
             pipeline="bpf_histogram",
-            input_spec=InputSpec("perf.data", ["bpf"], max_size=256 * 1024 * 1024),
+            input_spec=InputSpec("raw.bpf", ["bpf"], max_size=256 * 1024 * 1024),
             output_specs=[
                 OutputSpec("bpf_histogram.svg", "RESULT", "image/svg+xml"),
                 OutputSpec("bpf_data.json", "RESULT", "application/json"),

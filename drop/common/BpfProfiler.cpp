@@ -45,6 +45,7 @@ namespace drop
     static int exec_bpftrace(const string &scriptPath, const string &outputPath,
                              const hotmethod::TaskDesc &taskDesc, BpfMode mode);
     static bool has_histogram_bucket(const string &path);
+    static bool has_folded_stack(const string &path);
 
     static bool tracepoint_available(const string &name)
     {
@@ -63,6 +64,8 @@ namespace drop
         uint32_t hz = taskDesc.sampleargv().hz();
         if (hz == 0)
             hz = 99;
+        if (mode == BpfMode::CPU && hz < 19)
+            hz = 19;
         uint64_t dur = taskDesc.sampleargv().duration();
         if (dur == 0)
             dur = 10;
@@ -71,12 +74,18 @@ namespace drop
         switch (mode)
         {
         case BpfMode::CPU:
+        {
+            string cg = taskDesc.sampleargv().callgraph();
+            for (auto &c : cg)
+                c = tolower(c);
+            string stackExpr = (cg == "ustack" || cg == "user") ? "ustack" : "kstack";
             if (pid > 0)
-                s += "profile:hz:" + to_string(hz) + "\n/pid == " + to_string(pid) + "/\n{\n    @samples[ustack] = count();\n}\n\n";
+                s += "profile:hz:" + to_string(hz) + "\n/pid == " + to_string(pid) + "/\n{\n    @samples[" + stackExpr + "] = count();\n}\n\n";
             else
-                s += "profile:hz:" + to_string(hz) + "\n{\n    @samples[ustack] = count();\n}\n\n";
+                s += "profile:hz:" + to_string(hz) + "\n{\n    @samples[" + stackExpr + "] = count();\n}\n\n";
             s += "interval:s:" + to_string(dur) + "\n{\n    exit();\n}\n";
             break;
+        }
 
         case BpfMode::IO_LATENCY:
             s += "#define dev_t unsigned int\n";
@@ -147,27 +156,52 @@ namespace drop
                 continue;
             if (mode == BpfMode::CPU)
             {
-                // bpftrace v0.14 文本输出可能是单行或多行：
-                // 单行: @samples[func1;func2]: 42
-                // 多行: @samples[\n  func1\n  func2\n]: 42
-                // 转换为标准折叠栈: func1;func2 42
-                if (line.find("@samples[") == 0)
+                // bpftrace v0.14/v0.20 文本输出可能是单行或多行：
+                // @samples[func1;func2]: 42
+                // @[
+                //     leaf+7
+                //     parent+9
+                // ]: 42
+                // 转换为标准折叠栈: parent;leaf 42
+                string trimmed = line;
+                size_t first = trimmed.find_first_not_of(" \t");
+                if (first != string::npos)
+                    trimmed = trimmed.substr(first);
+                if (trimmed.find("@samples[") == 0 || trimmed.find("@[") == 0)
                 {
-                    string stack;
+                    vector<string> frames;
                     string count;
 
-                    // 检查是否单行格式（同一行有 ]:）
-                    size_t endBr = line.rfind("]:");
+                    size_t endBr = trimmed.rfind("]:");
                     if (endBr != string::npos)
                     {
-                        size_t startBr = line.find("[");
-                        stack = line.substr(startBr + 1, endBr - startBr - 1);
-                        count = line.substr(endBr + 2);
+                        size_t startBr = trimmed.find("[");
+                        string stack = trimmed.substr(startBr + 1, endBr - startBr - 1);
+                        count = trimmed.substr(endBr + 2);
+                        string frame;
+                        for (char c : stack)
+                        {
+                            if (c == ';')
+                            {
+                                if (!frame.empty())
+                                {
+                                    frames.push_back(frame);
+                                    frame.clear();
+                                }
+                            }
+                            else
+                            {
+                                frame += c;
+                            }
+                        }
+                        if (!frame.empty())
+                            frames.push_back(frame);
                     }
                     else
                     {
-                        // 多行格式：收集后续行
-                        stack = line.substr(line.find("[") + 1);
+                        string firstFrame = trimmed.substr(trimmed.find("[") + 1);
+                        if (!firstFrame.empty())
+                            frames.push_back(firstFrame);
                         while (getline(in, line))
                         {
                             if (line.find("]:") != string::npos)
@@ -175,51 +209,38 @@ namespace drop
                                 size_t cb = line.rfind("]:");
                                 if (cb != string::npos)
                                 {
-                                    stack += line.substr(0, cb);
+                                    string frame = line.substr(0, cb);
+                                    if (!frame.empty())
+                                        frames.push_back(frame);
                                     count = line.substr(cb + 2);
                                 }
                                 break;
                             }
-                            stack += line;
+                            frames.push_back(line);
                         }
                     }
 
-                    // 清理：将 \n 替换为 ;
-                    string cleanStack;
-                    for (char c : stack)
+                    vector<string> cleanFrames;
+                    for (string frame : frames)
                     {
-                        if (c == '\n' || c == '\r')
+                        size_t fs = frame.find_first_not_of(" \t\n\r");
+                        size_t fe = frame.find_last_not_of(" \t\n\r");
+                        if (fs == string::npos || fe == string::npos)
                             continue;
-                        if (c == ' ' && (cleanStack.empty() || cleanStack.back() == ';'))
+                        frame = frame.substr(fs, fe - fs + 1);
+                        if (frame.empty() || frame == "@[" || frame == "]")
                             continue;
-                        cleanStack += c;
+                        cleanFrames.push_back(frame);
                     }
-                    // 去首尾空格并压缩内部空格
-                    size_t ss = cleanStack.find_first_not_of(" \t");
-                    size_t se = cleanStack.find_last_not_of(" \t");
-                    if (ss != string::npos && se != string::npos)
-                        cleanStack = cleanStack.substr(ss, se - ss + 1);
-                    // 将空白分隔替换为 ;
+
                     string finalStack;
-                    bool inSpace = false;
-                    for (char c : cleanStack)
+                    for (auto it = cleanFrames.rbegin(); it != cleanFrames.rend(); ++it)
                     {
-                        if (c == ' ' || c == '\t')
-                        {
-                            if (!inSpace)
-                            {
-                                finalStack += ';';
-                                inSpace = true;
-                            }
-                        }
-                        else
-                        {
-                            finalStack += c;
-                            inSpace = false;
-                        }
+                        if (!finalStack.empty())
+                            finalStack += ";";
+                        finalStack += *it;
                     }
 
-                    // 清理 count
                     size_t cs = count.find_first_not_of(" \t\n\r");
                     size_t ce = count.find_last_not_of(" \t\n\r");
                     if (cs != string::npos && ce != string::npos)
@@ -252,6 +273,24 @@ namespace drop
                 continue;
             char c = line[pos];
             if (c == '[' || c == '(')
+                return true;
+        }
+        return false;
+    }
+
+    static bool has_folded_stack(const string &path)
+    {
+        ifstream in(path);
+        if (!in.is_open())
+            return false;
+
+        string line;
+        while (getline(in, line))
+        {
+            size_t pos = line.find_first_not_of(" \t");
+            if (pos == string::npos)
+                continue;
+            if (line.find(';') != string::npos)
                 return true;
         }
         return false;
@@ -298,6 +337,7 @@ namespace drop
                 av.push_back(a.c_str());
             av.push_back(nullptr);
             execvp("bpftrace", const_cast<char *const *>(av.data()));
+            perror("[bpf] execvp bpftrace 失败");
             _exit(127);
         }
 
@@ -342,6 +382,8 @@ namespace drop
             if (ec != 0)
             {
                 cerr << "[bpf] 退出码=" << ec << endl;
+                if (ec == 127)
+                    return -5;
                 return ec;
             }
             return 0;
@@ -391,21 +433,34 @@ namespace drop
         if (r == 0)
             postprocess(raw, outputPath, mode);
         remove(tmp.c_str());
-        remove(raw.c_str());
+        if (r == 0)
+            remove(raw.c_str());
 
         if (r == 0)
         {
             ifstream ck(outputPath);
             if (!ck.is_open() || ck.peek() == ifstream::traits_type::eof())
             {
-                cerr << "[bpf] 输出文件为空" << endl;
+                if (mode == BpfMode::CPU)
+                    cerr << "[bpf] NO_EBPF_SAMPLES: CPU profile 没有 folded stack；请提高频率/加长 duration 或确认 kstack/ustack 可用" << endl;
+                else
+                    cerr << "[bpf] NO_EBPF_SAMPLES: 输出文件为空；请确认采集窗口内存在 IO/调度负载" << endl;
+                remove(outputPath.c_str());
                 return -2;
             }
             ck.close();
 
+            if (mode == BpfMode::CPU && !has_folded_stack(outputPath))
+            {
+                cerr << "[bpf] NO_EBPF_SAMPLES: CPU 输出中没有有效 folded stack" << endl;
+                remove(outputPath.c_str());
+                return -2;
+            }
+
             if (mode != BpfMode::CPU && !has_histogram_bucket(outputPath))
             {
-                cerr << "[bpf] 未采到直方图桶，请确认现场负载存在并适当加长 duration" << endl;
+                cerr << "[bpf] NO_EBPF_SAMPLES: 未采到直方图桶，请确认现场负载存在并适当加长 duration" << endl;
+                remove(outputPath.c_str());
                 return -2;
             }
         }

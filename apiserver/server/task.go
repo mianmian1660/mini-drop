@@ -503,6 +503,13 @@ func (s *APIServer) findRawCollectionArtifact(tid string) (string, int64, bool) 
 }
 
 func pickRawCollectionObject(files []storage.FileInfo) (string, int64, bool) {
+	for _, wanted := range []string{"raw.bpf", "profile.collapsed", "profile.pb.gz", "perf.data"} {
+		for _, file := range files {
+			if filepath.Base(file.Name) == wanted {
+				return file.Name, file.Size, true
+			}
+		}
+	}
 	for _, file := range files {
 		if filepath.Base(file.Name) == "perf.data" {
 			return file.Name, file.Size, true
@@ -517,20 +524,22 @@ func pickRawCollectionObject(files []storage.FileInfo) (string, int64, bool) {
 }
 
 func pickRawCollectionLocalFile(files []map[string]interface{}) (string, int64, bool) {
+	for _, wanted := range []string{"raw.bpf", "profile.collapsed", "profile.pb.gz", "perf.data"} {
+		for _, file := range files {
+			name, _ := file["name"].(string)
+			if name == "" || filepath.Base(name) != wanted {
+				continue
+			}
+			size := rawLocalFileSize(file)
+			return name, size, true
+		}
+	}
 	for _, file := range files {
 		name, _ := file["name"].(string)
 		if name == "" {
 			continue
 		}
-		size := int64(0)
-		switch v := file["size"].(type) {
-		case int64:
-			size = v
-		case int:
-			size = int64(v)
-		case float64:
-			size = int64(v)
-		}
+		size := rawLocalFileSize(file)
 		if strings.HasSuffix(name, "_perf.data") || filepath.Base(name) == "perf.data" {
 			return name, size, true
 		}
@@ -540,18 +549,23 @@ func pickRawCollectionLocalFile(files []map[string]interface{}) (string, int64, 
 		if name == "" || !isRawCollectionName(name) {
 			continue
 		}
-		size := int64(0)
-		switch v := file["size"].(type) {
-		case int64:
-			size = v
-		case int:
-			size = int64(v)
-		case float64:
-			size = int64(v)
-		}
+		size := rawLocalFileSize(file)
 		return name, size, true
 	}
 	return "", 0, false
+}
+
+func rawLocalFileSize(file map[string]interface{}) int64 {
+	switch v := file["size"].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
 }
 
 func isRawCollectionName(name string) bool {
@@ -563,7 +577,8 @@ func isRawCollectionName(name string) bool {
 	return strings.Contains(base, "perf") ||
 		strings.HasSuffix(base, ".data") ||
 		strings.HasSuffix(base, ".bpf") ||
-		strings.HasSuffix(base, ".collapsed")
+		strings.HasSuffix(base, ".collapsed") ||
+		strings.HasSuffix(base, ".pb.gz")
 }
 
 // ListTasks 获取任务列表（支持分页、搜索、状态筛选）
@@ -1477,8 +1492,12 @@ func mimeType(filename string) string {
 		return "text/markdown; charset=utf-8"
 	case ".txt":
 		return "text/plain; charset=utf-8"
+	case ".bpf", ".collapsed":
+		return "text/plain; charset=utf-8"
 	case ".html":
 		return "text/html; charset=utf-8"
+	case ".gz":
+		return "application/gzip"
 	case ".png":
 		return "image/png"
 	default:

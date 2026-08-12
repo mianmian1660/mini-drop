@@ -163,6 +163,92 @@ def t_analyze_bpf_output_cpu_schema():
     assert r["sample_unit"] == "samples"
     assert r["self_time_top"][0]["function"] == "hot"
 
+def t_analyze_bpf_prefers_raw_bpf_artifact():
+    import hotmethod_analyzer as hm
+
+    class Cursor:
+        def execute(self, sql, args):
+            self.args = args
+        def fetchall(self):
+            return [("tid-bpf/raw.bpf",), ("tid-bpf/perf.data",)]
+        def close(self):
+            pass
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    class Storage:
+        def __init__(self):
+            self.read_keys = []
+            self.writes = {}
+        def object_exists(self, bucket, key):
+            return key == "tid-bpf/raw.bpf"
+        def get_object(self, bucket, key):
+            self.read_keys.append(key)
+            if key == "tid-bpf/raw.bpf":
+                return b"@io_lat_us:\n[1, 2) 5\n[2, 4) 10\n"
+            return None
+        def put_object(self, bucket, key, data, content_type):
+            self.writes[key] = content_type
+        def presigned_get_url(self, bucket, key):
+            return "http://example/" + key
+
+    storage = Storage()
+    original_connect = hm._connect_storage
+    try:
+        hm._connect_storage = lambda cfg: (storage, True)
+        result = hm._analyze_bpf(Conn(), {}, {"name": "bpf", "request_params": {"event": "io"}}, "drop-data", "tid-bpf", "/tmp")
+    finally:
+        hm._connect_storage = original_connect
+
+    assert storage.read_keys[0] == "tid-bpf/raw.bpf"
+    assert "tid-bpf/bpf_data.json" in storage.writes
+    assert "tid-bpf/bpf_raw.txt" in storage.writes
+    assert any(item["name"] == "bpf_histogram.svg" for item in result["local_files"])
+
+def t_analyze_bpf_falls_back_to_legacy_perf_data():
+    import hotmethod_analyzer as hm
+
+    class Cursor:
+        def execute(self, sql, args):
+            pass
+        def fetchall(self):
+            return []
+        def close(self):
+            pass
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    class Storage:
+        def __init__(self):
+            self.read_keys = []
+            self.writes = {}
+        def object_exists(self, bucket, key):
+            return key == "tid-old/perf.data"
+        def get_object(self, bucket, key):
+            self.read_keys.append(key)
+            if key == "tid-old/perf.data":
+                return b"@sched_lat_us:\n[0, 10) 3\n"
+            return None
+        def put_object(self, bucket, key, data, content_type):
+            self.writes[key] = content_type
+        def presigned_get_url(self, bucket, key):
+            return "http://example/" + key
+
+    storage = Storage()
+    original_connect = hm._connect_storage
+    try:
+        hm._connect_storage = lambda cfg: (storage, True)
+        hm._analyze_bpf(Conn(), {}, {"name": "old", "request_params": {"event": "sched"}}, "drop-data", "tid-old", "/tmp")
+    finally:
+        hm._connect_storage = original_connect
+
+    assert "tid-old/perf.data" in storage.read_keys
+    assert "tid-old/bpf_data.json" in storage.writes
+
 def t_parse_memtrace():
     from memleak_analyzer import parse_memtrace
     allocs, free_lines = parse_memtrace("alloc:main;worker;my_malloc 0x1000 1024\nfree:main;my_free 0x1000\nalloc:main;leak 0x2000 4096\n")
