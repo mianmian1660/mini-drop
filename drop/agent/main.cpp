@@ -35,6 +35,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -96,6 +97,71 @@ static string sha256_file(const string &path)
         return "";
     size_t space = output.find(' ');
     return space == string::npos ? output : output.substr(0, space);
+}
+
+// ============================================================
+// snapshot_kallsyms — 快照 /proc/kallsyms 供 analysis 解析内核符号
+// ============================================================
+// 为什么必须由 Agent 做：读到真实内核地址需要 CAP_SYSLOG，光有
+// kptr_restrict=0 不够。analysis 不是特权容器，它本地的 /proc/kallsyms
+// 地址全是 0，内核帧只会显示 [unknown]。Agent 是特权容器，读得到真值。
+//
+// 全零校验是必须的：一张地址全 0 的 kallsyms 在格式上完全合法，传上去
+// 只会让下游拿到一份无效甚至误导性的符号表。宁可不传，也不传有毒的表。
+//
+// 返回 true 表示快照可用并已写入 outPath。
+static bool snapshot_kallsyms(const string &outPath)
+{
+    std::ifstream in("/proc/kallsyms");
+    if (!in.is_open())
+    {
+        cout << "[agent] 无法读取 /proc/kallsyms，跳过内核符号快照" << endl;
+        return false;
+    }
+
+    string content;
+    string line;
+    bool sawNonZeroAddr = false;
+    size_t lineNo = 0;
+    while (std::getline(in, line))
+    {
+        // 只需在前若干行里确认地址不是全 0，无需扫全文（文件常有 5~10MB）
+        if (!sawNonZeroAddr && lineNo < 64)
+        {
+            size_t space = line.find(' ');
+            if (space != string::npos &&
+                line.substr(0, space).find_first_not_of('0') != string::npos)
+            {
+                sawNonZeroAddr = true;
+            }
+        }
+        ++lineNo;
+        content += line;
+        content += '\n';
+    }
+    in.close();
+
+    if (content.empty())
+    {
+        cout << "[agent] /proc/kallsyms 为空，跳过内核符号快照" << endl;
+        return false;
+    }
+    if (!sawNonZeroAddr)
+    {
+        cout << "[agent] 警告: /proc/kallsyms 地址全为 0（缺少 CAP_SYSLOG 或 "
+             << "kptr_restrict 受限），拒绝上传无效符号表，内核符号将无法解析" << endl;
+        return false;
+    }
+
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out.is_open())
+    {
+        cout << "[agent] 无法写入 kallsyms 快照: " << outPath << endl;
+        return false;
+    }
+    out << content;
+    out.close();
+    return true;
 }
 
 static bool write_manifest_file(const hotmethod::TaskDesc &task,
@@ -611,6 +677,22 @@ static hotmethod::TaskResult build_task_result(
                  << " sha256=" << sha256 << endl;
             bool rawUploaded = drop::upload_to_minio(cosConfig, actualPath, remoteKey);
             bool manifestUploaded = manifestWritten && drop::upload_to_minio(cosConfig, manifestPath, manifestKey);
+
+            // 内核符号快照：随产物一起上传，analysis 侧靠它解析内核帧。
+            // 失败只降级不影响任务成败——用户态符号和火焰图本身仍然可用。
+            string kallsymsPath = "/tmp/" + task.taskid() + "_kallsyms";
+            string kallsymsKey = task.taskid() + "/kallsyms";
+            if (snapshot_kallsyms(kallsymsPath))
+            {
+                if (drop::upload_to_minio(cosConfig, kallsymsPath, kallsymsKey))
+                    cout << "[runner] stage=Upload taskID=" << task.taskid()
+                         << " kallsymsKey=" << kallsymsKey
+                         << " size=" << file_size(kallsymsPath) << endl;
+                else
+                    cout << "[agent] kallsyms 上传失败，内核符号将无法解析" << endl;
+                ::remove(kallsymsPath.c_str());
+            }
+
             if (rawUploaded)
                 taskResult.set_coskey(remoteKey);
             if (manifestUploaded)

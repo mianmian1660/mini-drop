@@ -401,6 +401,21 @@ def _download_first_existing(storage, bucket: str, keys: list, local_path: str, 
     return False
 
 
+def _download_kallsyms(storage, bucket: str, tid: str,
+                       local_path: str, conn=None):
+    """
+    下载 Agent 采集时快照的 /proc/kallsyms。
+
+    优先读取 artifacts 表中记录的 RAW 产物，兼容后续对象 key 调整；如果元数据缺失，
+    再回退到早期固定路径 {tid}/kallsyms。
+    """
+    keys = _raw_artifact_keys(conn, tid, suffixes=["/kallsyms", ".kallsyms", "kallsyms"])
+    keys.append(f"{tid}/kallsyms")
+    if _download_first_existing(storage, bucket, keys, local_path, "kallsyms"):
+        return local_path
+    print(f"[analysis] 无 kallsyms 快照，内核符号将无法解析", file=sys.stderr)
+    return None
+
 def _upload_output(storage, bucket: str, tid: str,
                    filename: str, content, content_type: str = "application/octet-stream") -> str:
     """
@@ -541,13 +556,20 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
         print(f"[analysis] 错误: 找不到 perf.data，无法生成火焰图", file=sys.stderr)
         return outputs
 
+    # --- 2b. 获取 kallsyms 快照（缺失则降级，内核符号显示为 [unknown]）---
+    local_kallsyms = None
+    if storage_ok:
+        local_kallsyms = _download_kallsyms(
+            storage, bucket, tid, f"/tmp/{tid}_kallsyms", conn)
+
     # --- 3. 生成火焰图 SVG ---
     task_name = task.get("name", tid)
     title = f"CPU Flame Graph: {task_name}"
 
     print(f"[analysis] 开始生成火焰图 ...", file=sys.stderr)
     try:
-        svg_content = generate_flamegraph(local_perf, title=title)
+        svg_content = generate_flamegraph(local_perf, title=title,
+                                          kallsyms_path=local_kallsyms)
     except Exception as e:
         exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
                    f"火焰图生成失败: {e}",
@@ -555,7 +577,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
 
     # --- 4. 获取折叠栈 ---
     try:
-        folded_text = get_folded_stacks(local_perf)
+        folded_text = get_folded_stacks(local_perf, local_kallsyms)
     except Exception as e:
         print(f"[analysis] 折叠栈生成失败: {e}", file=sys.stderr)
         folded_text = ""
