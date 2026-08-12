@@ -546,7 +546,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
 
     # --- 4. 获取折叠栈 ---
     try:
-        folded_text = get_folded_stacks(local_perf)
+        folded_text = get_folded_stacks(local_perf, local_kallsyms)
     except Exception as e:
         print(f"[analysis] 折叠栈生成失败: {e}", file=sys.stderr)
         folded_text = ""

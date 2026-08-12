@@ -291,16 +291,19 @@ def _looks_like_folded_stacks(lines) -> bool:
 # ----------------------------------------------------------
 # get_folded_stacks — 只执行前两步，返回折叠栈（不给 flamegraph）
 # ----------------------------------------------------------
-def get_folded_stacks(perf_data_path: str) -> str:
+def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None) -> str:
     """
     只执行 perf script → stackcollapse，返回折叠栈文本
     用于后续的热点分析（TopN 计算等）
 
     参数:
         perf_data_path: perf.data 文件路径
+        kallsyms_path:  Agent 采集时快照的 /proc/kallsyms，透传给
+            _detect_and_fold 用于解析内核帧。传 None 时内核符号可能
+            无法解析（详见 run_perf_script 的说明）。
 
     返回:
         折叠后的栈文本
     """
     _check_dependencies()
-    return _detect_and_fold(perf_data_path)
+    return _detect_and_fold(perf_data_path, kallsyms_path)
