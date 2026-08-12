@@ -88,6 +88,15 @@ export const tasks = {
         }),
 };
 
+// ---------- 持续 Profiling ----------
+export const profiles = {
+    targets: () => client.get('/api/v1/profile/targets'),
+    flamegraph: (params = {}) => client.get('/api/v1/profile/flamegraph', { params }),
+    topn: (params = {}) => client.get('/api/v1/profile/topn', { params }),
+    diff: (params = {}) => client.get('/api/v1/profile/diff', { params }),
+    labelValues: (params = {}) => client.get('/api/v1/profile/label-values', { params }),
+};
+
 // ---------- 分析结果 ----------
 // 当前后端将建议、归因和产物汇总在任务详情中；在这里收敛为结果页可复用的数据接口。
 export const analysisResults = {

@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstdlib>
 
 using namespace std;
 
@@ -108,6 +109,7 @@ namespace drop_agent
         }
 
         cfg.hostname = json_get_string(content, "hostname");
+        cfg.ipAddr = json_get_string(content, "ipAddr");
         cfg.uid = json_get_string(content, "uid");
         cfg.agentVersion = json_get_string(content, "agentVersion");
         cfg.platform = json_get_string(content, "platform");
@@ -125,8 +127,21 @@ namespace drop_agent
             cfg.registerTimeoutSec = (uint32_t)stoul(regTimeout);
 
         // 默认值填充
+        const char *envHost = getenv("DROP_AGENT_HOSTNAME");
+        if (envHost && *envHost)
+            cfg.hostname = envHost;
         if (cfg.hostname.empty())
             cfg.hostname = "demo-host";
+        // Agent IP 是后端区分“本机/远程主机”的关键字段。
+        // 容器和 SSH 隧道场景下自动探测常会得到 127.0.0.1，所以允许用环境变量显式覆盖。
+        const char *envIP = getenv("DROP_AGENT_IP");
+        if (envIP && *envIP)
+            cfg.ipAddr = envIP;
+        if (cfg.ipAddr.empty())
+            cfg.ipAddr = "127.0.0.1";
+        const char *envUID = getenv("DROP_AGENT_UID");
+        if (envUID && *envUID)
+            cfg.uid = envUID;
         if (cfg.uid.empty())
             cfg.uid = "agent-001";
         if (cfg.agentVersion.empty())
@@ -156,6 +171,7 @@ namespace drop_agent
 
         cout << "[config] 加载配置文件: " << configPath << endl;
         cout << "[config]   hostname=" << cfg.hostname << endl;
+        cout << "[config]   ipAddr=" << cfg.ipAddr << endl;
         cout << "[config]   uid=" << cfg.uid << endl;
         cout << "[config]   version=" << cfg.agentVersion << endl;
         cout << "[config]   platform=" << cfg.platform << endl;
@@ -170,8 +186,21 @@ namespace drop_agent
     AgentConfig AgentConfig::Default(const string &serverAddr)
     {
         AgentConfig cfg;
-        cfg.hostname = "demo-host";
-        cfg.uid = "agent-001";
+        const char *envHost = getenv("DROP_AGENT_HOSTNAME");
+        if (envHost && *envHost)
+            cfg.hostname = envHost;
+        else
+            cfg.hostname = "demo-host";
+        const char *envIP = getenv("DROP_AGENT_IP");
+        if (envIP && *envIP)
+            cfg.ipAddr = envIP;
+        else
+            cfg.ipAddr = "127.0.0.1";
+        const char *envUID = getenv("DROP_AGENT_UID");
+        if (envUID && *envUID)
+            cfg.uid = envUID;
+        else
+            cfg.uid = "agent-001";
         cfg.agentVersion = "1.0.0";
         cfg.platform = "linux/amd64";
         cfg.capabilities = {"perf_cpu", "async-profiler", "java", "go_pprof", "ebpf_cpu", "ebpf_io", "ebpf_sched", "ebpf", "bpftrace"};

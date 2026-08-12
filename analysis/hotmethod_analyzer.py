@@ -353,72 +353,68 @@ def _download_perf_data(storage, bucket: str, tid: str,
         return False
 
 
+def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
+    suffixes = suffixes or []
+    keys = []
+    if conn is None:
+        return keys
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT object_key FROM artifacts WHERE task_tid = %s AND kind = 'RAW' ORDER BY created_at DESC, id DESC",
+            (tid,),
+        )
+        for row in cur.fetchall():
+            key = row[0]
+            if not key:
+                continue
+            lowered = key.lower()
+            if not suffixes or any(lowered.endswith(suffix) for suffix in suffixes):
+                keys.append(key)
+        cur.close()
+    except Exception as e:
+        print(f"[analysis] 读取 RAW artifact 元数据失败: {e}", file=sys.stderr)
+    return keys
+
+
+def _download_first_existing(storage, bucket: str, keys: list, local_path: str, label: str) -> bool:
+    if storage is None:
+        return False
+    seen = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            if hasattr(storage, "object_exists") and not storage.object_exists(bucket, key):
+                print(f"[analysis] MinIO 上不存在 {key}", file=sys.stderr)
+                continue
+            data = storage.get_object(bucket, key)
+            if not data:
+                continue
+            with open(local_path, "wb") as f:
+                f.write(data)
+            print(f"[analysis] 下载 {label}: {key} → {local_path} ({len(data)} bytes)", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"[analysis] 下载 {label} 失败 key={key}: {e}", file=sys.stderr)
+    return False
+
+
 def _download_kallsyms(storage, bucket: str, tid: str,
-                       local_path: str):
+                       local_path: str, conn=None):
     """
-    下载 Agent 采集时快照的 /proc/kallsyms
+    下载 Agent 采集时快照的 /proc/kallsyms。
 
-    没有它内核帧只会显示 [unknown]：analysis 不是特权容器，读本地
-    /proc/kallsyms 拿到的地址全是 0（需要 CAP_SYSLOG），perf 无法用。
-
-    返回: 本地路径（成功）或 None（缺失/失败，调用方应降级而非报错）
+    优先读取 artifacts 表中记录的 RAW 产物，兼容后续对象 key 调整；如果元数据缺失，
+    再回退到早期固定路径 {tid}/kallsyms。
     """
-    if storage is None:
-        return None
-
-    key = f"{tid}/kallsyms"
-    try:
-        if not storage.object_exists(bucket, key):
-            print(f"[analysis] 无 kallsyms 快照（{key}），内核符号将无法解析",
-                  file=sys.stderr)
-            return None
-        data = storage.get_object(bucket, key)
-        if not data:
-            return None
-        with open(local_path, "wb") as f:
-            f.write(data)
-        print(f"[analysis] 下载 kallsyms → {local_path} ({len(data)} bytes)",
-              file=sys.stderr)
+    keys = _raw_artifact_keys(conn, tid, suffixes=["/kallsyms", ".kallsyms", "kallsyms"])
+    keys.append(f"{tid}/kallsyms")
+    if _download_first_existing(storage, bucket, keys, local_path, "kallsyms"):
         return local_path
-    except Exception as e:
-        print(f"[analysis] 下载 kallsyms 失败（降级继续）: {e}", file=sys.stderr)
-        return None
-
-
-def _download_symbol_archive(storage, bucket: str, tid: str,
-                             local_path: str):
-    """
-    下载 Agent 打包的 build-id 符号缓存（用户态符号）
-
-    没有它用户态帧只会显示 [模块名]：analysis 容器里没有被采集进程的
-    二进制文件，perf 无法从中读取符号表。Agent 侧把 perf 的 build-id
-    缓存打成 tar 传过来，解开后 perf script 就能解析。
-
-    注意：strip 过的二进制即使传过来也解析不出符号，这是已知局限。
-
-    返回: 本地路径（成功）或 None（缺失/失败，调用方应降级而非报错）
-    """
-    if storage is None:
-        return None
-
-    key = f"{tid}/symbols.tar.gz"
-    try:
-        if not storage.object_exists(bucket, key):
-            print(f"[analysis] 无符号包（{key}），用户态符号将无法解析",
-                  file=sys.stderr)
-            return None
-        data = storage.get_object(bucket, key)
-        if not data:
-            return None
-        with open(local_path, "wb") as f:
-            f.write(data)
-        print(f"[analysis] 下载符号包 → {local_path} ({len(data)} bytes)",
-              file=sys.stderr)
-        return local_path
-    except Exception as e:
-        print(f"[analysis] 下载符号包失败（降级继续）: {e}", file=sys.stderr)
-        return None
-
+    print(f"[analysis] 无 kallsyms 快照，内核符号将无法解析", file=sys.stderr)
+    return None
 
 def _upload_output(storage, bucket: str, tid: str,
                    filename: str, content, content_type: str = "application/octet-stream") -> str:
@@ -564,7 +560,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     local_kallsyms = None
     if storage_ok:
         local_kallsyms = _download_kallsyms(
-            storage, bucket, tid, f"/tmp/{tid}_kallsyms")
+            storage, bucket, tid, f"/tmp/{tid}_kallsyms", conn)
 
     # --- 2c. 获取用户态符号包（缺失则降级，用户态帧显示为 [模块名]）---
     local_symbols = None
@@ -1085,16 +1081,9 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
     has_data = False
 
     if storage_ok:
-        try:
-            key = f"{tid}/perf.data"
-            data = storage.get_object(bucket, key)
-            if data:
-                with open(local_bpf, 'wb') as f:
-                    f.write(data)
-                if os.path.exists(local_bpf) and os.path.getsize(local_bpf) > 0:
-                    has_data = True
-        except Exception as e:
-            print(f"[analysis] MinIO 下载 bpf 数据失败: {e}", file=sys.stderr)
+        keys = _raw_artifact_keys(conn, tid, suffixes=["raw.bpf", ".bpf", "perf.data", ".txt"])
+        keys.extend([f"{tid}/raw.bpf", f"{tid}/perf.data"])
+        has_data = _download_first_existing(storage, bucket, keys, local_bpf, "eBPF raw")
 
     if not has_data:
         print(f"[analysis] 错误: 找不到 eBPF 数据文件", file=sys.stderr)

@@ -178,7 +178,14 @@ export default function TimelinePage() {
 
     return (
         <div style={S.container}>
-            <h2>📊 Continuous Profiling 时间轴</h2>
+            <h2>时间轴</h2>
+            <div style={S.card}>
+                <h3 style={{ marginTop: 0 }}>请优先在主机性能中心查看时间轴</h3>
+                <p style={S.hint}>
+                    时间轴已经迁入具体主机页面，会按当前主机过滤定时采集窗口。这里保留为兼容入口。
+                </p>
+                <Link to="/" style={{ ...S.btnSm, textDecoration: 'none' }}>返回主机列表</Link>
+            </div>
 
             {/* 定时任务列表 */}
             <div style={S.card}>

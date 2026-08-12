@@ -1,5 +1,6 @@
 {
     "hostname": "mini-drop-agent",
+    "ipAddr": "127.0.0.1",
     "uid": "agent-001",
     "agentVersion": "1.0.0",
     "heartbeatIntervalSec": 5,

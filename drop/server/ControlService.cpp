@@ -100,38 +100,49 @@ namespace drop_server
     {
         string targetIP = request->targetip();
 
-        // 在 agents_ 中查找该 IP 对应的 Agent
+        // 在 agents_ 中查找该 IP 对应的 Agent (优先匹配 online 和最新心跳的记录)
         {
             lock_guard<mutex> lock(agents_mutex);
+            const AgentInfo *bestMatch = nullptr;
             for (const auto &pair : agents_)
             {
                 const AgentInfo &info = pair.second;
                 if (info.ipAddr == targetIP)
                 {
-                    response->set_code(0);
-                    response->set_msg("ok");
-                    response->set_cpupercent(info.lastSelfPstats.cpupercent());
-                    response->set_memorykb(info.lastSelfPstats.rsskb());
-                    response->set_readkbpers(info.lastSelfPstats.readkbpers());
-                    response->set_writekbpers(info.lastSelfPstats.writekbpers());
-                    response->set_agent_id(info.agentID);
-                    response->set_hostname(info.hostname);
-                    response->set_version(info.version);
-                    response->set_platform(info.platform);
-                    response->set_resource_budget(info.resourceBudget);
-                    response->set_online(info.online);
-                    response->set_last_seen_unix_ms(info.lastSeenUnixMs);
-                    for (const auto &capability : info.capabilities)
-                        response->add_capabilities(capability);
-                    for (const auto &label : info.labels)
-                        response->add_labels(label);
-
-                    cout << "[server] StatAgent: ip=" << targetIP
-                         << " host=" << info.hostname
-                         << " online=" << info.online
-                         << " cpu=" << info.lastSelfPstats.cpupercent() << "%" << endl;
-                    return grpc::Status::OK;
+                    if (!bestMatch || (!bestMatch->online && info.online) ||
+                        (bestMatch->online == info.online && info.lastSeenUnixMs > bestMatch->lastSeenUnixMs))
+                    {
+                        bestMatch = &info;
+                    }
                 }
+            }
+
+            if (bestMatch)
+            {
+                const AgentInfo &info = *bestMatch;
+                response->set_code(0);
+                response->set_msg("ok");
+                response->set_cpupercent(info.lastSelfPstats.cpupercent());
+                response->set_memorykb(info.lastSelfPstats.rsskb());
+                response->set_readkbpers(info.lastSelfPstats.readkbpers());
+                response->set_writekbpers(info.lastSelfPstats.writekbpers());
+                response->set_agent_id(info.agentID);
+                response->set_hostname(info.hostname);
+                response->set_version(info.version);
+                response->set_platform(info.platform);
+                response->set_resource_budget(info.resourceBudget);
+                response->set_online(info.online);
+                response->set_last_seen_unix_ms(info.lastSeenUnixMs);
+                for (const auto &capability : info.capabilities)
+                    response->add_capabilities(capability);
+                for (const auto &label : info.labels)
+                    response->add_labels(label);
+
+                cout << "[server] StatAgent: ip=" << targetIP
+                     << " host=" << info.hostname
+                     << " online=" << info.online
+                     << " cpu=" << info.lastSelfPstats.cpupercent() << "%" << endl;
+                return grpc::Status::OK;
             }
         }
 

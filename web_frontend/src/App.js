@@ -7,8 +7,9 @@
 //   3. 已登录 → 显示顶部导航（含用户名）+ 页面路由
 //
 // 页面路由：
-//   /                → HomePage（Agent 列表 + 任务列表）
-//   /tasks           → TaskListPage（全部任务）
+//   /                → HomePage（主机/服务 Dashboard）
+//   /hosts/:targetId → HostDetailPage（主机内性能中心）
+//   /tasks           → TaskListPage（兼容：全部任务）
 //   /task/result     → TaskResultPage（任务详情 + 火焰图）
 //   /login           → LoginPage（登录页）
 // ============================================================
@@ -22,6 +23,8 @@ import TaskResultPage from './pages/TaskResultPage';
 import TimelinePage from './pages/TimelinePage';
 import TaskDiffPage from './pages/TaskDiffPage';
 import LoginPage from './pages/LoginPage';
+import ProfilesPage from './pages/ProfilesPage';
+import HostDetailPage from './pages/HostDetailPage';
 
 // ============================================================
 // CSS 样式
@@ -122,9 +125,8 @@ export default function App() {
                     <span style={{ fontSize: 12, color: '#888' }}>性能分析平台</span>
                 </div>
                 <nav style={styles.nav}>
-                    <Link to="/" style={styles.navLink}>主页</Link>
-                    <Link to="/tasks" style={styles.navLink}>任务列表</Link>
-                    <Link to="/timeline" style={styles.navLink}>时间轴</Link>
+                    <Link to="/" style={styles.navLink}>主机</Link>
+                    <Link to="/tasks" style={styles.navLink}>全部任务</Link>
                     <span style={{ color: '#555' }}>|</span>
                     <span style={styles.userInfo}>
                         👤 {userName}
@@ -136,7 +138,9 @@ export default function App() {
             {/* URL 路由 */}
             <Routes>
                 <Route path="/" element={<HomePage />} />
+                <Route path="/hosts/:targetId" element={<HostDetailPage />} />
                 <Route path="/tasks" element={<TaskListPage />} />
+                <Route path="/profiles" element={<ProfilesPage />} />
                 <Route path="/task/result" element={<TaskResultPage />} />
                 <Route path="/timeline" element={<TimelinePage />} />
                 <Route path="/task/diff" element={<TaskDiffPage />} />

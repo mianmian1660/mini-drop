@@ -159,7 +159,6 @@ func TestPickRawCollectionObjectPrefersPerfData(t *testing.T) {
 		{Name: "tid-1/flamegraph.svg", Size: 100},
 		{Name: "tid-1/top.json", Size: 20},
 		{Name: "tid-1/perf.data", Size: 2048},
-		{Name: "tid-1/raw.bpf", Size: 512},
 	})
 
 	if !ok {
@@ -167,6 +166,22 @@ func TestPickRawCollectionObjectPrefersPerfData(t *testing.T) {
 	}
 	if key != "tid-1/perf.data" || size != 2048 {
 		t.Fatalf("key=%q size=%d, want tid-1/perf.data 2048", key, size)
+	}
+}
+
+func TestPickRawCollectionObjectPrefersTypedRawArtifacts(t *testing.T) {
+	key, size, ok := pickRawCollectionObject([]storage.FileInfo{
+		{Name: "tid-1/perf.data", Size: 2048},
+		{Name: "tid-1/bpf_histogram.svg", Size: 100},
+		{Name: "tid-1/bpf_data.json", Size: 20},
+		{Name: "tid-1/raw.bpf", Size: 512},
+	})
+
+	if !ok {
+		t.Fatal("expected typed raw collection artifact")
+	}
+	if key != "tid-1/raw.bpf" || size != 512 {
+		t.Fatalf("key=%q size=%d, want tid-1/raw.bpf 512", key, size)
 	}
 }
 
@@ -337,6 +352,32 @@ func TestNotifyTaskResultPersistsAttemptArtifactMetadataIdempotently(t *testing.
 	}
 	if attempt.EndTime == nil || attempt.ExitCode != 0 || !strings.Contains(string(attempt.ArtifactKeys), "perf.data") {
 		t.Fatalf("attempt evidence=%#v, want completed with artifact key", attempt)
+	}
+}
+
+func TestNotifyTaskResultRawBPFQueuesBPFAnalysis(t *testing.T) {
+	s := newTestAPIServer(t)
+	mustCreateRunningTask(t, s, "tid-notify-bpf")
+
+	w := postNotify(t, s, `{"task_id":"tid-notify-bpf","cos_key":"tid-notify-bpf/raw.bpf","artifact_size":128}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200, body=%s", w.Code, w.Body.String())
+	}
+
+	var artifact model.Artifact
+	if err := s.DB.Where("task_tid = ? AND kind = ?", "tid-notify-bpf", model.ArtifactKindRaw).First(&artifact).Error; err != nil {
+		t.Fatalf("raw artifact not recorded: %v", err)
+	}
+	if artifact.ObjectKey != "tid-notify-bpf/raw.bpf" || artifact.ContentType != "text/plain; charset=utf-8" {
+		t.Fatalf("artifact=%#v, want raw.bpf text artifact", artifact)
+	}
+
+	var job model.AnalysisJob
+	if err := s.DB.Where("task_tid = ?", "tid-notify-bpf").First(&job).Error; err != nil {
+		t.Fatalf("analysis job not queued: %v", err)
+	}
+	if job.Pipeline != "bpf_histogram" {
+		t.Fatalf("pipeline=%q, want bpf_histogram", job.Pipeline)
 	}
 }
 

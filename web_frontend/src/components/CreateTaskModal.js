@@ -106,9 +106,9 @@ function missingCapabilityText(kind, capabilities) {
     return `当前 Agent 未声明 ${labels.join(' / ')} capability`;
 }
 
-export default function CreateTaskModal({ onClose, onSuccess }) {
+export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = '', lockTargetIP = false, scheduleSuccessLink = '/timeline' }) {
     const [f, setF] = useState({
-        name: '', target_ip: '', task_kind: '', target_pid: 0, duration: 10, frequency: 99,
+        name: '', target_ip: initialTargetIP || '', task_kind: '', target_pid: 0, duration: 10, frequency: 99,
         callgraph: 'fp', event: 'cpu-clock', pprof_url: '',
         continuous: false, cron_expr: '*/5 * * * *', window_seconds: 300,
     });
@@ -130,11 +130,15 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                 const list = r.data?.agents || [];
                 setAgentList(list);
                 const on = list.filter(a => a.online);
-                if (on.length > 0) setF(p => p.target_ip ? p : ({ ...p, target_ip: on[0].ip_addr }));
+                if (initialTargetIP) {
+                    setF(p => ({ ...p, target_ip: initialTargetIP }));
+                } else if (on.length > 0) {
+                    setF(p => p.target_ip ? p : ({ ...p, target_ip: on[0].ip_addr }));
+                }
             }
         }).catch(() => { }).finally(() => setAload(false));
 
-    }, []);
+    }, [initialTargetIP]);
 
     useEffect(() => {
         taskKinds.list().then(r => {
@@ -319,10 +323,11 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
                     <label style={S.label}>目标 Agent *</label>
                     {aload ? <p style={{ fontSize: 12, color: '#999' }}>加载中...</p>
                         : agentList.length === 0 ? <p style={{ fontSize: 12, color: '#f44' }}>没有在线 Agent</p>
-                            : <select style={S.select} value={f.target_ip} onChange={e => up('target_ip', e.target.value)}>
+                            : <select style={S.select} value={f.target_ip} onChange={e => up('target_ip', e.target.value)} disabled={lockTargetIP}>
                                 <option value="">-- 选择 Agent --</option>
                                 {agentList.map(a => <option key={a.ip_addr} value={a.ip_addr}>{a.hostname} ({a.ip_addr}) {a.online ? '在线' : '离线'}</option>)}
                             </select>}
+                    {lockTargetIP && <p style={S.hint}>已锁定为当前主机。</p>}
                 </div>
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
@@ -418,7 +423,7 @@ export default function CreateTaskModal({ onClose, onSuccess }) {
 
                 {err && <p style={S.err}>{err}</p>}
                 {ok && <div style={S.ok}>{ok} {cid && (isSch
-                    ? <Link to="/timeline" style={{ color: '#4a6cf7', fontWeight: 'bold' }}>去时间轴 (SID: {cid})</Link>
+                    ? <Link to={scheduleSuccessLink} style={{ color: '#4a6cf7', fontWeight: 'bold' }}>去时间轴 (SID: {cid})</Link>
                     : <Link to={`/task/result?tid=${cid}`} style={{ color: '#4a6cf7', fontWeight: 'bold' }}>查看任务 {cid}</Link>)}
                 </div>}
 
