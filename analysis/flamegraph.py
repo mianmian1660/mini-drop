@@ -32,7 +32,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STACKCOLLAPSE_SCRIPT = os.path.join(_SCRIPT_DIR, "stackcollapse-perf.pl")
 FLAMEGRAPH_SCRIPT = os.path.join(_SCRIPT_DIR, "flamegraph.pl")
 _FOLDED_STACK_LINE_RE = re.compile(r"^.+\s+\d+(?:\.\d+)?$")
-PERF_SCRIPT_FIELDS = "comm,pid,tid,cpu,time,event,ip,sym,dso"
+PERF_SCRIPT_FIELDS = "comm,pid,tid,time,event,ip,sym,dso"
 
 
 def _check_dependencies():
