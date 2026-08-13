@@ -11,9 +11,18 @@ FROM node:18-alpine AS builder
 
 WORKDIR /app
 
-# 利用 Docker 缓存层：先复制依赖清单
-COPY package.json ./
-RUN npm install --production=false
+# 利用 Docker 缓存层：先复制依赖清单，源码放在后面，改源码不会重装依赖
+#
+# 依赖安装是整个构建里最慢的一步（react-scripts 会拖进 1000+ 个传递依赖），
+# 这里做了两件事把它从 20 分钟级压到分钟级：
+#   1. 连 package-lock.json 一起复制。缺了它 npm 必须联网逐个查询元数据来解析
+#      版本范围；有它就直接按锁定版本下载，同时保证构建可复现。
+#   2. 默认走国内镜像源。境外构建可以覆盖回官方源：
+#      docker compose build --build-arg NPM_REGISTRY=https://registry.npmjs.org
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+COPY package.json package-lock.json ./
+RUN npm config set registry "$NPM_REGISTRY" \
+    && npm install --include=dev
 
 # 复制源码 → 编译
 COPY public/ public/
