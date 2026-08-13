@@ -672,13 +672,17 @@ def t_symbolization_chain_is_wired():
     assert "_download_symbol_archive" in ana_def, "用户态符号包下载环节缺失"
     assert "_install_symbol_archive" in fg_def, "符号包解包环节缺失"
 
-    # 2) generate_flamegraph 必须还接得住这两个参数，否则下载了也传不进去
-    gf = next((n for n in ast.walk(fg_tree)
-               if isinstance(n, ast.FunctionDef) and n.name == "generate_flamegraph"), None)
-    assert gf is not None, "generate_flamegraph 缺失"
-    gf_args = {a.arg for a in gf.args.args} | {a.arg for a in gf.args.kwonlyargs}
-    assert "kallsyms_path" in gf_args, "generate_flamegraph 丢失 kallsyms_path 参数"
-    assert "symbol_archive" in gf_args, "generate_flamegraph 丢失 symbol_archive 参数"
+    # 2) 两条消费路径都必须接得住这两个参数，否则下载了也传不进去。
+    #    SVG(generate_flamegraph) 和 TopN(get_folded_stacks) 各调一次
+    #    perf script，漏接任一个，那条路径的符号就会退回 [模块名]——
+    #    阶段一的 kallsyms 就是只接了 SVG 漏了 TopN，见设计文档 §9.1。
+    for fn_name in ("generate_flamegraph", "get_folded_stacks"):
+        fn = next((n for n in ast.walk(fg_tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == fn_name), None)
+        assert fn is not None, f"{fn_name} 缺失"
+        fn_args = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+        assert "kallsyms_path" in fn_args, f"{fn_name} 丢失 kallsyms_path 参数"
+        assert "symbol_archive" in fn_args, f"{fn_name} 丢失 symbol_archive 参数"
 
     # 3) 兜底：没有"调用了但没定义"的内部函数（合并丢代码的典型症状）
     missing = sorted(c for c in ana_called

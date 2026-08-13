@@ -258,6 +258,11 @@ def generate_flamegraph(perf_data_path: str,
     return svg
 
 
+# 已解开过的符号包路径。解包是往 ~/.debug 写文件的进程级副作用，
+# 同一次分析里 SVG 和 TopN 两条路径都会调用，这里去重避免重复解压。
+_INSTALLED_ARCHIVES = set()
+
+
 def _install_symbol_archive(archive_path: str) -> bool:
     """
     把 Agent 传来的 build-id 符号缓存解开到本地，供 perf script 查符号
@@ -280,6 +285,10 @@ def _install_symbol_archive(archive_path: str) -> bool:
               file=sys.stderr)
         return False
 
+    # SVG 和 TopN 两条路径各调一次，同一个包重复解开纯属浪费
+    if archive_path in _INSTALLED_ARCHIVES:
+        return True
+
     buildid_dir = os.path.join(os.path.expanduser("~"), ".debug")
     try:
         os.makedirs(buildid_dir, exist_ok=True)
@@ -297,6 +306,7 @@ def _install_symbol_archive(archive_path: str) -> bool:
             tar.extractall(buildid_dir, members=safe)
         print(f"[flamegraph] 符号包已解开到 {buildid_dir}（{len(safe)} 个条目）",
               file=sys.stderr)
+        _INSTALLED_ARCHIVES.add(archive_path)
         return True
     except Exception as e:
         print(f"[flamegraph] 解开符号包失败（降级继续）: {e}", file=sys.stderr)
@@ -343,7 +353,8 @@ def _looks_like_folded_stacks(lines) -> bool:
 # ----------------------------------------------------------
 # get_folded_stacks — 只执行前两步，返回折叠栈（不给 flamegraph）
 # ----------------------------------------------------------
-def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None) -> str:
+def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None,
+                      symbol_archive: str = None) -> str:
     """
     只执行 perf script → stackcollapse，返回折叠栈文本
     用于后续的热点分析（TopN 计算等）
@@ -353,9 +364,18 @@ def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None) -> str:
         kallsyms_path:  Agent 采集时快照的 /proc/kallsyms，透传给
             _detect_and_fold 用于解析内核帧。传 None 时内核符号可能
             无法解析（详见 run_perf_script 的说明）。
+        symbol_archive: Agent 打包的 build-id 符号缓存，解析用户态符号用。
+
+    符号包为什么这里也要接：TopN 和 SVG 是两条独立的消费路径，各自调一次
+    perf script。之前只有 generate_flamegraph 接了 symbol_archive，本函数
+    能拿到用户态符号纯属顺序凑巧——SVG 先跑并把符号解到了 ~/.debug 这个
+    进程级位置。一旦调用顺序变化或 SVG 那步被跳过，TopN 就会悄悄退回
+    [模块名]。显式接进来把这层隐式依赖去掉。
+    （阶段一的 kallsyms 踩过同形状的坑，见 docs/symbolization-design.md §9.1。）
 
     返回:
         折叠后的栈文本
     """
     _check_dependencies()
+    _install_symbol_archive(symbol_archive)
     return _detect_and_fold(perf_data_path, kallsyms_path)
