@@ -20,7 +20,6 @@ import os
 import re
 import subprocess
 import sys
-import tarfile
 import tempfile
 from typing import Optional
 
@@ -211,8 +210,7 @@ def generate_flamegraph(perf_data_path: str,
                         title: str = "CPU Flame Graph",
                         width: int = 1200,
                         colors: str = "hot",
-                        kallsyms_path: str = None,
-                        symbol_archive: str = None) -> str:
+                        kallsyms_path: str = None) -> str:
     """
     一键生成火焰图 SVG：perf.data → SVG
     支持两种输入：
@@ -230,7 +228,10 @@ def generate_flamegraph(perf_data_path: str,
         width:          SVG 宽度
         colors:         配色方案
         kallsyms_path:  Agent 快照的 /proc/kallsyms，解析内核符号用
-        symbol_archive: Agent 打包的 build-id 符号缓存，解析用户态符号用
+
+    用户态符号（build-id 索引）由调用方在此之前通过
+    symbolizer.install_symbols_for_task() 装进 perf 默认查找的
+    ~/.debug/.build-id/ 下（阶段三），这里不需要再接一个显式路径参数。
 
     返回:
         SVG 字符串
@@ -245,9 +246,6 @@ def generate_flamegraph(perf_data_path: str,
     print(f"[flamegraph] ===== 开始生成火焰图 =====", file=sys.stderr)
     print(f"[flamegraph] 输入: {perf_data_path}", file=sys.stderr)
 
-    # 必须在 perf script 之前解包：perf 是在解析时才去 build-id 缓存里找符号的
-    _install_symbol_archive(symbol_archive)
-
     # 智能检测：如果文件内容已经是折叠栈格式（含分号分隔），跳过 perf script
     folded = _detect_and_fold(perf_data_path, kallsyms_path)
 
@@ -256,61 +254,6 @@ def generate_flamegraph(perf_data_path: str,
 
     print(f"[flamegraph] ===== 火焰图生成完毕 =====", file=sys.stderr)
     return svg
-
-
-# 已解开过的符号包路径。解包是往 ~/.debug 写文件的进程级副作用，
-# 同一次分析里 SVG 和 TopN 两条路径都会调用，这里去重避免重复解压。
-_INSTALLED_ARCHIVES = set()
-
-
-def _install_symbol_archive(archive_path: str) -> bool:
-    """
-    把 Agent 传来的 build-id 符号缓存解开到本地，供 perf script 查符号
-
-    perf 解析用户态地址时会去 $HOME/.debug/.build-id 下按 build-id 找对应
-    二进制。analysis 容器里没有被采集进程的二进制，所以要靠 Agent 打包传来。
-
-    实测要点（2026-08-13 容器内验证）：
-      - `perf archive` 子命令在镜像里不存在，Agent 侧改用 tar 打包，这里对应解包
-      - perf record 会自动填充该缓存，无需额外 buildid-cache 操作
-      - strip 过的二进制解包后仍解析不出符号，属已知局限
-
-    解包失败只降级不抛异常——用户态符号显示为 [模块名]，但内核符号和
-    火焰图本身仍然可用。
-
-    返回: True=已解开, False=跳过或失败
-    """
-    if not archive_path or not os.path.exists(archive_path):
-        print("[flamegraph] 警告: 未提供符号包，用户态符号可能无法解析",
-              file=sys.stderr)
-        return False
-
-    # SVG 和 TopN 两条路径各调一次，同一个包重复解开纯属浪费
-    if archive_path in _INSTALLED_ARCHIVES:
-        return True
-
-    buildid_dir = os.path.join(os.path.expanduser("~"), ".debug")
-    try:
-        os.makedirs(buildid_dir, exist_ok=True)
-        with tarfile.open(archive_path, "r:gz") as tar:
-            # 逐个校验成员路径，拒绝 ../ 或绝对路径逃逸出 buildid_dir。
-            # 符号包来自 Agent，但仍按不可信输入处理。
-            safe = []
-            for member in tar.getmembers():
-                target = os.path.realpath(os.path.join(buildid_dir, member.name))
-                if target == buildid_dir or target.startswith(buildid_dir + os.sep):
-                    safe.append(member)
-                else:
-                    print(f"[flamegraph] 跳过越界的符号包条目: {member.name}",
-                          file=sys.stderr)
-            tar.extractall(buildid_dir, members=safe)
-        print(f"[flamegraph] 符号包已解开到 {buildid_dir}（{len(safe)} 个条目）",
-              file=sys.stderr)
-        _INSTALLED_ARCHIVES.add(archive_path)
-        return True
-    except Exception as e:
-        print(f"[flamegraph] 解开符号包失败（降级继续）: {e}", file=sys.stderr)
-        return False
 
 
 def _detect_and_fold(perf_data_path: str, kallsyms_path: str = None) -> str:
@@ -353,8 +296,7 @@ def _looks_like_folded_stacks(lines) -> bool:
 # ----------------------------------------------------------
 # get_folded_stacks — 只执行前两步，返回折叠栈（不给 flamegraph）
 # ----------------------------------------------------------
-def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None,
-                      symbol_archive: str = None) -> str:
+def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None) -> str:
     """
     只执行 perf script → stackcollapse，返回折叠栈文本
     用于后续的热点分析（TopN 计算等）
@@ -364,18 +306,16 @@ def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None,
         kallsyms_path:  Agent 采集时快照的 /proc/kallsyms，透传给
             _detect_and_fold 用于解析内核帧。传 None 时内核符号可能
             无法解析（详见 run_perf_script 的说明）。
-        symbol_archive: Agent 打包的 build-id 符号缓存，解析用户态符号用。
 
-    符号包为什么这里也要接：TopN 和 SVG 是两条独立的消费路径，各自调一次
-    perf script。之前只有 generate_flamegraph 接了 symbol_archive，本函数
-    能拿到用户态符号纯属顺序凑巧——SVG 先跑并把符号解到了 ~/.debug 这个
-    进程级位置。一旦调用顺序变化或 SVG 那步被跳过，TopN 就会悄悄退回
-    [模块名]。显式接进来把这层隐式依赖去掉。
-    （阶段一的 kallsyms 踩过同形状的坑，见 docs/symbolization-design.md §9.1。）
+    用户态符号（build-id 索引）由调用方在此之前装进 perf 默认查找的
+    ~/.debug/.build-id/ 下（见 symbolizer.install_symbols_for_task，
+    阶段三），不需要本函数再接一个显式路径参数——历史上这里曾经只有
+    generate_flamegraph 接了对应参数、本函数漏接，是阶段一 kallsyms
+    踩过的同一类坑（见 docs/symbolization-design.md §9.1），阶段三改成
+    "调用前统一装好"从根上避免了这层隐式依赖。
 
     返回:
         折叠后的栈文本
     """
     _check_dependencies()
-    _install_symbol_archive(symbol_archive)
     return _detect_and_fold(perf_data_path, kallsyms_path)

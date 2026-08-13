@@ -238,5 +238,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&AnalysisJob{},
 		&Outbox{},
 		&SchemaMigration{},
+		&SymbolFile{},
+		&TaskBuildID{},
 	)
 }

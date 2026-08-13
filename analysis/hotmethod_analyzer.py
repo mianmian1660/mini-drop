@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from storage import MinIOStorage, create_storage
 from error import ErrorCode, ErrorInfo, exit_ok, exit_error
 from flamegraph import generate_flamegraph, get_folded_stacks
+from symbolizer import install_symbols_for_task
 from collapsed_data_parser import analyze_collapsed
 from analysis_advisor import generate_suggestions as advisor_generate_suggestions
 from memleak_analyzer import analyze_memtrace, generate_mock_memtrace
@@ -416,41 +417,6 @@ def _download_kallsyms(storage, bucket: str, tid: str,
     print(f"[analysis] 无 kallsyms 快照，内核符号将无法解析", file=sys.stderr)
     return None
 
-def _download_symbol_archive(storage, bucket: str, tid: str,
-                             local_path: str):
-    """
-    下载 Agent 打包的 build-id 符号缓存（用户态符号）
-
-    没有它用户态帧只会显示 [模块名]：analysis 容器里没有被采集进程的
-    二进制文件，perf 无法从中读取符号表。Agent 侧把 perf 的 build-id
-    缓存打成 tar 传过来，解开后 perf script 就能解析。
-
-    注意：strip 过的二进制即使传过来也解析不出符号，这是已知局限。
-
-    返回: 本地路径（成功）或 None（缺失/失败，调用方应降级而非报错）
-    """
-    if storage is None:
-        return None
-
-    key = f"{tid}/symbols.tar.gz"
-    try:
-        if not storage.object_exists(bucket, key):
-            print(f"[analysis] 无符号包（{key}），用户态符号将无法解析",
-                  file=sys.stderr)
-            return None
-        data = storage.get_object(bucket, key)
-        if not data:
-            return None
-        with open(local_path, "wb") as f:
-            f.write(data)
-        print(f"[analysis] 下载符号包 → {local_path} ({len(data)} bytes)",
-              file=sys.stderr)
-        return local_path
-    except Exception as e:
-        print(f"[analysis] 下载符号包失败（降级继续）: {e}", file=sys.stderr)
-        return None
-
-
 def _upload_output(storage, bucket: str, tid: str,
                    filename: str, content, content_type: str = "application/octet-stream") -> str:
     """
@@ -597,11 +563,13 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
         local_kallsyms = _download_kallsyms(
             storage, bucket, tid, f"/tmp/{tid}_kallsyms", conn)
 
-    # --- 2c. 获取用户态符号包（缺失则降级，用户态帧显示为 [模块名]）---
-    local_symbols = None
+    # --- 2c. 按 build-id 安装用户态符号（缺失则降级，用户态帧显示为 [模块名]）---
+    # 阶段三：不再整包下载 tar，改成查 task_build_ids 表按需逐个安装到
+    # perf 默认查找的 ~/.debug/.build-id/ 下，装完 perf script 自动能用，
+    # 不需要再显式传一个 symbol_archive 路径进去。
     if storage_ok:
-        local_symbols = _download_symbol_archive(
-            storage, bucket, tid, f"/tmp/{tid}_symbols.tar.gz")
+        installed_count = install_symbols_for_task(conn, storage, bucket, tid)
+        print(f"[analysis] 已安装 {installed_count} 个用户态符号", file=sys.stderr)
 
     # --- 3. 生成火焰图 SVG ---
     task_name = task.get("name", tid)
@@ -610,8 +578,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     print(f"[analysis] 开始生成火焰图 ...", file=sys.stderr)
     try:
         svg_content = generate_flamegraph(local_perf, title=title,
-                                          kallsyms_path=local_kallsyms,
-                                          symbol_archive=local_symbols)
+                                          kallsyms_path=local_kallsyms)
     except Exception as e:
         exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
                    f"火焰图生成失败: {e}",
@@ -619,8 +586,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
 
     # --- 4. 获取折叠栈 ---
     try:
-        folded_text = get_folded_stacks(local_perf, local_kallsyms,
-                                        symbol_archive=local_symbols)
+        folded_text = get_folded_stacks(local_perf, local_kallsyms)
     except Exception as e:
         print(f"[analysis] 折叠栈生成失败: {e}", file=sys.stderr)
         folded_text = ""

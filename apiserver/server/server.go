@@ -669,6 +669,11 @@ func (s *APIServer) registerRoutes() {
 	s.Router.GET("/api/v1/auth/check", s.AuthCheck)
 	s.Router.POST("/api/v1/internal/task-notify", s.NotifyTaskResult)
 
+	// 符号库账本（阶段三）：只服务 drop_agent，没有用户身份，
+	// 和 task-notify 一样直接挂在 s.Router 上，不进 CheckLogin 分组。
+	s.Router.POST("/api/v1/symbols/check", s.CheckSymbols)
+	s.Router.PUT("/api/v1/symbols/:build_id", s.UploadSymbol)
+
 	// 其余 /api/v1 路由：统一要求带身份信息
 	api := s.Router.Group("/api/v1")
 	api.Use(s.CheckLogin)

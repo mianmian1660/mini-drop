@@ -638,13 +638,19 @@ def t_symbolization_chain_is_wired():
     """
     符号化链路完整性回归测试
 
-    链路是三段：Agent 打包上传 → analysis 下载 → flamegraph 解包，缺任一段
-    符号都解析不出来。2026-08-13 的一次远端合并丢掉了 _download_symbol_archive
-    的定义，但调用处还在，导致每个 perf CPU 任务的分析都抛 NameError 崩溃，
-    且 py_compile 查不出来（语法合法，只是名字没定义）。故加此测试。
+    内核符号链路（阶段一）：Agent 快照 kallsyms → analysis 下载 → 透传给
+    perf script。用户态符号链路（阶段三）：Agent 按 build-id 去重上传 →
+    symbolizer 查 task_build_ids 表逐个下载安装到 perf 默认查找路径。
+    缺任一段符号都解析不出来。
 
-    用 AST 源码检查而非 import：hotmethod_analyzer 依赖 minio，在未安装该模块
-    的环境里 import 会直接失败，源码级检查不受影响，任何环境都能跑。
+    2026-08-13 的一次远端合并丢掉了 _download_symbol_archive 的定义，
+    但调用处还在，导致每个 perf CPU 任务的分析都抛 NameError 崩溃，
+    且 py_compile 查不出来（语法合法，只是名字没定义）。故加此测试，
+    阶段三重构符号化实现后，断言对象换成新的 symbolizer.py 模块。
+
+    用 AST 源码检查而非 import：hotmethod_analyzer/symbolizer 依赖
+    minio/psycopg2，在未安装这些模块的环境里 import 会直接失败，
+    源码级检查不受影响，任何环境都能跑。
     """
     import ast, os, builtins
 
@@ -666,15 +672,21 @@ def t_symbolization_chain_is_wired():
 
     _, ana_def, ana_imp, ana_called = scan(os.path.join(base, "hotmethod_analyzer.py"))
     fg_tree, fg_def, _, _ = scan(os.path.join(base, "flamegraph.py"))
+    _, sym_def, _, _ = scan(os.path.join(base, "symbolizer.py"))
 
-    # 1) 三段都必须存在
+    # 1) 内核符号链路：下载 + 消费两端都必须存在
     assert "_download_kallsyms" in ana_def, "内核符号下载环节缺失"
-    assert "_download_symbol_archive" in ana_def, "用户态符号包下载环节缺失"
-    assert "_install_symbol_archive" in fg_def, "符号包解包环节缺失"
 
-    # 2) 两条消费路径都必须接得住这两个参数，否则下载了也传不进去。
+    # 2) 用户态符号链路（阶段三）：symbolizer.py 三个函数都必须定义，
+    #    且 hotmethod_analyzer 必须真的调用了编排函数，不能只有定义没有调用点。
+    for fn_name in ("get_task_build_ids", "install_symbol", "install_symbols_for_task"):
+        assert fn_name in sym_def, f"symbolizer.{fn_name} 缺失"
+    assert "install_symbols_for_task" in ana_called, \
+        "hotmethod_analyzer 没有调用 symbolizer.install_symbols_for_task"
+
+    # 3) 内核符号的两条消费路径都必须接得住 kallsyms_path，否则下载了也传不进去。
     #    SVG(generate_flamegraph) 和 TopN(get_folded_stacks) 各调一次
-    #    perf script，漏接任一个，那条路径的符号就会退回 [模块名]——
+    #    perf script，漏接任一个，那条路径的符号就会退回 [unknown]——
     #    阶段一的 kallsyms 就是只接了 SVG 漏了 TopN，见设计文档 §9.1。
     for fn_name in ("generate_flamegraph", "get_folded_stacks"):
         fn = next((n for n in ast.walk(fg_tree)
@@ -682,9 +694,15 @@ def t_symbolization_chain_is_wired():
         assert fn is not None, f"{fn_name} 缺失"
         fn_args = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
         assert "kallsyms_path" in fn_args, f"{fn_name} 丢失 kallsyms_path 参数"
-        assert "symbol_archive" in fn_args, f"{fn_name} 丢失 symbol_archive 参数"
 
-    # 3) 兜底：没有"调用了但没定义"的内部函数（合并丢代码的典型症状）
+    # 4) 阶段三清理：symbol_archive 相关旧代码路径应已彻底删除，不是改了个名字
+    #    还留着半条尾巴——留着才是真正的隐患（两套机制并存、行为不可预测）。
+    assert "_install_symbol_archive" not in fg_def, \
+        "旧的整包符号解包函数应已删除（阶段三改为按 build-id 安装）"
+    assert "_download_symbol_archive" not in ana_def, \
+        "旧的整包符号下载函数应已删除（阶段三改为查 task_build_ids 按需下载）"
+
+    # 5) 兜底：没有"调用了但没定义"的内部函数（合并丢代码的典型症状）
     missing = sorted(c for c in ana_called
                      if c.startswith("_") and c not in ana_def
                      and c not in ana_imp and not hasattr(builtins, c))
