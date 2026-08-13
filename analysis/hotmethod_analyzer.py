@@ -416,6 +416,41 @@ def _download_kallsyms(storage, bucket: str, tid: str,
     print(f"[analysis] 无 kallsyms 快照，内核符号将无法解析", file=sys.stderr)
     return None
 
+def _download_symbol_archive(storage, bucket: str, tid: str,
+                             local_path: str):
+    """
+    下载 Agent 打包的 build-id 符号缓存（用户态符号）
+
+    没有它用户态帧只会显示 [模块名]：analysis 容器里没有被采集进程的
+    二进制文件，perf 无法从中读取符号表。Agent 侧把 perf 的 build-id
+    缓存打成 tar 传过来，解开后 perf script 就能解析。
+
+    注意：strip 过的二进制即使传过来也解析不出符号，这是已知局限。
+
+    返回: 本地路径（成功）或 None（缺失/失败，调用方应降级而非报错）
+    """
+    if storage is None:
+        return None
+
+    key = f"{tid}/symbols.tar.gz"
+    try:
+        if not storage.object_exists(bucket, key):
+            print(f"[analysis] 无符号包（{key}），用户态符号将无法解析",
+                  file=sys.stderr)
+            return None
+        data = storage.get_object(bucket, key)
+        if not data:
+            return None
+        with open(local_path, "wb") as f:
+            f.write(data)
+        print(f"[analysis] 下载符号包 → {local_path} ({len(data)} bytes)",
+              file=sys.stderr)
+        return local_path
+    except Exception as e:
+        print(f"[analysis] 下载符号包失败（降级继续）: {e}", file=sys.stderr)
+        return None
+
+
 def _upload_output(storage, bucket: str, tid: str,
                    filename: str, content, content_type: str = "application/octet-stream") -> str:
     """

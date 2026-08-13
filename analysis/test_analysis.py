@@ -634,6 +634,59 @@ def t_stage6_collector_declarations_are_gated():
         assert decls[task_kind]["enabled"] is False
         assert decls[task_kind]["capabilities"]
 
+def t_symbolization_chain_is_wired():
+    """
+    符号化链路完整性回归测试
+
+    链路是三段：Agent 打包上传 → analysis 下载 → flamegraph 解包，缺任一段
+    符号都解析不出来。2026-08-13 的一次远端合并丢掉了 _download_symbol_archive
+    的定义，但调用处还在，导致每个 perf CPU 任务的分析都抛 NameError 崩溃，
+    且 py_compile 查不出来（语法合法，只是名字没定义）。故加此测试。
+
+    用 AST 源码检查而非 import：hotmethod_analyzer 依赖 minio，在未安装该模块
+    的环境里 import 会直接失败，源码级检查不受影响，任何环境都能跑。
+    """
+    import ast, os, builtins
+
+    base = os.path.dirname(os.path.abspath(__file__))
+
+    def scan(path):
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        defined = {n.name for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        imported = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                imported |= {a.asname or a.name for a in n.names}
+            elif isinstance(n, ast.Import):
+                imported |= {(a.asname or a.name).split(".")[0] for a in n.names}
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        return tree, defined, imported, called
+
+    _, ana_def, ana_imp, ana_called = scan(os.path.join(base, "hotmethod_analyzer.py"))
+    fg_tree, fg_def, _, _ = scan(os.path.join(base, "flamegraph.py"))
+
+    # 1) 三段都必须存在
+    assert "_download_kallsyms" in ana_def, "内核符号下载环节缺失"
+    assert "_download_symbol_archive" in ana_def, "用户态符号包下载环节缺失"
+    assert "_install_symbol_archive" in fg_def, "符号包解包环节缺失"
+
+    # 2) generate_flamegraph 必须还接得住这两个参数，否则下载了也传不进去
+    gf = next((n for n in ast.walk(fg_tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "generate_flamegraph"), None)
+    assert gf is not None, "generate_flamegraph 缺失"
+    gf_args = {a.arg for a in gf.args.args} | {a.arg for a in gf.args.kwonlyargs}
+    assert "kallsyms_path" in gf_args, "generate_flamegraph 丢失 kallsyms_path 参数"
+    assert "symbol_archive" in gf_args, "generate_flamegraph 丢失 symbol_archive 参数"
+
+    # 3) 兜底：没有"调用了但没定义"的内部函数（合并丢代码的典型症状）
+    missing = sorted(c for c in ana_called
+                     if c.startswith("_") and c not in ana_def
+                     and c not in ana_imp and not hasattr(builtins, c))
+    assert not missing, f"hotmethod_analyzer 调用了未定义的内部函数: {missing}"
+
+
 if __name__ == "__main__":
     tests = [v for k,v in list(globals().items()) if k.startswith("t_") and callable(v)]
     passed = failed = 0
