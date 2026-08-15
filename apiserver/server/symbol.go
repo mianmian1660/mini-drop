@@ -14,6 +14,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -34,9 +35,15 @@ import (
 // maxSymbolUploadBytes 单个符号文件大小上限（§8 风险 8：需限制上传体量）。
 const maxSymbolUploadBytes = 200 * 1024 * 1024
 
+// maxKernelSymbolUploadBytes keeps kallsyms uploads bounded. Current Linux
+// kallsyms snapshots are usually around 10MB on the target host.
+const maxKernelSymbolUploadBytes = 64 * 1024 * 1024
+
 // buildIDPattern 校验 build_id 只能是十六进制字符串，防止被用来拼出
 // 越界的 MinIO 对象 key。
 var buildIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8,64}$`)
+
+var sha256Pattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
 type symbolCheckEntry struct {
 	BuildID string `json:"build_id" binding:"required"`
@@ -46,6 +53,15 @@ type symbolCheckEntry struct {
 type symbolCheckReq struct {
 	TID     string             `json:"tid" binding:"required"`
 	Entries []symbolCheckEntry `json:"entries" binding:"required"`
+}
+
+type kernelSymbolCheckReq struct {
+	TID           string `json:"tid" binding:"required"`
+	SHA256        string `json:"sha256" binding:"required"`
+	SizeBytes     int64  `json:"size_bytes"`
+	KernelRelease string `json:"kernel_release"`
+	Hostname      string `json:"hostname"`
+	TargetIP      string `json:"target_ip"`
 }
 
 // CheckSymbols — POST /api/v1/symbols/check
@@ -190,4 +206,235 @@ func (s *APIServer) UploadSymbol(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"build_id": buildID, "status": "ready"})
+}
+
+// CheckKernelSymbol — POST /api/v1/kernel-symbols/check
+// Agent 先发送 kallsyms 的 sha256 和元数据；服务端已有同内容快照时只登记
+// 当前任务引用，否则返回 upload_required=true 让 Agent 再 PUT 文件本体。
+func (s *APIServer) CheckKernelSymbol(c *gin.Context) {
+	var req kernelSymbolCheckReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	req.SHA256 = strings.ToLower(strings.TrimSpace(req.SHA256))
+	req.TID = strings.TrimSpace(req.TID)
+	if req.TID == "" || !sha256Pattern.MatchString(req.SHA256) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tid 或 sha256 格式不合法"})
+		return
+	}
+	if !s.StorageConnected() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "对象存储未连接"})
+		return
+	}
+
+	objectKey := kernelSymbolObjectKey(req.SHA256)
+	now := time.Now()
+	var row model.KernelSymbolFile
+	err := s.DB.Where("sha256 = ? AND status = ?", req.SHA256, model.SymbolFileStatusReady).First(&row).Error
+	if err == nil {
+		if row.ObjectKey == "" {
+			row.ObjectKey = objectKey
+		}
+		_ = s.DB.Model(&model.KernelSymbolFile{}).Where("sha256 = ?", req.SHA256).Updates(map[string]interface{}{
+			"last_used_at": &now,
+			"target_ip":    firstNonEmpty(req.TargetIP, row.TargetIP),
+		}).Error
+		if err := s.recordKernelSymbolArtifact(req.TID, row.ObjectKey, row.SizeBytes, req.SHA256); err != nil {
+			s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", req.TID), zap.String("sha256", req.SHA256), zap.Error(err))
+		}
+		c.JSON(http.StatusOK, gin.H{"upload_required": false, "object_key": row.ObjectKey})
+		return
+	}
+	if err != gorm.ErrRecordNotFound {
+		s.Logger.Error("查询 kallsyms 账本失败", zap.String("sha256", req.SHA256), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败: " + err.Error()})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	exists, existsErr := s.Storage.ObjectExists(ctx, s.Config.Storage.Bucket, objectKey)
+	if existsErr == nil && exists {
+		row = model.KernelSymbolFile{
+			SHA256:        req.SHA256,
+			ObjectKey:     objectKey,
+			KernelRelease: req.KernelRelease,
+			Hostname:      req.Hostname,
+			TargetIP:      req.TargetIP,
+			SizeBytes:     req.SizeBytes,
+			Status:        model.SymbolFileStatusReady,
+			CreatedAt:     now,
+			LastUsedAt:    &now,
+		}
+		if err := s.DB.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "sha256"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"object_key":     row.ObjectKey,
+				"kernel_release": row.KernelRelease,
+				"hostname":       row.Hostname,
+				"target_ip":      row.TargetIP,
+				"size_bytes":     row.SizeBytes,
+				"status":         row.Status,
+				"last_used_at":   row.LastUsedAt,
+			}),
+		}).Create(&row).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "落库失败: " + err.Error()})
+			return
+		}
+		if err := s.recordKernelSymbolArtifact(req.TID, objectKey, req.SizeBytes, req.SHA256); err != nil {
+			s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", req.TID), zap.String("sha256", req.SHA256), zap.Error(err))
+		}
+		c.JSON(http.StatusOK, gin.H{"upload_required": false, "object_key": objectKey})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"upload_required": true, "object_key": objectKey})
+}
+
+// UploadKernelSymbol — PUT /api/v1/kernel-symbols/:sha256
+func (s *APIServer) UploadKernelSymbol(c *gin.Context) {
+	sum := strings.ToLower(strings.TrimSpace(c.Param("sha256")))
+	tid := strings.TrimSpace(c.Query("tid"))
+	if tid == "" || !sha256Pattern.MatchString(sum) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tid 或 sha256 格式不合法"})
+		return
+	}
+	if !s.StorageConnected() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "对象存储未连接"})
+		return
+	}
+	if c.Request.ContentLength > maxKernelSymbolUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "文件超过大小上限"})
+		return
+	}
+
+	limited := http.MaxBytesReader(c.Writer, c.Request.Body, maxKernelSymbolUploadBytes)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "读取上传内容失败: " + err.Error()})
+		return
+	}
+	if !looksLikeKallsyms(body) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "上传内容不是合法 kallsyms 快照"})
+		return
+	}
+	actual := sha256.Sum256(body)
+	actualHex := hex.EncodeToString(actual[:])
+	if actualHex != sum {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sha256 校验失败"})
+		return
+	}
+
+	objectKey := kernelSymbolObjectKey(sum)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := s.Storage.PutObject(ctx, s.Config.Storage.Bucket, objectKey, bytes.NewReader(body), int64(len(body)), "application/octet-stream"); err != nil {
+		s.Logger.Error("kallsyms 上传失败", zap.String("sha256", sum), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "上传失败: " + err.Error()})
+		return
+	}
+
+	now := time.Now()
+	row := model.KernelSymbolFile{
+		SHA256:        sum,
+		ObjectKey:     objectKey,
+		KernelRelease: strings.TrimSpace(c.Query("kernel_release")),
+		Hostname:      strings.TrimSpace(c.Query("hostname")),
+		TargetIP:      strings.TrimSpace(c.Query("target_ip")),
+		SizeBytes:     int64(len(body)),
+		Status:        model.SymbolFileStatusReady,
+		CreatedAt:     now,
+		LastUsedAt:    &now,
+	}
+	if err := s.DB.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "sha256"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"object_key":     row.ObjectKey,
+			"kernel_release": row.KernelRelease,
+			"hostname":       row.Hostname,
+			"target_ip":      row.TargetIP,
+			"size_bytes":     row.SizeBytes,
+			"status":         row.Status,
+			"last_used_at":   row.LastUsedAt,
+		}),
+	}).Create(&row).Error; err != nil {
+		s.Logger.Error("kallsyms 账本落库失败", zap.String("sha256", sum), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "落库失败: " + err.Error()})
+		return
+	}
+	if err := s.recordKernelSymbolArtifact(tid, objectKey, int64(len(body)), sum); err != nil {
+		s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", tid), zap.String("sha256", sum), zap.Error(err))
+	}
+	c.JSON(http.StatusOK, gin.H{"sha256": sum, "status": "ready", "object_key": objectKey})
+}
+
+func kernelSymbolObjectKey(sum string) string {
+	return "kernel-symbols/" + sum + "/kallsyms"
+}
+
+func isKernelSymbolObjectKey(key string) bool {
+	return strings.HasPrefix(key, "kernel-symbols/") && strings.HasSuffix(key, "/kallsyms")
+}
+
+func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64, sum string) error {
+	if tid == "" || objectKey == "" {
+		return nil
+	}
+	artifact := model.Artifact{
+		TaskTID:     tid,
+		Kind:        model.ArtifactKindRaw,
+		ObjectKey:   objectKey,
+		Size:        size,
+		SHA256:      sum,
+		Hash:        "sha256:" + sum,
+		Retention:   "raw",
+		ContentType: "application/octet-stream",
+		Status:      model.ArtifactStatusReady,
+		CreatedAt:   time.Now(),
+	}
+	return s.DB.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "task_tid"}, {Name: "kind"}, {Name: "object_key"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"size":         artifact.Size,
+			"sha256":       artifact.SHA256,
+			"hash":         artifact.Hash,
+			"retention":    artifact.Retention,
+			"content_type": artifact.ContentType,
+			"status":       artifact.Status,
+		}),
+	}).Create(&artifact).Error
+}
+
+func looksLikeKallsyms(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	lines := bytes.SplitN(body, []byte{'\n'}, 8)
+	valid := 0
+	for _, line := range lines {
+		fields := bytes.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		addr := fields[0]
+		if len(addr) < 8 {
+			continue
+		}
+		ok := true
+		nonZero := false
+		for _, b := range addr {
+			if !((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')) {
+				ok = false
+				break
+			}
+			if b != '0' {
+				nonZero = true
+			}
+		}
+		if ok && nonZero {
+			valid++
+		}
+	}
+	return valid > 0
 }

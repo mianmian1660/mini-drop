@@ -242,6 +242,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&ProfileBatch{},
 		&ProfileWindow{},
 		&SymbolFile{},
+		&KernelSymbolFile{},
 		&TaskBuildID{},
 	)
 }

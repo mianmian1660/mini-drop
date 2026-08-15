@@ -30,6 +30,21 @@ type SymbolFile struct {
 	LastUsedAt *time.Time `gorm:"column:last_used_at" json:"last_used_at"`
 }
 
+// KernelSymbolFile — sha256 索引的 /proc/kallsyms 快照账本。
+// 同一台机器同一内核的 kallsyms 内容通常稳定，按内容哈希去重后，
+// 多个任务只保存 Artifact 引用，不再重复存 10MB 级快照。
+type KernelSymbolFile struct {
+	SHA256        string     `gorm:"column:sha256;primaryKey;size:64" json:"sha256"`
+	ObjectKey     string     `gorm:"column:object_key;size:512" json:"object_key"`
+	KernelRelease string     `gorm:"column:kernel_release;size:128" json:"kernel_release"`
+	Hostname      string     `gorm:"column:hostname;size:256" json:"hostname"`
+	TargetIP      string     `gorm:"column:target_ip;size:45;index" json:"target_ip"`
+	SizeBytes     int64      `gorm:"column:size_bytes" json:"size_bytes"`
+	Status        int        `gorm:"column:status;default:0;index" json:"status"`
+	CreatedAt     time.Time  `gorm:"column:created_at" json:"created_at"`
+	LastUsedAt    *time.Time `gorm:"column:last_used_at" json:"last_used_at"`
+}
+
 // TaskBuildID — 某个任务需要哪些 build-id（tid, build_id 复合主键）
 type TaskBuildID struct {
 	TID     string `gorm:"column:tid;primaryKey;size:64" json:"tid"`

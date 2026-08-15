@@ -227,7 +227,7 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     std::string dataPath = "/tmp/mini_drop_native_cp_" + std::to_string(window.startMs) + ".data";
     std::string perf = perf_bin();
     std::string recordOutput;
-    int rc = drop::exec_capture({perf, "record", "-q", "-a", "-F", std::to_string(cfg.sampleRateHz), "-g", "-o", dataPath, "--", "sleep", std::to_string(cfg.aggregationWindowSec)}, &recordOutput, 4096);
+    int rc = drop::exec_capture({perf, "record", "--no-buildid-cache", "-q", "-a", "-F", std::to_string(cfg.sampleRateHz), "-g", "-o", dataPath, "--", "sleep", std::to_string(cfg.aggregationWindowSec)}, &recordOutput, 4096);
     window.endMs = now_ms();
     if (rc != 0)
     {

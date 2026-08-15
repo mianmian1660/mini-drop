@@ -1205,6 +1205,12 @@ func (s *APIServer) DeleteTask(c *gin.Context) {
 
 	s.Logger.Info("任务已删除", zap.String("tid", tid))
 
+	if s.StorageConnected() {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		defer cancel()
+		s.cleanupTaskArtifacts(ctx, tid, true)
+	}
+
 	s.RespondOK(c, gin.H{"message": "任务已删除"})
 }
 

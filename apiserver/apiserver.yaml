@@ -33,6 +33,14 @@ storage:
   bucket: "drop-data"
   presign_expire_sec: 900   # 预签名 URL 有效期（秒），默认 15 分钟
 
+# 存储保留期配置
+retention:
+  enabled: true
+  raw_retention_hours: 168      # RAW / INTERMEDIATE / LOG 默认保留 7 天
+  result_retention_hours: 720   # RESULT / MANIFEST 默认保留 30 天
+  cleanup_interval_sec: 3600
+  batch_limit: 200
+
 # 日志配置
 log:
   level: info               # debug / info / warn / error

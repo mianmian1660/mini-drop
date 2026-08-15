@@ -97,6 +97,9 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 启动任务状态轮询器（W3：定期检查 Running 任务是否应标记为完成）
 	go s.startTaskPoller()
 
+	// 启动存储保留期清理器，避免任务产物和 stopped continuous session 长期堆积。
+	go s.startRetentionCleaner()
+
 	// B: 启动时补偿历史已完成但未入分析队列的任务，修复回调缺失期间留下的卡住记录。
 	go func() {
 		time.Sleep(12 * time.Second)
@@ -673,6 +676,8 @@ func (s *APIServer) registerRoutes() {
 	// 和 task-notify 一样直接挂在 s.Router 上，不进 CheckLogin 分组。
 	s.Router.POST("/api/v1/symbols/check", s.CheckSymbols)
 	s.Router.PUT("/api/v1/symbols/:build_id", s.UploadSymbol)
+	s.Router.POST("/api/v1/kernel-symbols/check", s.CheckKernelSymbol)
+	s.Router.PUT("/api/v1/kernel-symbols/:sha256", s.UploadKernelSymbol)
 
 	// 其余 /api/v1 路由：统一要求带身份信息
 	api := s.Router.Group("/api/v1")

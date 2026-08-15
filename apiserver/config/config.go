@@ -19,6 +19,7 @@ type Config struct {
 	Database       DatabaseConfig       `mapstructure:"database"`
 	GRPC           GRPCConfig           `mapstructure:"grpc"`
 	Storage        StorageConfig        `mapstructure:"storage"`
+	Retention      RetentionConfig      `mapstructure:"retention"`
 	Log            LogConfig            `mapstructure:"log"`
 	Security       SecurityConfig       `mapstructure:"security"`
 	Observability  ObservabilityConfig  `mapstructure:"observability"`
@@ -58,6 +59,15 @@ type StorageConfig struct {
 	UseSSL           bool   `mapstructure:"use_ssl"`
 	Bucket           string `mapstructure:"bucket"`
 	PresignExpireSec int    `mapstructure:"presign_expire_sec"`
+}
+
+// RetentionConfig controls automatic cleanup of task artifacts.
+type RetentionConfig struct {
+	Enabled              bool `mapstructure:"enabled"`
+	RawRetentionHours    int  `mapstructure:"raw_retention_hours"`
+	ResultRetentionHours int  `mapstructure:"result_retention_hours"`
+	CleanupIntervalSec   int  `mapstructure:"cleanup_interval_sec"`
+	BatchLimit           int  `mapstructure:"batch_limit"`
 }
 
 // LogConfig 日志配置
@@ -139,6 +149,11 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("storage.use_ssl", false)
 	v.SetDefault("storage.bucket", "drop-data")
 	v.SetDefault("storage.presign_expire_sec", 900)
+	v.SetDefault("retention.enabled", true)
+	v.SetDefault("retention.raw_retention_hours", 168)
+	v.SetDefault("retention.result_retention_hours", 720)
+	v.SetDefault("retention.cleanup_interval_sec", 3600)
+	v.SetDefault("retention.batch_limit", 200)
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")
 	v.SetDefault("log.output", "stdout")
@@ -181,6 +196,21 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envSK := os.Getenv("S3_SECRET_KEY"); envSK != "" {
 		v.Set("storage.secret_key", envSK)
+	}
+	if envRetention := os.Getenv("RETENTION_ENABLED"); envRetention != "" {
+		v.Set("retention.enabled", parseBoolEnv(envRetention))
+	}
+	if envRawRetention := os.Getenv("ARTIFACT_RAW_RETENTION_HOURS"); envRawRetention != "" {
+		v.Set("retention.raw_retention_hours", envRawRetention)
+	}
+	if envResultRetention := os.Getenv("ARTIFACT_RESULT_RETENTION_HOURS"); envResultRetention != "" {
+		v.Set("retention.result_retention_hours", envResultRetention)
+	}
+	if envCleanupInterval := os.Getenv("RETENTION_CLEANUP_INTERVAL_SEC"); envCleanupInterval != "" {
+		v.Set("retention.cleanup_interval_sec", envCleanupInterval)
+	}
+	if envBatchLimit := os.Getenv("RETENTION_BATCH_LIMIT"); envBatchLimit != "" {
+		v.Set("retention.batch_limit", envBatchLimit)
 	}
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		v.Set("server.port", envPort)
@@ -235,6 +265,18 @@ func (cfg *Config) Validate() error {
 	hasMTLS := cfg.GRPC.MTLSCertFile != "" && cfg.GRPC.MTLSKeyFile != "" && cfg.GRPC.MTLSCAFile != ""
 	if env == "production" && !cfg.Security.AllowInsecureTransport && !hasMTLS {
 		return fmt.Errorf("生产环境必须配置 gRPC mTLS 证书，或显式设置 ALLOW_INSECURE_TRANSPORT=true 承认 insecure 通道")
+	}
+	if cfg.Retention.RawRetentionHours <= 0 {
+		cfg.Retention.RawRetentionHours = 168
+	}
+	if cfg.Retention.ResultRetentionHours <= 0 {
+		cfg.Retention.ResultRetentionHours = 720
+	}
+	if cfg.Retention.CleanupIntervalSec <= 0 {
+		cfg.Retention.CleanupIntervalSec = 3600
+	}
+	if cfg.Retention.BatchLimit <= 0 {
+		cfg.Retention.BatchLimit = 200
 	}
 	return nil
 }
