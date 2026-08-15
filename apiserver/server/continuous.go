@@ -1,8 +1,13 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,11 +46,47 @@ type ContinuousBatchIngestReq struct {
 }
 
 type ContinuousWindowIngest struct {
-	WindowStart time.Time              `json:"window_start"`
-	WindowEnd   time.Time              `json:"window_end"`
-	ObjectKey   string                 `json:"object_key"`
-	SampleCount uint64                 `json:"sample_count"`
+	WindowStart time.Time               `json:"window_start"`
+	WindowEnd   time.Time               `json:"window_end"`
+	ObjectKey   string                  `json:"object_key"`
+	SampleCount uint64                  `json:"sample_count"`
+	Labels      map[string]interface{}  `json:"labels"`
+	Samples     []ContinuousStackSample `json:"samples"`
+}
+
+type ContinuousStackSample struct {
+	Stack       []string               `json:"stack"`
+	StackString string                 `json:"stack_string"`
+	Count       uint64                 `json:"count"`
+	Comm        string                 `json:"comm"`
+	PID         int                    `json:"pid"`
+	Exe         string                 `json:"exe"`
 	Labels      map[string]interface{} `json:"labels"`
+}
+
+type continuousStoredBatch struct {
+	SessionSID string                   `json:"session_sid"`
+	BatchID    string                   `json:"batch_id"`
+	TargetIP   string                   `json:"target_ip"`
+	StartTime  time.Time                `json:"start_time"`
+	EndTime    time.Time                `json:"end_time"`
+	Windows    []ContinuousWindowIngest `json:"windows"`
+}
+
+type continuousAggregate struct {
+	Total      float64
+	Top        map[string]*ProfileTopItem
+	Root       *continuousTreeNode
+	LabelValue map[string]map[string]bool
+	ObjectKeys []string
+}
+
+type continuousTreeNode struct {
+	Name     string
+	Value    float64
+	Self     float64
+	Children map[string]*continuousTreeNode
+	Order    []*continuousTreeNode
 }
 
 func (s *APIServer) CreateContinuousSession(c *gin.Context) {
@@ -167,8 +208,16 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	if req.TargetIP == "" {
 		req.TargetIP = session.TargetIP
 	}
+	if req.ObjectKey == "" {
+		req.ObjectKey = continuousBatchObjectKey(req.SessionSID, req.BatchID)
+	}
 	if req.WindowCount == 0 {
 		req.WindowCount = uint32(len(req.Windows))
+	}
+	if err := s.storeContinuousBatchPayload(c.Request.Context(), req); err != nil {
+		s.Logger.Error("保存 Continuous ProfileBatch payload 失败", zap.String("sid", req.SessionSID), zap.Error(err))
+		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "保存 Continuous ProfileBatch payload 失败")
+		return
 	}
 	now := time.Now()
 	batch := model.ProfileBatch{
@@ -250,18 +299,398 @@ func (s *APIServer) QueryContinuousProfile(c *gin.Context) {
 	if !ok {
 		return
 	}
+	fg, found, err := s.queryNativeContinuousFlamegraph(c.Request.Context(), q)
+	if err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	}
+	topn, _, err := s.queryNativeContinuousTopN(c.Request.Context(), q)
+	if err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	}
+	if !found {
+		s.RespondOK(c, gin.H{
+			"query":          profileLabelSelector(q),
+			"nodes":          []ProfileNode{},
+			"items":          []ProfileTopItem{},
+			"total":          0,
+			"unit":           "samples",
+			"empty":          true,
+			"message":        "Native Continuous Profiling 暂无覆盖该时间范围的 10s window",
+			"source":         "mini-drop-native",
+			"profile_source": "native",
+			"generated_at":   time.Now(),
+		})
+		return
+	}
 	s.RespondOK(c, gin.H{
-		"query":          profileLabelSelector(q),
-		"nodes":          []ProfileNode{},
-		"items":          []ProfileTopItem{},
-		"total":          0,
-		"unit":           "samples",
-		"empty":          true,
-		"message":        "Native Continuous Profiling batch 查询已接入，采样器上传数据后可生成历史 Flamegraph/TopN",
-		"source":         "mini-drop-native",
-		"profile_source": "native",
-		"generated_at":   time.Now(),
+		"query":          fg.Query,
+		"nodes":          fg.Nodes,
+		"items":          topn.Items,
+		"total":          fg.Total,
+		"unit":           fg.Unit,
+		"empty":          fg.Empty,
+		"message":        fg.Message,
+		"source":         fg.Source,
+		"profile_source": fg.ProfileSource,
+		"profile_url":    fg.ProfileURL,
+		"generated_at":   fg.GeneratedAt,
 	})
+}
+
+func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req ContinuousBatchIngestReq) error {
+	if !s.StorageConnected() {
+		return errProfileUnavailable
+	}
+	payload := continuousStoredBatch{
+		SessionSID: req.SessionSID,
+		BatchID:    req.BatchID,
+		TargetIP:   req.TargetIP,
+		StartTime:  req.StartTime,
+		EndTime:    req.EndTime,
+		Windows:    req.Windows,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return s.Storage.PutObject(ctx, s.Config.Storage.Bucket, req.ObjectKey, bytes.NewReader(body), int64(len(body)), "application/json")
+}
+
+func continuousBatchObjectKey(sessionSID, batchID string) string {
+	return "continuous/" + sessionSID + "/" + batchID + ".json"
+}
+
+func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q ProfileQuery) (ProfileFlamegraph, bool, error) {
+	agg, found, err := s.queryNativeContinuousAggregate(ctx, q)
+	if err != nil || !found {
+		return ProfileFlamegraph{}, found, err
+	}
+	nodes := continuousTreeToProfileNodes(agg.Root, "")
+	out := ProfileFlamegraph{
+		Nodes:         nodes,
+		Total:         agg.Total,
+		Unit:          "samples",
+		Empty:         len(nodes) == 0 || agg.Total == 0,
+		Source:        "mini-drop-native",
+		ProfileSource: "native",
+		ProfileURL:    s.continuousProfileURL(ctx, agg.ObjectKeys),
+		Query:         profileLabelSelector(q),
+		GeneratedAt:   time.Now(),
+	}
+	if out.Empty {
+		out.Message = "Native Continuous Profiling 暂无匹配样本"
+	}
+	return out, true, nil
+}
+
+func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuery) (ProfileTopN, bool, error) {
+	agg, found, err := s.queryNativeContinuousAggregate(ctx, q)
+	if err != nil || !found {
+		return ProfileTopN{}, found, err
+	}
+	items := make([]ProfileTopItem, 0, len(agg.Top))
+	for _, item := range agg.Top {
+		items = append(items, *item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Value == items[j].Value {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].Value > items[j].Value
+	})
+	if len(items) > 100 {
+		items = items[:100]
+	}
+	out := ProfileTopN{
+		Items:         items,
+		Total:         agg.Total,
+		Unit:          "samples",
+		Empty:         len(items) == 0 || agg.Total == 0,
+		Source:        "mini-drop-native",
+		ProfileSource: "native",
+		ProfileURL:    s.continuousProfileURL(ctx, agg.ObjectKeys),
+		Query:         profileLabelSelector(q),
+		GeneratedAt:   time.Now(),
+	}
+	if out.Empty {
+		out.Message = "Native Continuous Profiling 暂无匹配样本"
+	}
+	return out, true, nil
+}
+
+func (s *APIServer) queryNativeContinuousLabelValues(ctx context.Context, q ProfileQuery, label string) (ProfileLabelValues, bool, error) {
+	if !isAllowedProfileFilterLabel(label) {
+		return ProfileLabelValues{
+			Label:       label,
+			Values:      []string{},
+			Available:   false,
+			Message:     "Native Continuous Profiling 仅支持 comm/pid/exe 过滤标签",
+			Source:      "mini-drop-native",
+			Query:       profileLabelSelector(q),
+			GeneratedAt: time.Now(),
+		}, true, nil
+	}
+	agg, found, err := s.queryNativeContinuousAggregate(ctx, q)
+	if err != nil || !found {
+		return ProfileLabelValues{}, found, err
+	}
+	values := make([]string, 0, len(agg.LabelValue[label]))
+	for value := range agg.LabelValue[label] {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	out := ProfileLabelValues{
+		Label:       label,
+		Values:      values,
+		Available:   len(values) > 0,
+		Source:      "mini-drop-native",
+		Query:       profileLabelSelector(q),
+		GeneratedAt: time.Now(),
+	}
+	if len(values) == 0 {
+		out.Message = "Native Continuous Profiling 暂无可用过滤标签"
+	}
+	return out, true, nil
+}
+
+func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q ProfileQuery) (continuousAggregate, bool, error) {
+	var windows []model.ProfileWindow
+	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
+	if !q.CanReadAll {
+		if len(q.OwnerUIDs) > 0 {
+			sessionQuery = sessionQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", q.OwnerUIDs)
+		} else {
+			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
+		}
+	}
+	err := s.DB.Where("session_sid IN (?)", sessionQuery).
+		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
+		Order("window_start ASC").
+		Find(&windows).Error
+	if err != nil {
+		return continuousAggregate{}, false, err
+	}
+	if len(windows) == 0 {
+		return continuousAggregate{}, false, nil
+	}
+	if !s.StorageConnected() {
+		return continuousAggregate{}, true, errProfileUnavailable
+	}
+	agg := continuousAggregate{
+		Top: map[string]*ProfileTopItem{},
+		Root: &continuousTreeNode{
+			Name:     "root",
+			Children: map[string]*continuousTreeNode{},
+		},
+		LabelValue: map[string]map[string]bool{
+			"comm": {},
+			"pid":  {},
+			"exe":  {},
+		},
+	}
+	byObject := map[string][]model.ProfileWindow{}
+	objectOrder := []string{}
+	for _, window := range windows {
+		if window.ObjectKey == "" {
+			continue
+		}
+		if _, ok := byObject[window.ObjectKey]; !ok {
+			objectOrder = append(objectOrder, window.ObjectKey)
+		}
+		byObject[window.ObjectKey] = append(byObject[window.ObjectKey], window)
+	}
+	for _, objectKey := range objectOrder {
+		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+		if err != nil {
+			return continuousAggregate{}, true, err
+		}
+		agg.ObjectKeys = append(agg.ObjectKeys, objectKey)
+		for _, window := range batch.Windows {
+			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+				continue
+			}
+			for _, sample := range window.Samples {
+				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
+					continue
+				}
+				continuousAddSample(&agg, sample, window.Labels)
+			}
+		}
+	}
+	return agg, true, nil
+}
+
+func (s *APIServer) loadContinuousStoredBatch(ctx context.Context, objectKey string) (continuousStoredBatch, error) {
+	rc, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, objectKey)
+	if err != nil {
+		return continuousStoredBatch{}, err
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(io.LimitReader(rc, 32*1024*1024))
+	if err != nil {
+		return continuousStoredBatch{}, err
+	}
+	var batch continuousStoredBatch
+	if err := json.Unmarshal(body, &batch); err != nil {
+		return continuousStoredBatch{}, err
+	}
+	return batch, nil
+}
+
+func continuousSampleMatches(sample ContinuousStackSample, windowLabels map[string]interface{}, filters map[string]interface{}) bool {
+	for _, key := range []string{"comm", "pid", "exe"} {
+		want := labelString(filters, key)
+		if want == "" {
+			continue
+		}
+		if continuousSampleLabel(sample, windowLabels, key) != want {
+			return false
+		}
+	}
+	return true
+}
+
+func continuousSampleLabel(sample ContinuousStackSample, windowLabels map[string]interface{}, key string) string {
+	if value := labelString(sample.Labels, key); value != "" {
+		return value
+	}
+	switch key {
+	case "comm":
+		if sample.Comm != "" {
+			return sample.Comm
+		}
+	case "pid":
+		if sample.PID > 0 {
+			return strconv.Itoa(sample.PID)
+		}
+	case "exe":
+		if sample.Exe != "" {
+			return sample.Exe
+		}
+	}
+	return labelString(windowLabels, key)
+}
+
+func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample, windowLabels map[string]interface{}) {
+	count := float64(sample.Count)
+	if count <= 0 {
+		count = 1
+	}
+	stack := continuousSampleStack(sample)
+	if len(stack) == 0 {
+		stack = []string{firstNonEmpty(continuousSampleLabel(sample, windowLabels, "comm"), continuousSampleLabel(sample, windowLabels, "exe"), "unknown")}
+	}
+	agg.Total += count
+	for _, key := range []string{"comm", "pid", "exe"} {
+		if value := continuousSampleLabel(sample, windowLabels, key); value != "" {
+			agg.LabelValue[key][value] = true
+		}
+	}
+	for i, frame := range stack {
+		frame = strings.TrimSpace(frame)
+		if frame == "" {
+			frame = "unknown"
+		}
+		item := agg.Top[frame]
+		if item == nil {
+			item = &ProfileTopItem{Name: frame, Unit: "samples"}
+			agg.Top[frame] = item
+		}
+		item.Value += count
+		if i == len(stack)-1 {
+			item.Self += count
+		}
+	}
+	node := agg.Root
+	node.Value += count
+	for i, frame := range stack {
+		frame = strings.TrimSpace(frame)
+		if frame == "" {
+			frame = "unknown"
+		}
+		if node.Children == nil {
+			node.Children = map[string]*continuousTreeNode{}
+		}
+		child := node.Children[frame]
+		if child == nil {
+			child = &continuousTreeNode{Name: frame, Children: map[string]*continuousTreeNode{}}
+			node.Children[frame] = child
+			node.Order = append(node.Order, child)
+		}
+		child.Value += count
+		if i == len(stack)-1 {
+			child.Self += count
+		}
+		node = child
+	}
+}
+
+func continuousSampleStack(sample ContinuousStackSample) []string {
+	if len(sample.Stack) > 0 {
+		out := make([]string, 0, len(sample.Stack))
+		for _, frame := range sample.Stack {
+			if strings.TrimSpace(frame) != "" {
+				out = append(out, strings.TrimSpace(frame))
+			}
+		}
+		return out
+	}
+	if sample.StackString == "" {
+		return nil
+	}
+	parts := strings.Split(sample.StackString, ";")
+	out := make([]string, 0, len(parts))
+	for _, frame := range parts {
+		if strings.TrimSpace(frame) != "" {
+			out = append(out, strings.TrimSpace(frame))
+		}
+	}
+	return out
+}
+
+func continuousTreeToProfileNodes(root *continuousTreeNode, prefix string) []ProfileNode {
+	if root == nil {
+		return []ProfileNode{}
+	}
+	children := append([]*continuousTreeNode(nil), root.Order...)
+	sort.Slice(children, func(i, j int) bool {
+		if children[i].Value == children[j].Value {
+			return children[i].Name < children[j].Name
+		}
+		return children[i].Value > children[j].Value
+	})
+	out := make([]ProfileNode, 0, len(children))
+	for idx, child := range children {
+		id := strconv.Itoa(idx)
+		if prefix != "" {
+			id = prefix + "." + id
+		}
+		out = append(out, ProfileNode{
+			ID:       id,
+			Name:     child.Name,
+			Value:    child.Value,
+			Self:     child.Self,
+			Children: continuousTreeToProfileNodes(child, id),
+		})
+	}
+	return out
+}
+
+func (s *APIServer) continuousProfileURL(ctx context.Context, objectKeys []string) string {
+	if len(objectKeys) == 0 || !s.StorageConnected() {
+		return ""
+	}
+	url, err := s.Storage.PresignedGetURL(ctx, s.Config.Storage.Bucket, objectKeys[0], time.Duration(s.Config.Storage.PresignExpireSec)*time.Second)
+	if err != nil {
+		return ""
+	}
+	return url
+}
+
+func windowOverlaps(start, end, from, to time.Time) bool {
+	return !end.Before(from) && !start.After(to)
 }
 
 func applyContinuousDefaults(req *CreateContinuousSessionReq) {

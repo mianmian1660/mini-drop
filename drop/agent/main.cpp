@@ -20,6 +20,7 @@
 #include "common/PprofProfiler.h"         // drop::run_pprof (profilerType=2)
 #include "common/BpfProfiler.h"           // drop::run_bpf (profilerType=3, eBPF)
 #include "common/CapabilityDetector.h"    // drop::detect_capabilities
+#include "common/ContinuousSampler.h"     // drop::PerfEventSampler (Native CP)
 #include "common/Process.h"               // drop::collect_self_pidstats, collect_children_pidstats
 #include "common/COSClient.h"             // drop::upload_to_minio
 #include "common/Utils.h"                 // drop::read_file_content
@@ -323,6 +324,78 @@ static bool env_enabled(const char *name)
     transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
               { return static_cast<char>(tolower(c)); });
     return s == "1" || s == "true" || s == "yes" || s == "on";
+}
+
+static string env_string(const char *name, const string &fallback = "")
+{
+    const char *v = getenv(name);
+    if (v && *v)
+        return v;
+    return fallback;
+}
+
+static string extract_json_string_local(const string &json, const string &key)
+{
+    string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == string::npos)
+        return "";
+    pos = json.find(':', pos + needle.size());
+    if (pos == string::npos)
+        return "";
+    pos = json.find('"', pos);
+    if (pos == string::npos)
+        return "";
+    size_t end = pos + 1;
+    while (end < json.size())
+    {
+        if (json[end] == '"' && json[end - 1] != '\\')
+            return json.substr(pos + 1, end - pos - 1);
+        ++end;
+    }
+    return "";
+}
+
+static string create_native_continuous_session(const drop_agent::AgentConfig &cfg,
+                                               const string &apiBaseURL,
+                                               const string &authUID)
+{
+    string path = "/tmp/mini_drop_native_cp_create_session.json";
+    {
+        ofstream out(path, ios::binary);
+        if (!out.is_open())
+            return "";
+        out << "{"
+            << "\"name\":\"Native Continuous Profiling\","
+            << "\"target_ip\":\"" << json_escape_local(cfg.ipAddr) << "\","
+            << "\"hostname\":\"" << json_escape_local(cfg.hostname) << "\","
+            << "\"service_name\":\"hotmethod\","
+            << "\"sample_rate_hz\":19,"
+            << "\"aggregation_window_sec\":10,"
+            << "\"upload_batch_sec\":60,"
+            << "\"retention_hours\":24,"
+            << "\"labels\":{\"job\":\"hotmethod\",\"instance\":\"" << json_escape_local(cfg.ipAddr)
+            << "\",\"node\":\"" << json_escape_local(cfg.hostname) << "\"},"
+            << "\"capabilities\":{\"sampler\":\"perf_event\"}"
+            << "}";
+    }
+    string response;
+    int rc = drop::exec_capture({"curl", "-sS", "-m", "10", "-X", "POST",
+                                 "-H", "Content-Type: application/json",
+                                 "-H", "Drop-User-Uid: " + authUID,
+                                 "-d", "@" + path,
+                                 apiBaseURL + "/api/v1/continuous/sessions"},
+                                &response, 8192);
+    ::remove(path.c_str());
+    if (rc != 0)
+    {
+        cout << "[native-cp] 创建 ContinuousSession 失败 rc=" << rc << " response=" << response << endl;
+        return "";
+    }
+    string sid = extract_json_string_local(response, "sid");
+    if (sid.empty())
+        cout << "[native-cp] 创建 ContinuousSession 响应中未找到 sid: " << response << endl;
+    return sid;
 }
 
 // ============================================================
@@ -827,6 +900,35 @@ int main(int argc, char **argv)
     auto health_stub = healthcheck::HealthCheck::NewStub(channel);
     auto hotmethod_stub = hotmethod::Hotmethod::NewStub(channel);
 
+    drop::PerfEventSampler nativeSampler;
+    if (env_enabled("DROP_NATIVE_CP_ENABLED"))
+    {
+        string apiBaseURL = env_string("DROP_NATIVE_CP_API_BASE_URL", env_string("APISERVER_SYMBOL_BASE_URL", "http://127.0.0.1:8191"));
+        string authUID = env_string("DROP_NATIVE_CP_UID", cfg.uid);
+        string sessionSID = env_string("DROP_NATIVE_CP_SESSION_ID");
+        if (sessionSID.empty())
+            sessionSID = create_native_continuous_session(cfg, apiBaseURL, authUID);
+        if (!sessionSID.empty())
+        {
+            drop::ContinuousSamplerConfig nativeCfg;
+            nativeCfg.sampleRateHz = 19;
+            nativeCfg.aggregationWindowSec = 10;
+            nativeCfg.uploadBatchSec = 60;
+            nativeCfg.retentionHours = 24;
+            nativeCfg.sessionSID = sessionSID;
+            nativeCfg.targetIP = cfg.ipAddr;
+            nativeCfg.hostname = cfg.hostname;
+            nativeCfg.apiBaseURL = apiBaseURL;
+            nativeCfg.authUID = authUID;
+            string samplerError;
+            if (nativeSampler.Start(nativeCfg, &samplerError))
+                cout << "[native-cp] PerfEventSampler started session=" << sessionSID
+                     << " api=" << apiBaseURL << endl;
+            else
+                cout << "[native-cp] PerfEventSampler not started: " << samplerError << endl;
+        }
+    }
+
     // 心跳间隔转换为毫秒
     uint32_t intervalMs = cfg.heartbeatIntervalSec * 1000;
     vector<common::AttemptStatus> runningAttempts;
@@ -953,5 +1055,6 @@ int main(int argc, char **argv)
     }
 
     cout << "[agent] 收到退出信号，正在关闭..." << endl;
+    nativeSampler.Stop();
     return 0;
 }
