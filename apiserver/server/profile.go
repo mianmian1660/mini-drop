@@ -26,20 +26,36 @@ type ProfileClient interface {
 }
 
 type ProfileTarget struct {
-	ID               string                 `json:"id"`
-	Hostname         string                 `json:"hostname"`
-	IP               string                 `json:"ip"`
-	ServiceName      string                 `json:"service_name"`
-	Environment      string                 `json:"environment"`
-	Labels           map[string]interface{} `json:"labels"`
-	ProfileStatus    string                 `json:"profile_status"`
-	ProfileSource    string                 `json:"profile_source"`
-	ProfileURL       string                 `json:"profile_url,omitempty"`
-	DropAgentStatus  string                 `json:"drop_agent_status"`
-	LastProfileAt    *time.Time             `json:"last_profile_at"`
-	LastSeen         *time.Time             `json:"last_seen"`
-	DropAgentOnline  bool                   `json:"drop_agent_online"`
-	ContinuousActive bool                   `json:"continuous_active"`
+	ID                string                 `json:"id"`
+	Hostname          string                 `json:"hostname"`
+	IP                string                 `json:"ip"`
+	ServiceName       string                 `json:"service_name"`
+	Environment       string                 `json:"environment"`
+	Labels            map[string]interface{} `json:"labels"`
+	ProfileStatus     string                 `json:"profile_status"`
+	ProfileSource     string                 `json:"profile_source"`
+	ProfileURL        string                 `json:"profile_url,omitempty"`
+	DropAgentStatus   string                 `json:"drop_agent_status"`
+	LastProfileAt     *time.Time             `json:"last_profile_at"`
+	LastSeen          *time.Time             `json:"last_seen"`
+	DropAgentOnline   bool                   `json:"drop_agent_online"`
+	ContinuousActive  bool                   `json:"continuous_active"`
+	ContinuousSession *ContinuousSessionMeta `json:"continuous_session,omitempty"`
+}
+
+type ContinuousSessionMeta struct {
+	SID                  string                 `json:"sid"`
+	Name                 string                 `json:"name"`
+	Status               string                 `json:"status"`
+	Sampler              string                 `json:"sampler"`
+	SampleRateHz         uint32                 `json:"sample_rate_hz"`
+	AggregationWindowSec uint32                 `json:"aggregation_window_sec"`
+	UploadBatchSec       uint32                 `json:"upload_batch_sec"`
+	RetentionHours       uint32                 `json:"retention_hours"`
+	LastUploadAt         *time.Time             `json:"last_upload_at"`
+	StartedAt            time.Time              `json:"started_at"`
+	StoppedAt            *time.Time             `json:"stopped_at"`
+	Capabilities         map[string]interface{} `json:"capabilities"`
 }
 
 type ProfileQuery struct {
@@ -597,6 +613,7 @@ func (s *APIServer) attachContinuousSessionStatus(targets map[string]*ProfileTar
 	if err := query.Order("updated_at DESC").Find(&sessions).Error; err != nil {
 		return
 	}
+	attached := map[string]bool{}
 	for _, session := range sessions {
 		target, ok := findProfileTargetByIP(targets, session.TargetIP)
 		if !ok && session.Status != model.ContinuousSessionStatusRunning {
@@ -615,16 +632,42 @@ func (s *APIServer) attachContinuousSessionStatus(targets map[string]*ProfileTar
 			}
 			targets["session:"+session.SID] = target
 		}
+		if attached[target.ID] {
+			continue
+		}
 		target.ProfileSource = "native"
 		target.ProfileStatus = session.Status
 		target.ContinuousActive = session.Status == model.ContinuousSessionStatusRunning
 		target.ProfileURL = "/continuous/sessions/" + session.SID
+		target.ContinuousSession = continuousSessionMeta(session)
 		if session.LastUploadAt != nil {
 			target.LastProfileAt = session.LastUploadAt
 		}
 		if len(session.Labels) > 0 {
 			target.Labels = mergeProfileLabels(*target, profileLabelsFromAgent(session.Labels))
 		}
+		attached[target.ID] = true
+	}
+}
+
+func continuousSessionMeta(session model.ContinuousSession) *ContinuousSessionMeta {
+	capabilities := map[string]interface{}{}
+	if len(session.Capabilities) > 0 {
+		_ = json.Unmarshal(session.Capabilities, &capabilities)
+	}
+	return &ContinuousSessionMeta{
+		SID:                  session.SID,
+		Name:                 session.Name,
+		Status:               session.Status,
+		Sampler:              firstNonEmpty(labelString(capabilities, "sampler"), "perf_event"),
+		SampleRateHz:         firstNonZeroUint32(session.SampleRateHz, 19),
+		AggregationWindowSec: firstNonZeroUint32(session.AggregationWindowSec, 10),
+		UploadBatchSec:       firstNonZeroUint32(session.UploadBatchSec, 60),
+		RetentionHours:       firstNonZeroUint32(session.RetentionHours, 24),
+		LastUploadAt:         session.LastUploadAt,
+		StartedAt:            session.StartedAt,
+		StoppedAt:            session.StoppedAt,
+		Capabilities:         capabilities,
 	}
 }
 
@@ -839,6 +882,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstNonZeroUint32(value uint32, fallback uint32) uint32 {
+	if value != 0 {
+		return value
+	}
+	return fallback
 }
 
 func (s *APIServer) defaultProfileEnvironment() string {

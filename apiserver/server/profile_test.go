@@ -550,6 +550,19 @@ func TestInternalContinuousSessionIsSystemReadable(t *testing.T) {
 			if target.ProfileStatus != model.ContinuousSessionStatusRunning || !target.ContinuousActive {
 				t.Fatalf("target should expose running system profile: %+v", target)
 			}
+			if target.ContinuousSession == nil {
+				t.Fatalf("target should expose continuous session metadata: %+v", target)
+			}
+			meta := target.ContinuousSession
+			if meta.SID != session.SID || meta.Status != model.ContinuousSessionStatusRunning || meta.Sampler != "perf_event" {
+				t.Fatalf("unexpected continuous session metadata: %+v", meta)
+			}
+			if meta.SampleRateHz != 19 || meta.AggregationWindowSec != 10 || meta.UploadBatchSec != 60 || meta.RetentionHours != 24 {
+				t.Fatalf("unexpected continuous session runtime params: %+v", meta)
+			}
+			if meta.Capabilities["sampler"] != "perf_event" {
+				t.Fatalf("continuous session capabilities should include sampler, got %+v", meta.Capabilities)
+			}
 		}
 	}
 	if !found {
