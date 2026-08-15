@@ -5,7 +5,9 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace drop
@@ -24,6 +26,11 @@ struct ContinuousSamplerConfig
     int aggregationWindowSec = 10;
     int uploadBatchSec = 60;
     int retentionHours = 24;
+    std::string sessionSID;
+    std::string targetIP;
+    std::string hostname;
+    std::string apiBaseURL;
+    std::string authUID;
 };
 
 struct ContinuousSampleWindow
@@ -48,14 +55,18 @@ public:
 class PerfEventSampler : public Sampler
 {
 public:
+    ~PerfEventSampler() override;
     std::string Name() const override;
     bool Start(const ContinuousSamplerConfig &config, std::string *error) override;
     void Stop() override;
     bool Running() const override;
 
 private:
-    bool running_ = false;
+    void Loop();
+
+    std::atomic<bool> running_{false};
     ContinuousSamplerConfig config_;
+    std::thread worker_;
 };
 
 } // namespace drop

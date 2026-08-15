@@ -3,8 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/mini-drop/apiserver/model"
+	"github.com/mini-drop/apiserver/pkg/storage"
 	pb_control "github.com/mini-drop/apiserver/proto/control"
 )
 
@@ -27,6 +31,7 @@ func profileRouter(s *APIServer) *gin.Engine {
 	api.GET("/profile/topn", s.GetProfileTopN)
 	api.GET("/profile/diff", s.GetProfileDiff)
 	api.GET("/profile/label-values", s.GetProfileLabelValues)
+	api.POST("/internal/continuous/batches", s.IngestContinuousBatch)
 	return router
 }
 
@@ -373,6 +378,90 @@ func TestProfileQueryLabelsCannotOverrideTargetIdentity(t *testing.T) {
 	}
 }
 
+func TestNativeContinuousBatchIngestQueryAndFilters(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	_ = s.DB.Create(&model.AgentInfo{
+		Hostname: "node-a",
+		IPAddr:   "10.0.0.1",
+		UID:      "owner",
+		Online:   true,
+		LastSeen: now,
+	}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID:                  "cps-test",
+		Name:                 "test session",
+		TargetIP:             "10.0.0.1",
+		ServiceName:          "hotmethod",
+		SampleRateHz:         19,
+		AggregationWindowSec: 10,
+		UploadBatchSec:       60,
+		RetentionHours:       24,
+		Status:               model.ContinuousSessionStatusRunning,
+		UID:                  "owner",
+		StartedAt:            now.Add(-time.Minute),
+		CreatedAt:            now.Add(-time.Minute),
+		UpdatedAt:            now.Add(-time.Minute),
+	}).Error
+
+	body := fmt.Sprintf(`{
+		"session_sid":"cps-test",
+		"start_time":%q,
+		"end_time":%q,
+		"windows":[{
+			"window_start":%q,
+			"window_end":%q,
+			"sample_count":22,
+			"samples":[
+				{"stack":["runtime.main","main.busy"],"count":19,"comm":"python3","pid":123,"exe":"/usr/bin/python3"},
+				{"stack":["runtime.main","main.idle"],"count":3,"comm":"bash","pid":234,"exe":"/usr/bin/bash"}
+			]
+		}]
+	}`, now.Add(-20*time.Second).Format(time.RFC3339), now.Add(-10*time.Second).Format(time.RFC3339), now.Add(-20*time.Second).Format(time.RFC3339), now.Add(-10*time.Second).Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router := profileRouter(s)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ingest status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	filter := `{"comm":"python3","pid":"123","exe":"/usr/bin/python3"}`
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/topn?target_id=10.0.0.1:hotmethod&from="+url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339))+"&to="+url.QueryEscape(now.Format(time.RFC3339))+"&filters="+url.QueryEscape(filter), nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("topn status=%d body=%s", w.Code, w.Body.String())
+	}
+	var topBody struct {
+		Data ProfileTopN `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &topBody); err != nil {
+		t.Fatalf("topn json: %v", err)
+	}
+	if topBody.Data.Empty || topBody.Data.Total != 19 || len(topBody.Data.Items) == 0 || topBody.Data.Items[0].Name != "main.busy" {
+		t.Fatalf("unexpected topn: %+v", topBody.Data)
+	}
+	if !strings.Contains(topBody.Data.Query, `comm="python3"`) || !strings.Contains(topBody.Data.Query, `pid="123"`) || topBody.Data.ProfileURL == "" {
+		t.Fatalf("query/url not populated: %+v", topBody.Data)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/label-values?target_id=10.0.0.1:hotmethod&from="+url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339))+"&to="+url.QueryEscape(now.Format(time.RFC3339))+"&label=comm", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("labels status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"bash"`) || !strings.Contains(w.Body.String(), `"python3"`) {
+		t.Fatalf("expected comm label values, got %s", w.Body.String())
+	}
+}
+
 type failingProfileClient struct{}
 
 func (failingProfileClient) Flamegraph(context.Context, ProfileQuery) (ProfileFlamegraph, error) {
@@ -389,4 +478,46 @@ func (failingProfileClient) Diff(context.Context, ProfileDiffQuery) (ProfileDiff
 
 func (failingProfileClient) LabelValues(context.Context, ProfileQuery, string) (ProfileLabelValues, error) {
 	return ProfileLabelValues{}, errProfileUnavailable
+}
+
+type continuousMemoryStorage struct {
+	objects map[string]string
+}
+
+func newContinuousMemoryStorage() *continuousMemoryStorage {
+	return &continuousMemoryStorage{objects: map[string]string{}}
+}
+
+func (m *continuousMemoryStorage) EnsureBucket(context.Context, string) error { return nil }
+
+func (m *continuousMemoryStorage) PutObject(_ context.Context, _, key string, reader io.Reader, _ int64, _ string) error {
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	m.objects[key] = string(body)
+	return nil
+}
+
+func (m *continuousMemoryStorage) GetObject(_ context.Context, _, key string) (io.ReadCloser, error) {
+	body, ok := m.objects[key]
+	if !ok {
+		return nil, fmt.Errorf("missing object %s", key)
+	}
+	return io.NopCloser(strings.NewReader(body)), nil
+}
+
+func (m *continuousMemoryStorage) PresignedGetURL(context.Context, string, string, time.Duration) (string, error) {
+	return "http://example.test/continuous.json", nil
+}
+
+func (m *continuousMemoryStorage) ListObjects(context.Context, string, string) ([]storage.FileInfo, error) {
+	return []storage.FileInfo{}, nil
+}
+
+func (m *continuousMemoryStorage) DeleteObject(context.Context, string, string) error { return nil }
+
+func (m *continuousMemoryStorage) ObjectExists(_ context.Context, _, key string) (bool, error) {
+	_, ok := m.objects[key]
+	return ok, nil
 }

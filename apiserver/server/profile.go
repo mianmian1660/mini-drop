@@ -51,6 +51,8 @@ type ProfileQuery struct {
 	ProfileType string                 `json:"profile_type"`
 	Labels      map[string]interface{} `json:"labels"`
 	Filters     map[string]interface{} `json:"filters"`
+	OwnerUIDs   []string               `json:"-"`
+	CanReadAll  bool                   `json:"-"`
 }
 
 type ProfileDiffQuery struct {
@@ -64,6 +66,8 @@ type ProfileDiffQuery struct {
 	ProfileType string                 `json:"profile_type"`
 	Labels      map[string]interface{} `json:"labels"`
 	Filters     map[string]interface{} `json:"filters"`
+	OwnerUIDs   []string               `json:"-"`
+	CanReadAll  bool                   `json:"-"`
 }
 
 type ProfileNode struct {
@@ -188,6 +192,13 @@ func (s *APIServer) GetProfileFlamegraph(c *gin.Context) {
 	if reserved := s.respondReservedProfileType(c, q.ProfileType); reserved {
 		return
 	}
+	if data, found, err := s.queryNativeContinuousFlamegraph(c.Request.Context(), q); err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	} else if found {
+		s.RespondOK(c, data)
+		return
+	}
 	data, err := s.profileClient().Flamegraph(c.Request.Context(), q)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
@@ -202,6 +213,13 @@ func (s *APIServer) GetProfileTopN(c *gin.Context) {
 		return
 	}
 	if reserved := s.respondReservedProfileType(c, q.ProfileType); reserved {
+		return
+	}
+	if data, found, err := s.queryNativeContinuousTopN(c.Request.Context(), q); err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	} else if found {
+		s.RespondOK(c, data)
 		return
 	}
 	data, err := s.profileClient().TopN(c.Request.Context(), q)
@@ -220,6 +238,20 @@ func (s *APIServer) GetProfileDiff(c *gin.Context) {
 	if reserved := s.respondReservedProfileType(c, q.ProfileType); reserved {
 		return
 	}
+	if baseTop, baseFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
+		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+	}); err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	} else if compareTop, compareFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
+		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+	}); err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	} else if baseFound || compareFound {
+		s.RespondOK(c, diffTopN(baseTop, compareTop))
+		return
+	}
 	data, err := s.profileClient().Diff(c.Request.Context(), q)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
@@ -236,6 +268,13 @@ func (s *APIServer) GetProfileLabelValues(c *gin.Context) {
 	label := strings.TrimSpace(c.Query("label"))
 	if label == "" {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "label 不能为空")
+		return
+	}
+	if data, found, err := s.queryNativeContinuousLabelValues(c.Request.Context(), q, label); err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	} else if found {
+		s.RespondOK(c, data)
 		return
 	}
 	data, err := s.profileClient().LabelValues(c.Request.Context(), q, label)
@@ -318,6 +357,7 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 		return ProfileDiffQuery{}, false
 	}
 	q.Host, q.TargetID, q.Service, q.Labels, q.Filters = pq.Host, pq.TargetID, pq.Service, pq.Labels, pq.Filters
+	q.OwnerUIDs, q.CanReadAll = pq.OwnerUIDs, pq.CanReadAll
 	return q, true
 }
 
@@ -349,6 +389,14 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) bool {
 	}
 	q.Labels = mergeProfileLabels(target, q.Labels)
 	q.Filters = sanitizeProfileFilters(q.Filters)
+	auth := s.AuthContext(c)
+	q.CanReadAll = auth.IsPlatformAdmin()
+	if !q.CanReadAll {
+		q.OwnerUIDs = s.visibleOwnerUIDs(auth)
+		if len(q.OwnerUIDs) == 0 && auth.UID != "" {
+			q.OwnerUIDs = []string{auth.UID}
+		}
+	}
 	return true
 }
 
