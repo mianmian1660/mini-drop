@@ -384,7 +384,7 @@ static string create_native_continuous_session(const drop_agent::AgentConfig &cf
                                  "-H", "Content-Type: application/json",
                                  "-H", "Drop-User-Uid: " + authUID,
                                  "-d", "@" + path,
-                                 apiBaseURL + "/api/v1/continuous/sessions"},
+                                 apiBaseURL + "/api/v1/internal/continuous/sessions"},
                                 &response, 8192);
     ::remove(path.c_str());
     if (rc != 0)

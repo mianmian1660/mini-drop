@@ -31,7 +31,9 @@ func profileRouter(s *APIServer) *gin.Engine {
 	api.GET("/profile/topn", s.GetProfileTopN)
 	api.GET("/profile/diff", s.GetProfileDiff)
 	api.GET("/profile/label-values", s.GetProfileLabelValues)
+	api.POST("/internal/continuous/sessions", s.CreateInternalContinuousSession)
 	api.POST("/internal/continuous/batches", s.IngestContinuousBatch)
+	api.GET("/continuous/raw", s.ViewContinuousProfileObject)
 	return router
 }
 
@@ -459,6 +461,192 @@ func TestNativeContinuousBatchIngestQueryAndFilters(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"bash"`) || !strings.Contains(w.Body.String(), `"python3"`) {
 		t.Fatalf("expected comm label values, got %s", w.Body.String())
+	}
+}
+
+func TestInternalContinuousSessionIsSystemReadable(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	router := profileRouter(s)
+	_ = s.DB.Create(&model.AgentInfo{
+		Hostname: "node-system",
+		IPAddr:   "10.0.0.10",
+		Online:   true,
+		LastSeen: now,
+	}).Error
+
+	createBody := `{
+		"name":"Native Continuous Profiling",
+		"target_ip":"10.0.0.10",
+		"hostname":"node-system",
+		"service_name":"hotmethod",
+		"capabilities":{"sampler":"perf_event"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/sessions", strings.NewReader(createBody))
+	req.Header.Set("Drop-User-Uid", "agent-001")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create system session status=%d body=%s", w.Code, w.Body.String())
+	}
+	var createResp struct {
+		Data struct {
+			Session model.ContinuousSession `json:"session"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &createResp); err != nil {
+		t.Fatalf("create json: %v", err)
+	}
+	session := createResp.Data.Session
+	if session.SID == "" || session.UID != "" || session.UserName != "system-agent" {
+		t.Fatalf("unexpected system session: %+v", session)
+	}
+
+	start := now.Add(-20 * time.Second)
+	end := now.Add(-10 * time.Second)
+	batchBody := fmt.Sprintf(`{
+		"session_sid":%q,
+		"batch_id":"cpb-system",
+		"start_time":%q,
+		"end_time":%q,
+		"windows":[{
+			"window_start":%q,
+			"window_end":%q,
+			"sample_count":7,
+			"samples":[{"stack":["runtime.main","main.hot"],"count":7,"comm":"hotmethod","pid":345,"exe":"/usr/bin/hotmethod"}]
+		}]
+	}`, session.SID, start.Format(time.RFC3339), end.Format(time.RFC3339), start.Format(time.RFC3339), end.Format(time.RFC3339))
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(batchBody))
+	req.Header.Set("Drop-User-Uid", "agent-001")
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ingest system batch status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	queryRange := "&from=" + url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339)) + "&to=" + url.QueryEscape(now.Format(time.RFC3339))
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/targets", nil)
+	req.Header.Set("Drop-User-Uid", "user-demo")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("targets status=%d body=%s", w.Code, w.Body.String())
+	}
+	var targetsResp struct {
+		Data struct {
+			Targets []ProfileTarget `json:"targets"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &targetsResp); err != nil {
+		t.Fatalf("targets json: %v", err)
+	}
+	found := false
+	for _, target := range targetsResp.Data.Targets {
+		if target.ID == "10.0.0.10:hotmethod" {
+			found = true
+			if target.ProfileStatus != model.ContinuousSessionStatusRunning || !target.ContinuousActive {
+				t.Fatalf("target should expose running system profile: %+v", target)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("system profile target missing: %+v", targetsResp.Data.Targets)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/topn?target_id=10.0.0.10:hotmethod"+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "user-demo")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("topn status=%d body=%s", w.Code, w.Body.String())
+	}
+	var topResp struct {
+		Data ProfileTopN `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &topResp); err != nil {
+		t.Fatalf("topn json: %v", err)
+	}
+	if topResp.Data.Empty || topResp.Data.Total != 7 || len(topResp.Data.Items) == 0 {
+		t.Fatalf("ordinary user should read system topn: %+v", topResp.Data)
+	}
+	if !strings.HasPrefix(topResp.Data.ProfileURL, "/api/v1/continuous/raw?key=") || strings.Contains(topResp.Data.ProfileURL, "localhost") {
+		t.Fatalf("profile_url should be same-origin, got %q", topResp.Data.ProfileURL)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/flamegraph?target_id=10.0.0.10:hotmethod"+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "user-demo")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("flamegraph status=%d body=%s", w.Code, w.Body.String())
+	}
+	var flameResp struct {
+		Data ProfileFlamegraph `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &flameResp); err != nil {
+		t.Fatalf("flamegraph json: %v", err)
+	}
+	if flameResp.Data.Empty || flameResp.Data.Total != 7 || len(flameResp.Data.Nodes) == 0 {
+		t.Fatalf("ordinary user should read system flamegraph: %+v", flameResp.Data)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, topResp.Data.ProfileURL, nil)
+	req.Header.Set("Drop-User-Uid", "user-demo")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"batch_id":"cpb-system"`) {
+		t.Fatalf("raw continuous object status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestUserContinuousSessionRemainsPrivate(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	_ = s.DB.Create(&model.AgentInfo{
+		Hostname: "node-private",
+		IPAddr:   "10.0.0.20",
+		Online:   true,
+		LastSeen: now,
+	}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID:                  "cps-private",
+		Name:                 "private session",
+		TargetIP:             "10.0.0.20",
+		ServiceName:          "hotmethod",
+		SampleRateHz:         19,
+		AggregationWindowSec: 10,
+		UploadBatchSec:       60,
+		RetentionHours:       24,
+		Status:               model.ContinuousSessionStatusRunning,
+		UID:                  "owner",
+		StartedAt:            now.Add(-time.Minute),
+		CreatedAt:            now.Add(-time.Minute),
+		UpdatedAt:            now.Add(-time.Minute),
+	}).Error
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/profile/targets", nil)
+	req.Header.Set("Drop-User-Uid", "user-demo")
+	w := httptest.NewRecorder()
+	profileRouter(s).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("targets status=%d body=%s", w.Code, w.Body.String())
+	}
+	var targetsResp struct {
+		Data struct {
+			Targets []ProfileTarget `json:"targets"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &targetsResp); err != nil {
+		t.Fatalf("targets json: %v", err)
+	}
+	for _, target := range targetsResp.Data.Targets {
+		if target.ID == "10.0.0.20:hotmethod" && target.ProfileStatus == model.ContinuousSessionStatusRunning {
+			t.Fatalf("ordinary user should not see private continuous session running: %+v", target)
+		}
 	}
 }
 

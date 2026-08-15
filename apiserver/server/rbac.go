@@ -109,6 +109,9 @@ func (s *APIServer) ownerSharesGroup(ownerUID string, auth AuthContext) bool {
 }
 
 func (s *APIServer) canReadOwner(ownerUID string, auth AuthContext) bool {
+	if ownerUID == "" {
+		return true
+	}
 	if auth.IsPlatformAdmin() || ownerUID == auth.UID {
 		return true
 	}

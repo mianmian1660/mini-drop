@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -273,19 +274,8 @@ func (svc *TaskService) DownloadArtifact(tid string, artifactIDRaw string, auth 
 	if !svc.server.StorageConnected() {
 		return nil, serviceError(http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接")
 	}
-	expires := time.Duration(svc.server.Config.Storage.PresignExpireSec) * time.Second
-	if expires <= 0 || expires > 5*time.Minute {
-		expires = 5 * time.Minute
-	}
-	if expires < time.Minute {
-		expires = time.Minute
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	url, err := svc.server.Storage.PresignedGetURL(ctx, svc.server.Config.Storage.Bucket, artifact.ObjectKey, expires)
-	if err != nil {
-		return nil, serviceError(http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "生成下载链接失败")
-	}
+	downloadURL := "/api/v1/cosfiles/download?key=" + url.QueryEscape(artifact.ObjectKey)
+	expires := 5 * time.Minute
 	svc.server.Logger.Info("生成产物下载链接",
 		zap.String("task_id", task.TID),
 		zap.Uint("attempt_id", artifact.AttemptID),
@@ -296,7 +286,7 @@ func (svc *TaskService) DownloadArtifact(tid string, artifactIDRaw string, auth 
 	svc.server.recordTaskStatusEvent(task.TID, task.Status, task.Status, fmt.Sprintf("用户 %s 生成产物下载链接", auth.UID), "artifact_download")
 	return gin.H{
 		"artifact":   publicArtifact(artifact),
-		"url":        url,
+		"url":        downloadURL,
 		"expires_at": time.Now().Add(expires),
 	}, nil
 }
