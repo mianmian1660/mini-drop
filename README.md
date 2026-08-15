@@ -132,6 +132,37 @@ make demo-pprof
 
 如果 `make demo-cpu` 在 VMware 中无法生成真实 perf 火焰图，请先确认虚拟机是否支持虚拟化 CPU 性能计数器。若该选项无法勾选，建议不要把它作为机器故障处理，而是在演示说明中标注“当前 VMware 环境无法暴露 PMU，perf 真采需要换可用 Linux 环境”。但 eBPF 是评分硬项，必须在可运行 `bpftrace` 的 Linux 环境中完成 IO/调度现场采集。
 
+## Native Continuous Profiling（可选）
+
+Native Continuous Profiling 是独立于旧 schedule 时间轴的整机低频 CPU 采样链路。Agent 使用 `perf record -a -F 19 -g` 采集 10 秒窗口，按 60 秒 batch 上传到 apiserver，前端主机页的 Native profiling 标签页可按 `comm/pid/exe` 过滤并查看 TopN/火焰图。
+
+它默认关闭，原因是 WSL、部分 VMware/VirtualBox 和权限受限云主机经常无法运行 host perf 采样；默认关闭可以避免平台启动后持续刷 perf 权限错误。确认当前机器具备 perf 权限后，可显式启用：
+
+```bash
+DROP_NATIVE_CP_ENABLED=true docker compose up -d --build apiserver drop_agent
+```
+
+也可以运行 smoke 脚本完成一轮启用、等待上传和 API 查询：
+
+```bash
+bash scripts/native_cp_smoke.sh
+```
+
+可选环境变量：
+
+- `DROP_NATIVE_CP_ENABLED=true`：启用 Agent 内置 Native CP sampler。
+- `DROP_NATIVE_CP_API_BASE_URL=http://127.0.0.1:8191`：Agent 访问 apiserver 的地址，host network compose 默认使用本机地址。
+- `DROP_NATIVE_CP_SESSION_ID=cps-...`：复用已有 session；不设置时 Agent 会自动创建。
+- `WAIT_SECONDS=75`：smoke 等待上传 batch 的时间。
+
+如果 smoke 返回空结果或日志出现 `perf record failed`，先看：
+
+```bash
+docker compose logs --tail=120 drop_agent apiserver
+```
+
+常见原因仍是 `perf_event_paranoid`、容器 capability、host PID namespace 或虚拟化 PMU 不可用。此时 on-demand 任务和 Web/API 启动不受影响。
+
 最常用的完整演示顺序是：
 
 ```bash

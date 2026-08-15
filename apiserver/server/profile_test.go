@@ -462,6 +462,72 @@ func TestNativeContinuousBatchIngestQueryAndFilters(t *testing.T) {
 	}
 }
 
+func TestNativeContinuousRetentionDeletesExpiredWindowsBatchesAndObjects(t *testing.T) {
+	s := newTestAPIServer(t)
+	mem := newContinuousMemoryStorage()
+	s.Storage = mem
+	now := time.Now().UTC()
+	_ = s.DB.Create(&model.AgentInfo{
+		Hostname: "node-a",
+		IPAddr:   "10.0.0.1",
+		UID:      "owner",
+		Online:   true,
+		LastSeen: now,
+	}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID:                  "cps-retention",
+		Name:                 "retention session",
+		TargetIP:             "10.0.0.1",
+		ServiceName:          "hotmethod",
+		SampleRateHz:         19,
+		AggregationWindowSec: 10,
+		UploadBatchSec:       60,
+		RetentionHours:       1,
+		Status:               model.ContinuousSessionStatusRunning,
+		UID:                  "owner",
+		StartedAt:            now.Add(-3 * time.Hour),
+		CreatedAt:            now.Add(-3 * time.Hour),
+		UpdatedAt:            now.Add(-3 * time.Hour),
+	}).Error
+
+	start := now.Add(-2 * time.Hour)
+	end := start.Add(10 * time.Second)
+	body := fmt.Sprintf(`{
+		"session_sid":"cps-retention",
+		"batch_id":"cpb-old",
+		"start_time":%q,
+		"end_time":%q,
+		"windows":[{
+			"window_start":%q,
+			"window_end":%q,
+			"sample_count":1,
+			"samples":[{"stack":["main.old"],"count":1,"comm":"old","pid":123,"exe":"/bin/old"}]
+		}]
+	}`, start.Format(time.RFC3339), end.Format(time.RFC3339), start.Format(time.RFC3339), end.Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	profileRouter(s).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ingest status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var windowCount int64
+	s.DB.Model(&model.ProfileWindow{}).Where("session_sid = ?", "cps-retention").Count(&windowCount)
+	if windowCount != 0 {
+		t.Fatalf("expired profile windows should be deleted, count=%d", windowCount)
+	}
+	var batchCount int64
+	s.DB.Model(&model.ProfileBatch{}).Where("session_sid = ?", "cps-retention").Count(&batchCount)
+	if batchCount != 0 {
+		t.Fatalf("expired profile batches should be deleted, count=%d", batchCount)
+	}
+	if _, ok := mem.objects["continuous/cps-retention/cpb-old.json"]; ok {
+		t.Fatalf("expired profile batch object should be deleted")
+	}
+}
+
 type failingProfileClient struct{}
 
 func (failingProfileClient) Flamegraph(context.Context, ProfileQuery) (ProfileFlamegraph, error) {
@@ -515,7 +581,10 @@ func (m *continuousMemoryStorage) ListObjects(context.Context, string, string) (
 	return []storage.FileInfo{}, nil
 }
 
-func (m *continuousMemoryStorage) DeleteObject(context.Context, string, string) error { return nil }
+func (m *continuousMemoryStorage) DeleteObject(_ context.Context, _, key string) error {
+	delete(m.objects, key)
+	return nil
+}
 
 func (m *continuousMemoryStorage) ObjectExists(_ context.Context, _, key string) (bool, error) {
 	_, ok := m.objects[key]

@@ -107,8 +107,9 @@ services:
     environment:
       DROP_PERF_BIN: "/usr/local/bin/perf-real"
       DROP_AGENT_IP: "127.0.0.1"
-      DROP_NATIVE_CP_ENABLED: "false"
-      DROP_NATIVE_CP_API_BASE_URL: "http://127.0.0.1:8191"
+      DROP_NATIVE_CP_ENABLED: "${DROP_NATIVE_CP_ENABLED:-false}"
+      DROP_NATIVE_CP_API_BASE_URL: "${DROP_NATIVE_CP_API_BASE_URL:-http://127.0.0.1:8191}"
+      DROP_NATIVE_CP_SESSION_ID: "${DROP_NATIVE_CP_SESSION_ID:-}"
     network_mode: host # 使用宿主机网络（需要 perf 权限）
     privileged: true # 特权模式（perf 需要）
     pid: host # 使用宿主机 PID 命名空间
