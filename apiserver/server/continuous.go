@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -95,6 +97,14 @@ func (s *APIServer) CreateContinuousSession(c *gin.Context) {
 		s.forbid(c)
 		return
 	}
+	s.createContinuousSession(c, auth.UID, auth.Name)
+}
+
+func (s *APIServer) CreateInternalContinuousSession(c *gin.Context) {
+	s.createContinuousSession(c, "", "system-agent")
+}
+
+func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, userName string) {
 	var req CreateContinuousSessionReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误: "+err.Error())
@@ -122,8 +132,8 @@ func (s *APIServer) CreateContinuousSession(c *gin.Context) {
 		Labels:               labels,
 		Capabilities:         caps,
 		Status:               model.ContinuousSessionStatusRunning,
-		UID:                  auth.UID,
-		UserName:             auth.Name,
+		UID:                  ownerUID,
+		UserName:             userName,
 		StartedAt:            now,
 		CreatedAt:            now,
 		UpdatedAt:            now,
@@ -143,9 +153,9 @@ func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 	if !auth.IsPlatformAdmin() {
 		owners := s.visibleOwnerUIDs(auth)
 		if len(owners) > 0 {
-			query = query.Where("uid IN ?", owners)
+			query = query.Where("(uid IN ? OR uid = '' OR uid IS NULL)", owners)
 		} else {
-			query = query.Where("uid = ?", auth.UID)
+			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL)", auth.UID)
 		}
 	}
 	if err := query.Find(&sessions).Error; err != nil {
@@ -338,6 +348,38 @@ func (s *APIServer) QueryContinuousProfile(c *gin.Context) {
 		"profile_url":    fg.ProfileURL,
 		"generated_at":   fg.GeneratedAt,
 	})
+}
+
+func (s *APIServer) ViewContinuousProfileObject(c *gin.Context) {
+	key := strings.TrimSpace(c.Query("key"))
+	sid := continuousSessionSIDFromObjectKey(key)
+	if sid == "" {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "非法 Continuous Profile 对象路径")
+		return
+	}
+	if _, ok := s.loadReadableContinuousSession(c, sid, s.AuthContext(c)); !ok {
+		return
+	}
+	if !s.StorageConnected() {
+		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, key)
+	if err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在")
+		return
+	}
+	defer reader.Close()
+
+	c.Header("Content-Type", mimeType(key))
+	c.Header("Content-Disposition", contentDisposition("inline", path.Base(key)))
+	c.Status(http.StatusOK)
+	if _, err := io.Copy(c.Writer, reader); err != nil {
+		s.Logger.Warn("代理输出 Continuous Profile 对象失败", zap.String("key", key), zap.Error(err))
+	}
 }
 
 func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req ContinuousBatchIngestReq) error {
@@ -721,11 +763,23 @@ func (s *APIServer) continuousProfileURL(ctx context.Context, objectKeys []strin
 	if len(objectKeys) == 0 || !s.StorageConnected() {
 		return ""
 	}
-	url, err := s.Storage.PresignedGetURL(ctx, s.Config.Storage.Bucket, objectKeys[0], time.Duration(s.Config.Storage.PresignExpireSec)*time.Second)
-	if err != nil {
+	key := strings.TrimSpace(objectKeys[0])
+	if continuousSessionSIDFromObjectKey(key) == "" {
 		return ""
 	}
-	return url
+	return "/api/v1/continuous/raw?key=" + url.QueryEscape(key)
+}
+
+func continuousSessionSIDFromObjectKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" || strings.Contains(key, "..") || strings.Contains(key, "\\") || strings.HasPrefix(key, "/") {
+		return ""
+	}
+	parts := strings.Split(key, "/")
+	if len(parts) != 3 || parts[0] != "continuous" || parts[1] == "" || path.Ext(parts[2]) != ".json" {
+		return ""
+	}
+	return parts[1]
 }
 
 func windowOverlaps(start, end, from, to time.Time) bool {

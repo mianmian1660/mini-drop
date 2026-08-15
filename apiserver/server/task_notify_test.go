@@ -673,7 +673,7 @@ func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 	req.Header.Set("Drop-User-Uid", "owner")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "http://example.test/signed") {
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "/api/v1/cosfiles/download?key=tid-stage2%2F") {
 		t.Fatalf("owner artifact download status=%d body=%s", w.Code, w.Body.String())
 	}
 
