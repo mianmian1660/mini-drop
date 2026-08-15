@@ -599,6 +599,9 @@ func (s *APIServer) attachContinuousSessionStatus(targets map[string]*ProfileTar
 	}
 	for _, session := range sessions {
 		target, ok := findProfileTargetByIP(targets, session.TargetIP)
+		if !ok && session.Status != model.ContinuousSessionStatusRunning {
+			continue
+		}
 		if !ok {
 			target = &ProfileTarget{
 				ID:              profileTargetID(session.TargetIP, firstNonEmpty(session.ServiceName, "hotmethod")),
