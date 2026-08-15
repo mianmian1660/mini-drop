@@ -264,6 +264,7 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "登记 ProfileBatch 失败")
 		return
 	}
+	s.cleanupContinuousRetention(c.Request.Context(), session)
 	s.RespondOK(c, gin.H{"batch_id": req.BatchID, "session_sid": req.SessionSID})
 }
 
@@ -360,6 +361,44 @@ func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req Continu
 
 func continuousBatchObjectKey(sessionSID, batchID string) string {
 	return "continuous/" + sessionSID + "/" + batchID + ".json"
+}
+
+func (s *APIServer) cleanupContinuousRetention(ctx context.Context, session model.ContinuousSession) {
+	retentionHours := session.RetentionHours
+	if retentionHours == 0 {
+		retentionHours = 24
+	}
+	cutoff := time.Now().Add(-time.Duration(retentionHours) * time.Hour)
+
+	var expiredBatches []model.ProfileBatch
+	if err := s.DB.Where("session_sid = ? AND end_time < ?", session.SID, cutoff).Find(&expiredBatches).Error; err != nil {
+		s.Logger.Warn("Native Continuous Profiling retention 查询过期 batch 失败", zap.String("sid", session.SID), zap.Error(err))
+		return
+	}
+	if err := s.DB.Where("session_sid = ? AND window_end < ?", session.SID, cutoff).Delete(&model.ProfileWindow{}).Error; err != nil {
+		s.Logger.Warn("Native Continuous Profiling retention 删除过期 window 失败", zap.String("sid", session.SID), zap.Error(err))
+		return
+	}
+
+	for _, batch := range expiredBatches {
+		var remaining int64
+		if err := s.DB.Model(&model.ProfileWindow{}).Where("session_sid = ? AND batch_bid = ?", session.SID, batch.BID).Count(&remaining).Error; err != nil {
+			s.Logger.Warn("Native Continuous Profiling retention 检查 batch 引用失败", zap.String("sid", session.SID), zap.String("batch", batch.BID), zap.Error(err))
+			continue
+		}
+		if remaining > 0 {
+			continue
+		}
+		if err := s.DB.Where("bid = ?", batch.BID).Delete(&model.ProfileBatch{}).Error; err != nil {
+			s.Logger.Warn("Native Continuous Profiling retention 删除 batch 失败", zap.String("sid", session.SID), zap.String("batch", batch.BID), zap.Error(err))
+			continue
+		}
+		if batch.ObjectKey != "" && s.StorageConnected() {
+			if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, batch.ObjectKey); err != nil {
+				s.Logger.Warn("Native Continuous Profiling retention 删除对象失败", zap.String("sid", session.SID), zap.String("object_key", batch.ObjectKey), zap.Error(err))
+			}
+		}
+	}
 }
 
 func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q ProfileQuery) (ProfileFlamegraph, bool, error) {

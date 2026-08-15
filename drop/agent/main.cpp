@@ -398,6 +398,48 @@ static string create_native_continuous_session(const drop_agent::AgentConfig &cf
     return sid;
 }
 
+static void ensure_native_continuous_sampler(drop::PerfEventSampler &sampler,
+                                             const drop_agent::AgentConfig &cfg,
+                                             const string &apiBaseURL,
+                                             const string &authUID,
+                                             string &sessionSID,
+                                             steady_clock::time_point &nextRetryAt)
+{
+    if (!env_enabled("DROP_NATIVE_CP_ENABLED") || sampler.Running())
+        return;
+    auto now = steady_clock::now();
+    if (now < nextRetryAt)
+        return;
+    if (sessionSID.empty())
+        sessionSID = create_native_continuous_session(cfg, apiBaseURL, authUID);
+    if (sessionSID.empty())
+    {
+        nextRetryAt = now + seconds(30);
+        cout << "[native-cp] session not ready, retry in 30s" << endl;
+        return;
+    }
+
+    drop::ContinuousSamplerConfig nativeCfg;
+    nativeCfg.sampleRateHz = 19;
+    nativeCfg.aggregationWindowSec = 10;
+    nativeCfg.uploadBatchSec = 60;
+    nativeCfg.retentionHours = 24;
+    nativeCfg.sessionSID = sessionSID;
+    nativeCfg.targetIP = cfg.ipAddr;
+    nativeCfg.hostname = cfg.hostname;
+    nativeCfg.apiBaseURL = apiBaseURL;
+    nativeCfg.authUID = authUID;
+    string samplerError;
+    if (sampler.Start(nativeCfg, &samplerError))
+    {
+        cout << "[native-cp] PerfEventSampler started session=" << sessionSID
+             << " api=" << apiBaseURL << endl;
+        return;
+    }
+    cout << "[native-cp] PerfEventSampler not started: " << samplerError << endl;
+    nextRetryAt = now + seconds(30);
+}
+
 // ============================================================
 // 多采集器分发：按 profilerType 选择对应的采集函数
 // 返回 (resultCode, profilerName)
@@ -901,33 +943,10 @@ int main(int argc, char **argv)
     auto hotmethod_stub = hotmethod::Hotmethod::NewStub(channel);
 
     drop::PerfEventSampler nativeSampler;
-    if (env_enabled("DROP_NATIVE_CP_ENABLED"))
-    {
-        string apiBaseURL = env_string("DROP_NATIVE_CP_API_BASE_URL", env_string("APISERVER_SYMBOL_BASE_URL", "http://127.0.0.1:8191"));
-        string authUID = env_string("DROP_NATIVE_CP_UID", cfg.uid);
-        string sessionSID = env_string("DROP_NATIVE_CP_SESSION_ID");
-        if (sessionSID.empty())
-            sessionSID = create_native_continuous_session(cfg, apiBaseURL, authUID);
-        if (!sessionSID.empty())
-        {
-            drop::ContinuousSamplerConfig nativeCfg;
-            nativeCfg.sampleRateHz = 19;
-            nativeCfg.aggregationWindowSec = 10;
-            nativeCfg.uploadBatchSec = 60;
-            nativeCfg.retentionHours = 24;
-            nativeCfg.sessionSID = sessionSID;
-            nativeCfg.targetIP = cfg.ipAddr;
-            nativeCfg.hostname = cfg.hostname;
-            nativeCfg.apiBaseURL = apiBaseURL;
-            nativeCfg.authUID = authUID;
-            string samplerError;
-            if (nativeSampler.Start(nativeCfg, &samplerError))
-                cout << "[native-cp] PerfEventSampler started session=" << sessionSID
-                     << " api=" << apiBaseURL << endl;
-            else
-                cout << "[native-cp] PerfEventSampler not started: " << samplerError << endl;
-        }
-    }
+    string nativeCPAPIBaseURL = env_string("DROP_NATIVE_CP_API_BASE_URL", env_string("APISERVER_SYMBOL_BASE_URL", "http://127.0.0.1:8191"));
+    string nativeCPAuthUID = env_string("DROP_NATIVE_CP_UID", cfg.uid);
+    string nativeCPSessionSID = env_string("DROP_NATIVE_CP_SESSION_ID");
+    auto nativeCPNextRetryAt = steady_clock::time_point{};
 
     // 心跳间隔转换为毫秒
     uint32_t intervalMs = cfg.heartbeatIntervalSec * 1000;
@@ -936,6 +955,8 @@ int main(int argc, char **argv)
 
     while (agent_running)
     {
+        ensure_native_continuous_sampler(nativeSampler, cfg, nativeCPAPIBaseURL, nativeCPAuthUID, nativeCPSessionSID, nativeCPNextRetryAt);
+
         // 自监控
         common::PidStats selfPs = drop::collect_self_pidstats();
         vector<common::PidStats> childrenPs = drop::collect_children_pidstats();
