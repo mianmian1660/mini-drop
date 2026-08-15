@@ -2,9 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { profiles } from '../api';
 import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
 import {
-    PROFILE_SAMPLE_PERIOD_MS,
     formatMetricValue,
-    formatProfileTotal,
     formatRawMetric,
     isCPUTimeUnit,
     metricColumnLabel,
@@ -34,6 +32,10 @@ const S = {
     metric: { padding: '10px 14px 10px 0', minWidth: 0 },
     metricLabel: { color: '#667085', fontSize: 12, marginBottom: 4 },
     metricValue: { color: '#111827', fontSize: 16, fontWeight: 700, wordBreak: 'break-word', lineHeight: 1.35 },
+    metaLine: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', marginTop: 12 },
+    metaItem: { display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid #eaecf0', background: '#fff', color: '#344054', borderRadius: 999, padding: '5px 9px', fontSize: 12, fontWeight: 700 },
+    metaItemWarn: { borderColor: '#fda29b', background: '#fff6f5', color: '#b42318' },
+    metaKey: { color: '#667085', fontWeight: 700 },
     chipWrap: { display: 'flex', flexWrap: 'wrap', gap: 8 },
     chip: { display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid #eaecf0', background: '#fff', color: '#344054', borderRadius: 999, padding: '4px 8px', fontSize: 12, fontWeight: 700 },
     chipKey: { color: '#667085', fontWeight: 700 },
@@ -79,6 +81,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const profileURL = flamegraph?.profile_url || topn?.profile_url || target?.profile_url;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
     const sampleState = sampleStateForTarget(target, flamegraph, topn);
+    const sessionMeta = continuousSessionMeta(target);
+    const uploadState = uploadFreshness(sessionMeta);
     const unit = flamegraph?.unit || topn?.unit || '';
     const activeFilters = useMemo(() => (scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}), [scope, selectedComm]);
     const activeFilterText = activeFilters.comm ? `comm=${activeFilters.comm}` : '';
@@ -237,13 +241,21 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     )}
                 </div>
                 <div style={{ ...S.summaryGrid, marginTop: 14 }}>
-                    <Metric label="样本状态" value={sampleState} />
-                    <Metric label="时间窗口" value={`${formatTime(timeWindow.from)} - ${formatTime(timeWindow.to)}`} />
-                    <Metric label="总占用" value={formatProfileTotal(flamegraph?.total || topn?.total, unit)} />
-                    <Metric label="热点函数" value={`${topn?.items?.length || 0} 个`} />
+                    <Metric label="采集方式" value={sessionMeta.sampler} />
+                    <Metric label="采样频率" value={formatRateHz(sessionMeta.sampleRateHz)} />
+                    <Metric label="聚合窗口" value={formatDurationSec(sessionMeta.aggregationWindowSec)} />
+                    <Metric label="上传周期" value={formatDurationSec(sessionMeta.uploadBatchSec)} />
+                </div>
+                <div style={S.metaLine}>
+                    <span style={S.metaItem}><span style={S.metaKey}>数据保留</span>{formatHours(sessionMeta.retentionHours)}</span>
+                    <span style={uploadState.warn ? { ...S.metaItem, ...S.metaItemWarn } : S.metaItem} title={uploadState.title}>
+                        <span style={S.metaKey}>最近上传</span>{uploadState.label}
+                    </span>
+                    <span style={S.metaItem}><span style={S.metaKey}>Session</span>{shortSessionID(sessionMeta.sid)}</span>
+                    <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
                 </div>
                 <div style={{ ...S.info, marginTop: 14 }}>
-                    {scopeLabel}；整机低频采样，查询时按 comm/pid/exe 过滤。comm 是 Linux task comm，可能被截断到约 15 字符；19Hz 采样约 {PROFILE_SAMPLE_PERIOD_MS.toFixed(1)} 毫秒/样本。
+                    {scopeLabel}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，查询时按 comm/pid/exe 过滤。当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。comm 是 Linux task comm，可能被截断到约 15 字符。
                     {scope === 'process' && commMessage ? ` ${commMessage}` : ''}
                 </div>
                 <LabelChips target={target} />
@@ -296,6 +308,88 @@ function Field({ label, children, wide = false }) {
 
 function Metric({ label, value }) {
     return <div style={S.metric}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value || '-'}</div></div>;
+}
+
+function continuousSessionMeta(target) {
+    const raw = target?.continuous_session || {};
+    const caps = raw.capabilities || {};
+    return {
+        sid: raw.sid || '',
+        name: raw.name || 'Native Continuous Profiling',
+        status: raw.status || target?.profile_status || 'unknown',
+        sampler: raw.sampler || caps.sampler || 'perf_event',
+        sampleRateHz: numberOrDefault(raw.sample_rate_hz, 19),
+        aggregationWindowSec: numberOrDefault(raw.aggregation_window_sec, 10),
+        uploadBatchSec: numberOrDefault(raw.upload_batch_sec, 60),
+        retentionHours: numberOrDefault(raw.retention_hours, 24),
+        lastUploadAt: raw.last_upload_at || target?.last_profile_at || '',
+        startedAt: raw.started_at || '',
+        stoppedAt: raw.stopped_at || '',
+        capabilities: caps,
+    };
+}
+
+function uploadFreshness(meta) {
+    const status = String(meta.status || '').toLowerCase();
+    if (status !== 'running') {
+        return {
+            label: meta.lastUploadAt ? formatRelativeTime(meta.lastUploadAt) : '未上传',
+            warn: false,
+            title: meta.lastUploadAt ? formatTime(meta.lastUploadAt) : '',
+        };
+    }
+    if (!meta.lastUploadAt) {
+        return { label: '等待首次上传', warn: true, title: 'session 正在运行，但还没有登记 last_upload_at' };
+    }
+    const uploadedAt = new Date(meta.lastUploadAt);
+    const uploadedMs = uploadedAt.getTime();
+    if (Number.isNaN(uploadedMs)) {
+        return { label: String(meta.lastUploadAt), warn: false, title: String(meta.lastUploadAt) };
+    }
+    const ageSec = Math.max(0, (Date.now() - uploadedMs) / 1000);
+    const staleAfterSec = Math.max(numberOrDefault(meta.uploadBatchSec, 60) * 2, 120);
+    return {
+        label: formatRelativeTime(meta.lastUploadAt),
+        warn: ageSec > staleAfterSec,
+        title: formatTime(meta.lastUploadAt),
+    };
+}
+
+function numberOrDefault(value, fallback) {
+    const num = Number(value);
+    return Number.isFinite(num) && num > 0 ? num : fallback;
+}
+
+function formatRateHz(value) {
+    return `${numberOrDefault(value, 19)} Hz`;
+}
+
+function formatDurationSec(value) {
+    return `${numberOrDefault(value, 0)} s`;
+}
+
+function formatHours(value) {
+    return `${numberOrDefault(value, 24)} h`;
+}
+
+function shortSessionID(value) {
+    const text = String(value || '');
+    if (!text) return '-';
+    return text.length > 14 ? `${text.slice(0, 8)}...${text.slice(-4)}` : text;
+}
+
+function formatRelativeTime(value) {
+    if (!value) return '-';
+    const date = new Date(value);
+    const ms = date.getTime();
+    if (Number.isNaN(ms)) return String(value);
+    const diffSec = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (diffSec < 60) return `${diffSec} 秒前`;
+    const diffMin = Math.round(diffSec / 60);
+    if (diffMin < 60) return `${diffMin} 分钟前`;
+    const diffHour = Math.round(diffMin / 60);
+    if (diffHour < 24) return `${diffHour} 小时前`;
+    return formatTime(value);
 }
 
 function LabelChips({ target }) {
@@ -388,6 +482,7 @@ function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, fil
     return [
         `target: ${target?.id || '-'}`,
         `profile_type: ${profileType}`,
+        `continuous_session: ${JSON.stringify(target?.continuous_session || {})}`,
         `time_range: ${timeWindow.from} -> ${timeWindow.to}`,
         `selector: ${labelSelectorForTarget(target, filters)}`,
         `filters: ${JSON.stringify(filters || {})}`,
