@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,12 +11,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/mini-drop/apiserver/config"
 	"github.com/mini-drop/apiserver/model"
 	pb_control "github.com/mini-drop/apiserver/proto/control"
-	parcapb "github.com/mini-drop/apiserver/proto/parca/query/v1alpha1"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/test/bufconn"
 )
 
 func profileRouter(s *APIServer) *gin.Engine {
@@ -288,7 +283,6 @@ func TestUpsertAgentFromStatCleansDuplicateAgentIDRows(t *testing.T) {
 
 func TestProfileFlamegraphUnconfiguredReturnsEmptyState(t *testing.T) {
 	s := newTestAPIServer(t)
-	s.Config.Profile = config.ProfileConfig{Enabled: false}
 	_ = s.DB.Create(&model.AgentInfo{Hostname: "node-a", IPAddr: "10.0.0.1", UID: "owner", Online: true, LastSeen: time.Now()}).Error
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/profile/flamegraph?target_id=10.0.0.1:hotmethod&profile_type=cpu", nil)
@@ -298,8 +292,8 @@ func TestProfileFlamegraphUnconfiguredReturnsEmptyState(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"empty":true`) || !strings.Contains(w.Body.String(), "Parca") {
-		t.Fatalf("expected empty Parca state, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"empty":true`) || !strings.Contains(w.Body.String(), "Native Continuous Profiling") {
+		t.Fatalf("expected native empty state, got %s", w.Body.String())
 	}
 }
 
@@ -341,61 +335,24 @@ func TestProfileDependencyUnavailable(t *testing.T) {
 	}
 }
 
-func TestParcaGRPCTopNMapsNativeResponse(t *testing.T) {
-	addr, dialer, stop := startTestParcaQueryService(t, &testParcaQueryService{
-		top: &parcapb.QueryResponse{
-			Report: &parcapb.QueryResponse_Top{Top: &parcapb.Top{
-				Unit: "nanoseconds",
-				List: []*parcapb.TopNode{
-					{Meta: &parcapb.TopNodeMeta{Function: &parcapb.Function{Name: "main.busy"}}, Cumulative: 42, Flat: 30},
-					{Meta: &parcapb.TopNodeMeta{Mapping: &parcapb.Mapping{File: "libc.so"}}, Cumulative: 12, Flat: 5},
-				},
-			}},
-			Total: 54,
-		},
-	})
-	defer stop()
-	client := NewHTTPProfileClient(config.ProfileConfig{Enabled: true, ParcaGRPCAddr: addr, ParcaUIURL: "http://parca.local"}).(*parcaProfileClient)
-	client.dialOptions = append(client.dialOptions, grpc.WithContextDialer(dialer))
-
-	out, err := client.TopN(context.Background(), ProfileQuery{
-		Host:        "111.230.29.115",
-		Service:     "hotmethod",
-		From:        time.Now().Add(-time.Minute),
-		To:          time.Now(),
-		ProfileType: "cpu",
-		Labels:      map[string]interface{}{"job": "hotmethod", "instance": "111.230.29.115"},
-	})
-	if err != nil {
-		t.Fatalf("TopN: %v", err)
-	}
-	if out.Empty || out.Total != 54 || len(out.Items) != 2 {
-		t.Fatalf("unexpected TopN: %+v", out)
-	}
-	if out.Items[0].Name != "main.busy" || out.Items[0].Value != 42 || out.Items[0].Self != 30 || out.Unit != "nanoseconds" {
-		t.Fatalf("unexpected item mapping: %+v", out)
-	}
-	if !strings.Contains(out.Query, `instance="111.230.29.115"`) || out.ParcaURL == "" {
-		t.Fatalf("query/url not populated: %+v", out)
-	}
-}
-
-func TestParcaQuerySelectorIncludesAllowedFilters(t *testing.T) {
-	query := parcaQueryLabelSelector(ProfileQuery{
-		Host:    "wrong-host",
-		Service: "wrong-service",
+func TestNativeProfileSelectorIncludesAllowedFilters(t *testing.T) {
+	query := profileLabelSelector(ProfileQuery{
+		Host:    "111.230.29.115",
+		Service: "hotmethod",
 		Labels: map[string]interface{}{
 			"job":      "hotmethod",
 			"instance": "111.230.29.115",
 		},
 		Filters: map[string]interface{}{
 			"comm":     "python3",
+			"pid":      "1234",
+			"exe":      "/usr/bin/python3",
 			"job":      "evil",
 			"instance": "other-host",
 			"env":      "prod",
 		},
 	})
-	if query != `{comm="python3",instance="111.230.29.115",job="hotmethod"}` {
+	if query != `{comm="python3",pid="1234",exe="/usr/bin/python3",instance="111.230.29.115",job="hotmethod"}` {
 		t.Fatalf("query=%s", query)
 	}
 }
@@ -414,224 +371,6 @@ func TestProfileQueryLabelsCannotOverrideTargetIdentity(t *testing.T) {
 	if labels["job"] != "hotmethod" || labels["instance"] != "111.230.29.115" || labels["env"] != "prod" {
 		t.Fatalf("labels=%#v", labels)
 	}
-}
-
-func TestParcaLabelValuesUsesTargetScopedComm(t *testing.T) {
-	svc := &testParcaQueryService{
-		labels: []string{"job", "instance", "comm"},
-		valuesByLabel: map[string][]string{
-			"comm": {"python3", "test_c_profilin", "python3"},
-		},
-	}
-	addr, dialer, stop := startTestParcaQueryService(t, svc)
-	defer stop()
-	client := NewHTTPProfileClient(config.ProfileConfig{Enabled: true, ParcaGRPCAddr: addr}).(*parcaProfileClient)
-	client.dialOptions = append(client.dialOptions, grpc.WithContextDialer(dialer))
-
-	out, err := client.LabelValues(context.Background(), ProfileQuery{
-		Host:        "111.230.29.115",
-		Service:     "hotmethod",
-		From:        time.Now().Add(-time.Minute),
-		To:          time.Now(),
-		ProfileType: "cpu",
-		Labels:      map[string]interface{}{"job": "hotmethod", "instance": "111.230.29.115"},
-	}, "comm")
-	if err != nil {
-		t.Fatalf("LabelValues: %v", err)
-	}
-	if !out.Available || strings.Join(out.Values, ",") != "python3,test_c_profilin" {
-		t.Fatalf("unexpected label values: %+v", out)
-	}
-	if svc.lastValuesRequest == nil || len(svc.lastValuesRequest.GetMatch()) != 1 {
-		t.Fatalf("Values request not captured")
-	}
-	match := svc.lastValuesRequest.GetMatch()[0]
-	if !strings.Contains(match, `job="hotmethod"`) || !strings.Contains(match, `instance="111.230.29.115"`) || strings.Contains(match, "comm=") {
-		t.Fatalf("unexpected label-values match: %s", match)
-	}
-}
-
-func TestParcaGRPCFlamegraphMapsNativeResponse(t *testing.T) {
-	addr, dialer, stop := startTestParcaQueryService(t, &testParcaQueryService{
-		flamegraph: &parcapb.QueryResponse{
-			Report: &parcapb.QueryResponse_Flamegraph{Flamegraph: &parcapb.Flamegraph{
-				Unit: "nanoseconds",
-				Root: &parcapb.FlamegraphRootNode{
-					Cumulative: 100,
-					Children: []*parcapb.FlamegraphNode{
-						{
-							Meta:       &parcapb.TopNodeMeta{Function: &parcapb.Function{Name: "root.fn"}},
-							Cumulative: 100,
-							Children: []*parcapb.FlamegraphNode{
-								{Meta: &parcapb.TopNodeMeta{Function: &parcapb.Function{Name: "leaf.fn"}}, Cumulative: 40},
-							},
-						},
-					},
-				},
-			}},
-			Total: 100,
-		},
-	})
-	defer stop()
-	client := NewHTTPProfileClient(config.ProfileConfig{Enabled: true, ParcaGRPCAddr: addr, ParcaUIURL: "http://parca.local"}).(*parcaProfileClient)
-	client.dialOptions = append(client.dialOptions, grpc.WithContextDialer(dialer))
-
-	out, err := client.Flamegraph(context.Background(), ProfileQuery{
-		Host:        "111.230.29.115",
-		Service:     "hotmethod",
-		From:        time.Now().Add(-time.Minute),
-		To:          time.Now(),
-		ProfileType: "cpu",
-		Labels:      map[string]interface{}{"job": "hotmethod", "instance": "111.230.29.115"},
-	})
-	if err != nil {
-		t.Fatalf("Flamegraph: %v", err)
-	}
-	if out.Empty || out.Total != 100 || out.Unit != "nanoseconds" || len(out.Nodes) != 1 {
-		t.Fatalf("unexpected flamegraph: %+v", out)
-	}
-	if out.Nodes[0].Name != "root.fn" || out.Nodes[0].Self != 60 || len(out.Nodes[0].Children) != 1 {
-		t.Fatalf("unexpected node mapping: %+v", out.Nodes[0])
-	}
-	if !strings.Contains(out.Query, `instance="111.230.29.115"`) || out.ParcaURL == "" {
-		t.Fatalf("query/url not populated: %+v", out)
-	}
-}
-
-func TestParcaGRPCFlamegraphResolvesTableIndexesAsOneBased(t *testing.T) {
-	out := parcaFlamegraphResponseToMiniDrop(&parcapb.QueryResponse{
-		Report: &parcapb.QueryResponse_Flamegraph{Flamegraph: &parcapb.Flamegraph{
-			Unit: "nanoseconds",
-			Root: &parcapb.FlamegraphRootNode{
-				Cumulative: 100,
-				Children: []*parcapb.FlamegraphNode{
-					{
-						Meta:       &parcapb.TopNodeMeta{LocationIndex: 1},
-						Cumulative: 100,
-						Children: []*parcapb.FlamegraphNode{
-							{Meta: &parcapb.TopNodeMeta{LocationIndex: 2}, Cumulative: 40},
-						},
-					},
-				},
-			},
-			Locations: []*parcapb.Location{
-				{Lines: []*parcapb.Line{{FunctionIndex: 1}}},
-				{MappingIndex: 1},
-			},
-			Function: []*parcapb.Function{
-				{Name: "first.fn"},
-				{Name: "wrong.second.fn"},
-			},
-			Mapping: []*parcapb.Mapping{
-				{File: "first.mapping"},
-				{File: "wrong.second.mapping"},
-			},
-		}},
-		Total: 100,
-	})
-
-	if out.Empty || len(out.Nodes) != 1 {
-		t.Fatalf("unexpected flamegraph: %+v", out)
-	}
-	if out.Nodes[0].Name != "first.fn" {
-		t.Fatalf("root name=%q, want first.fn", out.Nodes[0].Name)
-	}
-	if len(out.Nodes[0].Children) != 1 || out.Nodes[0].Children[0].Name != "first.mapping" {
-		t.Fatalf("child mapping name mismatch: %+v", out.Nodes[0].Children)
-	}
-}
-
-func TestParcaTargetStatusUsesRemoteStoreLabels(t *testing.T) {
-	addr, dialer, stop := startTestParcaQueryService(t, &testParcaQueryService{
-		valuesByLabel: map[string][]string{
-			"job":      {"hotmethod"},
-			"instance": {"111.230.29.115"},
-		},
-	})
-	defer stop()
-	client := NewHTTPProfileClient(config.ProfileConfig{Enabled: true, ParcaGRPCAddr: addr}).(*parcaProfileClient)
-	client.dialOptions = append(client.dialOptions, grpc.WithContextDialer(dialer))
-
-	status := client.TargetStatus(context.Background(), ProfileTarget{
-		IP:          "111.230.29.115",
-		ServiceName: "hotmethod",
-		Labels:      map[string]interface{}{"job": "hotmethod", "instance": "111.230.29.115"},
-	})
-	if status.Status != "online_with_samples" || status.Error != "" {
-		t.Fatalf("unexpected status: %+v", status)
-	}
-}
-
-func TestParcaTargetStatusDistinguishesNoSamples(t *testing.T) {
-	addr, dialer, stop := startTestParcaQueryService(t, &testParcaQueryService{labels: []string{"job", "instance"}})
-	defer stop()
-	client := NewHTTPProfileClient(config.ProfileConfig{Enabled: true, ParcaGRPCAddr: addr}).(*parcaProfileClient)
-	client.dialOptions = append(client.dialOptions, grpc.WithContextDialer(dialer))
-
-	status := client.TargetStatus(context.Background(), ProfileTarget{
-		IP:          "111.230.29.115",
-		ServiceName: "hotmethod",
-		Labels:      map[string]interface{}{"job": "hotmethod", "instance": "111.230.29.115"},
-	})
-	if status.Status != "online_no_samples" || status.Error != "" {
-		t.Fatalf("unexpected status: %+v", status)
-	}
-}
-
-type testParcaQueryService struct {
-	parcapb.UnimplementedQueryServiceServer
-	top               *parcapb.QueryResponse
-	flamegraph        *parcapb.QueryResponse
-	valuesByLabel     map[string][]string
-	values            []string
-	labels            []string
-	lastValuesRequest *parcapb.ValuesRequest
-	lastLabelsRequest *parcapb.LabelsRequest
-	lastQueryRequest  *parcapb.QueryRequest
-}
-
-func (s *testParcaQueryService) ProfileTypes(context.Context, *parcapb.ProfileTypesRequest) (*parcapb.ProfileTypesResponse, error) {
-	return &parcapb.ProfileTypesResponse{Types: []*parcapb.ProfileType{{Name: "process_cpu", SampleType: "samples", SampleUnit: "count", PeriodType: "cpu", PeriodUnit: "nanoseconds", Delta: true}}}, nil
-}
-
-func (s *testParcaQueryService) Query(_ context.Context, req *parcapb.QueryRequest) (*parcapb.QueryResponse, error) {
-	s.lastQueryRequest = req
-	if req.GetReportType() == parcapb.QueryRequest_REPORT_TYPE_FLAMEGRAPH_TABLE && s.flamegraph != nil {
-		return s.flamegraph, nil
-	}
-	if s.top != nil {
-		return s.top, nil
-	}
-	return &parcapb.QueryResponse{Report: &parcapb.QueryResponse_Top{Top: &parcapb.Top{}}}, nil
-}
-
-func (s *testParcaQueryService) Values(_ context.Context, req *parcapb.ValuesRequest) (*parcapb.ValuesResponse, error) {
-	s.lastValuesRequest = req
-	if s.valuesByLabel != nil {
-		return &parcapb.ValuesResponse{LabelValues: s.valuesByLabel[req.GetLabelName()]}, nil
-	}
-	return &parcapb.ValuesResponse{LabelValues: s.values}, nil
-}
-
-func (s *testParcaQueryService) Labels(_ context.Context, req *parcapb.LabelsRequest) (*parcapb.LabelsResponse, error) {
-	s.lastLabelsRequest = req
-	return &parcapb.LabelsResponse{LabelNames: s.labels}, nil
-}
-
-func startTestParcaQueryService(t *testing.T, svc parcapb.QueryServiceServer) (string, func(context.Context, string) (net.Conn, error), func()) {
-	t.Helper()
-	lis := bufconn.Listen(1024 * 1024)
-	server := grpc.NewServer()
-	parcapb.RegisterQueryServiceServer(server, svc)
-	go func() {
-		_ = server.Serve(lis)
-	}()
-	return "bufnet", func(context.Context, string) (net.Conn, error) {
-			return lis.Dial()
-		}, func() {
-			server.Stop()
-			_ = lis.Close()
-		}
 }
 
 type failingProfileClient struct{}

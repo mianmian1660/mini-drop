@@ -1,11 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { select } from 'd3-selection';
-import { flamegraph as createFlamegraph } from 'd3-flame-graph';
-import 'd3-flame-graph/dist/d3-flamegraph.css';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { profiles } from '../api';
+import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
 import {
     PROFILE_SAMPLE_PERIOD_MS,
-    formatFlamegraphLabel,
     formatMetricValue,
     formatProfileTotal,
     formatRawMetric,
@@ -43,7 +40,7 @@ const S = {
     sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12, flexWrap: 'wrap' },
     subtle: { color: '#667085', fontSize: 12 },
     inlineNote: { color: '#667085', fontSize: 12, lineHeight: 1.5 },
-    flameBox: { height: 520, overflowX: 'auto', overflowY: 'hidden', border: '1px solid #eaecf0', borderRadius: 8, background: '#fff', padding: 6 },
+    flameBox: { height: 560, overflowX: 'auto', overflowY: 'auto', border: '1px solid #eaecf0', borderRadius: 8, background: '#fff', padding: 6 },
     empty: { textAlign: 'center', padding: 44, color: '#667085', background: '#fff', border: '1px dashed #d0d7de', borderRadius: 8 },
     error: { background: '#fff3f3', border: '1px solid #ffcdd2', color: '#b42318', borderRadius: 8, padding: 12 },
     warn: { color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '9px 12px', fontSize: 13 },
@@ -64,9 +61,6 @@ const RANGE_OPTIONS = [
     ['6h', '最近 6 小时'],
 ];
 
-const FLAMEGRAPH_MAX_DEPTH = 80;
-const FLAMEGRAPH_MAX_NODES = 3500;
-
 export default function ContinuousProfilingPanel({ target, targets = [], targetId = '', onTargetChange, showTargetSelect = false }) {
     const [range, setRange] = useState('30m');
     const [profileType, setProfileType] = useState('cpu');
@@ -82,13 +76,13 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [commMessage, setCommMessage] = useState('');
     const [commLoading, setCommLoading] = useState(false);
     const timeWindow = useMemo(() => makeTimeWindow(range), [range]);
-    const parcaURL = flamegraph?.parca_url || topn?.parca_url || target?.parca_query_url || target?.parca_ui_url;
+    const profileURL = flamegraph?.profile_url || topn?.profile_url || target?.profile_url;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
     const sampleState = sampleStateForTarget(target, flamegraph, topn);
     const unit = flamegraph?.unit || topn?.unit || '';
     const activeFilters = useMemo(() => (scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}), [scope, selectedComm]);
     const activeFilterText = activeFilters.comm ? `comm=${activeFilters.comm}` : '';
-    const scopeLabel = activeFilters.comm ? `进程级持续 profiling / ${activeFilterText} / CPU 占用时长` : '主机级持续 profiling / CPU 占用时长';
+    const scopeLabel = activeFilters.comm ? `进程级 Native Continuous Profiling / ${activeFilterText} / CPU 占用时长` : '整机 Native Continuous Profiling / CPU 占用时长';
 
     const refresh = useCallback(async () => {
         if (!target) return;
@@ -113,12 +107,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             if (fgRes.code === 0) setFlamegraph(fgRes.data);
             if (topRes.code === 0) setTopn(topRes.data);
             if (fgRes.code !== 0 || topRes.code !== 0) {
-                setError(fgRes.message || topRes.message || '持续 profiling 查询失败');
+                setError(fgRes.message || topRes.message || 'Native Continuous Profiling 查询失败');
             }
         } catch (err) {
             setFlamegraph(null);
             setTopn(null);
-            setError(err?.message || '持续 profiling 查询失败');
+            setError(err?.message || 'Native Continuous Profiling 查询失败');
         } finally {
             setQuerying(false);
         }
@@ -190,13 +184,13 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 <div style={S.head}>
                     <div>
                         <div style={S.titleLine}>
-                            <h3 style={S.title}>持续 profiling</h3>
+                            <h3 style={S.title}>Native Continuous Profiling</h3>
                             <span style={S.stateBadge}>{sampleState}</span>
                         </div>
                         <p style={S.subtitle}>{target.hostname || target.ip} · {target.service_name || 'hotmethod'}</p>
                     </div>
                     <div style={S.actions}>
-                        {parcaURL && <a href={parcaURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Parca</a>}
+                        {profileURL && <a href={profileURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Profile</a>}
                         <button style={S.btnSecondary} onClick={() => setResetKey(v => v + 1)} disabled={!hasFlamegraph}>重置缩放</button>
                         <button style={S.btn} onClick={refresh} disabled={querying}>{querying ? '刷新中' : '刷新'}</button>
                     </div>
@@ -249,7 +243,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <Metric label="热点函数" value={`${topn?.items?.length || 0} 个`} />
                 </div>
                 <div style={{ ...S.info, marginTop: 14 }}>
-                    {scopeLabel}；非样本数、非单次请求耗时。comm 是 Linux task comm，可能被截断到约 15 字符；19Hz 采样约 {PROFILE_SAMPLE_PERIOD_MS.toFixed(1)} 毫秒/样本。
+                    {scopeLabel}；整机低频采样，查询时按 comm/pid/exe 过滤。comm 是 Linux task comm，可能被截断到约 15 字符；19Hz 采样约 {PROFILE_SAMPLE_PERIOD_MS.toFixed(1)} 毫秒/样本。
                     {scope === 'process' && commMessage ? ` ${commMessage}` : ''}
                 </div>
                 <LabelChips target={target} />
@@ -265,9 +259,19 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             {flamegraph?.source || 'mini-drop'} · {profileUnitLabel(flamegraph?.unit || unit)} · 宽度按 {isCPUTimeUnit(flamegraph?.unit || unit) ? 'CPU 占用时长' : '原始 value'} 计算
                         </div>
                     </div>
-                    <span style={S.subtle}>{hasFlamegraph ? `${countNodes(flamegraph.nodes)} 个栈帧节点` : '暂无栈帧节点'}</span>
+                    <span style={S.subtle}>{hasFlamegraph ? `${countProfileNodes(flamegraph.nodes)} 个栈帧节点` : '暂无栈帧节点'}</span>
                 </div>
-                <FlamegraphCanvas key={resetKey} data={flamegraph} loading={querying} parcaURL={parcaURL} filterText={activeFilterText} />
+                <InteractiveFlamegraph
+                    key={resetKey}
+                    data={flamegraph}
+                    loading={querying}
+                    externalUrl={profileURL}
+                    externalLabel="打开 Profile"
+                    filterText={activeFilterText}
+                    emptyMessage="所选时间范围没有 profile 数据"
+                    loadingMessage="正在查询 Native profiling..."
+                    boxStyle={S.flameBox}
+                />
             </section>
 
             <section style={S.card}>
@@ -275,7 +279,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <h3 style={S.title}>热点 TopN</h3>
                     <span style={S.subtle}>{topn?.items?.length || 0} functions · {profileUnitLabel(topn?.unit || unit)}</span>
                 </div>
-                <TopNTable data={topn} loading={querying} parcaURL={parcaURL} filterText={activeFilterText} />
+                <TopNTable data={topn} loading={querying} profileURL={profileURL} filterText={activeFilterText} />
             </section>
 
             <details style={S.details}>
@@ -305,99 +309,11 @@ function LabelChips({ target }) {
     );
 }
 
-function FlamegraphCanvas({ data, loading, parcaURL, filterText = '' }) {
-    const graphRef = useRef(null);
-    const chartRef = useRef(null);
-    const [renderError, setRenderError] = useState('');
-    const renderData = useMemo(() => data ? prepareFlamegraphForRender(data) : null, [data]);
-
-    useEffect(() => {
-        if (!graphRef.current || !renderData || renderData.empty || !Array.isArray(renderData.nodes) || renderData.nodes.length === 0) return undefined;
-        const selection = select(graphRef.current);
-        selection.selectAll('*').remove();
-        setRenderError('');
-        try {
-            const width = Math.max(graphRef.current.clientWidth - 16 || 1120, 1120);
-            const height = Math.max(320, Math.min(500, (maxDepth(renderData.nodes) + 3) * 18));
-            const chart = createFlamegraph()
-                .width(width)
-                .height(height)
-                .cellHeight(17)
-                .transitionDuration(120)
-                .minFrameSize(0.8)
-                .sort(true)
-                .label(d => formatFlamegraphLabel(d, renderData.unit))
-                .title('');
-            chartRef.current = chart;
-            selection.datum(miniDropToD3Flamegraph(renderData)).call(chart);
-        } catch (err) {
-            chartRef.current = null;
-            setRenderError(err?.message || '火焰图渲染失败');
-        }
-        return () => {
-            chartRef.current = null;
-            selection.selectAll('*').remove();
-        };
-    }, [renderData]);
-
-    if (loading && !data) return <div style={S.empty}>正在查询持续 profiling...</div>;
-    if (!data || data.empty || !Array.isArray(data.nodes) || data.nodes.length === 0) {
-        return <ProfileEmpty message={data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '所选时间范围没有 profile 数据')} url={data?.parca_url || parcaURL} />;
-    }
-
-    return (
-        <>
-            {renderData?.render_note && <div style={{ ...S.inlineNote, marginBottom: 8 }}>{renderData.render_note}</div>}
-            <div ref={graphRef} style={S.flameBox} />
-            {renderError && <div style={{ ...S.warn, marginTop: 12 }}>火焰图渲染失败：{renderError}</div>}
-            {renderError && <ProfileEmpty message="仍可通过 Parca 查询入口或下方 TopN 排查热点。" url={data?.parca_url || parcaURL} />}
-        </>
-    );
-}
-
-function prepareFlamegraphForRender(data) {
-    if (!data || data.empty || !Array.isArray(data.nodes)) return data;
-    const originalNodes = countNodes(data.nodes);
-    const originalDepth = maxDepth(data.nodes);
-    if (originalNodes <= FLAMEGRAPH_MAX_NODES && originalDepth <= FLAMEGRAPH_MAX_DEPTH) {
-        return data;
-    }
-    const budget = { remaining: FLAMEGRAPH_MAX_NODES };
-    const nodes = pruneProfileNodes(data.nodes, 1, budget);
-    const shownNodes = countNodes(nodes);
-    const notes = [];
-    if (originalDepth > FLAMEGRAPH_MAX_DEPTH) notes.push(`深度 ${originalDepth} -> ${maxDepth(nodes)}`);
-    if (originalNodes > shownNodes) notes.push(`节点 ${shownNodes}/${originalNodes}`);
-    return {
-        ...data,
-        nodes,
-        render_note: `火焰图已按展示性能裁剪（${notes.join('，')}）。TopN 和诊断信息仍保留完整查询结果。`,
-    };
-}
-
-function pruneProfileNodes(nodes, depth, budget) {
-    if (!Array.isArray(nodes) || budget.remaining <= 0) return [];
-    const out = [];
-    const sorted = [...nodes].sort((a, b) => Number(b.value || 0) - Number(a.value || 0));
-    for (const node of sorted) {
-        if (budget.remaining <= 0) break;
-        budget.remaining -= 1;
-        const next = { ...node };
-        if (depth >= FLAMEGRAPH_MAX_DEPTH || budget.remaining <= 0) {
-            next.children = [];
-        } else {
-            next.children = pruneProfileNodes(node.children || [], depth + 1, budget);
-        }
-        out.push(next);
-    }
-    return out;
-}
-
-function TopNTable({ data, loading, parcaURL, filterText = '' }) {
+function TopNTable({ data, loading, profileURL, filterText = '' }) {
     if (loading && !data) return <div style={S.empty}>正在查询 TopN...</div>;
     const items = data?.items || [];
     if (data?.empty || items.length === 0) {
-        return <ProfileEmpty message={data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} url={data?.parca_url || parcaURL} />;
+        return <ProfileEmpty message={data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} url={data?.profile_url || profileURL} />;
     }
     return (
         <div style={S.tableWrap}>
@@ -427,46 +343,19 @@ function ProfileEmpty({ message, url }) {
     return (
         <div style={S.empty}>
             <div style={{ fontWeight: 700, color: '#475467', marginBottom: 6 }}>{message}</div>
-            {url && <a href={url} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Parca</a>}
+            {url && <a href={url} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Profile</a>}
         </div>
     );
 }
 
-function miniDropToD3Flamegraph(data) {
-    return {
-        name: 'root',
-        value: Number(data?.total || sumNodeValues(data?.nodes || [])) || 1,
-        children: (data?.nodes || []).map(toD3Node),
-    };
-}
-
-function toD3Node(node) {
-    return {
-        name: node.name || 'unknown',
-        value: Math.max(0, Number(node.value || 0)),
-        children: (node.children || []).map(toD3Node),
-    };
-}
-
-function maxDepth(nodes, depth = 1) {
-    if (!Array.isArray(nodes) || nodes.length === 0) return depth;
-    return Math.max(...nodes.map(node => maxDepth(node.children || [], depth + 1)));
-}
-
-function countNodes(nodes) {
-    return (nodes || []).reduce((sum, node) => sum + 1 + countNodes(node.children || []), 0);
-}
-
-function sumNodeValues(nodes) {
-    return nodes.reduce((sum, node) => sum + Number(node.value || 0), 0);
-}
-
 function sampleStateForTarget(target, flamegraph, topn) {
-    const status = String(target?.parca_agent_status || 'unknown');
+    const status = String(target?.profile_status || 'unknown');
     if (status === 'online_with_samples') return '有样本';
     if (status === 'online_no_samples') return '在线但暂无样本';
     if (status === 'online') return '在线';
-    if (status === 'parca_unreachable') return 'Parca 不可达';
+    if (status === 'running') return '运行中';
+    if (status === 'stopped') return '已停止';
+    if (status === 'no_session') return '暂无 session';
     if (status === 'query_unsupported') return '查询不兼容';
     if (flamegraph?.empty || topn?.empty) return '暂无样本';
     if (status === 'offline') return '离线';
@@ -505,7 +394,7 @@ function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, fil
         `query: ${flamegraph?.query || topn?.query || '-'}`,
         `unit: ${flamegraph?.unit || topn?.unit || '-'}`,
         `total_raw_value: ${formatRawMetric(flamegraph?.total || topn?.total || 0, flamegraph?.unit || topn?.unit || '')}`,
-        `parca_url: ${flamegraph?.parca_url || topn?.parca_url || target?.parca_query_url || target?.parca_ui_url || '-'}`,
+        `profile_url: ${flamegraph?.profile_url || topn?.profile_url || target?.profile_url || '-'}`,
     ].join('\n');
 }
 
@@ -529,7 +418,7 @@ function truncate(value, limit) {
 }
 
 function prioritizeProcessNames(values) {
-    const preferred = ['test_c_profilin', 'test_python_pro', 'python3', 'drop_agent', 'parca-agent'];
+    const preferred = ['test_c_profilin', 'python3', 'test_go_profili', 'java', 'node', 'drop_agent'];
     const unique = Array.from(new Set((values || []).filter(Boolean).map(String)));
     return unique.sort((a, b) => {
         const ai = preferred.indexOf(a);

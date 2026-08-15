@@ -79,68 +79,6 @@ services:
       /bin/sh -c " mc alias set myminio http://minio:9000 drop dropdrop; mc mb --ignore-existing myminio/drop-data; mc anonymous set public myminio/drop-data; echo 'MinIO init: bucket=drop-data, policy=public'; "
 
   # ========================================================
-  # parca — 持续 Profiling 存储与查询服务
-  # ========================================================
-  parca:
-    image: ghcr.io/parca-dev/parca:v0.28.0
-    user: "0:0"
-    command:
-      - /parca
-      - --config-path=/etc/parca/parca.yaml
-      - --http-address=:7070
-      - --enable-persistence
-      - --storage-path=/var/lib/parca
-      - --log-level=info
-    ports:
-      - "7070:7070"
-    volumes:
-      - ./deploy/parca/parca.yaml:/etc/parca/parca.yaml:ro
-      - parcadata:/var/lib/parca
-
-  # ========================================================
-  # parca-agent — 本机持续 Profiling Agent（真实 Linux 下可选开启）
-  # 远端主机请单独运行 parca-agent，并使用：
-  # --remote-store-address=<中心IP>:7070 --remote-store-insecure
-  # --metadata-external-labels=job=hotmethod;env=development;instance=<远端IP>;node=<远端hostname>
-  # ========================================================
-  parca_agent:
-    image: ghcr.io/parca-dev/parca-agent:v0.49.0
-    profiles:
-      - host-parca-agent
-    command:
-      - --node=mini-drop-local
-      - --remote-store-address=127.0.0.1:7070
-      - --remote-store-insecure
-      - --remote-store-use-v2-schema=false
-      - --metadata-external-labels=job=hotmethod;env=development;instance=127.0.0.1;node=mini-drop-local
-      - --log-level=info
-    restart: unless-stopped
-    network_mode: host
-    privileged: true
-    pid: host
-    security_opt:
-      - apparmor:unconfined
-    cap_add:
-      - SYS_ADMIN
-      - SYS_PTRACE
-      - PERFMON
-      - BPF
-      - SYS_RESOURCE
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /sys/kernel/debug:/sys/kernel/debug:rw
-      - /sys/kernel/tracing:/sys/kernel/tracing:rw
-      - /sys/fs/bpf:/sys/fs/bpf:rw
-      - /proc:/host/proc:ro
-    depends_on:
-      parca:
-        condition: service_started
-
-  # ========================================================
   # drop_server — C++ 调度中心
   # 接收心跳、派发任务、收结果
   # ========================================================
@@ -212,9 +150,6 @@ services:
       ALLOW_INSECURE_TRANSPORT: "true"
       METRICS_ENABLED: "true"
       PROFILE_ENABLED: "true"
-      PARCA_URL: "http://parca:7070"
-      PARCA_GRPC_ADDR: "parca:7070"
-      PARCA_UI_URL: "http://localhost:7070"
       AGENT_DISCOVERY_EXTRA_IPS: "111.230.29.115" # 远端 drop_agent 自报该 IP 后，首页会显示独立远程主机
       S3_ENDPOINT: "minio:9000" # MinIO 地址（Docker 内部网络）
       S3_PUBLIC_ENDPOINT: "localhost:9000" # 浏览器访问地址（预签名 URL 用）
@@ -228,8 +163,6 @@ services:
       minio:
         condition: service_healthy
       drop_server:
-        condition: service_started
-      parca:
         condition: service_started
     healthcheck:
       test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:8191/healthz >/dev/null 2>&1" ]
@@ -281,4 +214,3 @@ services:
 volumes:
   pgdata:
   miniodata:
-  parcadata:

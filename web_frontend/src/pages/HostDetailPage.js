@@ -7,6 +7,7 @@ import Pagination from '../components/Pagination';
 import TimelineChart, { statusColor } from '../components/TimelineChart';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { formatMetricValue, metricColumnLabel } from '../utils/profileMetrics';
+import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
 
 const S = {
     container: { maxWidth: 1320, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
@@ -72,8 +73,8 @@ const S = {
 const tabs = [
     { id: 'overview', label: '概览' },
     { id: 'tasks', label: '任务列表' },
-    { id: 'timeline', label: '时间轴' },
-    { id: 'profiling', label: '持续 profiling' },
+    { id: 'timeline', label: '深度采样时间轴' },
+    { id: 'profiling', label: 'Native Profiling' },
     { id: 'logs', label: 'Agent 日志' },
 ];
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed' };
@@ -147,7 +148,7 @@ export default function HostDetailPage() {
             });
             if (res.code === 0) setProfileSummary(res.data || null);
         } catch (err) {
-            setProfileSummary({ empty: true, message: err?.message || '持续 profiling 查询失败' });
+            setProfileSummary({ empty: true, message: err?.message || 'Native Continuous Profiling 查询失败' });
         }
     }, []);
 
@@ -259,12 +260,12 @@ export default function HostDetailPage() {
 }
 
 function HostContext({ target, activeTab }) {
-    const parcaText = statusLabel(String(target.parca_agent_status || 'unknown'), 'parca');
+    const profileText = statusLabel(String(target.profile_status || 'unknown'), 'profile');
     const summary = [
         target.hostname || target.ip || '-',
         target.ip || '-',
         target.service_name || '-',
-        `parca_agent ${parcaText}`,
+        `Native profiling ${profileText}`,
     ].join(' · ');
     return (
         <details style={S.contextDetails}>
@@ -281,7 +282,7 @@ function HostContext({ target, activeTab }) {
                 <ContextItem label="service" value={target.service_name || '-'} />
                 <ContextItem label="environment" value={target.environment || '-'} />
                 <ContextItem label="按需采样 drop_agent" value={<StatusPill value={target.drop_agent_status} kind="drop" />} />
-                <ContextItem label="持续 profiling parca_agent" value={<StatusPill value={target.parca_agent_status} kind="parca" />} />
+                <ContextItem label="Native Continuous Profiling" value={<StatusPill value={target.profile_status} kind="profile" />} />
                 <ContextItem label="time range" value={activeTab === 'profiling' ? 'Tab 内选择' : '当前主机上下文'} />
                 <ContextItem label="labels" value={labelSummary(target.labels)} wide />
             </div>
@@ -290,24 +291,24 @@ function HostContext({ target, activeTab }) {
 }
 
 function DropAgentNotice({ target, activeTab }) {
-    const parcaReady = isParcaAgentReady(target?.parca_agent_status);
-    if (activeTab === 'profiling' && parcaReady) {
+    const profileReady = isProfileReady(target?.profile_status);
+    if (activeTab === 'profiling' && profileReady) {
         return (
             <div style={S.info}>
-                drop_agent 离线只影响按需采样创建；当前持续 profiling 来自 parca_agent，仍可查看整机 CPU 占用时长。
+                drop_agent 离线只影响按需采样创建；Native Continuous Profiling session 仍可查看整机 CPU 占用时长。
             </div>
         );
     }
     return (
         <div style={S.warn}>
-            drop_agent 离线，暂不能新建按需采样；持续 profiling 是否可看取决于 parca_agent 状态。
+            drop_agent 离线，暂不能新建按需采样；Native Continuous Profiling 是否可看取决于 session 状态。
         </div>
     );
 }
 
 function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks: taskItems, schedules: scheduleItems, profileSummary, onRefresh, onTab }) {
     const profilingMsg = profileSummary?.empty
-        ? (profileSummary.message || '无持续 profiling 数据')
+        ? (profileSummary.message || '无 Native profiling 数据')
         : `${profileSummary?.items?.length || 0} 个热点函数 · ${formatMetricValue(profileSummary?.total, profileSummary?.unit)}`;
     return (
         <>
@@ -321,8 +322,8 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                     <Metric label="资源数据源" value={stat.source === 'grpc' ? '实时 gRPC' : '数据库快照'} />
                     <Metric label="CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
                     <Metric label="内存" value={formatMemory(stat.memory_kb)} />
-                    <Metric label="定时窗口" value={scheduleItems.length} />
-                    <Metric label="持续 profiling" value={profilingMsg} />
+                    <Metric label="深度采样窗口" value={scheduleItems.length} />
+                    <Metric label="Native profiling" value={profilingMsg} />
                 </div>
                 <div style={S.capWrap}>
                     {capabilities.length === 0 ? <span style={S.subtle}>未声明采集能力</span> : capabilities.map(cap => <span key={cap} style={S.capPill}>{capabilityLabel(cap)}</span>)}
@@ -339,10 +340,10 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                 </section>
                 <section style={S.card}>
                     <div style={S.sectionHead}>
-                        <h3 style={S.sectionTitle}>最近定时窗口</h3>
+                        <h3 style={S.sectionTitle}>最近深度采样窗口</h3>
                         <button style={S.btnSm} onClick={() => onTab('timeline')}>查看时间轴</button>
                     </div>
-                    {scheduleItems.length === 0 ? <div style={S.empty}>该主机暂无持续采集计划</div> : (
+                    {scheduleItems.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划</div> : (
                         <div style={S.auditList}>
                             {scheduleItems.slice(0, 5).map(s => (
                                 <div key={s.sid} style={S.auditItem}>
@@ -358,10 +359,10 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
 
             <section style={S.card}>
                 <div style={S.sectionHead}>
-                    <h3 style={S.sectionTitle}>持续 profiling 摘要</h3>
-                    <button style={S.btnSm} onClick={() => onTab('profiling')}>进入持续 profiling</button>
+                    <h3 style={S.sectionTitle}>Native profiling 摘要</h3>
+                    <button style={S.btnSm} onClick={() => onTab('profiling')}>进入 Native profiling</button>
                 </div>
-                {profileSummary?.empty ? <div style={S.empty}>{profileSummary.message || '暂无持续 profiling 数据'}</div> : <TopNTable data={profileSummary} compact />}
+                {profileSummary?.empty ? <div style={S.empty}>{profileSummary.message || '暂无 Native profiling 数据'}</div> : <TopNTable data={profileSummary} compact />}
             </section>
         </>
     );
@@ -431,6 +432,10 @@ function HostTimelinePanel({ target }) {
     const [kindFilter, setKindFilter] = useState('');
     const [hasResultFilter, setHasResultFilter] = useState('');
     const [range, setRange] = useState('all');
+    const [customFrom, setCustomFrom] = useState('');
+    const [customTo, setCustomTo] = useState('');
+    const [appliedCustomFrom, setAppliedCustomFrom] = useState('');
+    const [appliedCustomTo, setAppliedCustomTo] = useState('');
     const [baselineTid, setBaselineTid] = useState('');
 
     const timelineFilters = useCallback(() => ({
@@ -448,15 +453,26 @@ function HostTimelinePanel({ target }) {
         }
     }, [target.ip, masterTid]);
 
-    const loadTimeline = useCallback(async (sid = masterTid) => {
+    const loadTimeline = useCallback(async (sid = masterTid, override = {}) => {
         if (!sid) return;
         setMasterTid(sid);
         setLoading(true);
         setError('');
         try {
             const opts = { ...timelineFilters() };
-            if (range !== 'all') {
-                const hours = Number(range);
+            const effectiveRange = override.range || range;
+            if (effectiveRange === 'custom') {
+                const from = override.from || appliedCustomFrom;
+                const to = override.to || appliedCustomTo;
+                if (!from || !to) {
+                    setPoints([]);
+                    setError('请选择自定义开始时间和结束时间后再查询');
+                    return;
+                }
+                opts.from = from;
+                opts.to = to;
+            } else if (effectiveRange !== 'all') {
+                const hours = Number(effectiveRange);
                 const to = new Date();
                 const from = new Date(to.getTime() - hours * 3600 * 1000);
                 opts.from = from.toISOString();
@@ -470,19 +486,51 @@ function HostTimelinePanel({ target }) {
         } finally {
             setLoading(false);
         }
-    }, [masterTid, range, timelineFilters]);
+    }, [masterTid, range, appliedCustomFrom, appliedCustomTo, timelineFilters]);
 
     useEffect(() => { loadSchedules(); }, [loadSchedules]);
-    useEffect(() => { if (masterTid) loadTimeline(masterTid); }, [masterTid, range, statusFilter, kindFilter, hasResultFilter, loadTimeline]);
+    useEffect(() => {
+        if (!masterTid || range === 'custom') return;
+        loadTimeline(masterTid);
+    }, [masterTid, range, statusFilter, kindFilter, hasResultFilter, loadTimeline]);
+
+    const applyCustomRange = useCallback(() => {
+        if (!customFrom || !customTo) {
+            setError('请选择自定义开始时间和结束时间后再查询');
+            return;
+        }
+        const fromISO = localDateTimeToISO(customFrom);
+        const toISO = localDateTimeToISO(customTo);
+        if (!fromISO || !toISO) {
+            setError('自定义时间格式无效');
+            return;
+        }
+        if (new Date(toISO) < new Date(fromISO)) {
+            setError('结束时间不能早于开始时间');
+            return;
+        }
+        setRange('custom');
+        setAppliedCustomFrom(fromISO);
+        setAppliedCustomTo(toISO);
+        loadTimeline(masterTid, { range: 'custom', from: fromISO, to: toISO });
+    }, [customFrom, customTo, masterTid, loadTimeline]);
+
+    const refreshTimeline = useCallback(() => {
+        if (range === 'custom') {
+            loadTimeline(masterTid, { range: 'custom' });
+            return;
+        }
+        loadTimeline(masterTid);
+    }, [range, masterTid, loadTimeline]);
 
     return (
         <>
             <section style={S.card}>
                 <div style={S.sectionHead}>
-                    <h3 style={S.sectionTitle}>该主机时间轴</h3>
-                    <span style={S.subtle}>只显示 target_ip = {target.ip} 的定时采集</span>
+                    <h3 style={S.sectionTitle}>该主机周期性深度采样时间轴</h3>
+                    <span style={S.subtle}>只显示 target_ip = {target.ip} 的周期性深度采样窗口 · 时间按浏览器本地时区显示：{browserTimeZoneLabel()}</span>
                 </div>
-                {scheduleList.length === 0 ? <div style={S.empty}>该主机暂无持续采集计划。点击“新建采样”并勾选持续采集后会出现在这里。</div> : (
+                {scheduleList.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划。点击“新建采样”并勾选周期性深度采样后会出现在这里。</div> : (
                     <>
                         <div style={S.toolbar}>
                             <select style={S.select} value={masterTid} onChange={e => setMasterTid(e.target.value)}>
@@ -493,6 +541,7 @@ function HostTimelinePanel({ target }) {
                                 <option value="1">最近 1 小时</option>
                                 <option value="24">最近 24 小时</option>
                                 <option value="168">最近 7 天</option>
+                                <option value="custom">自定义区间</option>
                             </select>
                             <select style={S.select} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
                                 <option value="">全部状态</option>
@@ -506,8 +555,28 @@ function HostTimelinePanel({ target }) {
                                 <option value="true">有结果</option>
                                 <option value="false">无结果</option>
                             </select>
-                            <button style={S.btnSm} onClick={() => loadTimeline(masterTid)}>刷新</button>
+                            <button style={S.btnSm} onClick={refreshTimeline}>刷新</button>
                         </div>
+                        {range === 'custom' && (
+                            <div style={S.toolbar}>
+                                <input
+                                    type="datetime-local"
+                                    style={S.input}
+                                    value={customFrom}
+                                    onChange={e => setCustomFrom(e.target.value)}
+                                    aria-label="自定义开始时间"
+                                />
+                                <span style={S.subtle}>→</span>
+                                <input
+                                    type="datetime-local"
+                                    style={S.input}
+                                    value={customTo}
+                                    onChange={e => setCustomTo(e.target.value)}
+                                    aria-label="自定义结束时间"
+                                />
+                                <button style={S.btnSm} onClick={applyCustomRange}>查询</button>
+                            </div>
+                        )}
                         {error && <div style={S.error}>{error}</div>}
                         {loading ? <div style={S.loading}>加载时间轴...</div> : points.length === 0 ? <div style={S.empty}>当前筛选条件下没有采集窗口</div> : (
                             <TimelineResult points={points} baselineTid={baselineTid} setBaselineTid={setBaselineTid} />
@@ -545,7 +614,7 @@ function TimelineResult({ points, baselineTid, setBaselineTid }) {
                             </div>
                         </div>
                         <div style={S.subtle}>
-                            窗口 {formatTime(p.window_start || p.create_time)} → {formatTime(p.window_end || p.end_time) || '进行中'}
+                            窗口 {formatDateTime(p.window_start || p.create_time)} → {formatDateTime(p.window_end || p.end_time) || '进行中'}
                         </div>
                     </div>
                 ))}
@@ -615,11 +684,11 @@ function TaskTable({ tasks: taskItems, compact = false }) {
     );
 }
 
-function TopNTable({ data, loading, compact = false, parcaUIURL }) {
+function TopNTable({ data, loading, compact = false, profileURL }) {
     if (loading && !data) return <div style={S.empty}>正在查询 TopN...</div>;
     const items = data?.items || [];
     if (data?.empty || items.length === 0) {
-        return <ProfileEmptyState parcaUIURL={parcaUIURL} compact={compact} />;
+        return <ProfileEmptyState profileURL={profileURL} compact={compact} />;
     }
     return (
         <table style={S.table}>
@@ -643,19 +712,19 @@ function TopNTable({ data, loading, compact = false, parcaUIURL }) {
     );
 }
 
-function ProfileEmptyState({ parcaUIURL, compact = false }) {
+function ProfileEmptyState({ profileURL, compact = false }) {
     return (
         <div style={S.empty}>
             <div style={{ fontWeight: 700, color: '#475467', marginBottom: 6 }}>
-                暂无持续 profiling 样本
+                暂无 Native profiling 样本
             </div>
             {!compact && (
                 <div style={{ ...S.subtle, marginBottom: 12 }}>
-                    请切换时间范围或打开持续 profiling 标签页查看详情。
+                    请切换时间范围或打开 Native profiling 标签页查看详情。
                 </div>
             )}
-            {parcaUIURL && (
-                <a href={parcaUIURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Parca 查询</a>
+            {profileURL && (
+                <a href={profileURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Profile 查询</a>
             )}
         </div>
     );
@@ -675,12 +744,12 @@ function Metric({ label, value }) {
 
 function StatusPill({ value, kind = '' }) {
     const status = String(value || 'unknown');
-    const color = isParcaAgentReady(status) ? '#16a34a' : status === 'offline' ? '#dc2626' : status === 'unconfigured' ? '#64748b' : '#7c3aed';
+    const color = isProfileReady(status) ? '#16a34a' : status === 'offline' ? '#dc2626' : (status === 'unconfigured' || status === 'no_session') ? '#64748b' : '#7c3aed';
     return <span style={{ ...S.badge, background: color, color: '#fff' }}>{statusLabel(status, kind)}</span>;
 }
 
-function isParcaAgentReady(status) {
-    return status === 'online' || status === 'online_with_samples';
+function isProfileReady(status) {
+    return status === 'running' || status === 'online_with_samples';
 }
 
 function statusLabel(status, kind = '') {
@@ -689,7 +758,9 @@ function statusLabel(status, kind = '') {
     if (status === 'online') return '在线';
     if (status === 'offline') return kind === 'drop' ? '离线（仅影响按需采样）' : '离线';
     if (status === 'unconfigured') return '未配置';
-    if (status === 'parca_unreachable') return 'Parca 不可达';
+    if (status === 'no_session') return '暂无 session';
+    if (status === 'running') return '运行中';
+    if (status === 'stopped') return '已停止';
     if (status === 'query_unsupported') return '查询不兼容';
     return status || '未知';
 }

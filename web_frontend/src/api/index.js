@@ -71,7 +71,7 @@ export const tasks = {
     artifactDownload: (tid, artifactId) => client.get(`/api/v1/tasks/${tid}/artifacts/${artifactId}/download`),
     eventsStreamURL: (tid) => apiURL(`/api/v1/tasks/${encodeURIComponent(tid)}/events/stream`),
     suggestionsStreamURL: (tid) => apiURL(`/api/v1/tasks/${encodeURIComponent(tid)}/suggestions/stream`),
-    // Continuous Profiling 时间轴
+    // Periodic Deep Sampling 时间轴
     // 全部窗口:      tasks.timeline(masterTid)
     // 区间筛选:      tasks.timeline(masterTid, { from, to })    （RFC3339 字符串）
     // 按时刻回溯:    tasks.timeline(masterTid, { at, span })    at 为 RFC3339，span 为时长如 '30m'/'2h'
@@ -88,13 +88,21 @@ export const tasks = {
         }),
 };
 
-// ---------- 持续 Profiling ----------
+// ---------- Native Continuous Profiling ----------
 export const profiles = {
     targets: () => client.get('/api/v1/profile/targets'),
     flamegraph: (params = {}) => client.get('/api/v1/profile/flamegraph', { params }),
     topn: (params = {}) => client.get('/api/v1/profile/topn', { params }),
     diff: (params = {}) => client.get('/api/v1/profile/diff', { params }),
     labelValues: (params = {}) => client.get('/api/v1/profile/label-values', { params }),
+};
+
+export const continuous = {
+    createSession: (data) => client.post('/api/v1/continuous/sessions', data),
+    sessions: (params = {}) => client.get('/api/v1/continuous/sessions', { params }),
+    stopSession: (sid) => client.post(`/api/v1/continuous/sessions/${sid}/stop`),
+    timeline: (sid, params = {}) => client.get(`/api/v1/continuous/sessions/${sid}/timeline`, { params }),
+    query: (params = {}) => client.get('/api/v1/continuous/query', { params }),
 };
 
 // ---------- 分析结果 ----------
@@ -117,7 +125,7 @@ export const analysisResults = {
     },
 };
 
-// ---------- 定时任务 / Continuous Profiling ----------
+// ---------- 周期性深度采样 / Periodic Deep Sampling ----------
 export const schedules = {
     create: (data) => client.post('/api/v1/schedule/task', data),
     list: () => client.get('/api/v1/schedule/tasks'),

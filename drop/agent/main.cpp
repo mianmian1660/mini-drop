@@ -19,6 +19,7 @@
 #include "common/AsyncProfilerProfiler.h" // drop::run_async_profiler (profilerType=1)
 #include "common/PprofProfiler.h"         // drop::run_pprof (profilerType=2)
 #include "common/BpfProfiler.h"           // drop::run_bpf (profilerType=3, eBPF)
+#include "common/CapabilityDetector.h"    // drop::detect_capabilities
 #include "common/Process.h"               // drop::collect_self_pidstats, collect_children_pidstats
 #include "common/COSClient.h"             // drop::upload_to_minio
 #include "common/Utils.h"                 // drop::read_file_content
@@ -781,11 +782,21 @@ int main(int argc, char **argv)
         cfg = drop_agent::AgentConfig::Default("localhost:50051");
     }
 
+    auto capabilityReport = drop::detect_capabilities();
+    cfg.capabilities = drop::merge_capabilities(cfg.capabilities, capabilityReport.capabilities);
+
     cout << "[agent] drop_agent 启动 (W5 多采集器)" << endl;
     cout << "[agent] hostname=" << cfg.hostname
          << " ip=" << cfg.ipAddr
          << " uid=" << cfg.uid
          << " version=" << cfg.agentVersion << endl;
+    cout << "[agent] Native CP capabilities: perf_event="
+         << (capabilityReport.perfEventReadable ? "yes" : "no")
+         << " perf=" << (capabilityReport.perfCommand ? "yes" : "no")
+         << " btf=" << (capabilityReport.btf ? "yes" : "no")
+         << " ebpf_fs=" << (capabilityReport.ebpfFS ? "yes" : "no")
+         << " sched_tracepoint=" << (capabilityReport.schedTracepoint ? "yes" : "no")
+         << " perf_event_paranoid=" << capabilityReport.perfEventParanoid << endl;
 
     // ---------- 2. 多 Server 故障转移连接 ----------
     common::CosConfig cosConfig;

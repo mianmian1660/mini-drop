@@ -1648,7 +1648,7 @@ func (s *APIServer) UploadTestFile(c *gin.Context) {
 const defaultTimelineSpan = 30 * time.Minute
 
 // ============================================================
-// GetTimeline — Continuous Profiling 时间轴
+// GetTimeline — Periodic Deep Sampling 时间轴（旧 schedule master + child tasks）
 // GET /api/v1/tasks/timeline?master_tid=xxx
 // GET /api/v1/tasks/timeline?master_tid=xxx&from=<RFC3339>&to=<RFC3339>  区间筛选
 // GET /api/v1/tasks/timeline?master_tid=xxx&at=<RFC3339>&span=30m        回溯某一时刻前后的窗口

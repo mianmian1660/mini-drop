@@ -294,7 +294,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
             if (f.continuous) {
                 const r = await schedules.create({ ...payload, cron_expr: f.cron_expr, window_seconds: f.window_seconds });
                 if (r.code === 0) {
-                    setCid(r.data?.sid || ''); setIsSch(true); setOk('持续采集已创建！');
+                    setCid(r.data?.sid || ''); setIsSch(true); setOk('周期性深度采样已创建！');
                     setTimeout(() => onSuccess?.(), 3000);
                 } else setErr(r.message || '创建失败');
             } else {
@@ -403,11 +403,11 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                 <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
                     <label style={S.chk}>
                         <input type="checkbox" checked={f.continuous} onChange={e => up('continuous', e.target.checked)} />
-                        <span style={{ fontWeight: 'bold', fontSize: 14 }}>持续采集 (Continuous Profiling)</span>
+                        <span style={{ fontWeight: 'bold', fontSize: 14 }}>周期性深度采样 (Periodic Deep Sampling)</span>
                     </label>
                     {f.continuous && (
                         <div>
-                            <label style={S.label}>持续采集窗口预设</label>
+                            <label style={S.label}>周期性深度采样窗口预设</label>
                             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
                                 {WINDOW_PRESETS.map(p => (
                                     <button key={p.cron} style={S.presetBtn(f.cron_expr === p.cron && f.window_seconds === p.windowSeconds)}
@@ -429,7 +429,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
 
                 <div style={{ marginTop: 16, display: 'flex', gap: 10 }}>
                     <button style={{ ...S.btn, opacity: sub || kload || kindList.length === 0 ? 0.6 : 1 }} onClick={submit} disabled={sub || kload || kindList.length === 0}>
-                        {sub ? '提交中...' : f.continuous ? '创建持续采集' : '提交任务'}
+                        {sub ? '提交中...' : f.continuous ? '创建周期性深度采样' : '提交任务'}
                     </button>
                     <button style={{ ...S.btn, background: '#999' }} onClick={onClose} disabled={sub}>取消</button>
                 </div>

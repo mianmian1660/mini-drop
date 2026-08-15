@@ -43,7 +43,7 @@ type APIServer struct {
 	Cron       *cron.Cron              // 定时任务调度器（W5）
 	CronJobs   map[string]cron.EntryID // SID → cron EntryID 映射（支持动态停止/删除）
 	TaskSvc    *TaskService            // 阶段 2：任务编排服务
-	ProfileCli ProfileClient           // Continuous Profiling 查询客户端（Parca adapter）
+	ProfileCli ProfileClient           // Native Continuous Profiling 查询客户端
 }
 
 // New 创建一个新的 APIServer 实例
@@ -67,7 +67,7 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 		Router: router,
 	}
 	s.TaskSvc = NewTaskService(s)
-	s.ProfileCli = NewHTTPProfileClient(cfg.Profile)
+	s.ProfileCli = NewNativeProfileClient()
 
 	// 初始化对象存储（MinIO）
 	if err := s.initStorage(); err != nil {
@@ -697,17 +697,23 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/tasks/:tid/events/stream", s.StreamTaskEvents)
 		api.GET("/tasks/:tid/suggestions/stream", s.StreamTaskSuggestions)
 
-		// Continuous Profiling 时间轴 (W6)
+		// Periodic Deep Sampling 时间轴（旧 schedule 兼容入口）
 		api.GET("/tasks/timeline", s.GetTimeline)
 		api.GET("/tasks/diff", s.GetTaskDiff)
 
-		// Continuous Profiling 查询（Parca adapter）
+		// Native Continuous Profiling 查询
 		api.GET("/profile/targets", s.ListProfileTargets)
 		api.GET("/profile/query", s.GetProfileFlamegraph)
 		api.GET("/profile/flamegraph", s.GetProfileFlamegraph)
 		api.GET("/profile/topn", s.GetProfileTopN)
 		api.GET("/profile/diff", s.GetProfileDiff)
 		api.GET("/profile/label-values", s.GetProfileLabelValues)
+		api.POST("/continuous/sessions", s.CreateContinuousSession)
+		api.GET("/continuous/sessions", s.ListContinuousSessions)
+		api.POST("/continuous/sessions/:sid/stop", s.StopContinuousSession)
+		api.POST("/internal/continuous/batches", s.IngestContinuousBatch)
+		api.GET("/continuous/sessions/:sid/timeline", s.GetContinuousTimeline)
+		api.GET("/continuous/query", s.QueryContinuousProfile)
 
 		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)
