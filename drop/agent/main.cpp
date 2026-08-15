@@ -23,6 +23,7 @@
 #include "common/Process.h"               // drop::collect_self_pidstats, collect_children_pidstats
 #include "common/COSClient.h"             // drop::upload_to_minio
 #include "common/Utils.h"                 // drop::read_file_content
+#include "common/SymbolCollector.h"       // drop::collect_and_upload_symbols (阶段三)
 #include "agent/Config.h"                 // drop_agent::AgentConfig
 
 #include <iostream>
@@ -692,6 +693,19 @@ static hotmethod::TaskResult build_task_result(
                 else
                     cout << "[agent] kallsyms 上传失败，内核符号将无法解析" << endl;
                 ::remove(kallsymsPath.c_str());
+            }
+
+            // 用户态符号：只有 perf 采集器产出 perf.data，其余采集器
+            // (async-profiler / pprof / eBPF) 不经过 perf script，处理纯属浪费。
+            // 阶段三：按 build-id 去重上传，不再整包打 tar 直传 MinIO
+            // （旧的 archive_perf_symbols/symbols.tar.gz 机制已废弃）。
+            if (task.profilertype() == 0)
+            {
+                const char *symbolBaseEnv = getenv("APISERVER_SYMBOL_BASE_URL");
+                string symbolBaseURL = (symbolBaseEnv && *symbolBaseEnv) ? symbolBaseEnv : "http://apiserver:8191";
+                if (!drop::collect_and_upload_symbols(actualPath, task.taskid(),
+                                                       task.sampleargv().pid(), symbolBaseURL))
+                    cout << "[agent] 符号采集/上传未完全成功，部分用户态符号可能无法解析" << endl;
             }
 
             if (rawUploaded)

@@ -266,6 +266,33 @@ perf buildid-list -i perf.data
 | 二 | 对 `pprof_demo` 采集一次，TopN 中出现 `main.burnCPU` 等真实 Go 函数名 |
 | 三 | 连续两次对同一目标采集，第二次的 `symbols/check` 返回空 `missing` 列表（证明去重生效） |
 
+### 9.1 阶段一实际验收结果（2026-08-12）
+
+**结论：通过。** 整机（`target_pid=0`，`perf record -a`）采集一次 15 秒 CPU 样本，前端 TopN 表格中不再出现任何 `[[kernel.kallsyms]]` 条目，内核帧全部替换为真实函数名，例如 `pv_native_safe_halt`（98.3%，虚拟机空闲占比高属正常）、`do_user_addr_fault`、`_raw_spin_unlock_irqrestore`、`dput`、`do_writepages`、`rcu_do_batch`、`__alloc_pages`、`__pte_offset_map_lock`、`seq_putc`、`rb_next`、`__d_lookup`。
+
+TopN 中仍存在的方括号条目（`[libseccomp.so.2.5.3]` `[perl]` `[runc]` `[containerd-shim-runc-v2]` `[apiserver]` `[containerd]` `[dockerd]` `[libc.so.6]` `[perf-6064.map]`）均为**用户态符号未解析**，属于阶段二/三范围，不是阶段一遗留问题。
+
+**验收过程中发现并修复一处遗漏**：最初实现只把 `kallsyms_path` 接进了 `generate_flamegraph()`（生成 SVG 的路径），漏接了 `get_folded_stacks()`（生成 TopN/建议/`folded.txt` 的路径）——`get_folded_stacks()` 的函数签名当时根本没有 `kallsyms_path` 参数。现象是同一次分析里 `perf script` 被调用两次，一次带 `--kallsyms=`（SVG 用，正确）、一次不带（TopN 用，仍解析失败），最终建议引擎插入的还是 `[[kernel.kallsyms]]`。修复：给 `get_folded_stacks()` 加 `kallsyms_path` 参数并透传给 `_detect_and_fold()`，调用点同步传入 `local_kallsyms`。
+
+**教训**：给一个"内核符号"需求接线时，实际有两条独立的消费路径（SVG 生成 / TopN 生成），各自调用一次 `perf script`，参数必须两处都接，只测 SVG 或只测 TopN 都无法发现另一条路径的遗漏。
+
+### 9.2 阶段二实际验收结果（2026-08-13）
+
+**结论：通过。** 用 `pprof_demo`（`main.go` 中 `burnCPU()` 启 8 个 goroutine 死循环烧 CPU，制造持续、可核对的用户态负载）作为验证目标，针对其宿主机 PID 采集一次 15 秒 CPU 样本，前端 TopN：
+
+```
+main.burnCPU.func1                    1,907 次   99.6%
+irqentry_exit_to_user_mode                6 次   0.31%
+profile_signal_perm                       1 次   0.05%
+compress/flate.(*deflateFast).encode      1 次   0.05%
+```
+
+`main.burnCPU.func1` 是验收标准指定的目标函数（`.func1` 为其内部匿名 goroutine 闭包），99.6% 占比确认解析生效；`compress/flate.(*deflateFast).encode` 是另一个独立解析成功的 Go 标准库函数，排除孤例巧合；`irqentry_exit_to_user_mode`、`profile_signal_perm` 为真实内核函数，确认阶段一未被这次改动带出回归。
+
+**验收过程中发现并修复一处与符号化无关的预置 bug**：`analysis/flamegraph.py` 的 `PERF_SCRIPT_FIELDS` 固定要求 `perf script` 打印 `cpu` 字段，但 `perf record -p <pid>`（针对具体进程）默认不记录采样的 CPU 归属，仅 `-a`（整机模式）才有。此前所有验证都恰好用整机模式，从未暴露；一旦针对具体 PID 采集，`perf script` 直接以 exit 255 崩溃，分析全链路失败，与符号包本身无关。修复：`PERF_SCRIPT_FIELDS` 去掉 `cpu` 字段（下游折叠栈解析、TopN、建议均不依赖该列）。
+
+**发现一个已知特性，非阻塞性 bug**：符号包（`.build-id/<xx>/<rest>/elf`）的自定义 tar 打包/解压机制本身是正确的——软链接是相对路径、指向 `.debug` 内部自包含结构，实测解压后文件完整（8.8MB 有效 ELF 内容），排除了最初怀疑的"软链接跨容器失效"。真正的现象是：**Agent 自身的 `$HOME/.debug` build-id 缓存需要"热身"**——`perf record` 对一个从未见过的目标二进制首次采集时，其内部自动建缓存的过程可能跟不上，打出的符号包会漏掉该二进制；同一目标被多次采集后，Agent 本地缓存积累完整，后续符号包才会包含它。首次尝试（`target_pid=56751`）TopN 仍显示 `[pprof-demo]`，未替换任何后端逻辑、仅等待并重新采集一次后即变为 `main.burnCPU.func1`，印证了这一特性而非随机故障。**影响**：对一个全新目标的第一次采集，用户态符号可能不完整；同一目标重复采集会自愈。暂不阻塞验收，但应记入已知限制，避免被误判为间歇性 bug 而重复排查。
+
 ---
 
 ## 10. 前置验证实验（动手前必做）

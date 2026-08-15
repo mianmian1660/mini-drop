@@ -31,7 +31,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STACKCOLLAPSE_SCRIPT = os.path.join(_SCRIPT_DIR, "stackcollapse-perf.pl")
 FLAMEGRAPH_SCRIPT = os.path.join(_SCRIPT_DIR, "flamegraph.pl")
 _FOLDED_STACK_LINE_RE = re.compile(r"^.+\s+\d+(?:\.\d+)?$")
-PERF_SCRIPT_FIELDS = "comm,pid,tid,cpu,time,event,ip,sym,dso"
+PERF_SCRIPT_FIELDS = "comm,pid,tid,time,event,ip,sym,dso"
 
 
 def _check_dependencies():
@@ -227,6 +227,11 @@ def generate_flamegraph(perf_data_path: str,
         title:          火焰图标题
         width:          SVG 宽度
         colors:         配色方案
+        kallsyms_path:  Agent 快照的 /proc/kallsyms，解析内核符号用
+
+    用户态符号（build-id 索引）由调用方在此之前通过
+    symbolizer.install_symbols_for_task() 装进 perf 默认查找的
+    ~/.debug/.build-id/ 下（阶段三），这里不需要再接一个显式路径参数。
 
     返回:
         SVG 字符串
@@ -301,6 +306,13 @@ def get_folded_stacks(perf_data_path: str, kallsyms_path: str = None) -> str:
         kallsyms_path:  Agent 采集时快照的 /proc/kallsyms，透传给
             _detect_and_fold 用于解析内核帧。传 None 时内核符号可能
             无法解析（详见 run_perf_script 的说明）。
+
+    用户态符号（build-id 索引）由调用方在此之前装进 perf 默认查找的
+    ~/.debug/.build-id/ 下（见 symbolizer.install_symbols_for_task，
+    阶段三），不需要本函数再接一个显式路径参数——历史上这里曾经只有
+    generate_flamegraph 接了对应参数、本函数漏接，是阶段一 kallsyms
+    踩过的同一类坑（见 docs/symbolization-design.md §9.1），阶段三改成
+    "调用前统一装好"从根上避免了这层隐式依赖。
 
     返回:
         折叠后的栈文本
