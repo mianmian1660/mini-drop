@@ -59,6 +59,7 @@ namespace drop
             string perfBin = resolve_perf_bin();
             args_storage.push_back(perfBin);
             args_storage.push_back("record");
+            args_storage.push_back("--no-buildid-cache");
 
             string event = taskDesc.sampleargv().event();
             if (!event.empty())

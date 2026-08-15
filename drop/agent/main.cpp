@@ -43,6 +43,8 @@
 #include <cstring>
 #include <utility>
 #include <sys/stat.h>
+#include <sys/utsname.h>
+#include <unistd.h>
 
 #include <grpcpp/grpcpp.h>
 #include "common/proto/healthcheck.grpc.pb.h"
@@ -100,6 +102,65 @@ static string sha256_file(const string &path)
         return "";
     size_t space = output.find(' ');
     return space == string::npos ? output : output.substr(0, space);
+}
+
+static string url_encode_local(const string &s)
+{
+    static const char *hex = "0123456789ABCDEF";
+    string out;
+    for (unsigned char c : s)
+    {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
+        {
+            out += static_cast<char>(c);
+        }
+        else
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+static string kernel_release()
+{
+    struct utsname u {};
+    if (uname(&u) == 0)
+        return string(u.release);
+    return "";
+}
+
+static string agent_hostname()
+{
+    const char *envHost = getenv("DROP_AGENT_HOSTNAME");
+    if (envHost && *envHost)
+        return string(envHost);
+    char buf[256] = {0};
+    if (gethostname(buf, sizeof(buf) - 1) == 0)
+        return string(buf);
+    return "";
+}
+
+static string agent_ip()
+{
+    const char *envIP = getenv("DROP_AGENT_IP");
+    if (envIP && *envIP)
+        return string(envIP);
+    return "";
+}
+
+static string apiserver_base_url()
+{
+    const char *symbolBaseEnv = getenv("APISERVER_SYMBOL_BASE_URL");
+    if (symbolBaseEnv && *symbolBaseEnv)
+        return string(symbolBaseEnv);
+    const char *nativeBaseEnv = getenv("DROP_NATIVE_CP_API_BASE_URL");
+    if (nativeBaseEnv && *nativeBaseEnv)
+        return string(nativeBaseEnv);
+    return "http://127.0.0.1:8191";
 }
 
 // ============================================================
@@ -164,6 +225,114 @@ static bool snapshot_kallsyms(const string &outPath)
     }
     out << content;
     out.close();
+    return true;
+}
+
+static bool response_upload_required(const string &response)
+{
+    string compact;
+    compact.reserve(response.size());
+    for (char c : response)
+    {
+        if (!isspace(static_cast<unsigned char>(c)))
+            compact += c;
+    }
+    return compact.find("\"upload_required\":true") != string::npos;
+}
+
+static bool response_upload_not_required(const string &response)
+{
+    string compact;
+    compact.reserve(response.size());
+    for (char c : response)
+    {
+        if (!isspace(static_cast<unsigned char>(c)))
+            compact += c;
+    }
+    return compact.find("\"upload_required\":false") != string::npos;
+}
+
+static bool check_kernel_symbol(const string &baseURL,
+                                const string &tid,
+                                const string &sha256,
+                                int64_t size,
+                                string *response)
+{
+    string reqPath = "/tmp/" + tid + "_kallsyms_check.json";
+    {
+        ofstream out(reqPath, ios::binary);
+        if (!out.is_open())
+            return false;
+        out << "{"
+            << "\"tid\":\"" << json_escape_local(tid) << "\","
+            << "\"sha256\":\"" << json_escape_local(sha256) << "\","
+            << "\"size_bytes\":" << size << ","
+            << "\"kernel_release\":\"" << json_escape_local(kernel_release()) << "\","
+            << "\"hostname\":\"" << json_escape_local(agent_hostname()) << "\","
+            << "\"target_ip\":\"" << json_escape_local(agent_ip()) << "\""
+            << "}";
+    }
+    int rc = drop::exec_capture({"curl", "-sS", "-m", "10", "-X", "POST",
+                                 "-H", "Content-Type: application/json",
+                                 "-d", "@" + reqPath,
+                                 baseURL + "/api/v1/kernel-symbols/check"},
+                                response, 4096);
+    ::remove(reqPath.c_str());
+    return rc == 0;
+}
+
+static bool put_kernel_symbol(const string &baseURL,
+                              const string &tid,
+                              const string &sha256,
+                              const string &path,
+                              string *response)
+{
+    string url = baseURL + "/api/v1/kernel-symbols/" + sha256 +
+                 "?tid=" + url_encode_local(tid) +
+                 "&kernel_release=" + url_encode_local(kernel_release()) +
+                 "&hostname=" + url_encode_local(agent_hostname()) +
+                 "&target_ip=" + url_encode_local(agent_ip());
+    int rc = drop::exec_capture({"curl", "-sS", "-m", "60", "-X", "PUT",
+                                 "--data-binary", "@" + path, url},
+                                response, 4096);
+    return rc == 0;
+}
+
+static bool ensure_kernel_symbol_uploaded(const string &baseURL,
+                                          const string &tid,
+                                          const string &kallsymsPath)
+{
+    string sum = sha256_file(kallsymsPath);
+    if (sum.empty())
+    {
+        cout << "[agent] kallsyms sha256 计算失败，跳过去重上传" << endl;
+        return false;
+    }
+
+    string checkResp;
+    if (!check_kernel_symbol(baseURL, tid, sum, file_size(kallsymsPath), &checkResp))
+    {
+        cout << "[agent] kernel-symbols/check 调用失败，内核符号将降级" << endl;
+        return false;
+    }
+    if (response_upload_not_required(checkResp))
+    {
+        cout << "[agent] 服务端已有 kallsyms sha256=" << sum << "，复用共享对象" << endl;
+        return true;
+    }
+    if (!response_upload_required(checkResp))
+    {
+        cout << "[agent] kernel-symbols/check 响应不可识别: " << checkResp << endl;
+        return false;
+    }
+
+    string putResp;
+    if (!put_kernel_symbol(baseURL, tid, sum, kallsymsPath, &putResp))
+    {
+        cout << "[agent] kernel-symbols 上传失败，内核符号将降级" << endl;
+        return false;
+    }
+    cout << "[agent] kallsyms 去重上传成功 sha256=" << sum << endl;
     return true;
 }
 
@@ -798,15 +967,13 @@ static hotmethod::TaskResult build_task_result(
             // 内核符号快照：随产物一起上传，analysis 侧靠它解析内核帧。
             // 失败只降级不影响任务成败——用户态符号和火焰图本身仍然可用。
             string kallsymsPath = "/tmp/" + task.taskid() + "_kallsyms";
-            string kallsymsKey = task.taskid() + "/kallsyms";
             if (snapshot_kallsyms(kallsymsPath))
             {
-                if (drop::upload_to_minio(cosConfig, kallsymsPath, kallsymsKey))
+                if (ensure_kernel_symbol_uploaded(apiserver_base_url(), task.taskid(), kallsymsPath))
                     cout << "[runner] stage=Upload taskID=" << task.taskid()
-                         << " kallsymsKey=" << kallsymsKey
                          << " size=" << file_size(kallsymsPath) << endl;
                 else
-                    cout << "[agent] kallsyms 上传失败，内核符号将无法解析" << endl;
+                    cout << "[agent] kallsyms 去重上传失败，内核符号将无法解析" << endl;
                 ::remove(kallsymsPath.c_str());
             }
 
@@ -816,8 +983,7 @@ static hotmethod::TaskResult build_task_result(
             // （旧的 archive_perf_symbols/symbols.tar.gz 机制已废弃）。
             if (task.profilertype() == 0)
             {
-                const char *symbolBaseEnv = getenv("APISERVER_SYMBOL_BASE_URL");
-                string symbolBaseURL = (symbolBaseEnv && *symbolBaseEnv) ? symbolBaseEnv : "http://apiserver:8191";
+                string symbolBaseURL = apiserver_base_url();
                 if (!drop::collect_and_upload_symbols(actualPath, task.taskid(),
                                                        task.sampleargv().pid(), symbolBaseURL))
                     cout << "[agent] 符号采集/上传未完全成功，部分用户态符号可能无法解析" << endl;

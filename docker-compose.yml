@@ -13,10 +13,17 @@
 #   # 注释       = 行注释
 # ============================================================
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
 
   # 本地验收用 Go pprof 服务；生产任务可填写任意 Agent 可访问的 pprof_url。
   pprof_demo:
+    logging: *default-logging
     build:
       context: ./pprof_demo
     ports:
@@ -32,6 +39,7 @@ services:
   # 存用户、任务、Agent 等所有业务数据
   # ========================================================
   postgres:
+    logging: *default-logging
     image: postgres:14 # 用官方 PostgreSQL 14 镜像
     environment:
       # 环境变量（相当于配置）
@@ -53,6 +61,7 @@ services:
   # 存 Agent 采集的 perf.data 等大文件
   # ========================================================
   minio:
+    logging: *default-logging
     image: minio/minio:latest
     command: server /data --console-address ":9001" # 启动服务
     environment:
@@ -71,6 +80,7 @@ services:
 
   # MinIO 初始化：创建 bucket 并设为公开读取（火焰图 SVG 可直接访问）
   minio-init:
+    logging: *default-logging
     image: minio/mc:latest
     depends_on:
       minio:
@@ -83,6 +93,7 @@ services:
   # 接收心跳、派发任务、收结果
   # ========================================================
   drop_server:
+    logging: *default-logging
     build:
       # 从 Dockerfile 构建（不从镜像仓库拉）
       context: ./drop # Dockerfile 所在目录
@@ -100,6 +111,7 @@ services:
   # 运行在被监控机器上，执行 perf 等采集工具
   # ========================================================
   drop_agent:
+    logging: *default-logging
     build:
       context: ./drop
       dockerfile: Dockerfile
@@ -141,6 +153,7 @@ services:
   # 前端和底层系统之间的"中间人"
   # ========================================================
   apiserver:
+    logging: *default-logging
     build:
       context: ./apiserver
       dockerfile: Dockerfile
@@ -159,6 +172,11 @@ services:
       S3_PUBLIC_ENDPOINT: "localhost:9000" # 浏览器访问地址（预签名 URL 用）
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"
+      RETENTION_ENABLED: "true"
+      ARTIFACT_RAW_RETENTION_HOURS: "168"
+      ARTIFACT_RESULT_RETENTION_HOURS: "720"
+      RETENTION_CLEANUP_INTERVAL_SEC: "3600"
+      RETENTION_BATCH_LIMIT: "200"
     extra_hosts:
       - "localhost:host-gateway" # 让容器内也能通过 localhost 访问宿主机上的 MinIO 端口
     depends_on:
@@ -180,6 +198,7 @@ services:
   # 轮询数据库中已完成的任务，自动触发火焰图/热点/建议分析
   # ========================================================
   analysis:
+    logging: *default-logging
     build:
       context: ./analysis
       dockerfile: Dockerfile
@@ -200,6 +219,7 @@ services:
   # 用户浏览器访问的就是这个
   # ========================================================
   web_frontend:
+    logging: *default-logging
     build:
       context: ./web_frontend
       dockerfile: Dockerfile
