@@ -63,6 +63,8 @@ set(COMMON_SRCS
     common/AsyncProfilerProfiler.cpp
     common/PprofProfiler.cpp
     common/BpfProfiler.cpp
+    common/CapabilityDetector.cpp
+    common/ContinuousSampler.cpp
     common/Process.cpp
     common/COSClient.cpp
     common/Utils.cpp

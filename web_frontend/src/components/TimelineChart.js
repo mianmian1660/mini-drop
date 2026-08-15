@@ -10,6 +10,7 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import * as d3 from 'd3';
+import { formatDateTime, formatTimeShort } from '../utils/time';
 
 const HEIGHT = 112;    // svg 总高
 const BAR_TOP = 30;    // 色块顶端 y
@@ -41,8 +42,6 @@ const endOf = (p) => {
     const e = p.window_end ? new Date(p.window_end) : null;
     return e && e > s ? e : new Date(s.getTime() + 30000);
 };
-
-const fmt = (d) => d.toLocaleString('zh-CN');
 
 export default function TimelineChart({ points }) {
     const wrapRef = useRef(null);
@@ -95,7 +94,9 @@ export default function TimelineChart({ points }) {
         const gAxis = svg.append('g').attr('transform', `translate(0,${AXIS_Y})`);
 
         const makeAxis = (scale) =>
-            d3.axisBottom(scale).ticks(Math.max(2, Math.floor(innerW / 90)));
+            d3.axisBottom(scale)
+                .ticks(Math.max(2, Math.floor(innerW / 90)))
+                .tickFormat(formatTimeShort);
 
         const draw = (scale) => {
             gAxis.call(makeAxis(scale));
@@ -124,7 +125,7 @@ export default function TimelineChart({ points }) {
                         lines: [
                             d.name || d.tid,
                             `${ST[d.status] || '未知'}${d.is_effective ? ' · 当时生效' : ''}`,
-                            `${fmt(startOf(d))} → ${fmt(endOf(d))}`,
+                            `${formatDateTime(startOf(d))} → ${formatDateTime(endOf(d))}`,
                         ],
                     });
                 })

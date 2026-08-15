@@ -4,9 +4,10 @@
 // 任务状态 + 可视化结果 + TopN/直方图摘要 + 产物下载
 // ============================================================
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { tasks, cosfiles } from '../api';
 import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
+import InteractiveFlamegraph, { foldedTextToFlamegraph } from '../components/InteractiveFlamegraph';
 import AICard from '../components/AICard';
 import { collectorLabelFromTask, collectorLabelByKind, parseRequestParams } from '../utils/collectors';
 
@@ -31,7 +32,8 @@ const styles = {
     stageMeta: { margin: '6px 0 0 0', fontSize: 11, lineHeight: 1.35, color: '#667085', wordBreak: 'break-word', whiteSpace: 'pre-wrap' },
     failure: { border: '1px solid #fda29b', background: '#fff6f5', borderRadius: 6, padding: 14, marginBottom: 16, display: 'flex', gap: 14, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' },
     notice: { display: 'flex', gap: 8, alignItems: 'center', background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 13 },
-    flameFrame: { width: '100%', height: 560, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
+    flameFrame: { width: '100%', height: 720, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
+    interactiveFlameBox: { height: 720, overflowX: 'auto', overflowY: 'auto', border: '1px solid #d0d7de', borderRadius: 6, background: '#fff', padding: 6 },
     histogramStage: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 420, border: '1px solid #d0d7de', borderRadius: 6, background: '#fbfcfe', padding: 16, overflow: 'hidden' },
     histogramImage: { width: '100%', height: 'clamp(340px, 42vw, 520px)', objectFit: 'contain', display: 'block' },
     visualEmpty: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 260, color: '#667085', textAlign: 'center', background: '#f8fafc', border: '1px dashed #cbd5e1', borderRadius: 6, padding: 24 },
@@ -97,6 +99,20 @@ export default function TaskResultPage() {
     const [retryNotice, setRetryNotice] = useState('');
     const [streamState, setStreamState] = useState('connecting');
     const [flameMeta, setFlameMeta] = useState(null);
+    const [foldedFlamegraph, setFoldedFlamegraph] = useState(null);
+    const [foldedLoading, setFoldedLoading] = useState(false);
+    const [foldedError, setFoldedError] = useState('');
+    const [manualRefreshSeq, setManualRefreshSeq] = useState(0);
+    const taskRef = useRef(null);
+    const filesRef = useRef([]);
+
+    useEffect(() => {
+        taskRef.current = task;
+    }, [task]);
+
+    useEffect(() => {
+        filesRef.current = files;
+    }, [files]);
 
     const applyFiles = useCallback((inputFiles = []) => {
         const safeFiles = Array.isArray(inputFiles)
@@ -109,7 +125,7 @@ export default function TaskResultPage() {
         setFiles(safeFiles);
     }, []);
 
-    const applyTaskData = useCallback((data = {}) => {
+    const applyTaskData = useCallback((data = {}, options = {}) => {
         setTask(data.task || {});
         setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
         setBpfHistogram(data.bpf_histogram || null);
@@ -117,11 +133,13 @@ export default function TaskResultPage() {
         setAttribution(readEmbeddedAttribution(data.suggestions));
         setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
         setArtifacts(Array.isArray(data.artifacts) ? data.artifacts : []);
-        applyFiles(data.files || []);
+        if (!options.preserveVisualFiles) {
+            applyFiles(data.files || []);
+        }
         setError('');
     }, [applyFiles]);
 
-    const loadTask = useCallback(async (isPoll = false) => {
+    const loadTask = useCallback(async (isPoll = false, options = {}) => {
         if (!tid) return;
         if (!isPoll) setLoading(true);
         setPolling(isPoll);
@@ -132,7 +150,7 @@ export default function TaskResultPage() {
                 if (!isPoll) setError(res.message || '任务不存在');
                 return;
             }
-            applyTaskData(res.data || {});
+            applyTaskData(res.data || {}, options);
         } catch (err) {
             if (!isPoll) setError('加载任务详情失败: ' + (err.message || '未知错误'));
         } finally {
@@ -163,6 +181,12 @@ export default function TaskResultPage() {
             console.error('加载文件列表失败:', err);
         }
     }, [tid, applyFiles]);
+
+    const manualRefresh = useCallback(async () => {
+        setManualRefreshSeq(seq => seq + 1);
+        await loadTask(true);
+        await loadFiles();
+    }, [loadTask, loadFiles]);
 
     useEffect(() => {
         if (!tid) {
@@ -196,7 +220,7 @@ export default function TaskResultPage() {
                 try {
                     const payload = JSON.parse(evt.data || '{}');
                     const data = payload.task_snapshot || payload;
-                    applyTaskData(data);
+                    applyTaskData(data, { preserveVisualFiles: isCompletedWithVisual(taskRef.current, filesRef.current) });
                 } catch (_) {
                     setStreamState('polling');
                 }
@@ -258,6 +282,9 @@ export default function TaskResultPage() {
     }, [task, files, loadTask, loadFiles, streamState]);
 
     const artifact = useMemo(() => pickVisualArtifact(files), [files]);
+    const foldedArtifact = useMemo(() => pickFoldedArtifact(files), [files]);
+    const foldedArtifactUrl = foldedArtifact?.url || '';
+    const foldedArtifactName = foldedArtifact?.name || '';
     useEffect(() => {
         if (!artifact?.url || artifact.type !== 'flamegraph') {
             setFlameMeta(null);
@@ -277,6 +304,38 @@ export default function TaskResultPage() {
             worker.terminate();
         };
     }, [artifact]);
+
+    useEffect(() => {
+        if (!foldedArtifactUrl || artifact?.type === 'bpf') {
+            setFoldedFlamegraph(null);
+            setFoldedError('');
+            setFoldedLoading(false);
+            return undefined;
+        }
+        let cancelled = false;
+        setFoldedLoading(true);
+        setFoldedError('');
+        fetch(foldedArtifactUrl, { credentials: 'include' })
+            .then(response => {
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return response.text();
+            })
+            .then(text => {
+                if (cancelled) return;
+                setFoldedFlamegraph(foldedTextToFlamegraph(text, displayFileName(foldedArtifactName)));
+            })
+            .catch(err => {
+                if (cancelled) return;
+                setFoldedFlamegraph(null);
+                setFoldedError(err?.message || 'folded stacks 加载失败');
+            })
+            .finally(() => {
+                if (!cancelled) setFoldedLoading(false);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [foldedArtifactUrl, foldedArtifactName, artifact?.type, manualRefreshSeq]);
     const stageStatus = Number(task?.status);
     const stageAnalysisStatus = Number(task?.analysis_status);
     const stages = useMemo(
@@ -301,7 +360,7 @@ export default function TaskResultPage() {
     const analysisStatus = Number(task.analysis_status);
     const statusName = statusNames[status] || 'UNKNOWN';
     const statusColor = statusColors[status] || '#667085';
-    const shouldPoll = isActiveTaskStatus(status) || (status === 2 && analysisStatus < 2 && !artifact);
+    const shouldPoll = isActiveTaskStatus(status) || (status === 2 && analysisStatus < 2 && !hasVisual(files));
 
     const refreshArtifactLink = async (artifactItem) => {
         if (!artifactItem?.id) return;
@@ -353,7 +412,7 @@ export default function TaskResultPage() {
                     <p style={styles.subtitle}>{tid}</p>
                     <p style={styles.streamState}>{streamState === 'live' ? '实时事件流已连接' : streamState === 'connecting' ? '正在连接实时事件流' : '实时事件流不可用，已回退轮询'}</p>
                 </div>
-                <button style={styles.button} onClick={() => loadTask(true)} disabled={polling}>
+                <button style={styles.button} onClick={manualRefresh} disabled={polling}>
                     {polling ? '刷新中...' : '刷新'}
                 </button>
             </div>
@@ -387,15 +446,29 @@ export default function TaskResultPage() {
 
             <StatusEventsPanel events={statusEvents} />
 
-            <div style={styles.split}>
-                <div style={styles.card}>
-                    <h3 style={styles.sectionTitle}>{isBpfHistogramTask ? 'eBPF 直方图' : isBpfCpuTask ? 'eBPF CPU 火焰图' : isJavaTask ? 'Java 火焰图' : isPprofTask ? 'Go pprof 调用图' : '火焰图'}</h3>
-                    <VisualResult artifact={artifact} task={task} isBpfHistogramTask={isBpfHistogramTask} flameMeta={flameMeta} />
-                </div>
+            <div style={styles.card}>
+                <h3 style={styles.sectionTitle}>{isBpfHistogramTask ? 'eBPF 直方图' : isBpfCpuTask ? 'eBPF CPU 火焰图' : isJavaTask ? 'Java 火焰图' : isPprofTask ? 'Go pprof 调用图' : '火焰图'}</h3>
+                <VisualResult
+                    artifact={artifact}
+                    foldedArtifact={foldedArtifact}
+                    foldedFlamegraph={foldedFlamegraph}
+                    foldedLoading={foldedLoading}
+                    foldedError={foldedError}
+                    task={task}
+                    isBpfHistogramTask={isBpfHistogramTask}
+                    flameMeta={flameMeta}
+                />
+            </div>
 
+            <div style={styles.split}>
                 <div style={styles.card}>
                     <h3 style={styles.sectionTitle}>采集参数</h3>
                     <ParameterPanel task={task} />
+                </div>
+
+                <div style={styles.card}>
+                    <h3 style={styles.sectionTitle}>结果状态</h3>
+                    <ResultStatePanel task={task} files={files} artifact={artifact} foldedArtifact={foldedArtifact} />
                 </div>
             </div>
 
@@ -463,7 +536,7 @@ function Metric({ label, value }) {
     );
 }
 
-function VisualResult({ artifact, task, isBpfHistogramTask, flameMeta }) {
+function VisualResult({ artifact, foldedArtifact, foldedFlamegraph, foldedLoading, foldedError, task, isBpfHistogramTask, flameMeta }) {
     if (artifact?.url) {
         if (artifact.type === 'bpf' || isBpfHistogramTask) {
             return (
@@ -481,6 +554,47 @@ function VisualResult({ artifact, task, isBpfHistogramTask, flameMeta }) {
                         </a>
                         <a href={artifact.url} target="_blank" rel="noreferrer" style={styles.button}>
                             新窗口查看
+                        </a>
+                    </div>
+                </div>
+            );
+        }
+
+        if (foldedArtifact?.url) {
+            return (
+                <div>
+                    {foldedError && (
+                        <div style={styles.notice}>
+                            folded stacks 加载失败：{safeText(foldedError)}。已回退到原始 SVG 视图。
+                        </div>
+                    )}
+                    {!foldedError && (
+                        <InteractiveFlamegraph
+                            data={foldedFlamegraph}
+                            loading={foldedLoading}
+                            loadingMessage="正在从 folded stacks 构建交互式火焰图..."
+                            emptyMessage="folded stacks 中没有可渲染的样本"
+                            externalUrl={artifact.url}
+                            externalLabel="原始 SVG 视图"
+                            boxStyle={styles.interactiveFlameBox}
+                        />
+                    )}
+                    {foldedError && (
+                        <iframe
+                            src={artifact.url}
+                            title="Flame Graph"
+                            style={styles.flameFrame}
+                        />
+                    )}
+                    <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                        <a href={artifact.downloadUrl || artifact.url} target="_blank" rel="noreferrer" style={{ ...styles.button, ...styles.primaryButton }} download={displayFileName(artifact.name)}>
+                            下载原始 SVG
+                        </a>
+                        <a href={artifact.url} target="_blank" rel="noreferrer" style={styles.button}>
+                            原始 SVG 视图
+                        </a>
+                        <a href={foldedArtifact.downloadUrl || foldedArtifact.url} target="_blank" rel="noreferrer" style={styles.button} download={displayFileName(foldedArtifact.name)}>
+                            下载 folded stacks
                         </a>
                     </div>
                 </div>
@@ -509,7 +623,29 @@ function VisualResult({ artifact, task, isBpfHistogramTask, flameMeta }) {
                         下载可视化文件
                     </a>
                     <a href={artifact.url} target="_blank" rel="noreferrer" style={styles.button}>
-                        新窗口查看
+                        原始 SVG 视图
+                    </a>
+                </div>
+            </div>
+        );
+    }
+
+    if (foldedArtifact?.url) {
+        return (
+            <div>
+                {foldedError && <div style={styles.notice}>folded stacks 加载失败：{safeText(foldedError)}</div>}
+                <InteractiveFlamegraph
+                    data={foldedFlamegraph}
+                    loading={foldedLoading}
+                    loadingMessage="正在从 folded stacks 构建交互式火焰图..."
+                    emptyMessage="folded stacks 中没有可渲染的样本"
+                    externalUrl={foldedArtifact.url}
+                    externalLabel="打开 folded stacks"
+                    boxStyle={styles.interactiveFlameBox}
+                />
+                <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                    <a href={foldedArtifact.downloadUrl || foldedArtifact.url} target="_blank" rel="noreferrer" style={{ ...styles.button, ...styles.primaryButton }} download={displayFileName(foldedArtifact.name)}>
+                        下载 folded stacks
                     </a>
                 </div>
             </div>
@@ -557,6 +693,29 @@ function ParameterPanel({ task }) {
             <p style={styles.paramHint}>
                 这些参数来自任务创建请求，分析产物会在采集完成后自动关联到当前任务。
             </p>
+        </div>
+    );
+}
+
+function ResultStatePanel({ task, files, artifact, foldedArtifact }) {
+    const status = Number(task?.status);
+    const analysisStatus = Number(task?.analysis_status);
+    const rows = [
+        ['可视化产物', artifact?.name ? displayFileName(artifact.name) : '暂无'],
+        ['folded stacks', foldedArtifact?.name ? displayFileName(foldedArtifact.name) : '暂无'],
+        ['产物数量', files.length],
+        ['自动刷新', isCompletedWithVisual(task, files) ? '已停止，使用手动刷新更新' : '等待任务或分析完成'],
+        ['分析状态', analysisNames[analysisStatus] || '未知'],
+        ['任务状态', statusNames[status] || 'UNKNOWN'],
+    ];
+    return (
+        <div style={styles.paramList}>
+            {rows.map(([label, value]) => (
+                <div key={label} style={styles.paramRow}>
+                    <span style={styles.paramLabel}>{label}</span>
+                    <span style={styles.paramValue}>{value}</span>
+                </div>
+            ))}
         </div>
     );
 }
@@ -932,8 +1091,22 @@ function pickVisualArtifact(files) {
     };
 }
 
+function pickFoldedArtifact(files) {
+    const picked = files.find(isFoldedStackFile);
+    if (!picked) return null;
+    return {
+        name: picked.name,
+        url: picked.view_url || picked.download_url || '',
+        downloadUrl: picked.download_url || picked.view_url || '',
+    };
+}
+
 function hasVisual(files) {
-    return Boolean(pickVisualArtifact(files));
+    return Boolean(pickVisualArtifact(files) || pickFoldedArtifact(files));
+}
+
+function isCompletedWithVisual(task, files) {
+    return Number(task?.status) === 2 && hasVisual(files || []);
 }
 
 function isActiveTaskStatus(status) {
@@ -1005,6 +1178,18 @@ function isJavaFlamegraphFile(file) {
     return name.endsWith('.svg') && (
         name.includes('java_flamegraph') ||
         name.includes('java-flamegraph')
+    );
+}
+
+function isFoldedStackFile(file) {
+    const name = String(file?.name || '').toLowerCase();
+    if (!name) return false;
+    return (
+        name.endsWith('folded.txt') ||
+        name.endsWith('.collapsed') ||
+        name.includes('java_folded') ||
+        name.includes('java-folded') ||
+        name.includes('profile.collapsed')
     );
 }
 

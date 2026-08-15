@@ -79,13 +79,10 @@ type ObservabilityConfig struct {
 	MetricsEnabled bool `mapstructure:"metrics_enabled"`
 }
 
-// ProfileConfig controls the continuous profiling query proxy.
+// ProfileConfig controls Native Continuous Profiling query defaults.
 type ProfileConfig struct {
-	Enabled       bool   `mapstructure:"enabled"`
-	ParcaURL      string `mapstructure:"parca_url"`
-	ParcaGRPCAddr string `mapstructure:"parca_grpc_addr"`
-	ParcaUIURL    string `mapstructure:"parca_ui_url"`
-	TimeoutSec    int    `mapstructure:"timeout_sec"`
+	Enabled    bool `mapstructure:"enabled"`
+	TimeoutSec int  `mapstructure:"timeout_sec"`
 }
 
 // AgentDiscoveryConfig 控制 apiserver 主动探测哪些 Agent IP。
@@ -149,9 +146,6 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("security.allow_insecure_transport", true)
 	v.SetDefault("observability.metrics_enabled", true)
 	v.SetDefault("profile.enabled", false)
-	v.SetDefault("profile.parca_url", "")
-	v.SetDefault("profile.parca_grpc_addr", "parca:7070")
-	v.SetDefault("profile.parca_ui_url", "http://localhost:7070")
 	v.SetDefault("profile.timeout_sec", 5)
 	v.SetDefault("agent_discovery.extra_ips", "")
 
@@ -202,15 +196,6 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envProfileEnabled := os.Getenv("PROFILE_ENABLED"); envProfileEnabled != "" {
 		v.Set("profile.enabled", parseBoolEnv(envProfileEnabled))
-	}
-	if envParca := os.Getenv("PARCA_URL"); envParca != "" {
-		v.Set("profile.parca_url", envParca)
-	}
-	if envParcaGRPC := os.Getenv("PARCA_GRPC_ADDR"); envParcaGRPC != "" {
-		v.Set("profile.parca_grpc_addr", envParcaGRPC)
-	}
-	if envParcaUI := os.Getenv("PARCA_UI_URL"); envParcaUI != "" {
-		v.Set("profile.parca_ui_url", envParcaUI)
 	}
 	if envProfileTimeout := os.Getenv("PROFILE_TIMEOUT_SEC"); envProfileTimeout != "" {
 		v.Set("profile.timeout_sec", envProfileTimeout)

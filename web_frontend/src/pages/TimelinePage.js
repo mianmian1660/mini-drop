@@ -1,5 +1,5 @@
 // ============================================================
-// pages/TimelinePage.js — Continuous Profiling 时间轴
+// pages/TimelinePage.js — Periodic Deep Sampling 时间轴
 // 自动加载所有定时任务，点击即可查看历史采集窗口
 // 支持三种查询：全部窗口 / 时间区间（快捷或自定义）/ 按时刻回溯
 // ============================================================
@@ -8,6 +8,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks, schedules } from '../api';
 import TimelineChart, { statusColor } from '../components/TimelineChart';
+import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
 
 const S = {
     container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
@@ -134,9 +135,22 @@ export default function TimelinePage() {
 
     // 自定义区间：读取两个 datetime-local 输入（按浏览器本地时区解释）
     const loadCustomRange = useCallback(() => {
-        if (!fromInput || !toInput) return;
+        if (!fromInput || !toInput) {
+            setError('请选择自定义开始时间和结束时间后再查询');
+            return;
+        }
+        const fromISO = localDateTimeToISO(fromInput);
+        const toISO = localDateTimeToISO(toInput);
+        if (!fromISO || !toISO) {
+            setError('自定义时间格式无效');
+            return;
+        }
+        if (new Date(toISO) < new Date(fromISO)) {
+            setError('结束时间不能早于开始时间');
+            return;
+        }
         setActiveRange(-1);
-        loadRange(new Date(fromInput).toISOString(), new Date(toInput).toISOString());
+        loadRange(fromISO, toISO);
     }, [fromInput, toInput, loadRange]);
 
     // 自动轮询：沿用当前查询模式（全部窗口 / 时间区间 / 按时刻回溯）重新拉取
@@ -178,26 +192,26 @@ export default function TimelinePage() {
 
     return (
         <div style={S.container}>
-            <h2>时间轴</h2>
+            <h2>周期性深度采样时间轴</h2>
             <div style={S.card}>
                 <h3 style={{ marginTop: 0 }}>请优先在主机性能中心查看时间轴</h3>
                 <p style={S.hint}>
-                    时间轴已经迁入具体主机页面，会按当前主机过滤定时采集窗口。这里保留为兼容入口。
+                    时间轴已经迁入具体主机页面，会按当前主机过滤周期性深度采样窗口。这里保留为兼容入口。
                 </p>
                 <Link to="/" style={{ ...S.btnSm, textDecoration: 'none' }}>返回主机列表</Link>
             </div>
 
-            {/* 定时任务列表 */}
+                {/* 周期性深度采样计划列表 */}
             <div style={S.card}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                    <h3 style={{ margin: 0 }}>定时任务列表</h3>
+                    <h3 style={{ margin: 0 }}>周期性深度采样计划</h3>
                     <button style={S.btnSm} onClick={refreshSchedules}>🔄 刷新</button>
                 </div>
                 {schLoading ? <p style={S.loading}>加载中...</p>
                     : schList.length === 0 ? (
                         <div style={{ textAlign: 'center', padding: 20, color: '#999' }}>
-                            <p>暂无定时任务</p>
-                            <p style={S.hint}>💡 在主页新建任务时勾选"持续采集"即可创建</p>
+                            <p>暂无周期性深度采样计划</p>
+                            <p style={S.hint}>在主页新建任务时勾选“周期性深度采样”即可创建</p>
                         </div>
                     ) : (
                         schList.map(sch => (
@@ -236,7 +250,7 @@ export default function TimelinePage() {
                 <div style={S.card}>
                     <h3 style={{ marginTop: 0 }}>🔍 时间范围查询</h3>
                     <p style={S.hint}>
-                        选择一段时间，查看该区间内触发的全部采集窗口；时间按浏览器本地时区解释。
+                        选择一段时间，查看该区间内触发的全部采集窗口；时间按浏览器本地时区显示：{browserTimeZoneLabel()}。
                     </p>
                     <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
                         <button style={S.rangeBtn(activeRange === 1)} onClick={() => loadQuickRange(1)}>最近 1 小时</button>
@@ -392,14 +406,14 @@ export default function TimelinePage() {
                                     </div>
                                 </div>
                                 <div style={{ fontSize: 11, color: '#999', marginTop: 4 }}>
-                                    窗口 {new Date(p.window_start || p.create_time).toLocaleString('zh-CN')}
+                                    窗口 {formatDateTime(p.window_start || p.create_time)}
                                     {' → '}
                                     {p.window_end
-                                        ? new Date(p.window_end).toLocaleString('zh-CN')
-                                        : (p.end_time ? new Date(p.end_time).toLocaleString('zh-CN') : '进行中')}
+                                        ? formatDateTime(p.window_end)
+                                        : (p.end_time ? formatDateTime(p.end_time) : '进行中')}
                                     {p.frequency_hz ? ` · ${p.frequency_hz}Hz` : ''}
                                     {p.duration_seconds ? ` · ${p.duration_seconds}s` : ''}
-                                    {p.scheduled_at ? ` · 触发 ${new Date(p.scheduled_at).toLocaleString('zh-CN')}` : ''}
+                                    {p.scheduled_at ? ` · 触发 ${formatDateTime(p.scheduled_at)}` : ''}
                                 </div>
                             </div>
                         ))}

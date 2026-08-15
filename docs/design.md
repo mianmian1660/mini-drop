@@ -12,7 +12,8 @@ Mini-Drop 复刻的是一套分布式性能采集与分析平台。用户在 Web
 - 任务状态机：`PENDING -> RUNNING -> UPLOADING -> DONE / FAILED`，每次迁移落库并带 `reason`。
 - Agent 心跳：Agent 周期心跳，Server 30s 无心跳判离线，Web 展示 Agent 列表和审计日志。
 - 多采集器：perf CPU 火焰图、eBPF 内核探针、pprof/async-profiler 用户态采集器入口。
-- Continuous Profiling：定时任务与时间轴回溯。
+- Periodic Deep Sampling：旧 schedule 定时任务与时间轴回溯。
+- Native Continuous Profiling：以 ContinuousSession 为核心的整机低频 native CPU sampling。
 - 工程基线：结构化日志、显式错误处理、单测覆盖率超过 50%、端到端集成测试覆盖正常路径和异常路径。
 
 ## 2. 总体架构
@@ -191,17 +192,17 @@ Analyzer 解析 bpftrace 输出，将直方图桶转换为：
 
 用户态语言级采集器保留 async-profiler 与 pprof 两条路径。pprof 通过 HTTP `/debug/pprof/profile` 拉取 Go profile；async-profiler 面向 Java 进程。Web 创建任务时可以选择采集器类型，结果页会按采集器展示对应产物。
 
-## 7. Continuous Profiling
+## 7. Periodic Deep Sampling 与 Native Continuous Profiling
 
-Continuous Profiling 通过 `schedule_tasks` 与 robfig/cron 实现。用户在新建采样时勾选“持续采集”，系统会创建一个定时任务：
+旧 schedule 功能已重命名为 Periodic Deep Sampling。它通过 `schedule_tasks` 与 robfig/cron 实现。用户在新建采样时勾选“周期性深度采样”，系统会创建一个定时任务：
 
 ```text
 schedule_task -> cron trigger -> child hotmethod_task -> normal task flow
 ```
 
-每次 cron 触发都会创建一个普通采集任务，并将 `master_task_tid` 指向定时任务 SID。Web 的时间轴页面通过 `GET /api/v1/tasks/timeline?master_tid=...` 查询某个定时任务下的所有子任务，按时间顺序展示历史采集窗口。用户可以点击任意点进入对应结果页，回看该窗口的火焰图或直方图。
+每次 cron 触发都会创建一个普通 HotmethodTask，并将 `master_task_tid` 指向定时任务 SID。Web 的时间轴页面通过 `GET /api/v1/tasks/timeline?master_tid=...` 查询某个定时任务下的所有子任务，按时间顺序展示历史采集窗口。用户可以点击任意点进入对应结果页，回看该窗口的火焰图或直方图。
 
-当前实现的重点是让时间轴能验证“常驻低频采样、定时切割、按时间回溯”的基本闭环。后续可以进一步支持任意 5 分钟窗口聚合和跨窗口对比。
+新的 Native Continuous Profiling 不再复用 schedule SID 作为 master，而是以 `ContinuousSession` 表达一台 host 上的持续会话。MVP 固定为 Linux native CPU，整机低频采样，查询时按 `comm + pid + exe` 过滤；起步参数为 19Hz sampling、10s aggregation window、1min upload batch、24h retention。Agent 先检测 `perf_event`、`perf`、eBPF、BTF、tracepoint 与权限能力，MVP 走 perf_event/perf first，后续在支持 eBPF 的环境启用增强路径，不支持时回退到 perf_event。
 
 ## 8. 关键决策与取舍
 

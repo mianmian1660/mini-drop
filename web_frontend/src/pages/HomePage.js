@@ -66,12 +66,12 @@ export default function HomePage() {
             t.service_name,
             t.environment,
             t.drop_agent_status,
-            t.parca_agent_status,
+            t.profile_status,
         ].some(value => String(value || '').toLowerCase().includes(q)));
     }, [targets, keyword]);
 
     const onlineDropAgents = targets.filter(t => t.drop_agent_status === 'online').length;
-    const ebpfReady = targets.filter(t => isParcaAgentReady(t.parca_agent_status)).length;
+    const nativeProfileReady = targets.filter(t => isProfileReady(t.profile_status)).length;
     const pprofScrapeReady = targets.filter(t => t.pprof_scrape_status === 'available').length;
 
     if (loading) {
@@ -92,7 +92,7 @@ export default function HomePage() {
                 <Metric label="可观测对象" value={targets.length} />
                 <Metric label="drop_agent 在线" value={`${onlineDropAgents}/${targets.length}`} />
                 <Metric label="pprof scrape 可用" value={`${pprofScrapeReady}/${targets.length}`} />
-                <Metric label="eBPF profiling 可用" value={`${ebpfReady}/${targets.length}`} />
+                <Metric label="Native profiling 可用" value={`${nativeProfileReady}/${targets.length}`} />
             </div>
 
             {error && <div style={styles.error}>{error}</div>}
@@ -105,7 +105,7 @@ export default function HomePage() {
                         value={keyword}
                         onChange={e => setKeyword(e.target.value)}
                     />
-                    <span style={styles.subtle}>先进入主机，再查看该主机任务、时间轴和持续 profiling</span>
+                    <span style={styles.subtle}>先进入主机，再查看该主机任务、周期性深度采样时间轴和 Native profiling</span>
                 </div>
 
                 {filteredTargets.length === 0 ? (
@@ -119,7 +119,7 @@ export default function HomePage() {
                                 <th style={styles.th}>服务</th>
                                 <th style={styles.th}>环境</th>
                                 <th style={styles.th}>drop_agent</th>
-                                <th style={styles.th}>eBPF profiling</th>
+                                <th style={styles.th}>Native profiling</th>
                                 <th style={styles.th}>最近活动</th>
                                 <th style={styles.th}>操作</th>
                             </tr>
@@ -136,7 +136,7 @@ export default function HomePage() {
                                     <td style={styles.td}>{target.service_name || 'hotmethod'}</td>
                                     <td style={styles.td}>{target.environment || '-'}</td>
                                     <td style={styles.td}><StatusPill value={target.drop_agent_status} /></td>
-                                    <td style={styles.td}><StatusPill value={target.parca_agent_status} /></td>
+                                    <td style={styles.td}><StatusPill value={target.profile_status} /></td>
                                     <td style={styles.td}>{formatTime(target.last_profile_at || target.last_seen) || '-'}</td>
                                     <td style={styles.td}>
                                         <Link to={`/hosts/${encodeURIComponent(target.id)}`} style={styles.rowLink}>进入主机</Link>
@@ -149,14 +149,14 @@ export default function HomePage() {
             </section>
 
             <p style={styles.subtle}>
-                主机详情页会展示该主机的 Agent 状态、审计日志、按需任务、时间轴和持续 profiling。
+                主机详情页会展示该主机的 Agent 状态、审计日志、按需任务、周期性深度采样时间轴和 Native profiling。
             </p>
         </div>
     );
 }
 
-function isParcaAgentReady(status) {
-    return status === 'online' || status === 'online_with_samples';
+function isProfileReady(status) {
+    return status === 'running' || status === 'online_with_samples';
 }
 
 function Metric({ label, value }) {
@@ -170,11 +170,11 @@ function Metric({ label, value }) {
 
 function StatusPill({ value }) {
     const status = String(value || 'unknown');
-    const color = isParcaAgentReady(status)
+    const color = isProfileReady(status)
         ? '#16a34a'
         : status === 'offline'
             ? '#dc2626'
-            : status === 'unconfigured'
+            : status === 'unconfigured' || status === 'no_session'
                 ? '#64748b'
                 : '#7c3aed';
     return <span style={{ ...styles.badge, background: color, color: '#fff' }}>{status}</span>;

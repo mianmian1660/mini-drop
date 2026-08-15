@@ -1,5 +1,5 @@
 // ============================================================
-// server/schedule.go — 定时任务管理处理器（W5）
+// server/schedule.go — 周期性深度采样管理处理器（旧 schedule API 兼容）
 // 包含：创建/列表/删除定时任务 + cron 调度器
 // ============================================================
 
@@ -54,7 +54,7 @@ func (s *APIServer) initCron() {
 		for _, sch := range schedules {
 			s.addCronJob(sch)
 		}
-		s.Logger.Info("已恢复定时任务", zap.Int("count", len(schedules)))
+		s.Logger.Info("已恢复周期性深度采样计划", zap.Int("count", len(schedules)))
 	}
 
 	s.Cron.Start()
@@ -263,7 +263,7 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 	req.TaskKind, req.TaskType, req.ProfilerType = collectorReq.TaskKind, collectorReq.TaskType, collectorReq.ProfilerType
 	req.Event, req.PprofURL = collectorReq.Event, collectorReq.PprofURL
 
-	// 窗口校验：持续采集的每次采样必须在窗口周期内结束，否则相邻窗口会重叠，
+	// 窗口校验：周期性深度采样的每次采样必须在窗口周期内结束，否则相邻窗口会重叠，
 	// "回溯任意窗口"的语义就不成立了。
 	if req.WindowSeconds > 0 && req.Duration >= req.WindowSeconds {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, fmt.Sprintf("采样时长(%ds)需小于窗口周期(%ds)，否则相邻窗口会重叠", req.Duration, req.WindowSeconds))

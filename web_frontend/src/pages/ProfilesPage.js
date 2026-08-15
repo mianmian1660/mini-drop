@@ -62,8 +62,8 @@ export default function ProfilesPage() {
         <div style={S.container}>
             <div style={S.pageHead}>
                 <div>
-                    <p style={S.eyebrow}>Continuous Profiling</p>
-                    <h2 style={S.title}>持续 profiling</h2>
+                    <p style={S.eyebrow}>Native Continuous Profiling</p>
+                    <h2 style={S.title}>Native profiling</h2>
                 </div>
                 <Link to="/" style={S.btnSecondary}>返回主页</Link>
             </div>
@@ -73,7 +73,7 @@ export default function ProfilesPage() {
             {!hasExplicitTarget && (
                 <section style={S.band}>
                     <h3 style={{ margin: '0 0 8px', fontSize: 18 }}>请先选择主机</h3>
-                    <p style={{ ...S.subtle, margin: '0 0 12px' }}>持续 profiling 已迁入主机性能中心。请选择一个主机后再查看火焰图和 TopN。</p>
+                    <p style={{ ...S.subtle, margin: '0 0 12px' }}>Native profiling 已迁入主机性能中心。请选择一个主机后再查看火焰图和 TopN。</p>
                     <Link to="/" style={S.btnSecondary}>返回主机列表</Link>
                 </section>
             )}
