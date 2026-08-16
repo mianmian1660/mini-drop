@@ -25,6 +25,7 @@
 #include "common/COSClient.h"             // drop::upload_to_minio
 #include "common/Utils.h"                 // drop::read_file_content
 #include "common/SymbolCollector.h"       // drop::collect_and_upload_symbols (阶段三)
+#include "common/Log.h"                   // drop::log_event (结构化日志)
 #include "agent/Config.h"                 // drop_agent::AgentConfig
 
 #include <iostream>
@@ -407,10 +408,13 @@ static shared_ptr<grpc::Channel> connect_to_server(
         if (!status.ok())
         {
             cerr << "[agent]   注册失败: " << status.error_message() << endl;
+            drop::log_event("drop_agent", "agent_register_failed",
+                             {{"server_addr", addr}, {"error", status.error_message()}});
             continue;
         }
 
         cout << "[agent]   在 " << addr << " 注册成功!" << endl;
+        drop::log_event("drop_agent", "agent_registered", {{"server_addr", addr}});
         registered = true;
 
         // 拉取 COS 配置
@@ -970,6 +974,8 @@ static hotmethod::TaskResult build_task_result(
                  << " sha256=" << sha256 << endl;
             bool rawUploaded = drop::upload_to_minio(cosConfig, actualPath, remoteKey);
             bool manifestUploaded = manifestWritten && drop::upload_to_minio(cosConfig, manifestPath, manifestKey);
+            drop::log_event("drop_agent", rawUploaded ? "artifact_upload_succeeded" : "artifact_upload_failed",
+                             {{"task_id", task.taskid()}, {"object_key", remoteKey}});
 
             // 内核符号快照：随产物一起上传，analysis 侧靠它解析内核帧。
             // 失败只降级不影响任务成败——用户态符号和火焰图本身仍然可用。
@@ -1171,6 +1177,7 @@ int main(int argc, char **argv)
         {
             cerr << "[agent] 心跳失败: " << status.error_message()
                  << " — 尝试重连..." << endl;
+            drop::log_event("drop_agent", "heartbeat_failed", {{"error", status.error_message()}});
 
             // 故障转移：重新尝试连接
             auto newChannel = connect_to_server(cfg, cosConfig, registered);
@@ -1201,6 +1208,11 @@ int main(int argc, char **argv)
                  << " pid=" << task.sampleargv().pid()
                  << " hz=" << task.sampleargv().hz()
                  << " duration=" << task.sampleargv().duration() << endl;
+            drop::log_event("drop_agent", "task_received",
+                             {{"task_id", task.taskid()},
+                              {"task_kind", task.task_kind()},
+                              {"attempt_id", to_string(task.attempt_id())},
+                              {"profiler_type", to_string(ptype)}});
 
             // 输出文件路径（统一前缀，不同采集器加不同后缀）
             string outputPath = "/tmp/" + to_string(ptype) + "_" + task.taskid() + "_output";
@@ -1209,8 +1221,18 @@ int main(int argc, char **argv)
             currentAttempt.set_attempt_id(task.attempt_id());
             runningAttempts.push_back(currentAttempt);
 
+            auto collectStart = chrono::steady_clock::now();
             Runner runner(ptype, task, outputPath);
             RunnerOutcome outcome = runner.Run();
+            auto collectMs = chrono::duration_cast<chrono::milliseconds>(
+                                  chrono::steady_clock::now() - collectStart)
+                                  .count();
+            drop::log_event("drop_agent",
+                             outcome.resultCode == 0 ? "collection_succeeded" : "collection_failed",
+                             {{"task_id", task.taskid()},
+                              {"profiler", outcome.profilerName},
+                              {"result_code", to_string(outcome.resultCode)},
+                              {"duration_ms", to_string(collectMs)}});
 
             // 构建结果
             hotmethod::TaskResult taskResult = build_task_result(
@@ -1228,10 +1250,14 @@ int main(int argc, char **argv)
                      << " profiler=" << outcome.profilerName
                      << " error=\"" << taskResult.errormessage() << "\""
                      << " cosKey=" << taskResult.coskey() << endl;
+                drop::log_event("drop_agent", "notify_result_succeeded",
+                                 {{"task_id", task.taskid()}, {"cos_key", taskResult.coskey()}});
             }
             else
             {
                 cerr << "[agent] NotifyResult 上报失败: " << notifyStatus.error_message() << endl;
+                drop::log_event("drop_agent", "notify_result_failed",
+                                 {{"task_id", task.taskid()}, {"error", notifyStatus.error_message()}});
             }
 
             runningAttempts.erase(remove_if(runningAttempts.begin(), runningAttempts.end(),

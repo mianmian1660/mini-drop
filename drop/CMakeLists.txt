@@ -69,6 +69,7 @@ set(COMMON_SRCS
     common/COSClient.cpp
     common/Utils.cpp
     common/SymbolCollector.cpp
+    common/Log.cpp
 )
 
 # ---------- server 模块源文件 ----------

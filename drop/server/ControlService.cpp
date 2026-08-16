@@ -5,6 +5,7 @@
 #include "server/ControlService.h"
 #include "server/TaskQueue.h"
 #include "server/AgentInfo.h"
+#include "common/Log.h"
 
 #include <iostream>
 #include <string>
@@ -68,6 +69,8 @@ namespace drop_server
             cout << "[server] 任务拒绝: taskID=" << taskID
                  << " targetIP=" << request->targetip()
                  << " reason=" << enqueueResult.message << endl;
+            drop::log_event("drop_server", "task_enqueue_rejected",
+                             {{"task_id", taskID}, {"target_ip", request->targetip()}, {"reason", enqueueResult.message}});
             return grpc::Status::OK;
         }
 
@@ -76,6 +79,11 @@ namespace drop_server
              << " targetIP=" << request->targetip()
              << " duplicate=" << (enqueueResult.duplicate ? "true" : "false")
              << " 队列长度=" << queueSize << endl;
+        drop::log_event("drop_server", "task_enqueued",
+                         {{"task_id", taskID},
+                          {"target_ip", request->targetip()},
+                          {"duplicate", enqueueResult.duplicate ? "true" : "false"},
+                          {"queue_size", to_string(queueSize)}});
 
         response->set_taskid(taskID);
         response->set_code(0);
