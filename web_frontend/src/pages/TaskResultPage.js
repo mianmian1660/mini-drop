@@ -356,6 +356,8 @@ export default function TaskResultPage() {
     const isBpfCpuTask = isBpfTask && !isBpfHistogramTask;
     const isJavaTask = Number(task.type) === 1 || Number(task.profiler_type) === 1;
     const isPprofTask = Number(task.type) === 2 || Number(task.profiler_type) === 2;
+    const isPprofHeapTask = isPprofTask && (task.task_kind === 'go_pprof_heap' ||
+        (typeof taskParams.pprof_url === 'string' && taskParams.pprof_url.indexOf('/heap') !== -1));
     const status = Number(task.status);
     const analysisStatus = Number(task.analysis_status);
     const statusName = statusNames[status] || 'UNKNOWN';
@@ -447,7 +449,7 @@ export default function TaskResultPage() {
             <StatusEventsPanel events={statusEvents} />
 
             <div style={styles.card}>
-                <h3 style={styles.sectionTitle}>{isBpfHistogramTask ? 'eBPF 直方图' : isBpfCpuTask ? 'eBPF CPU 火焰图' : isJavaTask ? 'Java 火焰图' : isPprofTask ? 'Go pprof 调用图' : '火焰图'}</h3>
+                <h3 style={styles.sectionTitle}>{isBpfHistogramTask ? 'eBPF 直方图' : isBpfCpuTask ? 'eBPF CPU 火焰图' : isJavaTask ? 'Java 火焰图' : isPprofHeapTask ? 'Go pprof Heap 火焰图' : isPprofTask ? 'Go pprof CPU 调用图' : '火焰图'}</h3>
                 <VisualResult
                     artifact={artifact}
                     foldedArtifact={foldedArtifact}
@@ -484,7 +486,7 @@ export default function TaskResultPage() {
             {isBpfHistogramTask ? (
                 <BPFHistogramPanel histogram={bpfHistogram} />
             ) : isJavaTask ? null : (
-                <TopFunctionsPanel topFunctions={topFunctions} status={status} isPprof={isPprofTask} />
+                <TopFunctionsPanel topFunctions={topFunctions} status={status} isPprof={isPprofTask} isHeap={isPprofHeapTask} />
             )}
 
             {isBpfHistogramTask && topFunctions.length > 0 && (
@@ -805,8 +807,8 @@ function BPFHistogramPanel({ histogram }) {
     );
 }
 
-function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN', isPprof = false }) {
-    const unit = topFunctions[0]?.sample_unit || (isPprof ? 'seconds' : 'samples');
+function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN', isPprof = false, isHeap = false }) {
+    const unit = topFunctions[0]?.sample_unit || (isHeap ? 'bytes' : (isPprof ? 'seconds' : 'samples'));
     const isSeconds = unit === 'seconds';
     return (
         <div style={styles.card}>

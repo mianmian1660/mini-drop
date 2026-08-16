@@ -734,11 +734,15 @@ func TestStage5TaskKindsFilterByAgentCapabilities(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	items := resp["data"].(map[string]interface{})["task_kinds"].([]interface{})
-	if len(items) != 1 {
-		t.Fatalf("task kinds=%d, want only pprof-compatible kind: %s", len(items), w.Body.String())
+	if len(items) != 2 {
+		t.Fatalf("task kinds=%d, want pprof-compatible CPU and heap kinds: %s", len(items), w.Body.String())
 	}
-	if got := items[0].(map[string]interface{})["id"]; got != TaskKindGoPprof {
-		t.Fatalf("kind id=%v, want %s", got, TaskKindGoPprof)
+	seen := map[string]bool{}
+	for _, item := range items {
+		seen[item.(map[string]interface{})["id"].(string)] = true
+	}
+	if !seen[TaskKindGoPprof] || !seen[TaskKindGoPprofHeap] {
+		t.Fatalf("task kinds=%v, want %s and %s", seen, TaskKindGoPprof, TaskKindGoPprofHeap)
 	}
 }
 

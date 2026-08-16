@@ -80,6 +80,17 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [commAvailable, setCommAvailable] = useState(false);
     const [commMessage, setCommMessage] = useState('');
     const [commLoading, setCommLoading] = useState(false);
+    const [maxNodes, setMaxNodes] = useState(5000);
+    // diff selector state (baseline vs compare)
+    const [diffOpen, setDiffOpen] = useState(false);
+    const [diffBaseRange, setDiffBaseRange] = useState('30m');
+    const [diffCompareRange, setDiffCompareRange] = useState('15m');
+    const [diffResult, setDiffResult] = useState(null);
+    const [diffLoading, setDiffLoading] = useState(false);
+    const [diffError, setDiffError] = useState('');
+    // Memory tab: recent Go pprof heap tasks
+    const [heapTasks, setHeapTasks] = useState([]);
+    const [heapTasksLoading, setHeapTasksLoading] = useState(false);
     const timeWindow = useMemo(() => makeTimeWindow(range), [range]);
     const profileURL = flamegraph?.profile_url || topn?.profile_url || target?.profile_url;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
@@ -103,6 +114,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             from: timeWindow.from,
             to: timeWindow.to,
             profile_type: profileType,
+            max_nodes: maxNodes,
         };
         if (Object.keys(activeFilters).length > 0) {
             params.filters = JSON.stringify(activeFilters);
@@ -139,11 +151,62 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setQuerying(false);
         }
-    }, [target, timeWindow, profileType, activeFilters, signalTab, stackScope]);
+    }, [target, timeWindow, profileType, activeFilters, signalTab, stackScope, maxNodes]);
 
     useEffect(() => {
         refresh();
     }, [refresh]);
+
+    // Load recent Go pprof heap tasks for the Memory tab link.
+    const loadHeapTasks = useCallback(async () => {
+        if (!target) return;
+        setHeapTasksLoading(true);
+        try {
+            const res = await profiles.heapTasks({ host: target.ip, limit: 5 });
+            if (res.code === 0) {
+                setHeapTasks(res.data?.tasks || res.data || []);
+            }
+        } catch (e) {
+            // Silent: Memory tab is best-effort.
+        } finally {
+            setHeapTasksLoading(false);
+        }
+    }, [target]);
+
+    useEffect(() => {
+        if (profileType === 'memory') loadHeapTasks();
+    }, [profileType, loadHeapTasks]);
+
+    const runDiff = useCallback(async () => {
+        if (!target) return;
+        setDiffLoading(true);
+        setDiffError('');
+        setDiffResult(null);
+        try {
+            const { baseWindow, compareWindow } = makeSequentialDiffWindows(diffBaseRange, diffCompareRange);
+            const params = {
+                target_id: target.id,
+                host: target.ip,
+                service: target.service_name || 'hotmethod',
+                profile_type: 'cpu',
+                base_from: baseWindow.from,
+                base_to: baseWindow.to,
+                compare_from: compareWindow.from,
+                compare_to: compareWindow.to,
+                max_nodes: maxNodes,
+            };
+            const res = await profiles.diff(params);
+            if (res.code === 0) {
+                setDiffResult(res.data);
+            } else {
+                setDiffError(res.message || 'Diff 查询失败');
+            }
+        } catch (e) {
+            setDiffError(e?.message || 'Diff 查询失败');
+        } finally {
+            setDiffLoading(false);
+        }
+    }, [target, diffBaseRange, diffCompareRange, maxNodes]);
 
     useEffect(() => {
         setSelectedComm('');
@@ -237,6 +300,16 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             <option value="memory">Memory</option>
                         </select>
                     </Field>
+                    {signalTab === 'cpu' && profileType === 'cpu' && (
+                        <Field label="最大节点数">
+                            <select style={S.select} value={String(maxNodes)} onChange={e => setMaxNodes(parseInt(e.target.value, 10))}>
+                                <option value="1000">1000</option>
+                                <option value="5000">5000（默认）</option>
+                                <option value="10000">10000</option>
+                                <option value="20000">20000（最大）</option>
+                            </select>
+                        </Field>
+                    )}
                     <Field label="信号">
                         <span style={S.segmented}>
                             <button type="button" style={S.segment(signalTab === 'cpu')} onClick={() => setSignalTab('cpu')}>CPU</button>
@@ -322,13 +395,137 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 />
             </section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? 'IO 延迟' : '调度延迟'} />}
 
+            {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
+                <div style={{ ...S.warn, marginTop: 10 }}>
+                    {flamegraph?.truncated && <span>火焰图节点数超过 {maxNodes} 上限，已截断展示。请缩小时间范围或提高最大节点数以查看完整栈。</span>}
+                    {flamegraph?.truncated && flamegraph?.symbol_status && ' · '}
+                    {flamegraph?.symbol_status && flamegraph?.symbol_status !== 'not_applicable' && (
+                        <span>符号状态：{symbolStatusLabel(flamegraph.symbol_status)}</span>
+                    )}
+                </div>
+            )}
+
             {signalTab === 'cpu' && <section style={S.card}>
                 <div style={S.sectionHead}>
                     <h3 style={S.title}>热点 TopN</h3>
                     <span style={S.subtle}>{topn?.items?.length || 0} functions · {profileUnitLabel(topn?.unit || unit)}</span>
                 </div>
                 <TopNTable data={topn} loading={querying} profileURL={profileURL} filterText={activeFilterText} />
+                {topn?.truncated && (
+                    <div style={{ ...S.warn, marginTop: 8 }}>
+                        TopN 结果超过 {maxNodes} 条上限，已截断展示。
+                    </div>
+                )}
             </section>}
+
+            {signalTab === 'cpu' && profileType === 'cpu' && (
+                <section style={S.card}>
+                    <div style={S.sectionHead}>
+                        <h3 style={S.title}>时间窗 Diff（Baseline vs Compare）</h3>
+                        <button type="button" style={S.btn} onClick={() => setDiffOpen(o => !o)}>{diffOpen ? '收起' : '展开'}</button>
+                    </div>
+                    {diffOpen && (
+                        <div>
+                            <div style={{ ...S.summaryGrid, marginTop: 0 }}>
+                                <Field label="Baseline 时间窗">
+                                    <select style={S.select} value={diffBaseRange} onChange={e => setDiffBaseRange(e.target.value)}>
+                                        {RANGE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                                    </select>
+                                </Field>
+                                <Field label="Compare 时间窗">
+                                    <select style={S.select} value={diffCompareRange} onChange={e => setDiffCompareRange(e.target.value)}>
+                                        {RANGE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                                    </select>
+                                </Field>
+                            </div>
+                            <div style={{ marginTop: 10 }}>
+                                <button type="button" style={S.btn} onClick={runDiff} disabled={diffLoading || !target}>
+                                    {diffLoading ? '查询中...' : '执行 Diff'}
+                                </button>
+                            </div>
+                            {diffError && <div style={{ ...S.error, marginTop: 8 }}>{diffError}</div>}
+                            {diffResult && !diffResult.empty && Array.isArray(diffResult.items) && diffResult.items.length > 0 && (
+                                <div style={{ marginTop: 12, overflowX: 'auto' }}>
+                                    <table style={{ ...S.table, width: '100%' }}>
+                                        <thead>
+                                            <tr>
+                                                <th style={S.th}>函数</th>
+                                                <th style={S.th}>Baseline</th>
+                                                <th style={S.th}>Compare</th>
+                                                <th style={S.th}>Delta</th>
+                                                <th style={S.th}>变化</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {diffResult.items.slice(0, 20).map((item, idx) => {
+                                                const delta = (item.compare_value || 0) - (item.base_value || 0);
+                                                const pct = item.base_value ? (delta / item.base_value * 100) : 0;
+                                                const increased = delta > 0;
+                                                return (
+                                                    <tr key={idx}>
+                                                        <td style={S.td}>{item.name || item.function}</td>
+                                                        <td style={S.td}>{formatNum(item.base_value)}</td>
+                                                        <td style={S.td}>{formatNum(item.compare_value)}</td>
+                                                        <td style={{ ...S.td, color: increased ? '#B42318' : delta < 0 ? '#067647' : '#475467' }}>
+                                                            {delta >= 0 ? '+' : ''}{formatNum(delta)}
+                                                        </td>
+                                                        <td style={{ ...S.td, color: increased ? '#B42318' : delta < 0 ? '#067647' : '#475467' }}>
+                                                            {pct >= 0 ? '+' : ''}{pct.toFixed(1)}%
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                            {diffResult && (diffResult.empty || !diffResult.items || diffResult.items.length === 0) && (
+                                <div style={{ ...S.warn, marginTop: 8 }}>
+                                    Diff 结果为空：{diffResult.message || '所选时间窗内无匹配样本，请扩大时间范围或检查 backend 是否有数据。'}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </section>
+            )}
+
+            {profileType === 'memory' && (
+                <section style={S.card}>
+                    <div style={S.sectionHead}>
+                        <h3 style={S.title}>Go pprof Heap 按需任务</h3>
+                        <span style={S.subtle}>Continuous heap profiling 暂未启用</span>
+                    </div>
+                    <div style={{ ...S.info, marginTop: 8 }}>
+                        Memory profiling 当前不支持 continuous 模式。请创建 <code>Go pprof Heap</code> 按需任务采集目标进程的堆 profile，结果页将展示 bytes 维度的火焰图与 TopN。
+                    </div>
+                    <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <a style={{ ...S.btn, textDecoration: 'none', display: 'inline-block' }} href={`/hosts/${encodeURIComponent(target?.id || '')}?tab=tasks`}>
+                            前往主机任务
+                        </a>
+                        {heapTasksLoading && <span style={S.subtle}>加载最近任务...</span>}
+                    </div>
+                    {Array.isArray(heapTasks) && heapTasks.length > 0 && (
+                        <div style={{ marginTop: 12 }}>
+                            <div style={S.subtle}>最近 Go Heap 任务</div>
+                            <ul style={{ listStyle: 'none', padding: 0, marginTop: 6 }}>
+                                {heapTasks.map((t, i) => (
+                                    <li key={t.tid || t.id || i} style={{ padding: '4px 0', borderBottom: '1px solid #F2F4F7' }}>
+                                        <a href={`/task/result?tid=${encodeURIComponent(t.tid || t.id || '')}`} style={{ color: '#315efb' }}>
+                                            {t.name || `Heap Task ${t.tid || t.id || i + 1}`}
+                                        </a>
+                                        <span style={{ ...S.subtle, marginLeft: 8 }}>
+                                            {t.status ?? '-'} · {t.create_time || t.created_at ? new Date(t.create_time || t.created_at).toLocaleString() : ''}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+                    {Array.isArray(heapTasks) && heapTasks.length === 0 && !heapTasksLoading && (
+                        <div style={{ ...S.subtle, marginTop: 8 }}>暂无 Go Heap 任务记录</div>
+                    )}
+                </section>
+            )}
 
             <details style={S.details}>
                 <summary style={S.detailsSummary}>诊断信息</summary>
@@ -627,7 +824,28 @@ function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, sta
         `unit: ${flamegraph?.unit || topn?.unit || '-'}`,
         `total_raw_value: ${formatRawMetric(flamegraph?.total || topn?.total || 0, flamegraph?.unit || topn?.unit || '')}`,
         `profile_url: ${flamegraph?.profile_url || topn?.profile_url || target?.profile_url || '-'}`,
+        `symbol_status: ${flamegraph?.symbol_status || topn?.symbol_status || 'not_applicable'}`,
+        `truncated: ${flamegraph?.truncated || topn?.truncated || false}`,
     ].join('\n');
+}
+
+function symbolStatusLabel(status) {
+    switch (status) {
+        case 'complete': return '完整（build-id / kallsyms 可用）';
+        case 'partial': return '部分缺失（部分符号引用未解析）';
+        case 'missing': return '缺失（无 build-id / kallsyms 引用）';
+        case 'not_applicable': return '不适用';
+        default: return status || '未知';
+    }
+}
+
+function formatNum(n) {
+    if (n === null || n === undefined) return '-';
+    if (typeof n !== 'number' || !isFinite(n)) return String(n);
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+    return String(n);
 }
 
 function makeTimeWindow(range) {
@@ -635,6 +853,19 @@ function makeTimeWindow(range) {
     const minutes = { '15m': 15, '30m': 30, '1h': 60, '6h': 360 }[range] || 30;
     const from = new Date(to.getTime() - minutes * 60 * 1000);
     return { from: from.toISOString(), to: to.toISOString() };
+}
+
+function makeSequentialDiffWindows(baseRange, compareRange) {
+    const compareMinutes = { '15m': 15, '30m': 30, '1h': 60, '6h': 360 }[compareRange] || 15;
+    const baseMinutes = { '15m': 15, '30m': 30, '1h': 60, '6h': 360 }[baseRange] || 30;
+    const compareTo = new Date();
+    const compareFrom = new Date(compareTo.getTime() - compareMinutes * 60 * 1000);
+    const baseTo = compareFrom;
+    const baseFrom = new Date(baseTo.getTime() - baseMinutes * 60 * 1000);
+    return {
+        baseWindow: { from: baseFrom.toISOString(), to: baseTo.toISOString() },
+        compareWindow: { from: compareFrom.toISOString(), to: compareTo.toISOString() },
+    };
 }
 
 function formatTime(value) {

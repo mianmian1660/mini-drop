@@ -876,3 +876,180 @@ func (m *continuousMemoryStorage) ObjectExists(_ context.Context, _, key string)
 	_, ok := m.objects[key]
 	return ok, nil
 }
+
+func TestProfileQueryRejectsOversizedTimeWindow(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now().UTC()
+	from := now.Add(-7 * time.Hour)
+	to := now
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/profile/flamegraph?target_id=10.0.0.1:hotmethod&from="+
+			url.QueryEscape(from.Format(time.RFC3339))+"&to="+url.QueryEscape(to.Format(time.RFC3339)), nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	router := profileRouter(s)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for >6h window, got %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "6 小时") {
+		t.Fatalf("expected 6h limit message, got %s", w.Body.String())
+	}
+}
+
+func TestProfileFlamegraphMaxNodesTruncatesAndReportsSymbolStatus(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	_ = s.DB.Create(&model.AgentInfo{Hostname: "node-a", IPAddr: "10.0.0.1", UID: "owner", Online: true, LastSeen: now}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID: "cps-maxnodes", Name: "test", TargetIP: "10.0.0.1", ServiceName: "hotmethod",
+		SampleRateHz: 19, AggregationWindowSec: 10, UploadBatchSec: 60, RetentionHours: 24,
+		Status: model.ContinuousSessionStatusRunning, UID: "owner",
+		StartedAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
+	}).Error
+
+	// build a batch with symbol_refs containing build_id and many distinct stacks
+	samples := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		samples = append(samples, fmt.Sprintf(`{"stack":["runtime.main","main.fn%d"],"count":5,"comm":"app","pid":%d,"exe":"/app/bin"}`, i, 100+i))
+	}
+	body := fmt.Sprintf(`{
+		"session_sid":"cps-maxnodes",
+		"start_time":%q,
+		"end_time":%q,
+		"profile_format":"pprof",
+		"backend_status":"ok",
+		"selected_backend":"bpftrace",
+		"attempted_backends":["core","bpftrace"],
+		"symbol_refs":{"build_id":"abc123","kallsyms_sha256":"sha-kernel"},
+		"windows":[{
+			"window_start":%q,
+			"window_end":%q,
+			"sample_count":50,
+			"profile_format":"pprof",
+			"backend_status":"ok",
+			"selected_backend":"bpftrace",
+			"symbol_refs":{"build_id":"abc123","kallsyms_sha256":"sha-kernel"},
+			"samples":[%s]
+		}]
+	}`, now.Add(-20*time.Second).Format(time.RFC3339), now.Add(-10*time.Second).Format(time.RFC3339),
+		now.Add(-20*time.Second).Format(time.RFC3339), now.Add(-10*time.Second).Format(time.RFC3339),
+		strings.Join(samples, ","))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router := profileRouter(s)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ingest status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// max_nodes=1 should truncate
+	req = httptest.NewRequest(http.MethodGet,
+		"/api/v1/profile/flamegraph?target_id=10.0.0.1:hotmethod&from="+
+			url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339))+
+			"&to="+url.QueryEscape(now.Format(time.RFC3339))+"&max_nodes=1", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("flamegraph status=%d body=%s", w.Code, w.Body.String())
+	}
+	var fg struct {
+		Data ProfileFlamegraph `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &fg); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !fg.Data.Truncated {
+		t.Fatalf("expected truncated=true with max_nodes=1")
+	}
+	if fg.Data.SymbolStatus != "complete" {
+		t.Fatalf("expected symbol_status=complete, got %q", fg.Data.SymbolStatus)
+	}
+}
+
+func TestGoPprofHeapTaskKind(t *testing.T) {
+	defs := taskKindDefinitions()
+	found := false
+	for _, d := range defs {
+		if d.ID == TaskKindGoPprofHeap {
+			found = true
+			if d.Runner != "pprof" {
+				t.Fatalf("expected runner=pprof, got %s", d.Runner)
+			}
+			if d.AnalysisPipeline != "pprof_heap" {
+				t.Fatalf("expected pipeline=pprof_heap, got %s", d.AnalysisPipeline)
+			}
+			if d.TaskType != TaskTypePprof {
+				t.Fatalf("expected task_type=%d, got %d", TaskTypePprof, d.TaskType)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("TaskKindGoPprofHeap not found in definitions")
+	}
+
+	// inferTaskKind should detect heap URL
+	kind := inferTaskKind(CreateTaskReq{
+		ProfilerType: ProfilerPprof,
+		PprofURL:     "http://127.0.0.1:6060/debug/pprof/heap",
+	})
+	if kind != TaskKindGoPprofHeap {
+		t.Fatalf("expected go_pprof_heap, got %s", kind)
+	}
+
+	// CPU URL should still infer go_pprof
+	kind = inferTaskKind(CreateTaskReq{
+		ProfilerType: ProfilerPprof,
+		PprofURL:     "http://127.0.0.1:6060/debug/pprof/profile",
+	})
+	if kind != TaskKindGoPprof {
+		t.Fatalf("expected go_pprof, got %s", kind)
+	}
+}
+
+func TestContinuousSymbolCheckReturnsStatus(t *testing.T) {
+	s := newTestAPIServer(t)
+	st := newContinuousMemoryStorage()
+	s.Storage = st
+	// pre-populate one build-id symbol
+	_ = st.PutObject(context.Background(), "", "symbols/abc123", strings.NewReader("binary"), 6, "application/octet-stream")
+
+	router := gin.New()
+	api := router.Group("/api/v1")
+	api.POST("/internal/continuous/symbol-check", s.ContinuousSymbolCheck)
+
+	body := `{"build_ids":["abc123","def456"],"kallsyms_sha256":"sha-kernel"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/symbol-check", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			SymbolCheck struct {
+				BuildIDs     map[string]bool `json:"build_ids"`
+				Kallsyms     bool            `json:"kallsyms"`
+				Missing      []string        `json:"missing"`
+				SymbolStatus string          `json:"symbol_status"`
+			} `json:"symbol_check"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !resp.Data.SymbolCheck.BuildIDs["abc123"] {
+		t.Fatalf("expected abc123 to exist")
+	}
+	if resp.Data.SymbolCheck.BuildIDs["def456"] {
+		t.Fatalf("expected def456 to be missing")
+	}
+	if resp.Data.SymbolCheck.SymbolStatus != "partial" {
+		t.Fatalf("expected partial, got %s", resp.Data.SymbolCheck.SymbolStatus)
+	}
+}

@@ -120,6 +120,11 @@ struct WindowPayload
     std::vector<AggregatedSample> samples;
     std::vector<ProfilePayload> profiles;
     std::vector<HistogramPayload> histograms;
+    // Backend metadata (5-8: strict fallback strategy)
+    std::string backendStatus;                   // "ok" | "degraded" | "failed"
+    std::string backendReason;                   // human-readable reason
+    std::vector<std::string> attemptedBackends;  // ["core","bpftrace","perf"]
+    std::string selectedBackend;                 // "bpftrace" | "perf" | ""
 };
 
 static int64_t now_ms()
@@ -727,6 +732,42 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
     body += "\"batch_id\":\"" + json_escape(batchID) + "\",";
     body += "\"target_ip\":\"" + json_escape(cfg.targetIP) + "\",";
     body += "\"schema_version\":2,";
+    body += "\"profile_format\":\"json\",";
+    // Batch-level backend metadata (aggregated from windows)
+    std::string batchBackendStatus = "ok";
+    std::string batchBackendReason;
+    std::string batchSelectedBackend;
+    std::set<std::string> batchAttempted;
+    bool anyFailed = false;
+    for (const auto &window : windows)
+    {
+        if (window.backendStatus == "failed")
+            anyFailed = true;
+        for (const auto &b : window.attemptedBackends)
+            batchAttempted.insert(b);
+        if (!window.selectedBackend.empty() && batchSelectedBackend.empty())
+            batchSelectedBackend = window.selectedBackend;
+        if (!window.backendReason.empty() && batchBackendReason.empty())
+            batchBackendReason = window.backendReason;
+    }
+    if (anyFailed && batchBackendStatus != "failed")
+        batchBackendStatus = "degraded";
+    if (windows.empty() || (batchAttempted.empty() && !anyFailed))
+        batchBackendStatus = "ok";
+    body += "\"backend_status\":\"" + json_escape(batchBackendStatus) + "\",";
+    body += "\"backend_reason\":\"" + json_escape(batchBackendReason) + "\",";
+    body += "\"attempted_backends\":[";
+    {
+        size_t ai = 0;
+        for (const auto &b : batchAttempted)
+        {
+            if (ai++)
+                body += ",";
+            body += "\"" + json_escape(b) + "\"";
+        }
+    }
+    body += "],";
+    body += "\"selected_backend\":\"" + json_escape(batchSelectedBackend) + "\",";
     body += "\"signal_types\":[";
     size_t sigIndex = 0;
     for (const auto &signal : signalTypes)
@@ -762,6 +803,18 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
         body += "\"window_start\":\"" + rfc3339_from_ms(window.startMs) + "\",";
         body += "\"window_end\":\"" + rfc3339_from_ms(window.endMs) + "\",";
         body += "\"sample_count\":" + std::to_string(windowSamples) + ",";
+        body += "\"profile_format\":\"json\",";
+        body += "\"backend_status\":\"" + json_escape(window.backendStatus.empty() ? "ok" : window.backendStatus) + "\",";
+        body += "\"backend_reason\":\"" + json_escape(window.backendReason) + "\",";
+        body += "\"attempted_backends\":[";
+        for (size_t ai = 0; ai < window.attemptedBackends.size(); ++ai)
+        {
+            if (ai)
+                body += ",";
+            body += "\"" + json_escape(window.attemptedBackends[ai]) + "\"";
+        }
+        body += "],";
+        body += "\"selected_backend\":\"" + json_escape(window.selectedBackend) + "\",";
         body += "\"samples\":[";
         for (size_t si = 0; si < window.samples.size(); ++si)
         {
@@ -902,39 +955,96 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
     std::string signals = env_string_local("DROP_NATIVE_CP_SIGNALS", "cpu,io,sched");
     bool ebpfEnabled = env_enabled_local("DROP_NATIVE_CP_EBPF_ENABLED");
 
-    std::future<ProfilePayload> userFuture;
-    std::future<ProfilePayload> kernelFuture;
-    std::future<WindowPayload> perfFuture;
-    std::future<HistogramPayload> ioFuture;
-    std::future<HistogramPayload> schedFuture;
-    bool userStarted = false;
-    bool kernelStarted = false;
-    bool perfStarted = false;
-    bool ioStarted = false;
-    bool schedStarted = false;
+    // Strict fallback strategy (5-8): core(probe only) -> bpftrace -> perf
+    // bpftrace success (user OR kernel) skips perf entirely.
+    std::vector<std::string> &attempted = window.attemptedBackends;
 
     if (signal_enabled(signals, "cpu"))
     {
         std::string backends = env_string_local("DROP_NATIVE_CP_CPU_BACKENDS", "core,bpftrace,perf");
+        bool coreAllowed = backends.find("core") != std::string::npos;
+        bool bpftraceAllowed = backends.find("bpftrace") != std::string::npos;
         bool perfAllowed = backends.find("perf") != std::string::npos;
-        if (ebpfEnabled && backends.find("core") != std::string::npos)
+
+        // Stage 1: CO-RE probe only (no sampler implemented in this build)
+        if (coreAllowed && ebpfEnabled)
         {
+            attempted.push_back("core");
             std::cout << "[native-cp] CO-RE CPU backend unavailable: " << core_unavailable_reason() << std::endl;
         }
-        if (ebpfEnabled && backends.find("bpftrace") != std::string::npos && command_available("bpftrace"))
+
+        // Stage 2: bpftrace user/kernel (strict: only start perf if bpftrace fails)
+        bool bpftraceStarted = false;
+        std::future<ProfilePayload> userFuture;
+        std::future<ProfilePayload> kernelFuture;
+        if (bpftraceAllowed && ebpfEnabled && command_available("bpftrace"))
         {
+            attempted.push_back("bpftrace");
             userFuture = std::async(std::launch::async, collect_bpftrace_cpu_profile, cfg, "user");
             kernelFuture = std::async(std::launch::async, collect_bpftrace_cpu_profile, cfg, "kernel");
-            userStarted = true;
-            kernelStarted = true;
+            bpftraceStarted = true;
         }
-        if (perfAllowed)
+
+        bool cpuCollected = false;
+        if (bpftraceStarted)
         {
-            perfFuture = std::async(std::launch::async, collect_window, cfg);
-            perfStarted = true;
+            ProfilePayload user = userFuture.get();
+            if (!user.samples.empty())
+            {
+                window.profiles.push_back(user);
+                cpuCollected = true;
+            }
+            ProfilePayload kernel = kernelFuture.get();
+            if (!kernel.samples.empty())
+            {
+                window.profiles.push_back(kernel);
+                cpuCollected = true;
+            }
+        }
+
+        // Stage 3: perf fallback ONLY if bpftrace did not yield samples
+        if (!cpuCollected && perfAllowed)
+        {
+            attempted.push_back("perf");
+            std::future<WindowPayload> perfFuture = std::async(std::launch::async, collect_window, cfg);
+            WindowPayload perfWindow = perfFuture.get();
+            if (perfWindow.endMs > 0)
+                captureEndMs = std::max(captureEndMs, perfWindow.endMs);
+            window.samples = perfWindow.samples;
+            for (auto &sample : window.samples)
+                sample.backend = "perf";
+            cpuCollected = !window.samples.empty();
+        }
+
+        // Populate backend metadata
+        if (cpuCollected)
+        {
+            window.backendStatus = "ok";
+            // Determine selected backend from samples/profiles
+            for (const auto &profile : window.profiles)
+            {
+                if (!profile.backend.empty())
+                {
+                    window.selectedBackend = profile.backend;
+                    break;
+                }
+            }
+            if (window.selectedBackend.empty() && !window.samples.empty())
+                window.selectedBackend = "perf";
+        }
+        else
+        {
+            window.backendStatus = "failed";
+            window.backendReason = "no CPU samples collected by any backend";
+            std::cout << "[native-cp] no CPU profile samples collected in this window" << std::endl;
         }
     }
 
+    // IO/sched histograms still use bpftrace; no mock generation.
+    std::future<HistogramPayload> ioFuture;
+    std::future<HistogramPayload> schedFuture;
+    bool ioStarted = false;
+    bool schedStarted = false;
     if (ebpfEnabled && signal_enabled(signals, "io"))
     {
         ioFuture = std::async(std::launch::async, collect_bpftrace_latency_histogram, cfg, "io_latency");
@@ -945,41 +1055,6 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
         schedFuture = std::async(std::launch::async, collect_bpftrace_latency_histogram, cfg, "sched_latency");
         schedStarted = true;
     }
-
-    bool cpuCollected = false;
-    if (userStarted)
-    {
-        ProfilePayload user = userFuture.get();
-        if (!user.samples.empty())
-        {
-            window.profiles.push_back(user);
-            cpuCollected = true;
-        }
-    }
-    if (kernelStarted)
-    {
-        ProfilePayload kernel = kernelFuture.get();
-        if (!kernel.samples.empty())
-        {
-            window.profiles.push_back(kernel);
-            cpuCollected = true;
-        }
-    }
-    if (perfStarted)
-    {
-        WindowPayload perfWindow = perfFuture.get();
-        if (perfWindow.endMs > 0)
-            captureEndMs = std::max(captureEndMs, perfWindow.endMs);
-        if (!cpuCollected)
-        {
-            window.samples = perfWindow.samples;
-            for (auto &sample : window.samples)
-                sample.backend = "perf";
-            cpuCollected = !window.samples.empty();
-        }
-    }
-    if (signal_enabled(signals, "cpu") && !cpuCollected)
-        std::cout << "[native-cp] no CPU profile samples collected in this window" << std::endl;
     if (ioStarted)
         window.histograms.push_back(ioFuture.get());
     if (schedStarted)

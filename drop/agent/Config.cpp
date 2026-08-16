@@ -154,6 +154,7 @@ namespace drop_agent
             cfg.capabilities.push_back("async-profiler");
             cfg.capabilities.push_back("java");
             cfg.capabilities.push_back("go_pprof");
+            cfg.capabilities.push_back("go_pprof_heap");
             cfg.capabilities.push_back("ebpf_cpu");
             cfg.capabilities.push_back("ebpf_io");
             cfg.capabilities.push_back("ebpf_sched");
@@ -203,7 +204,7 @@ namespace drop_agent
             cfg.uid = "agent-001";
         cfg.agentVersion = "1.0.0";
         cfg.platform = "linux/amd64";
-        cfg.capabilities = {"perf_cpu", "async-profiler", "java", "go_pprof", "ebpf_cpu", "ebpf_io", "ebpf_sched", "ebpf", "bpftrace"};
+        cfg.capabilities = {"perf_cpu", "async-profiler", "java", "go_pprof", "go_pprof_heap", "ebpf_cpu", "ebpf_io", "ebpf_sched", "ebpf", "bpftrace"};
         cfg.labels = {"local"};
         cfg.resourceBudget = "{}";
         cfg.serverAddrs.push_back(serverAddr);

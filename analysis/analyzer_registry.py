@@ -40,6 +40,7 @@ def collector_declarations():
     """
     return [
         {"task_kind": "go_pprof", "pipeline": "pprof", "capabilities": ["pprof"], "enabled": True},
+        {"task_kind": "go_pprof_heap", "pipeline": "pprof_heap", "capabilities": ["pprof"], "enabled": True},
         {"task_kind": "async_profiler_java", "pipeline": "java_async_profiler", "capabilities": ["async-profiler", "java"], "enabled": True},
         {"task_kind": "java_heap", "pipeline": "java_heap", "capabilities": ["java", "java-heap"], "enabled": False},
         {"task_kind": "python_py_spy", "pipeline": "perf_flamegraph", "capabilities": ["py-spy", "python"], "enabled": False},

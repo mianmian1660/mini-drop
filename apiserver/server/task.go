@@ -593,16 +593,26 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 	if ps, err := strconv.Atoi(c.DefaultQuery("pageSize", "20")); err == nil && ps > 0 && ps <= 100 {
 		pageSize = ps
 	}
+	if limit, err := strconv.Atoi(c.Query("limit")); err == nil && limit > 0 && limit <= 100 {
+		pageSize = limit
+	}
 
 	var tasks []model.HotmethodTask
 	var total int64
 
 	query := s.DB.Model(&model.HotmethodTask{})
 
-	// 按关键词搜索（任务名称 / 任务 ID）
+	// 按关键词搜索（任务名称 / 任务 ID / 目标 IP）
 	if keyword := c.Query("keyword"); keyword != "" {
 		like := "%" + keyword + "%"
 		query = query.Where("name LIKE ? OR tid LIKE ? OR target_ip LIKE ?", like, like, like)
+	}
+
+	if taskKind := strings.TrimSpace(c.Query("task_kind")); taskKind != "" {
+		query = query.Where("task_kind = ?", taskKind)
+	}
+	if host := strings.TrimSpace(firstNonEmpty(c.Query("host"), c.Query("target_ip"))); host != "" {
+		query = query.Where("target_ip = ?", host)
 	}
 
 	// 按状态筛选

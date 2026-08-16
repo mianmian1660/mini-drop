@@ -1,7 +1,8 @@
 const COLLECTOR_LABELS = {
     perf_cpu: 'perf CPU 火焰图',
     async_profiler_java: 'Java async-profiler',
-    go_pprof: 'Go pprof',
+    go_pprof: 'Go pprof CPU',
+    go_pprof_heap: 'Go pprof Heap',
     ebpf_cpu: 'eBPF CPU 火焰图',
     ebpf_io: 'eBPF IO 延迟',
     ebpf_sched: 'eBPF 调度延迟',

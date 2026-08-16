@@ -41,33 +41,45 @@ type ContinuousSession struct {
 }
 
 type ProfileBatch struct {
-	ID            uint      `gorm:"primaryKey" json:"id"`
-	BID           string    `gorm:"column:bid;uniqueIndex;size:64" json:"bid"`
-	SessionSID    string    `gorm:"column:session_sid;size:64;index" json:"session_sid"`
-	TargetIP      string    `gorm:"column:target_ip;size:45;index" json:"target_ip"`
-	ObjectKey     string    `gorm:"column:object_key;size:512" json:"object_key"`
-	StartTime     time.Time `gorm:"column:start_time;index" json:"start_time"`
-	EndTime       time.Time `gorm:"column:end_time;index" json:"end_time"`
-	WindowCount   uint32    `gorm:"column:window_count" json:"window_count"`
-	SampleCount   uint64    `gorm:"column:sample_count" json:"sample_count"`
-	SchemaVersion uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
-	SignalTypes   []byte    `gorm:"column:signal_types;type:jsonb" json:"signal_types"`
-	Backends      []byte    `gorm:"column:backends;type:jsonb" json:"backends"`
-	Status        string    `gorm:"column:status;size:32;default:ready" json:"status"`
-	CreatedAt     time.Time `gorm:"column:created_at" json:"created_at"`
+	ID                uint      `gorm:"primaryKey" json:"id"`
+	BID               string    `gorm:"column:bid;uniqueIndex;size:64" json:"bid"`
+	SessionSID        string    `gorm:"column:session_sid;size:64;index" json:"session_sid"`
+	TargetIP          string    `gorm:"column:target_ip;size:45;index" json:"target_ip"`
+	ObjectKey         string    `gorm:"column:object_key;size:512" json:"object_key"`
+	StartTime         time.Time `gorm:"column:start_time;index" json:"start_time"`
+	EndTime           time.Time `gorm:"column:end_time;index" json:"end_time"`
+	WindowCount       uint32    `gorm:"column:window_count" json:"window_count"`
+	SampleCount       uint64    `gorm:"column:sample_count" json:"sample_count"`
+	SchemaVersion     uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
+	SignalTypes       []byte    `gorm:"column:signal_types;type:jsonb" json:"signal_types"`
+	Backends          []byte    `gorm:"column:backends;type:jsonb" json:"backends"`
+	Status            string    `gorm:"column:status;size:32;default:ready" json:"status"`
+	ProfileFormat     string    `gorm:"column:profile_format;size:32;default:json" json:"profile_format"`
+	BackendStatus     string    `gorm:"column:backend_status;size:32;default:ok" json:"backend_status"`
+	BackendReason     string    `gorm:"column:backend_reason" json:"backend_reason"`
+	AttemptedBackends []byte    `gorm:"column:attempted_backends;type:jsonb" json:"attempted_backends"`
+	SelectedBackend   string    `gorm:"column:selected_backend;size:64" json:"selected_backend"`
+	SymbolRefs        []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
+	CreatedAt         time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
 type ProfileWindow struct {
-	ID            uint      `gorm:"primaryKey" json:"id"`
-	SessionSID    string    `gorm:"column:session_sid;size:64;index:idx_profile_windows_session_time,priority:1" json:"session_sid"`
-	BatchBID      string    `gorm:"column:batch_bid;size:64;index" json:"batch_bid"`
-	WindowStart   time.Time `gorm:"column:window_start;index:idx_profile_windows_session_time,priority:2" json:"window_start"`
-	WindowEnd     time.Time `gorm:"column:window_end;index" json:"window_end"`
-	ObjectKey     string    `gorm:"column:object_key;size:512" json:"object_key"`
-	SampleCount   uint64    `gorm:"column:sample_count" json:"sample_count"`
-	SignalType    string    `gorm:"column:signal_type;size:64;default:cpu_profile;index" json:"signal_type"`
-	SchemaVersion uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
-	Backend       string    `gorm:"column:backend;size:64" json:"backend"`
-	Labels        []byte    `gorm:"column:labels;type:jsonb" json:"labels"`
-	CreatedAt     time.Time `gorm:"column:created_at" json:"created_at"`
+	ID                uint      `gorm:"primaryKey" json:"id"`
+	SessionSID        string    `gorm:"column:session_sid;size:64;index:idx_profile_windows_session_time,priority:1" json:"session_sid"`
+	BatchBID          string    `gorm:"column:batch_bid;size:64;index" json:"batch_bid"`
+	WindowStart       time.Time `gorm:"column:window_start;index:idx_profile_windows_session_time,priority:2" json:"window_start"`
+	WindowEnd         time.Time `gorm:"column:window_end;index" json:"window_end"`
+	ObjectKey         string    `gorm:"column:object_key;size:512" json:"object_key"`
+	SampleCount       uint64    `gorm:"column:sample_count" json:"sample_count"`
+	SignalType        string    `gorm:"column:signal_type;size:64;default:cpu_profile;index" json:"signal_type"`
+	SchemaVersion     uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
+	Backend           string    `gorm:"column:backend;size:64" json:"backend"`
+	Labels            []byte    `gorm:"column:labels;type:jsonb" json:"labels"`
+	ProfileFormat     string    `gorm:"column:profile_format;size:32;default:json" json:"profile_format"`
+	BackendStatus     string    `gorm:"column:backend_status;size:32;default:ok" json:"backend_status"`
+	BackendReason     string    `gorm:"column:backend_reason" json:"backend_reason"`
+	AttemptedBackends []byte    `gorm:"column:attempted_backends;type:jsonb" json:"attempted_backends"`
+	SelectedBackend   string    `gorm:"column:selected_backend;size:64" json:"selected_backend"`
+	SymbolRefs        []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
+	CreatedAt         time.Time `gorm:"column:created_at" json:"created_at"`
 }

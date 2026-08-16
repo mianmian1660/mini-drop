@@ -95,6 +95,8 @@ export const profiles = {
     topn: (params = {}) => client.get('/api/v1/profile/topn', { params }),
     diff: (params = {}) => client.get('/api/v1/profile/diff', { params }),
     labelValues: (params = {}) => client.get('/api/v1/profile/label-values', { params }),
+    // Fetch recent Go pprof heap tasks for the Memory tab link.
+    heapTasks: (params = {}) => client.get('/api/v1/tasks', { params: { ...params, task_kind: 'go_pprof_heap' } }),
 };
 
 export const continuous = {

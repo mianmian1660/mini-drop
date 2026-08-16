@@ -42,6 +42,8 @@ namespace drop
 {
 
     /// 构建 pprof 的完整 URL
+    /// Go pprof CPU profile (/debug/pprof/profile) 需要 seconds 参数；
+    /// Go pprof Heap profile (/debug/pprof/heap) 不接受 seconds 参数。
     static string build_pprof_url(const hotmethod::TaskDesc &taskDesc)
     {
         uint64_t duration = taskDesc.sampleargv().duration();
@@ -54,6 +56,34 @@ namespace drop
             fullUrl = taskDesc.sampleargv().event();
         if (fullUrl.empty())
             return "";
+
+        // Heap endpoint does not accept seconds= parameter
+        bool isHeap = fullUrl.find("/heap") != string::npos;
+        if (isHeap)
+        {
+            // Strip any existing seconds= param for heap URL
+            size_t pos = fullUrl.find("seconds=");
+            if (pos != string::npos)
+            {
+                size_t amp = fullUrl.find('&', pos);
+                if (amp == string::npos)
+                {
+                    // seconds= is last param; strip ? or & prefix
+                    if (pos > 0 && fullUrl[pos - 1] == '?')
+                        fullUrl = fullUrl.substr(0, pos - 1);
+                    else if (pos > 0 && fullUrl[pos - 1] == '&')
+                        fullUrl = fullUrl.substr(0, pos - 1);
+                    else
+                        fullUrl = fullUrl.substr(0, pos);
+                }
+                else
+                {
+                    fullUrl = fullUrl.substr(0, pos) + fullUrl.substr(amp + 1);
+                }
+            }
+            return fullUrl;
+        }
+
         const string seconds = "seconds=";
         if (fullUrl.find(seconds) == string::npos)
             fullUrl += (fullUrl.find('?') == string::npos ? "?" : "&") + seconds + to_string(duration);

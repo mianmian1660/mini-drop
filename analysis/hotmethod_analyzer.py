@@ -728,12 +728,12 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     }
 
 
-def _parse_pprof_top(output: str) -> dict:
-    """Convert `go tool pprof -top` CPU-time rows to the existing TopN schema.
+def _parse_pprof_top(output: str, sample_unit: str = "seconds") -> dict:
+    """Convert `go tool pprof -top` rows to the existing TopN schema.
 
-    pprof's ``flat`` value is duration (for example ``41.33s``), not a count
-    of sampling events.  It remains in ``samples`` for backwards-compatible
-    JSON, while ``sample_unit`` tells the result page how to label it.
+    For CPU profiles, ``flat`` is duration (e.g. ``41.33s``); for heap profiles,
+    ``flat`` is bytes (e.g. ``1048576``).  ``sample_unit`` tells the result
+    page how to label it.
     """
     rows = []
     total = 0
@@ -742,7 +742,7 @@ def _parse_pprof_top(output: str) -> dict:
         m = re.match(r"^\s*([\d.]+)([a-zA-Zµ]+)?\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)([a-zA-Zµ]+)?\s+([\d.]+)%\s+(.+)$", line)
         if not m:
             continue
-        samples = float(m.group(1))
+        samples = _pprof_value_to_unit(m.group(1), m.group(2), sample_unit)
         pct = float(m.group(3))
         name = m.group(8).strip()
         if not name or name.startswith("..."):
@@ -750,17 +750,77 @@ def _parse_pprof_top(output: str) -> dict:
         total += samples
         rows.append({"function": name, "samples": samples, "percentage": pct})
     return {
-        "language": "go", "source_format": "pprof", "sample_unit": "seconds", "total_samples": total,
+        "language": "go", "source_format": "pprof", "sample_unit": sample_unit, "total_samples": total,
         "self_time_top": [{**row, "rank": i + 1} for i, row in enumerate(rows[:20])],
     }
 
 
+def _pprof_value_to_unit(raw_value: str, raw_suffix: str, sample_unit: str) -> float:
+    value = float(raw_value)
+    suffix = (raw_suffix or "").strip().lower()
+    if sample_unit == "bytes":
+        multipliers = {
+            "": 1,
+            "b": 1,
+            "kb": 1024,
+            "kib": 1024,
+            "mb": 1024 ** 2,
+            "mib": 1024 ** 2,
+            "gb": 1024 ** 3,
+            "gib": 1024 ** 3,
+            "tb": 1024 ** 4,
+            "tib": 1024 ** 4,
+        }
+        return value * multipliers.get(suffix, 1)
+    if sample_unit == "seconds":
+        multipliers = {
+            "": 1,
+            "s": 1,
+            "sec": 1,
+            "ms": 1e-3,
+            "us": 1e-6,
+            "µs": 1e-6,
+            "μs": 1e-6,
+            "ns": 1e-9,
+        }
+        return value * multipliers.get(suffix, 1)
+    return value
+
+
 def _analyze_pprof(conn, storage_cfg: dict, task: dict, bucket: str, tid: str,
                    local_dir: str = "") -> dict:
+    """Analyse a gzip protobuf profile with the official Go pprof CLI.
+
+    Dispatches to CPU or heap analysis based on task_kind / pprof_url.
+    go_pprof_heap tasks use /debug/pprof/heap endpoint and report bytes.
+    """
+    # Determine if this is a heap profile
+    params = task.get("request_params") or {}
+    task_kind = ""
+    if isinstance(params, dict):
+        task_kind = params.get("task_kind") or ""
+    if not task_kind:
+        task_kind = task.get("task_kind") or ""
+    pprof_url = ""
+    if isinstance(params, dict):
+        pprof_url = params.get("pprof_url") or ""
+    is_heap = task_kind == "go_pprof_heap" or "/heap" in pprof_url
+
+    if is_heap:
+        return _analyze_pprof_heap(conn, storage_cfg, task, bucket, tid, local_dir)
+    return _analyze_pprof_cpu(conn, storage_cfg, task, bucket, tid, local_dir)
+
+
+def _analyze_pprof_cpu(conn, storage_cfg: dict, task: dict, bucket: str, tid: str,
+                       local_dir: str = "") -> dict:
     """Analyse a gzip protobuf CPU profile with the official Go pprof CLI."""
     storage, storage_ok = _connect_storage(storage_cfg)
     local_profile = f"/tmp/{tid}_pprof.pb.gz"
-    if not storage_ok or not _download_perf_data(storage, bucket, tid, local_profile):
+    # Try tid/profile.pb.gz first, then fall back to tid/perf.data (legacy)
+    keys = _raw_artifact_keys(conn, tid, suffixes=["profile.pb.gz", ".pb.gz"])
+    keys.append(f"{tid}/profile.pb.gz")
+    keys.append(f"{tid}/perf.data")
+    if not storage_ok or not _download_first_existing(storage, bucket, keys, local_profile, "pprof profile"):
         raise ValueError("找不到 pprof 原始 profile")
     if not shutil.which("go"):
         raise RuntimeError("分析镜像缺少 go tool pprof")
@@ -776,8 +836,62 @@ def _analyze_pprof(conn, storage_cfg: dict, task: dict, bucket: str, tid: str,
         raise RuntimeError("pprof TopN 生成失败: " + top_run.stderr.strip())
     with open(svg_path, "rb") as f:
         svg = f.read()
-    top_json = _parse_pprof_top(top_run.stdout)
+    top_json = _parse_pprof_top(top_run.stdout, "seconds")
     top_json["task_name"] = task.get("name", tid)
+    top_json["profile_type"] = "cpu"
+    outputs, urls, local_files = [], {}, []
+    for name, data, content_type in (("flamegraph.svg", svg, "image/svg+xml"), ("top.json", top_json, "application/json")):
+        key = _upload_output(storage, bucket, tid, name, data, content_type)
+        if key:
+            outputs.append(key)
+            urls[name] = _get_presigned_url(storage, bucket, key)
+        else:
+            path = _save_local_output(local_dir, f"{tid}_{name}", data)
+            if path:
+                outputs.append(path); local_files.append(path)
+    return {"outputs": outputs, "presigned_urls": urls, "local_files": local_files}
+
+
+def _analyze_pprof_heap(conn, storage_cfg: dict, task: dict, bucket: str, tid: str,
+                        local_dir: str = "") -> dict:
+    """Analyse a gzip protobuf Go heap profile.
+
+    Uses `go tool pprof -top` with inuse_space sample type; reports bytes.
+    Generates flamegraph.svg and top.json with sample_unit="bytes".
+    """
+    storage, storage_ok = _connect_storage(storage_cfg)
+    local_profile = f"/tmp/{tid}_pprof_heap.pb.gz"
+    keys = _raw_artifact_keys(conn, tid, suffixes=["profile.pb.gz", ".pb.gz"])
+    keys.append(f"{tid}/profile.pb.gz")
+    if not storage_ok or not _download_first_existing(storage, bucket, keys, local_profile, "pprof heap profile"):
+        raise ValueError("找不到 pprof heap 原始 profile")
+    if not shutil.which("go"):
+        raise RuntimeError("分析镜像缺少 go tool pprof")
+
+    # Validate this is a heap profile by checking sample type
+    sample_index = "inuse_space"
+    type_run = subprocess.run(["go", "tool", "pprof", "-top", "-sample_index", sample_index, local_profile],
+                              text=True, capture_output=True)
+    if type_run.returncode != 0:
+        # Try alloc_space as fallback
+        sample_index = "alloc_space"
+        type_run = subprocess.run(["go", "tool", "pprof", "-top", "-sample_index", sample_index, local_profile],
+                                  text=True, capture_output=True)
+        if type_run.returncode != 0:
+            raise RuntimeError("pprof heap TopN 生成失败（不是有效的 heap profile）: " + type_run.stderr.strip())
+
+    svg_path = f"/tmp/{tid}_pprof_heap.svg"
+    svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-sample_index", sample_index, "-output", svg_path, local_profile],
+                             text=True, capture_output=True)
+    if svg_run.returncode != 0 or not os.path.exists(svg_path):
+        raise RuntimeError("pprof heap SVG 生成失败: " + (svg_run.stderr.strip() or svg_run.stdout.strip()))
+
+    with open(svg_path, "rb") as f:
+        svg = f.read()
+    top_json = _parse_pprof_top(type_run.stdout, "bytes")
+    top_json["task_name"] = task.get("name", tid)
+    top_json["profile_type"] = "heap"
+    top_json["metric"] = sample_index
     outputs, urls, local_files = [], {}, []
     for name, data, content_type in (("flamegraph.svg", svg, "image/svg+xml"), ("top.json", top_json, "application/json")):
         key = _upload_output(storage, bucket, tid, name, data, content_type)

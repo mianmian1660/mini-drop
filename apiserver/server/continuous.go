@@ -25,6 +25,13 @@ import (
 const continuousMaxDBCount = uint64(1<<63 - 1)
 const continuousMaxReasonableProfileSampleCount = uint64(1_000_000_000)
 
+// 查询保护：最大时间窗口 6h，最大窗口数 2160（10s 窗口 × 6h = 2160），
+// max_nodes 默认 5000，上限 20000。借鉴 Pyroscope query API 的 maxNodes 保护。
+const continuousMaxQueryWindow = 6 * time.Hour
+const continuousMaxWindowCount = 2160
+const continuousDefaultMaxNodes = 5000
+const continuousMaxNodesCap = 20000
+
 type CreateContinuousSessionReq struct {
 	Name                 string                 `json:"name"`
 	TargetIP             string                 `json:"target_ip" binding:"required"`
@@ -39,32 +46,44 @@ type CreateContinuousSessionReq struct {
 }
 
 type ContinuousBatchIngestReq struct {
-	SessionSID    string                   `json:"session_sid" binding:"required"`
-	BatchID       string                   `json:"batch_id"`
-	TargetIP      string                   `json:"target_ip"`
-	ObjectKey     string                   `json:"object_key"`
-	StartTime     time.Time                `json:"start_time" binding:"required"`
-	EndTime       time.Time                `json:"end_time" binding:"required"`
-	WindowCount   uint32                   `json:"window_count"`
-	SampleCount   uint64                   `json:"sample_count"`
-	SchemaVersion uint32                   `json:"schema_version"`
-	SignalTypes   []string                 `json:"signal_types"`
-	Backends      map[string]string        `json:"backends"`
-	Windows       []ContinuousWindowIngest `json:"windows"`
+	SessionSID        string                   `json:"session_sid" binding:"required"`
+	BatchID           string                   `json:"batch_id"`
+	TargetIP          string                   `json:"target_ip"`
+	ObjectKey         string                   `json:"object_key"`
+	StartTime         time.Time                `json:"start_time" binding:"required"`
+	EndTime           time.Time                `json:"end_time" binding:"required"`
+	WindowCount       uint32                   `json:"window_count"`
+	SampleCount       uint64                   `json:"sample_count"`
+	SchemaVersion     uint32                   `json:"schema_version"`
+	SignalTypes       []string                 `json:"signal_types"`
+	Backends          map[string]string        `json:"backends"`
+	ProfileFormat     string                   `json:"profile_format"`
+	BackendStatus     string                   `json:"backend_status"`
+	BackendReason     string                   `json:"backend_reason"`
+	AttemptedBackends []string                 `json:"attempted_backends"`
+	SelectedBackend   string                   `json:"selected_backend"`
+	SymbolRefs        map[string]interface{}   `json:"symbol_refs"`
+	Windows           []ContinuousWindowIngest `json:"windows"`
 }
 
 type ContinuousWindowIngest struct {
-	WindowStart   time.Time                   `json:"window_start"`
-	WindowEnd     time.Time                   `json:"window_end"`
-	ObjectKey     string                      `json:"object_key"`
-	SampleCount   uint64                      `json:"sample_count"`
-	SignalType    string                      `json:"signal_type"`
-	SchemaVersion uint32                      `json:"schema_version"`
-	Backend       string                      `json:"backend"`
-	Labels        map[string]interface{}      `json:"labels"`
-	Samples       []ContinuousStackSample     `json:"samples"`
-	Profiles      []ContinuousProfileIngest   `json:"profiles"`
-	Histograms    []ContinuousHistogramIngest `json:"histograms"`
+	WindowStart       time.Time                   `json:"window_start"`
+	WindowEnd         time.Time                   `json:"window_end"`
+	ObjectKey         string                      `json:"object_key"`
+	SampleCount       uint64                      `json:"sample_count"`
+	SignalType        string                      `json:"signal_type"`
+	SchemaVersion     uint32                      `json:"schema_version"`
+	Backend           string                      `json:"backend"`
+	Labels            map[string]interface{}      `json:"labels"`
+	ProfileFormat     string                      `json:"profile_format"`
+	BackendStatus     string                      `json:"backend_status"`
+	BackendReason     string                      `json:"backend_reason"`
+	AttemptedBackends []string                    `json:"attempted_backends"`
+	SelectedBackend   string                      `json:"selected_backend"`
+	SymbolRefs        map[string]interface{}      `json:"symbol_refs"`
+	Samples           []ContinuousStackSample     `json:"samples"`
+	Profiles          []ContinuousProfileIngest   `json:"profiles"`
+	Histograms        []ContinuousHistogramIngest `json:"histograms"`
 }
 
 type ContinuousStackSample struct {
@@ -115,24 +134,32 @@ type ContinuousHistogramSummary struct {
 }
 
 type continuousStoredBatch struct {
-	SessionSID    string                   `json:"session_sid"`
-	BatchID       string                   `json:"batch_id"`
-	TargetIP      string                   `json:"target_ip"`
-	StartTime     time.Time                `json:"start_time"`
-	EndTime       time.Time                `json:"end_time"`
-	SchemaVersion uint32                   `json:"schema_version"`
-	SignalTypes   []string                 `json:"signal_types,omitempty"`
-	Backends      map[string]string        `json:"backends,omitempty"`
-	Windows       []ContinuousWindowIngest `json:"windows"`
+	SessionSID        string                   `json:"session_sid"`
+	BatchID           string                   `json:"batch_id"`
+	TargetIP          string                   `json:"target_ip"`
+	StartTime         time.Time                `json:"start_time"`
+	EndTime           time.Time                `json:"end_time"`
+	SchemaVersion     uint32                   `json:"schema_version"`
+	SignalTypes       []string                 `json:"signal_types,omitempty"`
+	Backends          map[string]string        `json:"backends,omitempty"`
+	ProfileFormat     string                   `json:"profile_format,omitempty"`
+	BackendStatus     string                   `json:"backend_status,omitempty"`
+	BackendReason     string                   `json:"backend_reason,omitempty"`
+	AttemptedBackends []string                 `json:"attempted_backends,omitempty"`
+	SelectedBackend   string                   `json:"selected_backend,omitempty"`
+	SymbolRefs        map[string]interface{}   `json:"symbol_refs,omitempty"`
+	Windows           []ContinuousWindowIngest `json:"windows"`
 }
 
 type continuousAggregate struct {
-	Total      float64
-	Top        map[string]*ProfileTopItem
-	Root       *continuousTreeNode
-	LabelValue map[string]map[string]bool
-	ObjectKeys []string
-	Backends   map[string]bool
+	Total        float64
+	Top          map[string]*ProfileTopItem
+	Root         *continuousTreeNode
+	LabelValue   map[string]map[string]bool
+	ObjectKeys   []string
+	Backends     map[string]bool
+	SymbolStatus string
+	WindowCount  int
 }
 
 type continuousTreeNode struct {
@@ -290,19 +317,25 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	}
 	now := time.Now()
 	batch := model.ProfileBatch{
-		BID:           req.BatchID,
-		SessionSID:    req.SessionSID,
-		TargetIP:      req.TargetIP,
-		ObjectKey:     req.ObjectKey,
-		StartTime:     req.StartTime,
-		EndTime:       req.EndTime,
-		WindowCount:   req.WindowCount,
-		SampleCount:   clampContinuousCount(req.SampleCount),
-		SchemaVersion: req.SchemaVersion,
-		SignalTypes:   mustJSONBytes(req.SignalTypes),
-		Backends:      mustJSONBytes(req.Backends),
-		Status:        model.ContinuousBatchStatusReady,
-		CreatedAt:     now,
+		BID:               req.BatchID,
+		SessionSID:        req.SessionSID,
+		TargetIP:          req.TargetIP,
+		ObjectKey:         req.ObjectKey,
+		StartTime:         req.StartTime,
+		EndTime:           req.EndTime,
+		WindowCount:       req.WindowCount,
+		SampleCount:       clampContinuousCount(req.SampleCount),
+		SchemaVersion:     req.SchemaVersion,
+		SignalTypes:       mustJSONBytes(req.SignalTypes),
+		Backends:          mustJSONBytes(req.Backends),
+		Status:            model.ContinuousBatchStatusReady,
+		ProfileFormat:     firstNonEmpty(req.ProfileFormat, "json"),
+		BackendStatus:     firstNonEmpty(req.BackendStatus, "ok"),
+		BackendReason:     req.BackendReason,
+		AttemptedBackends: mustJSONBytes(req.AttemptedBackends),
+		SelectedBackend:   req.SelectedBackend,
+		SymbolRefs:        mustJSONBytes(req.SymbolRefs),
+		CreatedAt:         now,
 	}
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "bid"}}, DoNothing: true}).Create(&batch).Error; err != nil {
@@ -313,19 +346,26 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 				continue
 			}
 			labels, _ := json.Marshal(in.Labels)
+			symbolRefs, _ := json.Marshal(in.SymbolRefs)
 			for _, signal := range continuousWindowSignalRows(in) {
 				window := model.ProfileWindow{
-					SessionSID:    req.SessionSID,
-					BatchBID:      req.BatchID,
-					WindowStart:   in.WindowStart,
-					WindowEnd:     in.WindowEnd,
-					ObjectKey:     firstNonEmpty(in.ObjectKey, req.ObjectKey),
-					SampleCount:   clampContinuousCount(continuousWindowSampleCount(in, signal.SignalType)),
-					SignalType:    signal.SignalType,
-					SchemaVersion: firstNonZeroUint32(in.SchemaVersion, req.SchemaVersion),
-					Backend:       signal.Backend,
-					Labels:        labels,
-					CreatedAt:     now,
+					SessionSID:        req.SessionSID,
+					BatchBID:          req.BatchID,
+					WindowStart:       in.WindowStart,
+					WindowEnd:         in.WindowEnd,
+					ObjectKey:         firstNonEmpty(in.ObjectKey, req.ObjectKey),
+					SampleCount:       clampContinuousCount(continuousWindowSampleCount(in, signal.SignalType)),
+					SignalType:        signal.SignalType,
+					SchemaVersion:     firstNonZeroUint32(in.SchemaVersion, req.SchemaVersion),
+					Backend:           signal.Backend,
+					Labels:            labels,
+					ProfileFormat:     firstNonEmpty(in.ProfileFormat, req.ProfileFormat, "json"),
+					BackendStatus:     firstNonEmpty(in.BackendStatus, req.BackendStatus, "ok"),
+					BackendReason:     firstNonEmpty(in.BackendReason, req.BackendReason),
+					AttemptedBackends: mustJSONBytes(firstNonEmptySlice(in.AttemptedBackends, req.AttemptedBackends)),
+					SelectedBackend:   firstNonEmpty(in.SelectedBackend, req.SelectedBackend),
+					SymbolRefs:        symbolRefs,
+					CreatedAt:         now,
 				}
 				if err := tx.Create(&window).Error; err != nil {
 					return err
@@ -454,15 +494,21 @@ func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req Continu
 		return errProfileUnavailable
 	}
 	payload := continuousStoredBatch{
-		SessionSID:    req.SessionSID,
-		BatchID:       req.BatchID,
-		TargetIP:      req.TargetIP,
-		StartTime:     req.StartTime,
-		EndTime:       req.EndTime,
-		SchemaVersion: req.SchemaVersion,
-		SignalTypes:   req.SignalTypes,
-		Backends:      req.Backends,
-		Windows:       req.Windows,
+		SessionSID:        req.SessionSID,
+		BatchID:           req.BatchID,
+		TargetIP:          req.TargetIP,
+		StartTime:         req.StartTime,
+		EndTime:           req.EndTime,
+		SchemaVersion:     req.SchemaVersion,
+		SignalTypes:       req.SignalTypes,
+		Backends:          req.Backends,
+		ProfileFormat:     req.ProfileFormat,
+		BackendStatus:     req.BackendStatus,
+		BackendReason:     req.BackendReason,
+		AttemptedBackends: req.AttemptedBackends,
+		SelectedBackend:   req.SelectedBackend,
+		SymbolRefs:        req.SymbolRefs,
+		Windows:           req.Windows,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -518,7 +564,11 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 	if err != nil || !found {
 		return ProfileFlamegraph{}, found, err
 	}
-	nodes := continuousTreeToProfileNodes(agg.Root, "")
+	maxNodes := q.MaxNodes
+	if maxNodes == 0 {
+		maxNodes = continuousDefaultMaxNodes
+	}
+	nodes, truncated := continuousTreeToProfileNodesTruncated(agg.Root, "", maxNodes)
 	out := ProfileFlamegraph{
 		Nodes:         nodes,
 		Total:         agg.Total,
@@ -529,6 +579,8 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 		ProfileSource: "native",
 		ProfileURL:    s.continuousProfileURL(ctx, agg.ObjectKeys),
 		Query:         profileLabelSelector(q),
+		SymbolStatus:  agg.SymbolStatus,
+		Truncated:     truncated,
 		GeneratedAt:   time.Now(),
 	}
 	if out.Empty {
@@ -552,8 +604,14 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 		}
 		return items[i].Value > items[j].Value
 	})
-	if len(items) > 100 {
-		items = items[:100]
+	maxNodes := q.MaxNodes
+	if maxNodes == 0 {
+		maxNodes = continuousDefaultMaxNodes
+	}
+	truncated := false
+	if len(items) > maxNodes {
+		items = items[:maxNodes]
+		truncated = true
 	}
 	out := ProfileTopN{
 		Items:         items,
@@ -565,6 +623,8 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 		ProfileSource: "native",
 		ProfileURL:    s.continuousProfileURL(ctx, agg.ObjectKeys),
 		Query:         profileLabelSelector(q),
+		SymbolStatus:  agg.SymbolStatus,
+		Truncated:     truncated,
 		GeneratedAt:   time.Now(),
 	}
 	if out.Empty {
@@ -622,6 +682,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		Where("signal_type = ?", "cpu_profile").
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
 		Order("window_start ASC").
+		Limit(continuousMaxWindowCount + 1).
 		Find(&windows).Error
 	if err != nil {
 		return continuousAggregate{}, false, err
@@ -643,7 +704,9 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			"pid":  {},
 			"exe":  {},
 		},
-		Backends: map[string]bool{},
+		Backends:     map[string]bool{},
+		SymbolStatus: "not_applicable",
+		WindowCount:  len(windows),
 	}
 	byObject := map[string][]model.ProfileWindow{}
 	objectOrder := []string{}
@@ -662,10 +725,12 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			return continuousAggregate{}, true, err
 		}
 		agg.ObjectKeys = append(agg.ObjectKeys, objectKey)
+		continuousAggregateSymbolStatus(&agg, batch.SymbolRefs)
 		for _, window := range batch.Windows {
 			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 				continue
 			}
+			continuousAggregateSymbolStatus(&agg, window.SymbolRefs)
 			for _, sample := range continuousProfileSamplesForQuery(window, q) {
 				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
 					continue
@@ -675,6 +740,52 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		}
 	}
 	return agg, true, nil
+}
+
+// continuousAggregateSymbolStatus 根据 symbol_refs 推断符号化状态。
+// 借鉴 Pyroscope 查询时 symbolization 状态展示：complete/partial/missing/not_applicable。
+func continuousAggregateSymbolStatus(agg *continuousAggregate, refs map[string]interface{}) {
+	if len(refs) == 0 {
+		return
+	}
+	hasBuildID := false
+	hasKallsyms := false
+	missing := false
+	for key, v := range refs {
+		lk := strings.ToLower(key)
+		if strings.Contains(lk, "build_id") || strings.Contains(lk, "buildid") {
+			if s, ok := v.(string); ok && s != "" {
+				hasBuildID = true
+			} else if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
+				hasBuildID = true
+			}
+		}
+		if strings.Contains(lk, "kallsyms") || strings.Contains(lk, "kernel") {
+			if s, ok := v.(string); ok && s != "" {
+				hasKallsyms = true
+			} else if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
+				hasKallsyms = true
+			}
+		}
+		if strings.Contains(lk, "missing") || strings.Contains(lk, "unresolved") {
+			missing = true
+		}
+	}
+	if missing {
+		if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
+			agg.SymbolStatus = "partial"
+		}
+		return
+	}
+	if hasBuildID || hasKallsyms {
+		if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
+			agg.SymbolStatus = "complete"
+		}
+		return
+	}
+	if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
+		agg.SymbolStatus = "missing"
+	}
 }
 
 func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
@@ -1074,6 +1185,69 @@ func continuousTreeToProfileNodes(root *continuousTreeNode, prefix string) []Pro
 	return out
 }
 
+// continuousTreeToProfileNodesTruncated 带节点数上限的火焰图构建。
+// 借鉴 Pyroscope maxNodes 查询保护：超过上限时按值排序截断，并返回 truncated=true。
+func continuousTreeToProfileNodesTruncated(root *continuousTreeNode, prefix string, maxNodes int) ([]ProfileNode, bool) {
+	if root == nil {
+		return []ProfileNode{}, false
+	}
+	if maxNodes <= 0 {
+		maxNodes = continuousDefaultMaxNodes
+	}
+	count := countTreeNodes(root)
+	truncated := count > maxNodes
+	if !truncated {
+		return continuousTreeToProfileNodes(root, prefix), false
+	}
+	remaining := maxNodes
+	nodes := continuousTreeToProfileNodesBudget(root, prefix, &remaining)
+	return nodes, true
+}
+
+func continuousTreeToProfileNodesBudget(root *continuousTreeNode, prefix string, remaining *int) []ProfileNode {
+	if root == nil || remaining == nil || *remaining <= 0 {
+		return []ProfileNode{}
+	}
+	children := append([]*continuousTreeNode(nil), root.Order...)
+	sort.Slice(children, func(i, j int) bool {
+		if children[i].Value == children[j].Value {
+			return children[i].Name < children[j].Name
+		}
+		return children[i].Value > children[j].Value
+	})
+	out := make([]ProfileNode, 0, len(children))
+	for idx, child := range children {
+		if *remaining <= 0 {
+			break
+		}
+		id := strconv.Itoa(idx)
+		if prefix != "" {
+			id = prefix + "." + id
+		}
+		*remaining = *remaining - 1
+		node := ProfileNode{
+			ID:    id,
+			Name:  child.Name,
+			Value: child.Value,
+			Self:  child.Self,
+		}
+		node.Children = continuousTreeToProfileNodesBudget(child, id, remaining)
+		out = append(out, node)
+	}
+	return out
+}
+
+func countTreeNodes(node *continuousTreeNode) int {
+	if node == nil {
+		return 0
+	}
+	count := len(node.Order)
+	for _, child := range node.Order {
+		count += countTreeNodes(child)
+	}
+	return count
+}
+
 func (s *APIServer) continuousProfileURL(ctx context.Context, objectKeys []string) string {
 	if len(objectKeys) == 0 || !s.StorageConnected() {
 		return ""
@@ -1322,6 +1496,15 @@ func firstNonZeroUint64(values ...uint64) uint64 {
 		}
 	}
 	return 0
+}
+
+func firstNonEmptySlice(slices ...[]string) []string {
+	for _, s := range slices {
+		if len(s) > 0 {
+			return s
+		}
+	}
+	return nil
 }
 
 func (s *APIServer) loadReadableContinuousSession(c *gin.Context, sid string, auth AuthContext) (model.ContinuousSession, bool) {

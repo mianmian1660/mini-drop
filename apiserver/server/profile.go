@@ -68,6 +68,7 @@ type ProfileQuery struct {
 	StackScope  string                 `json:"stack_scope"`
 	Labels      map[string]interface{} `json:"labels"`
 	Filters     map[string]interface{} `json:"filters"`
+	MaxNodes    int                    `json:"max_nodes"`
 	OwnerUIDs   []string               `json:"-"`
 	CanReadAll  bool                   `json:"-"`
 }
@@ -83,6 +84,7 @@ type ProfileDiffQuery struct {
 	ProfileType string                 `json:"profile_type"`
 	Labels      map[string]interface{} `json:"labels"`
 	Filters     map[string]interface{} `json:"filters"`
+	MaxNodes    int                    `json:"max_nodes"`
 	OwnerUIDs   []string               `json:"-"`
 	CanReadAll  bool                   `json:"-"`
 }
@@ -106,6 +108,8 @@ type ProfileFlamegraph struct {
 	ProfileSource string        `json:"profile_source"`
 	ProfileURL    string        `json:"profile_url,omitempty"`
 	Query         string        `json:"query,omitempty"`
+	SymbolStatus  string        `json:"symbol_status,omitempty"`
+	Truncated     bool          `json:"truncated"`
 	GeneratedAt   time.Time     `json:"generated_at"`
 }
 
@@ -127,6 +131,8 @@ type ProfileTopN struct {
 	ProfileSource string           `json:"profile_source"`
 	ProfileURL    string           `json:"profile_url,omitempty"`
 	Query         string           `json:"query,omitempty"`
+	SymbolStatus  string           `json:"symbol_status,omitempty"`
+	Truncated     bool             `json:"truncated"`
 	GeneratedAt   time.Time        `json:"generated_at"`
 }
 
@@ -258,12 +264,12 @@ func (s *APIServer) GetProfileDiff(c *gin.Context) {
 		return
 	}
 	if baseTop, baseFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
-		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
 	}); err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
 	} else if compareTop, compareFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
-		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
 	}); err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
@@ -331,6 +337,7 @@ func (s *APIServer) profileQueryFromRequest(c *gin.Context) (ProfileQuery, bool)
 		StackScope:  strings.ToLower(strings.TrimSpace(c.DefaultQuery("stack_scope", ""))),
 		Labels:      parseProfileLabels(c.Query("labels")),
 		Filters:     parseProfileFilters(c.Query("filters")),
+		MaxNodes:    parseMaxNodes(c, "max_nodes"),
 	}
 	if !s.validateProfileQuery(c, &q) {
 		return ProfileQuery{}, false
@@ -367,12 +374,18 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 		ProfileType: strings.ToLower(strings.TrimSpace(c.DefaultQuery("profile_type", "cpu"))),
 		Labels:      parseProfileLabels(c.Query("labels")),
 		Filters:     parseProfileFilters(c.Query("filters")),
+		MaxNodes:    parseMaxNodes(c, "max_nodes"),
 	}
 	if !baseFrom.Before(baseTo) || !compareFrom.Before(compareTo) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "对比时间范围不合法")
 		return ProfileDiffQuery{}, false
 	}
-	pq := ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters}
+	if compareTo.Sub(compareFrom) > continuousMaxQueryWindow {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
+			"查询时间窗口过大，最大支持 6 小时，请缩小时间范围")
+		return ProfileDiffQuery{}, false
+	}
+	pq := ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes}
 	if !s.validateProfileQuery(c, &pq) {
 		return ProfileDiffQuery{}, false
 	}
@@ -391,6 +404,11 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) bool {
 	}
 	if !q.From.Before(q.To) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "时间范围不合法")
+		return false
+	}
+	if q.To.Sub(q.From) > continuousMaxQueryWindow {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
+			"查询时间窗口过大，最大支持 6 小时，请缩小时间范围")
 		return false
 	}
 	if q.TargetID == "" && q.Host == "" {
@@ -420,6 +438,21 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) bool {
 	return true
 }
 
+func parseMaxNodes(c *gin.Context, name string) int {
+	raw := strings.TrimSpace(c.Query(name))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n > continuousMaxNodesCap {
+		return continuousMaxNodesCap
+	}
+	return n
+}
+
 func (s *APIServer) respondReservedProfileType(c *gin.Context, profileType string) bool {
 	if profileType != "memory" {
 		return false
@@ -430,9 +463,11 @@ func (s *APIServer) respondReservedProfileType(c *gin.Context, profileType strin
 		"total":          0,
 		"unit":           "bytes",
 		"empty":          true,
-		"message":        "memory profiling 已预留，v1 暂未启用",
+		"message":        "memory profiling 暂无 continuous 数据，请使用 Go pprof Heap 按需任务采集堆 profile",
 		"source":         "mini-drop-native",
 		"profile_source": "native",
+		"memory_mode":    "go_pprof_heap_task",
+		"create_url":     "/task/create?task_kind=go_pprof_heap",
 		"generated_at":   time.Now(),
 	})
 	return true

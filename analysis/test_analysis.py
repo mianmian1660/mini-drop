@@ -378,6 +378,48 @@ def t_parse_pprof_top_schema():
     assert result["self_time_top"][0]["function"] == "main.work"
     assert result["self_time_top"][0]["percentage"] == 66.67
 
+
+def t_parse_pprof_top_heap_bytes():
+    from hotmethod_analyzer import _parse_pprof_top
+    result = _parse_pprof_top("Showing nodes accounting for 1048576, 100% of 1048576 total\n"
+                              "      flat  flat%   sum%        cum   cum%\n"
+                              "  524288 50.00% 50.00%   524288 50.00%  main.allocBig\n"
+                              "  524288 50.00%   100%  1048576   100%  main.run\n",
+                              sample_unit="bytes")
+    assert result["sample_unit"] == "bytes"
+    assert result["self_time_top"][0]["function"] == "main.allocBig"
+    assert result["self_time_top"][0]["samples"] == 524288
+
+
+def t_parse_pprof_top_converts_units():
+    from hotmethod_analyzer import _parse_pprof_top
+    cpu = _parse_pprof_top("     20ms 66.67% 66.67%      20ms 66.67%  main.work\n")
+    assert abs(cpu["self_time_top"][0]["samples"] - 0.02) < 0.000001
+    heap = _parse_pprof_top("     1.5MB 75.00% 75.00%      1.5MB 75.00%  main.alloc\n",
+                            sample_unit="bytes")
+    assert heap["self_time_top"][0]["samples"] == 1.5 * 1024 * 1024
+
+
+def t_analyze_pprof_dispatches_heap_by_task_kind():
+    """_analyze_pprof should dispatch to heap analyzer when task_kind=go_pprof_heap."""
+    import inspect
+    import hotmethod_analyzer as hm
+    src = inspect.getsource(hm._analyze_pprof)
+    assert "go_pprof_heap" in src
+    assert "_analyze_pprof_heap" in src
+    # heap analyzer exists and references bytes sample_unit
+    heap_src = inspect.getsource(hm._analyze_pprof_heap)
+    assert "bytes" in heap_src
+    assert "inuse_space" in heap_src
+
+
+def t_analyze_pprof_dispatches_heap_by_url():
+    """_analyze_pprof should detect heap by /heap in pprof_url."""
+    import inspect
+    import hotmethod_analyzer as hm
+    src = inspect.getsource(hm._analyze_pprof)
+    assert "/heap" in src
+
 def t_lease_owner_guard_sql():
     from lease import AnalysisLeaseClient
 
@@ -628,6 +670,9 @@ def t_stage6_collector_declarations_are_gated():
     from analyzer_registry import collector_declarations
     decls = {item["task_kind"]: item for item in collector_declarations()}
     assert decls["go_pprof"]["enabled"] is True
+    assert decls["go_pprof_heap"]["enabled"] is True
+    assert decls["go_pprof_heap"]["pipeline"] == "pprof_heap"
+    assert decls["go_pprof_heap"]["capabilities"] == ["pprof"]
     assert decls["async_profiler_java"]["pipeline"] == "java_async_profiler"
     for task_kind in ["java_heap", "python_py_spy", "python_memray", "gperftools_cpu", "bolt_profile", "script_diagnostic"]:
         assert task_kind in decls

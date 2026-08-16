@@ -16,6 +16,7 @@ const (
 	TaskKindPerfCPU           = "perf_cpu"
 	TaskKindAsyncProfilerJava = "async_profiler_java"
 	TaskKindGoPprof           = "go_pprof"
+	TaskKindGoPprofHeap       = "go_pprof_heap"
 	TaskKindEBPFCPU           = "ebpf_cpu"
 	TaskKindEBPFIO            = "ebpf_io"
 	TaskKindEBPFSched         = "ebpf_sched"
@@ -101,7 +102,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 			Enabled: true,
 		},
 		{
-			ID: TaskKindGoPprof, Name: "go_pprof", DisplayName: "Go pprof",
+			ID: TaskKindGoPprof, Name: "go_pprof", DisplayName: "Go pprof CPU",
 			Runner: "pprof", AnalysisPipeline: "perf_flamegraph",
 			Capabilities: []string{"pprof"}, SupportedOS: []string{"linux"},
 			Default: map[string]interface{}{"target_pid": 0, "duration": 10, "frequency": 1, "pprof_url": ""},
@@ -111,6 +112,17 @@ func taskKindDefinitions() []TaskKindDefinition {
 				{Name: "pprof_url", Label: "pprof Profile URL", Type: "url", Required: true, Default: "", Placeholder: "http://127.0.0.1:6060/debug/pprof/profile"},
 			},
 			MaxDuration: 3600, MaxConcurrency: 1, TaskType: TaskTypePprof, ProfilerType: ProfilerPprof,
+			Enabled: true,
+		},
+		{
+			ID: TaskKindGoPprofHeap, Name: "go_pprof_heap", DisplayName: "Go pprof Heap",
+			Runner: "pprof", AnalysisPipeline: "pprof_heap",
+			Capabilities: []string{"pprof"}, SupportedOS: []string{"linux"},
+			Default: map[string]interface{}{"target_pid": 0, "duration": 1, "frequency": 1, "pprof_url": ""},
+			Schema: []TaskKindField{
+				{Name: "pprof_url", Label: "pprof Heap URL", Type: "url", Required: true, Default: "", Placeholder: "http://127.0.0.1:6060/debug/pprof/heap"},
+			},
+			MaxDuration: 60, MaxConcurrency: 1, TaskType: TaskTypePprof, ProfilerType: ProfilerPprof,
 			Enabled: true,
 		},
 		{
@@ -222,6 +234,9 @@ func inferTaskKind(req CreateTaskReq) string {
 	case ProfilerAsync:
 		return TaskKindAsyncProfilerJava
 	case ProfilerPprof:
+		if strings.Contains(strings.ToLower(req.PprofURL), "/heap") {
+			return TaskKindGoPprofHeap
+		}
 		return TaskKindGoPprof
 	case ProfilerBPF:
 		switch req.Event {
@@ -288,10 +303,13 @@ func validateTaskKindSpecific(kind TaskKindDefinition, req *CreateTaskReq) error
 		if req.Event == "" {
 			req.Event = "cpu"
 		}
-	case TaskKindGoPprof:
+	case TaskKindGoPprof, TaskKindGoPprofHeap:
 		parsed, err := url.ParseRequestURI(req.PprofURL)
 		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			return fmt.Errorf("pprof_url 必须是可访问的 http/https 完整 URL")
+		}
+		if kind.ID == TaskKindGoPprofHeap && !strings.Contains(strings.ToLower(req.PprofURL), "/heap") {
+			return fmt.Errorf("go_pprof_heap 任务的 pprof_url 必须指向 /debug/pprof/heap")
 		}
 	case TaskKindEBPFCPU, TaskKindEBPFIO, TaskKindEBPFSched:
 		if req.Event != kind.Event {
