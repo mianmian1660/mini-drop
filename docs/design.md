@@ -202,7 +202,9 @@ schedule_task -> cron trigger -> child hotmethod_task -> normal task flow
 
 每次 cron 触发都会创建一个普通 HotmethodTask，并将 `master_task_tid` 指向定时任务 SID。Web 的时间轴页面通过 `GET /api/v1/tasks/timeline?master_tid=...` 查询某个定时任务下的所有子任务，按时间顺序展示历史采集窗口。用户可以点击任意点进入对应结果页，回看该窗口的火焰图或直方图。
 
-新的 Native Continuous Profiling 不再复用 schedule SID 作为 master，而是以 `ContinuousSession` 表达一台 host 上的持续会话。MVP 固定为 Linux native CPU，整机低频采样，查询时按 `comm + pid + exe` 过滤；起步参数为 19Hz sampling、10s aggregation window、1min upload batch、24h retention。Agent 先检测 `perf_event`、`perf`、eBPF、BTF、tracepoint 与权限能力，MVP 走 perf_event/perf first，后续在支持 eBPF 的环境启用增强路径，不支持时回退到 perf_event。
+新的 Native Continuous Profiling 不再复用 schedule SID 作为 master，而是以 `ContinuousSession` 表达一台 host 上的持续会话。当前采用双轨持续采集：CPU profile 轨与 IO/调度延迟 histogram 轨。起步参数仍为 19Hz sampling、10s aggregation window、1min upload batch、24h retention。
+
+CPU 轨默认按 `CO-RE -> bpftrace -> perf` 顺序选择 backend。当前实现会探测 CO-RE/BTF 能力并记录不可用原因，真实 eBPF CPU 样本先由 bpftrace backend 产出，失败后回退到 `perf record`；查询时可按用户栈/内核栈视图展示。延迟轨使用 bpftrace 采集整机 IO/sched latency histogram，前端展示合并分布和 P50/P95/P99 趋势。不支持 eBPF 时不生成 mock，而是将信号标记为 unavailable 并保留 CPU perf fallback。
 
 ## 8. 关键决策与取舍
 

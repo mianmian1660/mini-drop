@@ -34,6 +34,7 @@ func profileRouter(s *APIServer) *gin.Engine {
 	api.POST("/internal/continuous/sessions", s.CreateInternalContinuousSession)
 	api.POST("/internal/continuous/batches", s.IngestContinuousBatch)
 	api.GET("/continuous/raw", s.ViewContinuousProfileObject)
+	api.GET("/continuous/histogram", s.QueryContinuousHistogram)
 	return router
 }
 
@@ -612,6 +613,90 @@ func TestInternalContinuousSessionIsSystemReadable(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"batch_id":"cpb-system"`) {
 		t.Fatalf("raw continuous object status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestContinuousHistogramIngestAndQuery(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	router := profileRouter(s)
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID:                  "cps-hist",
+		Name:                 "dual track",
+		TargetIP:             "10.0.0.30",
+		Hostname:             "node-hist",
+		ServiceName:          "hotmethod",
+		SampleRateHz:         19,
+		AggregationWindowSec: 10,
+		UploadBatchSec:       60,
+		RetentionHours:       24,
+		Capabilities:         []byte(`{"sampler":"dual_track","io_backend":"bpftrace","sched_backend":"bpftrace"}`),
+		Status:               model.ContinuousSessionStatusRunning,
+		UID:                  "owner",
+		StartedAt:            now.Add(-time.Minute),
+		CreatedAt:            now.Add(-time.Minute),
+		UpdatedAt:            now.Add(-time.Minute),
+	}).Error
+	start := now.Add(-20 * time.Second)
+	end := now.Add(-10 * time.Second)
+	body := fmt.Sprintf(`{
+		"session_sid":"cps-hist",
+		"batch_id":"cpb-hist",
+		"schema_version":2,
+		"signal_types":["cpu_profile","io_latency"],
+		"backends":{"cpu_user":"bpftrace","io_latency":"bpftrace"},
+		"start_time":%q,
+		"end_time":%q,
+		"windows":[{
+			"window_start":%q,
+			"window_end":%q,
+			"profiles":[{
+				"signal_type":"cpu_profile",
+				"backend":"bpftrace",
+				"stack_scope":"user",
+				"samples":[{"stack":["main","hot"],"count":5,"stack_scope":"user","backend":"bpftrace"}]
+			}],
+			"histograms":[{
+				"signal_type":"io_latency",
+				"backend":"bpftrace",
+				"unit":"us",
+				"event_count":9,
+				"summary":{"min":1,"max":8,"p50":2,"p95":6,"p99":6},
+				"buckets":[
+					{"range":"[1, 2)","low":1,"high":2,"count":4},
+					{"range":"[4, 8)","low":4,"high":8,"count":5}
+				]
+			}]
+		}]
+	}`, start.Format(time.RFC3339), end.Format(time.RFC3339), start.Format(time.RFC3339), end.Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ingest histogram status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	queryRange := "&from=" + url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339)) + "&to=" + url.QueryEscape(now.Format(time.RFC3339))
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/continuous/histogram?target_id=10.0.0.30:hotmethod&host=10.0.0.30&signal_type=io_latency"+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("histogram query status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"event_count":9`) || !strings.Contains(w.Body.String(), `"p95":6`) || !strings.Contains(w.Body.String(), `"backend":"bpftrace"`) {
+		t.Fatalf("unexpected histogram response: %s", w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/topn?target_id=10.0.0.30:hotmethod&host=10.0.0.30&stack_scope=user"+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"hot"`) {
+		t.Fatalf("stack_scope topn failed status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 
