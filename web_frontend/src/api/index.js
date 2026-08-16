@@ -103,6 +103,7 @@ export const continuous = {
     stopSession: (sid) => client.post(`/api/v1/continuous/sessions/${sid}/stop`),
     timeline: (sid, params = {}) => client.get(`/api/v1/continuous/sessions/${sid}/timeline`, { params }),
     query: (params = {}) => client.get('/api/v1/continuous/query', { params }),
+    histogram: (params = {}) => client.get('/api/v1/continuous/histogram', { params }),
 };
 
 // ---------- 分析结果 ----------

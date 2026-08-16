@@ -37,6 +37,7 @@ export default function InteractiveFlamegraph({
         nodes: countProfileNodes(data.nodes),
         depth: maxProfileDepth(data.nodes),
     } : { nodes: 0, depth: 0 }, [data, hasData]);
+    const shouldUseSafeView = hasData && (profileStats.nodes > SAFE_MAX_NODES || profileStats.depth > SAFE_MAX_DEPTH);
     const renderData = useMemo(() => {
         if (!hasData) return null;
         return renderMode === 'safe' ? pruneFlamegraphForRender(data, SAFE_MAX_DEPTH, SAFE_MAX_NODES) : data;
@@ -44,9 +45,9 @@ export default function InteractiveFlamegraph({
     const d3Data = useMemo(() => renderData ? miniDropToD3Flamegraph(renderData) : null, [renderData]);
 
     useEffect(() => {
-        setRenderMode('full');
+        setRenderMode(shouldUseSafeView ? 'safe' : 'full');
         setRenderError('');
-    }, [data]);
+    }, [data, shouldUseSafeView]);
 
     useEffect(() => {
         if (!graphRef.current || !hasData || !renderData || !d3Data) return undefined;
@@ -91,7 +92,7 @@ export default function InteractiveFlamegraph({
             <div ref={graphRef} style={{ ...BASE.flameBox, ...boxStyle }} />
             {renderMode === 'safe' && !renderError && (
                 <div style={BASE.note}>
-                    全量数据节点 {profileStats.nodes}、深度 {profileStats.depth}，浏览器直接渲染失败，已自动切到安全视图。
+                    全量数据节点 {profileStats.nodes}、深度 {profileStats.depth}，已使用安全视图保证渲染稳定。
                     <div style={BASE.actions}>
                         <button type="button" style={BASE.button} onClick={() => setRenderMode('full')}>重试全量渲染</button>
                         {(data?.profile_url || externalUrl) && <a href={data?.profile_url || externalUrl} target="_blank" rel="noreferrer" style={BASE.button}>{externalLabel}</a>}

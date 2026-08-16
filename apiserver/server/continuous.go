@@ -22,6 +22,9 @@ import (
 	"github.com/mini-drop/apiserver/util"
 )
 
+const continuousMaxDBCount = uint64(1<<63 - 1)
+const continuousMaxReasonableProfileSampleCount = uint64(1_000_000_000)
+
 type CreateContinuousSessionReq struct {
 	Name                 string                 `json:"name"`
 	TargetIP             string                 `json:"target_ip" binding:"required"`
@@ -36,24 +39,32 @@ type CreateContinuousSessionReq struct {
 }
 
 type ContinuousBatchIngestReq struct {
-	SessionSID  string                   `json:"session_sid" binding:"required"`
-	BatchID     string                   `json:"batch_id"`
-	TargetIP    string                   `json:"target_ip"`
-	ObjectKey   string                   `json:"object_key"`
-	StartTime   time.Time                `json:"start_time" binding:"required"`
-	EndTime     time.Time                `json:"end_time" binding:"required"`
-	WindowCount uint32                   `json:"window_count"`
-	SampleCount uint64                   `json:"sample_count"`
-	Windows     []ContinuousWindowIngest `json:"windows"`
+	SessionSID    string                   `json:"session_sid" binding:"required"`
+	BatchID       string                   `json:"batch_id"`
+	TargetIP      string                   `json:"target_ip"`
+	ObjectKey     string                   `json:"object_key"`
+	StartTime     time.Time                `json:"start_time" binding:"required"`
+	EndTime       time.Time                `json:"end_time" binding:"required"`
+	WindowCount   uint32                   `json:"window_count"`
+	SampleCount   uint64                   `json:"sample_count"`
+	SchemaVersion uint32                   `json:"schema_version"`
+	SignalTypes   []string                 `json:"signal_types"`
+	Backends      map[string]string        `json:"backends"`
+	Windows       []ContinuousWindowIngest `json:"windows"`
 }
 
 type ContinuousWindowIngest struct {
-	WindowStart time.Time               `json:"window_start"`
-	WindowEnd   time.Time               `json:"window_end"`
-	ObjectKey   string                  `json:"object_key"`
-	SampleCount uint64                  `json:"sample_count"`
-	Labels      map[string]interface{}  `json:"labels"`
-	Samples     []ContinuousStackSample `json:"samples"`
+	WindowStart   time.Time                   `json:"window_start"`
+	WindowEnd     time.Time                   `json:"window_end"`
+	ObjectKey     string                      `json:"object_key"`
+	SampleCount   uint64                      `json:"sample_count"`
+	SignalType    string                      `json:"signal_type"`
+	SchemaVersion uint32                      `json:"schema_version"`
+	Backend       string                      `json:"backend"`
+	Labels        map[string]interface{}      `json:"labels"`
+	Samples       []ContinuousStackSample     `json:"samples"`
+	Profiles      []ContinuousProfileIngest   `json:"profiles"`
+	Histograms    []ContinuousHistogramIngest `json:"histograms"`
 }
 
 type ContinuousStackSample struct {
@@ -63,16 +74,56 @@ type ContinuousStackSample struct {
 	Comm        string                 `json:"comm"`
 	PID         int                    `json:"pid"`
 	Exe         string                 `json:"exe"`
+	StackScope  string                 `json:"stack_scope"`
+	Backend     string                 `json:"backend"`
 	Labels      map[string]interface{} `json:"labels"`
 }
 
+type ContinuousProfileIngest struct {
+	SignalType string                  `json:"signal_type"`
+	Backend    string                  `json:"backend"`
+	StackScope string                  `json:"stack_scope"`
+	Samples    []ContinuousStackSample `json:"samples"`
+	Labels     map[string]interface{}  `json:"labels"`
+}
+
+type ContinuousHistogramIngest struct {
+	SignalType  string                      `json:"signal_type"`
+	Backend     string                      `json:"backend"`
+	Unit        string                      `json:"unit"`
+	EventCount  uint64                      `json:"event_count"`
+	Buckets     []ContinuousHistogramBucket `json:"buckets"`
+	Summary     ContinuousHistogramSummary  `json:"summary"`
+	Labels      map[string]interface{}      `json:"labels"`
+	Unavailable bool                        `json:"unavailable"`
+	Reason      string                      `json:"reason"`
+}
+
+type ContinuousHistogramBucket struct {
+	Range string  `json:"range"`
+	Low   float64 `json:"low"`
+	High  float64 `json:"high"`
+	Count uint64  `json:"count"`
+}
+
+type ContinuousHistogramSummary struct {
+	Min float64 `json:"min"`
+	Max float64 `json:"max"`
+	P50 float64 `json:"p50"`
+	P95 float64 `json:"p95"`
+	P99 float64 `json:"p99"`
+}
+
 type continuousStoredBatch struct {
-	SessionSID string                   `json:"session_sid"`
-	BatchID    string                   `json:"batch_id"`
-	TargetIP   string                   `json:"target_ip"`
-	StartTime  time.Time                `json:"start_time"`
-	EndTime    time.Time                `json:"end_time"`
-	Windows    []ContinuousWindowIngest `json:"windows"`
+	SessionSID    string                   `json:"session_sid"`
+	BatchID       string                   `json:"batch_id"`
+	TargetIP      string                   `json:"target_ip"`
+	StartTime     time.Time                `json:"start_time"`
+	EndTime       time.Time                `json:"end_time"`
+	SchemaVersion uint32                   `json:"schema_version"`
+	SignalTypes   []string                 `json:"signal_types,omitempty"`
+	Backends      map[string]string        `json:"backends,omitempty"`
+	Windows       []ContinuousWindowIngest `json:"windows"`
 }
 
 type continuousAggregate struct {
@@ -81,6 +132,7 @@ type continuousAggregate struct {
 	Root       *continuousTreeNode
 	LabelValue map[string]map[string]bool
 	ObjectKeys []string
+	Backends   map[string]bool
 }
 
 type continuousTreeNode struct {
@@ -224,6 +276,13 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	if req.WindowCount == 0 {
 		req.WindowCount = uint32(len(req.Windows))
 	}
+	if req.SchemaVersion == 0 {
+		req.SchemaVersion = 1
+	}
+	req.SignalTypes = normalizeContinuousSignalTypes(req)
+	if req.Backends == nil {
+		req.Backends = map[string]string{}
+	}
 	if err := s.storeContinuousBatchPayload(c.Request.Context(), req); err != nil {
 		s.Logger.Error("保存 Continuous ProfileBatch payload 失败", zap.String("sid", req.SessionSID), zap.Error(err))
 		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "保存 Continuous ProfileBatch payload 失败")
@@ -231,16 +290,19 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	}
 	now := time.Now()
 	batch := model.ProfileBatch{
-		BID:         req.BatchID,
-		SessionSID:  req.SessionSID,
-		TargetIP:    req.TargetIP,
-		ObjectKey:   req.ObjectKey,
-		StartTime:   req.StartTime,
-		EndTime:     req.EndTime,
-		WindowCount: req.WindowCount,
-		SampleCount: req.SampleCount,
-		Status:      model.ContinuousBatchStatusReady,
-		CreatedAt:   now,
+		BID:           req.BatchID,
+		SessionSID:    req.SessionSID,
+		TargetIP:      req.TargetIP,
+		ObjectKey:     req.ObjectKey,
+		StartTime:     req.StartTime,
+		EndTime:       req.EndTime,
+		WindowCount:   req.WindowCount,
+		SampleCount:   clampContinuousCount(req.SampleCount),
+		SchemaVersion: req.SchemaVersion,
+		SignalTypes:   mustJSONBytes(req.SignalTypes),
+		Backends:      mustJSONBytes(req.Backends),
+		Status:        model.ContinuousBatchStatusReady,
+		CreatedAt:     now,
 	}
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "bid"}}, DoNothing: true}).Create(&batch).Error; err != nil {
@@ -251,18 +313,23 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 				continue
 			}
 			labels, _ := json.Marshal(in.Labels)
-			window := model.ProfileWindow{
-				SessionSID:  req.SessionSID,
-				BatchBID:    req.BatchID,
-				WindowStart: in.WindowStart,
-				WindowEnd:   in.WindowEnd,
-				ObjectKey:   firstNonEmpty(in.ObjectKey, req.ObjectKey),
-				SampleCount: in.SampleCount,
-				Labels:      labels,
-				CreatedAt:   now,
-			}
-			if err := tx.Create(&window).Error; err != nil {
-				return err
+			for _, signal := range continuousWindowSignalRows(in) {
+				window := model.ProfileWindow{
+					SessionSID:    req.SessionSID,
+					BatchBID:      req.BatchID,
+					WindowStart:   in.WindowStart,
+					WindowEnd:     in.WindowEnd,
+					ObjectKey:     firstNonEmpty(in.ObjectKey, req.ObjectKey),
+					SampleCount:   clampContinuousCount(continuousWindowSampleCount(in, signal.SignalType)),
+					SignalType:    signal.SignalType,
+					SchemaVersion: firstNonZeroUint32(in.SchemaVersion, req.SchemaVersion),
+					Backend:       signal.Backend,
+					Labels:        labels,
+					CreatedAt:     now,
+				}
+				if err := tx.Create(&window).Error; err != nil {
+					return err
+				}
 			}
 		}
 		return tx.Model(&model.ContinuousSession{}).
@@ -387,12 +454,15 @@ func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req Continu
 		return errProfileUnavailable
 	}
 	payload := continuousStoredBatch{
-		SessionSID: req.SessionSID,
-		BatchID:    req.BatchID,
-		TargetIP:   req.TargetIP,
-		StartTime:  req.StartTime,
-		EndTime:    req.EndTime,
-		Windows:    req.Windows,
+		SessionSID:    req.SessionSID,
+		BatchID:       req.BatchID,
+		TargetIP:      req.TargetIP,
+		StartTime:     req.StartTime,
+		EndTime:       req.EndTime,
+		SchemaVersion: req.SchemaVersion,
+		SignalTypes:   req.SignalTypes,
+		Backends:      req.Backends,
+		Windows:       req.Windows,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -453,6 +523,7 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 		Nodes:         nodes,
 		Total:         agg.Total,
 		Unit:          "samples",
+		Backend:       continuousBackendList(agg.Backends),
 		Empty:         len(nodes) == 0 || agg.Total == 0,
 		Source:        "mini-drop-native",
 		ProfileSource: "native",
@@ -488,6 +559,7 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 		Items:         items,
 		Total:         agg.Total,
 		Unit:          "samples",
+		Backend:       continuousBackendList(agg.Backends),
 		Empty:         len(items) == 0 || agg.Total == 0,
 		Source:        "mini-drop-native",
 		ProfileSource: "native",
@@ -547,6 +619,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		}
 	}
 	err := s.DB.Where("session_sid IN (?)", sessionQuery).
+		Where("signal_type = ?", "cpu_profile").
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
 		Order("window_start ASC").
 		Find(&windows).Error
@@ -570,6 +643,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			"pid":  {},
 			"exe":  {},
 		},
+		Backends: map[string]bool{},
 	}
 	byObject := map[string][]model.ProfileWindow{}
 	objectOrder := []string{}
@@ -592,7 +666,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 				continue
 			}
-			for _, sample := range window.Samples {
+			for _, sample := range continuousProfileSamplesForQuery(window, q) {
 				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
 					continue
 				}
@@ -601,6 +675,167 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		}
 	}
 	return agg, true, nil
+}
+
+func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
+	q, ok := s.profileQueryFromRequest(c)
+	if !ok {
+		return
+	}
+	signalType := strings.ToLower(strings.TrimSpace(c.Query("signal_type")))
+	if signalType == "" {
+		signalType = strings.ToLower(strings.TrimSpace(c.Query("profile_type")))
+	}
+	if signalType != "io_latency" && signalType != "sched_latency" {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "signal_type 仅支持 io_latency/sched_latency")
+		return
+	}
+	data, found, err := s.queryNativeContinuousHistogram(c.Request.Context(), q, signalType)
+	if err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	}
+	if !found {
+		s.RespondOK(c, gin.H{
+			"query":        profileLabelSelector(q),
+			"signal_type":  signalType,
+			"empty":        true,
+			"message":      "Native Continuous eBPF 暂无覆盖该时间范围的 histogram window",
+			"source":       "mini-drop-native",
+			"generated_at": time.Now(),
+			"buckets":      []ContinuousHistogramBucket{},
+			"trend":        []gin.H{},
+		})
+		return
+	}
+	s.RespondOK(c, data)
+}
+
+func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q ProfileQuery, signalType string) (gin.H, bool, error) {
+	var windows []model.ProfileWindow
+	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
+	if !q.CanReadAll {
+		if len(q.OwnerUIDs) > 0 {
+			sessionQuery = sessionQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", q.OwnerUIDs)
+		} else {
+			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
+		}
+	}
+	err := s.DB.Where("session_sid IN (?)", sessionQuery).
+		Where("signal_type = ?", signalType).
+		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
+		Order("window_start ASC").
+		Find(&windows).Error
+	if err != nil {
+		return nil, false, err
+	}
+	if len(windows) == 0 {
+		return nil, false, nil
+	}
+	if !s.StorageConnected() {
+		return nil, true, errProfileUnavailable
+	}
+
+	type bucketAgg struct {
+		Range string
+		Low   float64
+		High  float64
+		Count uint64
+	}
+	merged := map[string]*bucketAgg{}
+	trend := []gin.H{}
+	backends := map[string]bool{}
+	var totalEvents uint64
+	var unavailableReason string
+	objectKeys := []string{}
+	seenObject := map[string]bool{}
+
+	for _, objectKey := range orderedContinuousObjectKeys(windows) {
+		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+		if err != nil {
+			return nil, true, err
+		}
+		if !seenObject[objectKey] {
+			objectKeys = append(objectKeys, objectKey)
+			seenObject[objectKey] = true
+		}
+		for _, window := range batch.Windows {
+			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+				continue
+			}
+			for _, hist := range window.Histograms {
+				if strings.ToLower(strings.TrimSpace(hist.SignalType)) != signalType {
+					continue
+				}
+				if hist.Backend != "" {
+					backends[hist.Backend] = true
+				}
+				if hist.Unavailable && unavailableReason == "" {
+					unavailableReason = hist.Reason
+				}
+				totalEvents = addContinuousCount(totalEvents, hist.EventCount)
+				for _, bucket := range hist.Buckets {
+					key := bucket.Range + "|" + strconv.FormatFloat(bucket.Low, 'f', -1, 64) + "|" + strconv.FormatFloat(bucket.High, 'f', -1, 64)
+					item := merged[key]
+					if item == nil {
+						item = &bucketAgg{Range: bucket.Range, Low: bucket.Low, High: bucket.High}
+						merged[key] = item
+					}
+					item.Count = addContinuousCount(item.Count, bucket.Count)
+				}
+				trend = append(trend, gin.H{
+					"window_start": window.WindowStart,
+					"window_end":   window.WindowEnd,
+					"event_count":  hist.EventCount,
+					"p50":          hist.Summary.P50,
+					"p95":          hist.Summary.P95,
+					"p99":          hist.Summary.P99,
+					"backend":      hist.Backend,
+					"unavailable":  hist.Unavailable,
+					"reason":       hist.Reason,
+				})
+			}
+		}
+	}
+	buckets := make([]ContinuousHistogramBucket, 0, len(merged))
+	for _, item := range merged {
+		buckets = append(buckets, ContinuousHistogramBucket{Range: item.Range, Low: item.Low, High: item.High, Count: item.Count})
+	}
+	sort.Slice(buckets, func(i, j int) bool {
+		if buckets[i].Low == buckets[j].Low {
+			return buckets[i].High < buckets[j].High
+		}
+		return buckets[i].Low < buckets[j].Low
+	})
+	summary := summarizeContinuousBuckets(buckets)
+	backendList := make([]string, 0, len(backends))
+	for backend := range backends {
+		backendList = append(backendList, backend)
+	}
+	sort.Strings(backendList)
+	empty := len(buckets) == 0 || totalEvents == 0
+	message := ""
+	if empty {
+		message = firstNonEmpty(unavailableReason, "Native Continuous eBPF 暂无 histogram 样本")
+	} else if unavailableReason != "" {
+		message = "部分窗口不可用: " + unavailableReason
+	}
+	return gin.H{
+		"query":        profileLabelSelector(q),
+		"signal_type":  signalType,
+		"buckets":      buckets,
+		"summary":      summary,
+		"trend":        trend,
+		"event_count":  totalEvents,
+		"unit":         "us",
+		"backend":      strings.Join(backendList, ","),
+		"backends":     backendList,
+		"empty":        empty,
+		"message":      message,
+		"source":       "mini-drop-native",
+		"profile_url":  s.continuousProfileURL(ctx, objectKeys),
+		"generated_at": time.Now(),
+	}, true, nil
 }
 
 func (s *APIServer) loadContinuousStoredBatch(ctx context.Context, objectKey string) (continuousStoredBatch, error) {
@@ -633,6 +868,39 @@ func continuousSampleMatches(sample ContinuousStackSample, windowLabels map[stri
 	return true
 }
 
+func continuousProfileSamplesForQuery(window ContinuousWindowIngest, q ProfileQuery) []ContinuousStackSample {
+	if len(window.Profiles) == 0 {
+		return window.Samples
+	}
+	out := []ContinuousStackSample{}
+	scope := strings.ToLower(strings.TrimSpace(q.StackScope))
+	if scope == "all" {
+		scope = ""
+	}
+	for _, profile := range window.Profiles {
+		if strings.ToLower(strings.TrimSpace(firstNonEmpty(profile.SignalType, "cpu_profile"))) != "cpu_profile" {
+			continue
+		}
+		profileScope := strings.ToLower(strings.TrimSpace(profile.StackScope))
+		if scope != "" && profileScope != "" && profileScope != scope {
+			continue
+		}
+		for _, sample := range profile.Samples {
+			if sample.StackScope == "" {
+				sample.StackScope = profile.StackScope
+			}
+			if sample.Backend == "" {
+				sample.Backend = profile.Backend
+			}
+			if sample.Labels == nil {
+				sample.Labels = profile.Labels
+			}
+			out = append(out, sample)
+		}
+	}
+	return out
+}
+
 func continuousSampleLabel(sample ContinuousStackSample, windowLabels map[string]interface{}, key string) string {
 	if value := labelString(sample.Labels, key); value != "" {
 		return value
@@ -655,6 +923,9 @@ func continuousSampleLabel(sample ContinuousStackSample, windowLabels map[string
 }
 
 func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample, windowLabels map[string]interface{}) {
+	if !continuousSampleLooksValid(sample) {
+		return
+	}
 	count := float64(sample.Count)
 	if count <= 0 {
 		count = 1
@@ -668,6 +939,9 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		if value := continuousSampleLabel(sample, windowLabels, key); value != "" {
 			agg.LabelValue[key][value] = true
 		}
+	}
+	if backend := strings.TrimSpace(sample.Backend); backend != "" {
+		agg.Backends[backend] = true
 	}
 	for i, frame := range stack {
 		frame = strings.TrimSpace(frame)
@@ -706,6 +980,47 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		}
 		node = child
 	}
+}
+
+func continuousBackendList(backends map[string]bool) string {
+	if len(backends) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(backends))
+	for backend := range backends {
+		if strings.TrimSpace(backend) != "" {
+			out = append(out, backend)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
+}
+
+func continuousSampleLooksValid(sample ContinuousStackSample) bool {
+	if sample.Count > continuousMaxReasonableProfileSampleCount {
+		return false
+	}
+	for _, frame := range continuousSampleStack(sample) {
+		if continuousFrameLooksInvalid(frame) {
+			return false
+		}
+	}
+	if continuousFrameLooksInvalid(sample.StackString) {
+		return false
+	}
+	return true
+}
+
+func continuousFrameLooksInvalid(frame string) bool {
+	frame = strings.TrimSpace(frame)
+	if frame == "" {
+		return false
+	}
+	lower := strings.ToLower(frame)
+	return strings.HasPrefix(frame, "ERROR:") ||
+		strings.HasPrefix(lower, "stdin:") ||
+		strings.Contains(lower, "failed to look up stack id") ||
+		strings.Contains(lower, "unknown error")
 }
 
 func continuousSampleStack(sample ContinuousStackSample) []string {
@@ -805,6 +1120,208 @@ func applyContinuousDefaults(req *CreateContinuousSessionReq) {
 	if req.Capabilities == nil {
 		req.Capabilities = map[string]interface{}{}
 	}
+}
+
+type continuousSignalRow struct {
+	SignalType string
+	Backend    string
+}
+
+func continuousWindowSignalRows(window ContinuousWindowIngest) []continuousSignalRow {
+	seen := map[string]bool{}
+	rows := []continuousSignalRow{}
+	add := func(signalType, backend string) {
+		signalType = strings.ToLower(strings.TrimSpace(firstNonEmpty(signalType, "cpu_profile")))
+		if signalType == "" {
+			signalType = "cpu_profile"
+		}
+		key := signalType + "|" + backend
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		rows = append(rows, continuousSignalRow{SignalType: signalType, Backend: backend})
+	}
+	if len(window.Samples) > 0 {
+		add(firstNonEmpty(window.SignalType, "cpu_profile"), continuousLegacyProfileBackend(window))
+	}
+	for _, profile := range window.Profiles {
+		add(firstNonEmpty(profile.SignalType, "cpu_profile"), firstNonEmpty(profile.Backend, window.Backend))
+	}
+	for _, hist := range window.Histograms {
+		add(hist.SignalType, firstNonEmpty(hist.Backend, window.Backend))
+	}
+	if len(rows) == 0 {
+		add(firstNonEmpty(window.SignalType, "cpu_profile"), window.Backend)
+	}
+	return rows
+}
+
+func continuousLegacyProfileBackend(window ContinuousWindowIngest) string {
+	if window.Backend != "" {
+		return window.Backend
+	}
+	for _, sample := range window.Samples {
+		if sample.Backend != "" {
+			return sample.Backend
+		}
+	}
+	return ""
+}
+
+func continuousWindowSampleCount(window ContinuousWindowIngest, signalType string) uint64 {
+	signalType = strings.ToLower(strings.TrimSpace(signalType))
+	var count uint64
+	if signalType == "cpu_profile" {
+		for _, sample := range window.Samples {
+			count = addContinuousCount(count, firstNonZeroUint64(sample.Count, 1))
+		}
+		for _, profile := range window.Profiles {
+			if strings.ToLower(strings.TrimSpace(firstNonEmpty(profile.SignalType, "cpu_profile"))) != "cpu_profile" {
+				continue
+			}
+			for _, sample := range profile.Samples {
+				count = addContinuousCount(count, firstNonZeroUint64(sample.Count, 1))
+			}
+		}
+	}
+	for _, hist := range window.Histograms {
+		if strings.ToLower(strings.TrimSpace(hist.SignalType)) == signalType {
+			count = addContinuousCount(count, hist.EventCount)
+		}
+	}
+	if count == 0 {
+		return clampContinuousCount(window.SampleCount)
+	}
+	return count
+}
+
+func addContinuousCount(total uint64, value uint64) uint64 {
+	value = clampContinuousCount(value)
+	if total >= continuousMaxDBCount || value >= continuousMaxDBCount {
+		return continuousMaxDBCount
+	}
+	if total > continuousMaxDBCount-value {
+		return continuousMaxDBCount
+	}
+	return total + value
+}
+
+func clampContinuousCount(value uint64) uint64 {
+	if value > continuousMaxDBCount {
+		return continuousMaxDBCount
+	}
+	return value
+}
+
+func normalizeContinuousSignalTypes(req ContinuousBatchIngestReq) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(signal string) {
+		signal = strings.ToLower(strings.TrimSpace(signal))
+		if signal == "" {
+			return
+		}
+		if seen[signal] {
+			return
+		}
+		seen[signal] = true
+		out = append(out, signal)
+	}
+	for _, signal := range req.SignalTypes {
+		add(signal)
+	}
+	for _, window := range req.Windows {
+		if len(window.Samples) > 0 {
+			add(firstNonEmpty(window.SignalType, "cpu_profile"))
+		}
+		for _, profile := range window.Profiles {
+			add(firstNonEmpty(profile.SignalType, "cpu_profile"))
+		}
+		for _, hist := range window.Histograms {
+			add(hist.SignalType)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"cpu_profile"}
+	}
+	return out
+}
+
+func orderedContinuousObjectKeys(windows []model.ProfileWindow) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, window := range windows {
+		if window.ObjectKey == "" || seen[window.ObjectKey] {
+			continue
+		}
+		seen[window.ObjectKey] = true
+		out = append(out, window.ObjectKey)
+	}
+	return out
+}
+
+func summarizeContinuousBuckets(buckets []ContinuousHistogramBucket) ContinuousHistogramSummary {
+	if len(buckets) == 0 {
+		return ContinuousHistogramSummary{}
+	}
+	var total uint64
+	min := buckets[0].Low
+	max := buckets[0].High
+	for _, bucket := range buckets {
+		total += bucket.Count
+		if bucket.Low < min {
+			min = bucket.Low
+		}
+		if bucket.High > max {
+			max = bucket.High
+		}
+	}
+	valueAt := func(target float64) float64 {
+		if total == 0 {
+			return 0
+		}
+		threshold := uint64(float64(total)*target + 0.999999)
+		if threshold == 0 {
+			threshold = 1
+		}
+		var seen uint64
+		for _, bucket := range buckets {
+			seen += bucket.Count
+			if seen >= threshold {
+				return (bucket.Low + bucket.High) / 2
+			}
+		}
+		last := buckets[len(buckets)-1]
+		return (last.Low + last.High) / 2
+	}
+	return ContinuousHistogramSummary{
+		Min: min,
+		Max: max,
+		P50: valueAt(0.50),
+		P95: valueAt(0.95),
+		P99: valueAt(0.99),
+	}
+}
+
+func mustJSONBytes(value interface{}) []byte {
+	if value == nil {
+		return nil
+	}
+	body, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return body
+}
+
+func firstNonZeroUint64(values ...uint64) uint64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func (s *APIServer) loadReadableContinuousSession(c *gin.Context, sid string, auth AuthContext) (model.ContinuousSession, bool) {
