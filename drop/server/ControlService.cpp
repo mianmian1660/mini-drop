@@ -89,6 +89,9 @@ namespace drop_server
         const control::FetchDataRequest * /*request*/,
         control::FetchDataResponse *response)
     {
+        // 预留但当前未启用：apiserver 侧没有任何真实代码路径调用这个 RPC
+        // （只有 proto 生成的桩代码和测试用的假实现），任务结果的获取
+        // 走的是 ResultNotifier 主动回调 + Artifact 下载，不经过这里。
         response->set_code(0);
         return grpc::Status::OK;
     }
@@ -158,15 +161,20 @@ namespace drop_server
         control::CancelTaskResponse *response)
     {
         bool canceled = false;
+        bool alreadyTerminal = false;
         {
             lock_guard<mutex> lock(tasks_mutex);
             canceled = cancel_task_locked(request->targetip(), request->taskid(), request->attempt_id());
+            hotmethod::TaskDesc probe;
+            probe.set_taskid(request->taskid());
+            probe.set_attempt_id(request->attempt_id());
+            alreadyTerminal = is_attempt_completed_locked(probe);
         }
 
         response->set_code(0);
         response->set_msg(canceled ? "queued task canceled" : "task not queued or already delivered");
         response->set_canceled(canceled);
-        response->set_already_terminal(false);
+        response->set_already_terminal(alreadyTerminal);
 
         cout << "[server] CancelTask: taskID=" << request->taskid()
              << " attemptID=" << request->attempt_id()

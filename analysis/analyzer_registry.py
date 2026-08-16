@@ -140,16 +140,4 @@ def build_default_registry() -> AnalyzerRegistry:
             timeout_seconds=300,
         ),
     )
-    registry.register(
-        hm.TASK_TYPE_JAVA_HEAP,
-        LegacyFunctionAnalyzer(
-            name="java_heap_declared",
-            pipeline="java_heap",
-            input_spec=InputSpec("heapdump.hprof", ["java"], max_size=2 * 1024 * 1024 * 1024),
-            output_specs=[OutputSpec("heap_summary.json", "RESULT", "application/json")],
-            analyze_func=make_legacy_func(hm.TASK_TYPE_JAVA_HEAP),
-            timeout_seconds=900,
-        ),
-    )
-
     return registry

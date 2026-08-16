@@ -37,7 +37,7 @@ bash scripts/setup_wsl_perf.sh
 
 脚本会基于当前 WSL 6.6/6.1 内核线编译匹配的 perf，安装到 `/usr/local/bin/perf`，不会替换 `/usr/bin/perf` 或修改内核。完成后用 `perf stat -e task-clock true` 验收。即便该检查通过，WSL 的硬件 PMU 事件仍可能受 Hyper-V 限制；项目会报告真实失败，不会伪造采样成功。
 
-题目要求 eBPF 必须真跑：演示视频里需要现场触发一次 IO 或调度异常，并在 Web 上看到分布变化。因此 eBPF 任务默认不再静默降级成 mock；如果日志里出现 `eBPF 采集失败`，需要更换到能运行 `bpftrace` 的 Linux 环境或修复容器权限。只有本地开发想看页面链路时，才可以显式设置 `DROP_ALLOW_EBPF_MOCK=1`。
+题目要求 eBPF 必须真跑：演示视频里需要现场触发一次 IO 或调度异常，并在 Web 上看到分布变化。因此 eBPF 任务默认不再静默降级成 mock；如果日志里出现 `eBPF 采集失败`，需要更换到能运行 `bpftrace` 的 Linux 环境或修复容器权限。只有本地开发想看页面链路时，才可以显式设置 `DROP_ALLOW_EBPF_MOCK=1`。同一个开关也控制 `analysis` 侧的内存泄漏分析器：MinIO 不可用或 `memtrace.txt` 缺失时默认直接报错，而不是悄悄用内置模拟数据冒充真实检测结果。
 
 如果 perf 或 eBPF 权限受限，请在宿主机上确认：
 

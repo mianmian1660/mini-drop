@@ -304,51 +304,86 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		if task.Status != TaskStatusDone {
 			currentStatus := task.Status
+			shouldAdvanceToDone := true
+
 			if currentStatus == TaskStatusRunning {
-				if err := tx.Model(&model.HotmethodTask{}).
-					Where("tid = ?", task.TID).
+				// 乐观锁：只有数据库里当前状态确实还是 RUNNING 才允许写
+				// UPLOADING，防止和巡检器/取消等并发路径互相覆盖。
+				result := tx.Model(&model.HotmethodTask{}).
+					Where("tid = ? AND status = ?", task.TID, TaskStatusRunning).
 					Updates(map[string]interface{}{
 						"status":      TaskStatusUploading,
 						"status_info": "采集产物已上传，等待登记完成",
+					})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected > 0 {
+					if err := tx.Create(&model.TaskStatusEvent{
+						TID:          task.TID,
+						FromStatus:   TaskStatusRunning,
+						ToStatus:     TaskStatusUploading,
+						Reason:       "采集产物已上传，等待登记完成",
+						Source:       "drop_server_notify",
+						Sequence:     nextTaskEventSequenceTx(tx, task.TID),
+						SourceModule: "drop_server_notify",
+						Payload:      []byte(fmt.Sprintf(`{"cos_key":%q}`, req.CosKey)),
+						CreatedAt:    endTime,
 					}).Error; err != nil {
-					return err
+						return err
+					}
+					currentStatus = TaskStatusUploading
+				} else {
+					// CAS 没命中：任务状态已被别的路径并发改过，重新读一次
+					// 真实值——只用来判断能不能继续推进到 DONE，不作为下面
+					// 更新语句的精确匹配条件。
+					var actual model.HotmethodTask
+					if err := tx.Select("status").Where("tid = ?", task.TID).First(&actual).Error; err != nil {
+						return err
+					}
+					currentStatus = actual.Status
+					if currentStatus != TaskStatusUploading {
+						shouldAdvanceToDone = false
+					}
 				}
-				if err := tx.Create(&model.TaskStatusEvent{
-					TID:          task.TID,
-					FromStatus:   TaskStatusRunning,
-					ToStatus:     TaskStatusUploading,
-					Reason:       "采集产物已上传，等待登记完成",
-					Source:       "drop_server_notify",
-					Sequence:     nextTaskEventSequenceTx(tx, task.TID),
-					SourceModule: "drop_server_notify",
-					Payload:      []byte(fmt.Sprintf(`{"cos_key":%q}`, req.CosKey)),
-					CreatedAt:    endTime,
-				}).Error; err != nil {
-					return err
+			}
+
+			if shouldAdvanceToDone {
+				// 同样加乐观锁：状态必须仍是 RUNNING 或 UPLOADING 之一才允许
+				// 写 DONE，避免把并发路径已经置为 FAILED/CANCELED 的任务强行
+				// 改回 DONE。
+				result := tx.Model(&model.HotmethodTask{}).
+					Where("tid = ? AND status IN (?, ?)", task.TID, TaskStatusRunning, TaskStatusUploading).
+					Updates(map[string]interface{}{
+						"status":      TaskStatusDone,
+						"status_info": "采集产物已上传，任务完成",
+						"end_time":    &endTime,
+					})
+				if result.Error != nil {
+					return result.Error
 				}
-				currentStatus = TaskStatusUploading
-			}
-			if err := tx.Model(&model.HotmethodTask{}).
-				Where("tid = ?", task.TID).
-				Updates(map[string]interface{}{
-					"status":      TaskStatusDone,
-					"status_info": "采集产物已上传，任务完成",
-					"end_time":    &endTime,
-				}).Error; err != nil {
-				return err
-			}
-			if err := tx.Create(&model.TaskStatusEvent{
-				TID:          task.TID,
-				FromStatus:   currentStatus,
-				ToStatus:     TaskStatusDone,
-				Reason:       "采集产物已上传，任务完成",
-				Source:       "drop_server_notify",
-				Sequence:     nextTaskEventSequenceTx(tx, task.TID),
-				SourceModule: "drop_server_notify",
-				Payload:      []byte(fmt.Sprintf(`{"cos_key":%q}`, req.CosKey)),
-				CreatedAt:    endTime,
-			}).Error; err != nil {
-				return err
+				if result.RowsAffected > 0 {
+					if err := tx.Create(&model.TaskStatusEvent{
+						TID:          task.TID,
+						FromStatus:   currentStatus,
+						ToStatus:     TaskStatusDone,
+						Reason:       "采集产物已上传，任务完成",
+						Source:       "drop_server_notify",
+						Sequence:     nextTaskEventSequenceTx(tx, task.TID),
+						SourceModule: "drop_server_notify",
+						Payload:      []byte(fmt.Sprintf(`{"cos_key":%q}`, req.CosKey)),
+						CreatedAt:    endTime,
+					}).Error; err != nil {
+						return err
+					}
+				} else {
+					s.Logger.Warn("跳过采集完成状态推进：写入 DONE 时状态已被并发修改",
+						zap.String("tid", task.TID))
+				}
+			} else {
+				s.Logger.Warn("跳过采集完成状态推进：任务已处于并发终态",
+					zap.String("tid", task.TID),
+					zap.Int("actual_status", currentStatus))
 			}
 		}
 		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, req.ArtifactSize); err != nil {
