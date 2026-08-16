@@ -9,6 +9,7 @@
 #include "server/TaskQueue.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio> // rename
@@ -35,11 +36,37 @@ namespace drop_server
                 .count();
         }
 
+        // 从 resource_budget（任意 JSON 字符串，无固定 schema）里提取 "priority" 键
+        // 对应的整数值。找不到该键或值不是整数时返回 0（默认优先级）。
         int infer_priority(const hotmethod::TaskDesc &task)
         {
-            if (task.resource_budget().find("\"priority\"") != string::npos)
-                return 10;
-            return 0;
+            const string &s = task.resource_budget();
+            auto pos = s.find("\"priority\"");
+            if (pos == string::npos)
+                return 0;
+            pos = s.find(':', pos);
+            if (pos == string::npos)
+                return 0;
+            pos++;
+            while (pos < s.size() && (isspace(static_cast<unsigned char>(s[pos])) || s[pos] == '"'))
+                pos++;
+            bool negative = false;
+            if (pos < s.size() && s[pos] == '-')
+            {
+                negative = true;
+                pos++;
+            }
+            int value = 0;
+            bool found = false;
+            while (pos < s.size() && isdigit(static_cast<unsigned char>(s[pos])))
+            {
+                value = value * 10 + (s[pos] - '0');
+                pos++;
+                found = true;
+            }
+            if (!found)
+                return 0;
+            return negative ? -value : value;
         }
 
         void write_i64(ofstream &out, int64_t v)
