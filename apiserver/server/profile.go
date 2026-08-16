@@ -65,6 +65,7 @@ type ProfileQuery struct {
 	From        time.Time              `json:"from"`
 	To          time.Time              `json:"to"`
 	ProfileType string                 `json:"profile_type"`
+	StackScope  string                 `json:"stack_scope"`
 	Labels      map[string]interface{} `json:"labels"`
 	Filters     map[string]interface{} `json:"filters"`
 	OwnerUIDs   []string               `json:"-"`
@@ -98,6 +99,7 @@ type ProfileFlamegraph struct {
 	Nodes         []ProfileNode `json:"nodes"`
 	Total         float64       `json:"total"`
 	Unit          string        `json:"unit"`
+	Backend       string        `json:"backend,omitempty"`
 	Empty         bool          `json:"empty"`
 	Message       string        `json:"message"`
 	Source        string        `json:"source"`
@@ -118,6 +120,7 @@ type ProfileTopN struct {
 	Items         []ProfileTopItem `json:"items"`
 	Total         float64          `json:"total"`
 	Unit          string           `json:"unit"`
+	Backend       string           `json:"backend,omitempty"`
 	Empty         bool             `json:"empty"`
 	Message       string           `json:"message"`
 	Source        string           `json:"source"`
@@ -325,6 +328,7 @@ func (s *APIServer) profileQueryFromRequest(c *gin.Context) (ProfileQuery, bool)
 		From:        from,
 		To:          to,
 		ProfileType: strings.ToLower(strings.TrimSpace(c.DefaultQuery("profile_type", "cpu"))),
+		StackScope:  strings.ToLower(strings.TrimSpace(c.DefaultQuery("stack_scope", ""))),
 		Labels:      parseProfileLabels(c.Query("labels")),
 		Filters:     parseProfileFilters(c.Query("filters")),
 	}

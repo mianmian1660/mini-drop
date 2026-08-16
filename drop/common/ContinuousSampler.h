@@ -69,4 +69,21 @@ private:
     std::thread worker_;
 };
 
+class DualTrackContinuousSampler : public Sampler
+{
+public:
+    ~DualTrackContinuousSampler() override;
+    std::string Name() const override;
+    bool Start(const ContinuousSamplerConfig &config, std::string *error) override;
+    void Stop() override;
+    bool Running() const override;
+
+private:
+    void Loop();
+
+    std::atomic<bool> running_{false};
+    ContinuousSamplerConfig config_;
+    std::thread worker_;
+};
+
 } // namespace drop

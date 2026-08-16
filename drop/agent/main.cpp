@@ -20,7 +20,7 @@
 #include "common/PprofProfiler.h"         // drop::run_pprof (profilerType=2)
 #include "common/BpfProfiler.h"           // drop::run_bpf (profilerType=3, eBPF)
 #include "common/CapabilityDetector.h"    // drop::detect_capabilities
-#include "common/ContinuousSampler.h"     // drop::PerfEventSampler (Native CP)
+#include "common/ContinuousSampler.h"     // drop::DualTrackContinuousSampler (Native CP)
 #include "common/Process.h"               // drop::collect_self_pidstats, collect_children_pidstats
 #include "common/COSClient.h"             // drop::upload_to_minio
 #include "common/Utils.h"                 // drop::read_file_content
@@ -535,7 +535,7 @@ static string create_native_continuous_session(const drop_agent::AgentConfig &cf
         if (!out.is_open())
             return "";
         out << "{"
-            << "\"name\":\"Native Continuous Profiling\","
+            << "\"name\":\"Native Dual-Track Continuous Profiling\","
             << "\"target_ip\":\"" << json_escape_local(cfg.ipAddr) << "\","
             << "\"hostname\":\"" << json_escape_local(cfg.hostname) << "\","
             << "\"service_name\":\"hotmethod\","
@@ -545,7 +545,14 @@ static string create_native_continuous_session(const drop_agent::AgentConfig &cf
             << "\"retention_hours\":24,"
             << "\"labels\":{\"job\":\"hotmethod\",\"instance\":\"" << json_escape_local(cfg.ipAddr)
             << "\",\"node\":\"" << json_escape_local(cfg.hostname) << "\"},"
-            << "\"capabilities\":{\"sampler\":\"perf_event\"}"
+            << "\"capabilities\":{"
+            << "\"sampler\":\"dual_track\","
+            << "\"cpu_backend\":\"core,bpftrace,perf\","
+            << "\"io_backend\":\"bpftrace\","
+            << "\"sched_backend\":\"bpftrace\","
+            << "\"signals\":\"" << json_escape_local(env_string("DROP_NATIVE_CP_SIGNALS", "cpu,io,sched")) << "\","
+            << "\"unavailable_reason\":\"\""
+            << "}"
             << "}";
     }
     string response;
@@ -567,7 +574,7 @@ static string create_native_continuous_session(const drop_agent::AgentConfig &cf
     return sid;
 }
 
-static void ensure_native_continuous_sampler(drop::PerfEventSampler &sampler,
+static void ensure_native_continuous_sampler(drop::DualTrackContinuousSampler &sampler,
                                              const drop_agent::AgentConfig &cfg,
                                              const string &apiBaseURL,
                                              const string &authUID,
@@ -601,11 +608,11 @@ static void ensure_native_continuous_sampler(drop::PerfEventSampler &sampler,
     string samplerError;
     if (sampler.Start(nativeCfg, &samplerError))
     {
-        cout << "[native-cp] PerfEventSampler started session=" << sessionSID
+        cout << "[native-cp] DualTrackContinuousSampler started session=" << sessionSID
              << " api=" << apiBaseURL << endl;
         return;
     }
-    cout << "[native-cp] PerfEventSampler not started: " << samplerError << endl;
+    cout << "[native-cp] DualTrackContinuousSampler not started: " << samplerError << endl;
     nextRetryAt = now + seconds(30);
 }
 
@@ -1088,9 +1095,13 @@ int main(int argc, char **argv)
     cout << "[agent] Native CP capabilities: perf_event="
          << (capabilityReport.perfEventReadable ? "yes" : "no")
          << " perf=" << (capabilityReport.perfCommand ? "yes" : "no")
+         << " bpftrace=" << (capabilityReport.bpftraceCommand ? "yes" : "no")
          << " btf=" << (capabilityReport.btf ? "yes" : "no")
          << " ebpf_fs=" << (capabilityReport.ebpfFS ? "yes" : "no")
+         << " tracefs=" << (capabilityReport.traceFS ? "yes" : "no")
+         << " block_tracepoint=" << (capabilityReport.blockTracepoint ? "yes" : "no")
          << " sched_tracepoint=" << (capabilityReport.schedTracepoint ? "yes" : "no")
+         << " memlock_unlimited=" << (capabilityReport.memlockUnlimited ? "yes" : "no")
          << " perf_event_paranoid=" << capabilityReport.perfEventParanoid << endl;
 
     // ---------- 2. 多 Server 故障转移连接 ----------
@@ -1108,7 +1119,7 @@ int main(int argc, char **argv)
     auto health_stub = healthcheck::HealthCheck::NewStub(channel);
     auto hotmethod_stub = hotmethod::Hotmethod::NewStub(channel);
 
-    drop::PerfEventSampler nativeSampler;
+    drop::DualTrackContinuousSampler nativeSampler;
     string nativeCPAPIBaseURL = env_string("DROP_NATIVE_CP_API_BASE_URL", env_string("APISERVER_SYMBOL_BASE_URL", "http://127.0.0.1:8191"));
     string nativeCPAuthUID = env_string("DROP_NATIVE_CP_UID", cfg.uid);
     string nativeCPSessionSID = env_string("DROP_NATIVE_CP_SESSION_ID");

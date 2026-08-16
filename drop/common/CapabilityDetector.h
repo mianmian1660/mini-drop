@@ -14,9 +14,13 @@ struct CapabilityReport
 {
     bool perfEventReadable = false;
     bool perfCommand = false;
+    bool bpftraceCommand = false;
     bool btf = false;
     bool ebpfFS = false;
+    bool traceFS = false;
+    bool blockTracepoint = false;
     bool schedTracepoint = false;
+    bool memlockUnlimited = false;
     int perfEventParanoid = 999;
     std::vector<std::string> capabilities;
 };

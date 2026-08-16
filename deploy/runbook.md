@@ -36,6 +36,15 @@
 2. 检查 apiserver 日志，敏感凭据会被脱敏，只需要核对 endpoint/bucket。
 3. 恢复后访问 Artifact 下载接口，确认能重新生成短期签名 URL。
 
+## Native Dual-Track Continuous Profiling 异常
+
+1. 默认开关为 `DROP_NATIVE_CP_ENABLED=true`、`DROP_NATIVE_CP_EBPF_ENABLED=true`、`DROP_NATIVE_CP_SIGNALS=cpu,io,sched`、`DROP_NATIVE_CP_CPU_BACKENDS=core,bpftrace,perf`。
+2. 先检查 `curl -fsS http://111.230.29.115/healthz` 和 `docker compose logs --tail=160 drop_agent apiserver`。
+3. Web 主机详情页的 Native Profiling 应显示 CPU、IO 延迟、调度延迟三类视图；CPU 轨显示当前 backend，IO/sched 显示 histogram 与 P95/P99 趋势。
+4. 如果日志出现 `CO-RE BTF unavailable`，确认 `/sys/kernel/btf/vmlinux` 或显式 `DROP_BTF_PATH`；当前版本会继续 fallback 到 bpftrace/perf。
+5. 如果日志出现 `bpftrace failed`、`tracepoints unavailable` 或 `Operation not permitted`，确认 `privileged`、`pid: host`、`tracefs/debugfs` 挂载、`BPF/PERFMON/SYS_RESOURCE` capability 和 memlock。
+6. 快速回滚：设置 `DROP_NATIVE_CP_EBPF_ENABLED=false` 并重建 `drop_agent`，CPU 轨退回 perf，IO/sched 会显示不可用原因且不生成 mock。
+
 ## SSE 连接异常
 
 1. 看 `mini_drop_sse_active_connections` 是否持续异常升高。

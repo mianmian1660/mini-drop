@@ -726,6 +726,7 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/continuous/raw", s.ViewContinuousProfileObject)
 		api.GET("/continuous/sessions/:sid/timeline", s.GetContinuousTimeline)
 		api.GET("/continuous/query", s.QueryContinuousProfile)
+		api.GET("/continuous/histogram", s.QueryContinuousHistogram)
 
 		// 文件管理（W4: MinIO 存储集成 + 本地文件降级）
 		api.GET("/cosfiles", s.ListCOSFiles)

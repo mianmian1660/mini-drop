@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { profiles } from '../api';
+import { continuous, profiles } from '../api';
 import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
 import {
     formatMetricValue,
@@ -66,8 +66,11 @@ const RANGE_OPTIONS = [
 export default function ContinuousProfilingPanel({ target, targets = [], targetId = '', onTargetChange, showTargetSelect = false }) {
     const [range, setRange] = useState('30m');
     const [profileType, setProfileType] = useState('cpu');
+    const [signalTab, setSignalTab] = useState('cpu');
+    const [stackScope, setStackScope] = useState('all');
     const [flamegraph, setFlamegraph] = useState(null);
     const [topn, setTopn] = useState(null);
+    const [histogram, setHistogram] = useState(null);
     const [querying, setQuerying] = useState(false);
     const [error, setError] = useState('');
     const [resetKey, setResetKey] = useState(0);
@@ -86,7 +89,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const unit = flamegraph?.unit || topn?.unit || '';
     const activeFilters = useMemo(() => (scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}), [scope, selectedComm]);
     const activeFilterText = activeFilters.comm ? `comm=${activeFilters.comm}` : '';
-    const scopeLabel = activeFilters.comm ? `进程级 Native Continuous Profiling / ${activeFilterText} / CPU 占用时长` : '整机 Native Continuous Profiling / CPU 占用时长';
+    const stackScopeLabel = stackScope === 'user' ? '用户栈' : stackScope === 'kernel' ? '内核栈' : '混合栈';
+    const scopeLabel = activeFilters.comm ? `进程级 Native Continuous Profiling / ${activeFilterText} / ${stackScopeLabel}` : `整机 Native Continuous Profiling / ${stackScopeLabel}`;
 
     const refresh = useCallback(async () => {
         if (!target) return;
@@ -104,23 +108,38 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             params.filters = JSON.stringify(activeFilters);
         }
         try {
-            const [fgRes, topRes] = await Promise.all([
-                profiles.flamegraph(params),
-                profiles.topn(params),
-            ]);
-            if (fgRes.code === 0) setFlamegraph(fgRes.data);
-            if (topRes.code === 0) setTopn(topRes.data);
-            if (fgRes.code !== 0 || topRes.code !== 0) {
-                setError(fgRes.message || topRes.message || 'Native Continuous Profiling 查询失败');
+            if (signalTab === 'cpu') {
+                setHistogram(null);
+                const cpuParams = { ...params };
+                if (stackScope !== 'all') cpuParams.stack_scope = stackScope;
+                const [fgRes, topRes] = await Promise.all([
+                    profiles.flamegraph(cpuParams),
+                    profiles.topn(cpuParams),
+                ]);
+                if (fgRes.code === 0) setFlamegraph(fgRes.data);
+                if (topRes.code === 0) setTopn(topRes.data);
+                if (fgRes.code !== 0 || topRes.code !== 0) {
+                    setError(fgRes.message || topRes.message || 'Native Continuous Profiling 查询失败');
+                }
+            } else {
+                setFlamegraph(null);
+                setTopn(null);
+                const signalType = signalTab === 'io' ? 'io_latency' : 'sched_latency';
+                const histRes = await continuous.histogram({ ...params, signal_type: signalType });
+                if (histRes.code === 0) setHistogram(histRes.data);
+                if (histRes.code !== 0) {
+                    setError(histRes.message || 'Native Continuous eBPF histogram 查询失败');
+                }
             }
         } catch (err) {
             setFlamegraph(null);
             setTopn(null);
+            setHistogram(null);
             setError(err?.message || 'Native Continuous Profiling 查询失败');
         } finally {
             setQuerying(false);
         }
-    }, [target, timeWindow, profileType, activeFilters]);
+    }, [target, timeWindow, profileType, activeFilters, signalTab, stackScope]);
 
     useEffect(() => {
         refresh();
@@ -218,6 +237,22 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             <option value="memory">Memory</option>
                         </select>
                     </Field>
+                    <Field label="信号">
+                        <span style={S.segmented}>
+                            <button type="button" style={S.segment(signalTab === 'cpu')} onClick={() => setSignalTab('cpu')}>CPU</button>
+                            <button type="button" style={S.segment(signalTab === 'io')} onClick={() => setSignalTab('io')}>IO 延迟</button>
+                            <button type="button" style={{ ...S.segment(signalTab === 'sched'), borderRight: 'none' }} onClick={() => setSignalTab('sched')}>调度延迟</button>
+                        </span>
+                    </Field>
+                    {signalTab === 'cpu' && (
+                        <Field label="栈视图">
+                            <span style={S.segmented}>
+                                <button type="button" style={S.segment(stackScope === 'all')} onClick={() => setStackScope('all')}>混合栈</button>
+                                <button type="button" style={S.segment(stackScope === 'user')} onClick={() => setStackScope('user')}>用户栈</button>
+                                <button type="button" style={{ ...S.segment(stackScope === 'kernel'), borderRight: 'none' }} onClick={() => setStackScope('kernel')}>内核栈</button>
+                            </span>
+                        </Field>
+                    )}
                     <Field label="范围">
                         <span style={S.segmented}>
                             <button type="button" style={S.segment(scope === 'host')} onClick={() => setScope('host')}>整机</button>
@@ -255,7 +290,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
                 </div>
                 <div style={{ ...S.info, marginTop: 14 }}>
-                    {scopeLabel}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，查询时按 comm/pid/exe 过滤。当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。comm 是 Linux task comm，可能被截断到约 15 字符。
+                    {signalTab === 'cpu' ? scopeLabel : `${signalTab === 'io' ? '整机 IO 延迟' : '整机调度延迟'} / eBPF histogram`}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。
+                    {signalTab === 'cpu' ? ' comm 是 Linux task comm，可能被截断到约 15 字符。' : ` 当前 backend：${histogram?.backend || signalBackend(sessionMeta, signalTab) || '-'}`}
                     {scope === 'process' && commMessage ? ` ${commMessage}` : ''}
                 </div>
                 <LabelChips target={target} />
@@ -263,12 +299,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 
             {error && <div style={S.error}>{error}</div>}
 
-            <section style={S.card}>
+            {signalTab === 'cpu' ? <section style={S.card}>
                 <div style={S.sectionHead}>
                     <div>
-                        <h3 style={S.title}>火焰图</h3>
+                        <h3 style={S.title}>火焰图 · {stackScopeLabel}</h3>
                         <div style={S.subtle}>
-                            {flamegraph?.source || 'mini-drop'} · {profileUnitLabel(flamegraph?.unit || unit)} · 宽度按 {isCPUTimeUnit(flamegraph?.unit || unit) ? 'CPU 占用时长' : '原始 value'} 计算
+                            {flamegraph?.source || 'mini-drop'} · {profileUnitLabel(flamegraph?.unit || unit)} · backend {flamegraph?.backend || topn?.backend || signalBackend(sessionMeta, 'cpu') || sessionMeta.sampler} · 宽度按 {isCPUTimeUnit(flamegraph?.unit || unit) ? 'CPU 占用时长' : '原始 value'} 计算
                         </div>
                     </div>
                     <span style={S.subtle}>{hasFlamegraph ? `${countProfileNodes(flamegraph.nodes)} 个栈帧节点` : '暂无栈帧节点'}</span>
@@ -284,19 +320,19 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     loadingMessage="正在查询 Native profiling..."
                     boxStyle={S.flameBox}
                 />
-            </section>
+            </section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? 'IO 延迟' : '调度延迟'} />}
 
-            <section style={S.card}>
+            {signalTab === 'cpu' && <section style={S.card}>
                 <div style={S.sectionHead}>
                     <h3 style={S.title}>热点 TopN</h3>
                     <span style={S.subtle}>{topn?.items?.length || 0} functions · {profileUnitLabel(topn?.unit || unit)}</span>
                 </div>
                 <TopNTable data={topn} loading={querying} profileURL={profileURL} filterText={activeFilterText} />
-            </section>
+            </section>}
 
             <details style={S.details}>
                 <summary style={S.detailsSummary}>诊断信息</summary>
-                <pre style={S.mono}>{diagnosticText({ target, flamegraph, topn, timeWindow, profileType, filters: activeFilters })}</pre>
+                <pre style={S.mono}>{diagnosticText({ target, flamegraph, topn, timeWindow, profileType, stackScope, filters: activeFilters })}</pre>
             </details>
         </div>
     );
@@ -442,6 +478,91 @@ function ProfileEmpty({ message, url }) {
     );
 }
 
+function HistogramPanel({ data, loading, title }) {
+    if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询 {title} histogram...</div></section>;
+    const buckets = data?.buckets || [];
+    const trend = data?.trend || [];
+    const maxCount = Math.max(1, ...buckets.map(b => Number(b.count) || 0));
+    const summary = data?.summary || {};
+    return (
+        <section style={S.card}>
+            <div style={S.sectionHead}>
+                <div>
+                    <h3 style={S.title}>{title} Histogram</h3>
+                    <div style={S.subtle}>{data?.source || 'mini-drop-native'} · backend {data?.backend || '-'} · unit {data?.unit || 'us'}</div>
+                </div>
+                <span style={S.subtle}>{formatMetricValue(data?.event_count || 0, 'samples')} events</span>
+            </div>
+            {data?.empty || buckets.length === 0 ? (
+                <ProfileEmpty message={data?.message || `${title} 暂无 histogram 样本`} url={data?.profile_url} />
+            ) : (
+                <>
+                    <div style={S.summaryGrid}>
+                        <Metric label="P50" value={formatLatency(summary.p50, data?.unit)} />
+                        <Metric label="P95" value={formatLatency(summary.p95, data?.unit)} />
+                        <Metric label="P99" value={formatLatency(summary.p99, data?.unit)} />
+                        <Metric label="事件数" value={formatMetricValue(data?.event_count || 0, 'samples')} />
+                    </div>
+                    <div style={{ ...S.tableWrap, marginTop: 14 }}>
+                        <table style={S.table}>
+                            <thead>
+                                <tr>
+                                    <th style={{ ...S.th, width: '24%' }}>延迟桶</th>
+                                    <th style={S.th}>分布</th>
+                                    <th style={{ ...S.th, width: 120 }}>事件数</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {buckets.map((bucket, index) => (
+                                    <tr key={`${bucket.range}-${index}`}>
+                                        <td style={S.td}>{bucket.range}</td>
+                                        <td style={S.td}>
+                                            <div style={S.barTrack}>
+                                                <div style={{ ...S.bar, width: `${Math.max(3, (Number(bucket.count) || 0) / maxCount * 100)}%`, background: '#12b76a' }} />
+                                            </div>
+                                        </td>
+                                        <td style={S.td}>{formatMetricValue(bucket.count, 'samples')}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div style={{ marginTop: 16 }}>
+                        <div style={S.sectionHead}>
+                            <h3 style={S.title}>P95/P99 趋势</h3>
+                            <span style={S.subtle}>{trend.length} 个窗口</span>
+                        </div>
+                        <div style={S.tableWrap}>
+                            <table style={S.table}>
+                                <thead>
+                                    <tr>
+                                        <th style={S.th}>窗口</th>
+                                        <th style={S.th}>P50</th>
+                                        <th style={S.th}>P95</th>
+                                        <th style={S.th}>P99</th>
+                                        <th style={S.th}>事件数</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {trend.slice(-20).map((point, index) => (
+                                        <tr key={`${point.window_start}-${index}`}>
+                                            <td style={S.td}>{formatTime(point.window_start)}</td>
+                                            <td style={S.td}>{formatLatency(point.p50, data?.unit)}</td>
+                                            <td style={S.td}>{formatLatency(point.p95, data?.unit)}</td>
+                                            <td style={S.td}>{formatLatency(point.p99, data?.unit)}</td>
+                                            <td style={S.td}>{formatMetricValue(point.event_count || 0, 'samples')}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </>
+            )}
+        </section>
+    );
+}
+
 function sampleStateForTarget(target, flamegraph, topn) {
     const status = String(target?.profile_status || 'unknown');
     if (status === 'online_with_samples') return '有样本';
@@ -454,6 +575,20 @@ function sampleStateForTarget(target, flamegraph, topn) {
     if (flamegraph?.empty || topn?.empty) return '暂无样本';
     if (status === 'offline') return '离线';
     return '未知';
+}
+
+function signalBackend(meta, signal) {
+    const caps = meta?.capabilities || {};
+    if (signal === 'cpu') return caps.cpu_backend || caps.sampler || '';
+    if (signal === 'io') return caps.io_backend || '';
+    if (signal === 'sched') return caps.sched_backend || '';
+    return '';
+}
+
+function formatLatency(value, unit = 'us') {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '-';
+    return `${Math.round(num * 100) / 100} ${unit || 'us'}`;
 }
 
 function labelEntries(target) {
@@ -478,14 +613,16 @@ function labelSelectorForTarget(target, filters = {}) {
     return `{${Object.entries(labels).map(([k, v]) => `${k}="${v}"`).join(', ')}}`;
 }
 
-function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, filters = {} }) {
+function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, stackScope = 'all', filters = {} }) {
     return [
         `target: ${target?.id || '-'}`,
         `profile_type: ${profileType}`,
+        `stack_scope: ${stackScope}`,
         `continuous_session: ${JSON.stringify(target?.continuous_session || {})}`,
         `time_range: ${timeWindow.from} -> ${timeWindow.to}`,
         `selector: ${labelSelectorForTarget(target, filters)}`,
         `filters: ${JSON.stringify(filters || {})}`,
+        `backend: ${flamegraph?.backend || topn?.backend || '-'}`,
         `query: ${flamegraph?.query || topn?.query || '-'}`,
         `unit: ${flamegraph?.unit || topn?.unit || '-'}`,
         `total_raw_value: ${formatRawMetric(flamegraph?.total || topn?.total || 0, flamegraph?.unit || topn?.unit || '')}`,

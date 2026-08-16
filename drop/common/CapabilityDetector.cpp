@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 namespace drop
 {
@@ -70,26 +71,44 @@ CapabilityReport detect_capabilities()
     report.perfEventParanoid = read_int_file("/proc/sys/kernel/perf_event_paranoid", 999);
     report.perfEventReadable = report.perfEventParanoid != 999;
     report.perfCommand = command_exists("perf") || command_exists("perf-real");
+    report.bpftraceCommand = command_exists("bpftrace");
     report.btf = path_exists("/sys/kernel/btf/vmlinux");
     report.ebpfFS = path_exists("/sys/fs/bpf");
+    report.traceFS = path_exists("/sys/kernel/tracing") || path_exists("/sys/kernel/debug/tracing");
+    report.blockTracepoint =
+        file_contains("/sys/kernel/tracing/available_events", "block:block_rq_issue") ||
+        file_contains("/sys/kernel/debug/tracing/available_events", "block:block_rq_issue");
     report.schedTracepoint =
         file_contains("/sys/kernel/tracing/available_events", "sched:sched_switch") ||
         file_contains("/sys/kernel/debug/tracing/available_events", "sched:sched_switch");
+    struct rlimit memlock {};
+    if (getrlimit(RLIMIT_MEMLOCK, &memlock) == 0)
+        report.memlockUnlimited = memlock.rlim_cur == RLIM_INFINITY || memlock.rlim_max == RLIM_INFINITY;
 
     if (report.perfEventReadable)
         report.capabilities.push_back("native_cp_perf_event");
     if (report.perfCommand)
         report.capabilities.push_back("native_cp_perf");
+    if (report.bpftraceCommand)
+        report.capabilities.push_back("native_cp_bpftrace");
     if (report.btf)
         report.capabilities.push_back("native_cp_btf");
     if (report.ebpfFS)
         report.capabilities.push_back("native_cp_ebpf_fs");
+    if (report.traceFS)
+        report.capabilities.push_back("native_cp_tracefs");
+    if (report.blockTracepoint)
+        report.capabilities.push_back("native_cp_tracepoint_block");
     if (report.schedTracepoint)
         report.capabilities.push_back("native_cp_tracepoint_sched");
+    if (report.memlockUnlimited)
+        report.capabilities.push_back("native_cp_memlock_unlimited");
     if (report.perfEventReadable && report.perfCommand)
         report.capabilities.push_back("native_cp_sampler_perf_event");
-    if (report.btf && report.ebpfFS)
-        report.capabilities.push_back("native_cp_sampler_ebpf_ready");
+    if (report.bpftraceCommand && report.traceFS && report.ebpfFS)
+        report.capabilities.push_back("native_cp_sampler_bpftrace_ready");
+    if (report.btf && report.ebpfFS && report.memlockUnlimited)
+        report.capabilities.push_back("native_cp_sampler_core_ready");
     return report;
 }
 
