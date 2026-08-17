@@ -14,6 +14,11 @@
 namespace drop_agent
 {
 
+    /// 探测 basePath/basePath+".collapsed"/".pb.gz"/".bpf"/".bpf.raw" 里哪个
+    /// 真实存在，找不到就回退成 basePath 本身——逐字对齐旧 class Runner::
+    /// ResolveOutputPath()，用于兜底/mock 路径写到了哪个变体文件的场景。
+    std::string ResolveOutputPath(const std::string &basePath);
+
     /// 采集产物在 MinIO 里的相对文件名（不含 "<tid>/" 前缀，调用方自己拼）。
     std::string RemoteKeyFor(const std::string &profilerName);
 

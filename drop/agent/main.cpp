@@ -3,22 +3,29 @@
 // ============================================================
 // 工作循环：注册 → 心跳（带 PidStats）→ 拉任务 → 按 profilerType 分发 → MinIO 上传 → 回报
 //
+// 采集器实现（drop_agent::Runner 生命周期接口，Validate/Prepare/Start/
+// Poll/Stop/Collect/Cleanup）：
+//   agent/Runner.h                     — 接口定义 + TaskContext
+//   agent/RunnerRegistry.h/cpp         — profilerType -> Runner 工厂
+//   agent/RunnerUtils.h/cpp            — 共用纯函数(错误码映射/输出路径探测)
+//   agent/runners/PerfRunner.cpp       — perf 采集 (profilerType=0)
+//   agent/runners/AsyncProfilerRunner.cpp — async-profiler 采集 (profilerType=1)
+//   agent/runners/PprofRunner.cpp      — pprof 采集 (profilerType=2)
+//   agent/runners/BpfRunner.cpp        — eBPF/bpftrace 采集 (profilerType=3)
+//
 // 通用逻辑分布在 common/ 库中：
-//   common/Perf.cpp                    — perf 采集执行 (profilerType=0)
-//   common/AsyncProfilerProfiler.cpp   — async-profiler 采集 (profilerType=1)
-//   common/PprofProfiler.cpp           — pprof 采集 (profilerType=2)
 //   common/Process.cpp                 — /proc 读取 + PidStats 采集
-//   common/COSClient.cpp               — MinIO 上传
+//   common/COSClient.cpp               — MinIO 上传（带重试）
 //   common/Utils.cpp                   — 工具函数
+//   common/ProcessExecutor.cpp         — 非阻塞子进程执行 + 超时/取消状态机
 //
 // Agent 配置逻辑：
 //   agent/Config.h/cpp                 — JSON 配置文件 + 多 Server 故障转移
 // ============================================================
 
-#include "common/Perf.h"                  // drop::run_perf (profilerType=0)
-#include "common/AsyncProfilerProfiler.h" // drop::run_async_profiler (profilerType=1)
-#include "common/PprofProfiler.h"         // drop::run_pprof (profilerType=2)
-#include "common/BpfProfiler.h"           // drop::run_bpf (profilerType=3, eBPF)
+#include "agent/Runner.h"                 // drop_agent::Runner 生命周期接口
+#include "agent/RunnerRegistry.h"         // drop_agent::CreateRunner
+#include "agent/RunnerUtils.h"            // drop_agent::ResolveOutputPath/RemoteKeyFor/ContentTypeFor
 #include "common/CapabilityDetector.h"    // drop::detect_capabilities
 #include "common/ContinuousSampler.h"     // drop::DualTrackContinuousSampler (Native CP)
 #include "common/Process.h"               // drop::collect_self_pidstats, collect_children_pidstats
@@ -621,102 +628,161 @@ static void ensure_native_continuous_sampler(drop::DualTrackContinuousSampler &s
 }
 
 // ============================================================
-// 多采集器分发：按 profilerType 选择对应的采集函数
-// 返回 (resultCode, profilerName)
+// 多采集器分发 + 错误消息映射：Phase 2 起改由 drop_agent::Runner 生命周期
+// 接口(agent/Runner.h) + drop_agent::CreateRunner(agent/RunnerRegistry.h) +
+// drop_agent::GetErrorMessage/GetErrorCode(agent/RunnerUtils.h) 实现，
+// 具体编排见下面的 run_task_lifecycle()。旧的 run_profiler()/
+// get_error_message()/get_error_code() 已删除，逻辑原样搬到了对应的
+// Runner 子类和 RunnerUtils 里。
 // ============================================================
-static pair<int, string> run_profiler(
-    uint32_t profilerType,
-    const hotmethod::TaskDesc &task,
-    const string &outputPath,
-    const string &suffix)
-{
-    string path = outputPath;
 
+struct RunnerOutcome
+{
+    int resultCode = 0;
+    string profilerName;
+    string outputPath;
+    string remoteKey;
+    string contentType;
+    bool partial = false;
+};
+
+// ============================================================
+// run_task_lifecycle — 新版采集编排
+// ============================================================
+// 用 drop_agent::Runner 的 Validate->Prepare->Start->(Poll循环)->Collect
+// 生命周期替代旧的一体化阻塞调用。Phase 2：仍在主线程同步跑完整个流程，
+// 不引入 std::thread（Phase 3 才会拆到独立 Worker 线程）。
+//
+// 两阶段结构对齐旧代码：
+//   阶段A：跑 Runner 生命周期拿到 (resultCode, profilerName)，
+//          DROP_ALLOW_EBPF_MOCK 兜底逻辑原样保留在这一阶段。
+//   阶段B：无论阶段A成功与否，统一用 ResolveOutputPath/RemoteKeyFor/
+//          ContentTypeFor 计算最终的 outputPath/partial/remoteKey/
+//          contentType——旧代码里 Runner::Run() 也是这个结构。
+// ============================================================
+static RunnerOutcome run_task_lifecycle(uint32_t profilerType, const hotmethod::TaskDesc &task,
+                                        const string &outputPath)
+{
+    RunnerOutcome out;
+    out.outputPath = outputPath;
+
+    cout << "[runner] stage=Validate taskID=" << task.taskid()
+         << " attemptID=" << task.attempt_id() << endl;
+    if (task.taskid().empty())
+    {
+        out.resultCode = -1;
+        out.profilerName = "unknown";
+        return out;
+    }
+    if (task.deadline_unix_ms() > 0)
+    {
+        int64_t nowMs = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        if (task.deadline_unix_ms() <= nowMs)
+        {
+            out.resultCode = -3;
+            out.profilerName = "deadline";
+            return out;
+        }
+    }
+
+    string profilerLabel;
     switch (profilerType)
     {
-    case 0: // perf
-    {
+    case 0:
+        profilerLabel = "perf";
         cout << "[agent] 选择采集器: perf (profilerType=0)" << endl;
-        int result = drop::run_perf(task, path);
-
-        if (result != 0)
-        {
-            // A3: 不再无条件 mock。默认显式返回失败，和 eBPF 走同一套门控，
-            // 避免演示/评审现场把"采集失败"悄悄伪装成"采集成功"。
-            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
-            {
-                cout << "[agent] perf 采集失败(result=" << result
-                     << ")，默认不生成 mock。如仅本地开发要看页面链路，"
-                     << "可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
-                return {result, "perf"};
-            }
-            cout << "[agent] perf 失败(result=" << result
-                 << ")，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
-            generate_mock_collapsed_stacks(path);
-            return {0, "perf(mock)"};
-        }
-        return {result, "perf"};
-    }
-    case 1: // async-profiler (Java)
-    {
-        path = outputPath + ".collapsed";
+        break;
+    case 1:
+        profilerLabel = "async-profiler";
         cout << "[agent] 选择采集器: async-profiler (profilerType=1)" << endl;
-        int result = drop::run_async_profiler(task, path);
-        if (result != 0)
-        {
-            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
-            {
-                cout << "[agent] async-profiler 采集失败(result=" << result
-                     << ")，默认不生成 mock。如仅本地开发要看页面链路，"
-                     << "可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
-                return {result, "async-profiler"};
-            }
-            cout << "[agent] async-profiler 不可用，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
-            generate_mock_collapsed_stacks(outputPath);
-            return {0, "async-profiler(mock)"};
-        }
-        return {result, "async-profiler"};
-    }
-    case 2: // pprof (Go)
-    {
-        path = outputPath + ".pb.gz";
+        break;
+    case 2:
+        profilerLabel = "pprof";
         cout << "[agent] 选择采集器: pprof (profilerType=2)" << endl;
-        int result = drop::run_pprof(task, path);
-        if (result != 0)
-        {
-            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
-            {
-                cout << "[agent] pprof 采集失败(result=" << result
-                     << ")，默认不生成 mock。如仅本地开发要看页面链路，"
-                     << "可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
-                return {result, "pprof"};
-            }
-            cout << "[agent] pprof 不可用，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
-            generate_mock_collapsed_stacks(outputPath);
-            return {0, "pprof(mock)"};
-        }
-        return {result, "pprof"};
-    }
-    case 3: // eBPF (bpftrace)
-    {
-        path = outputPath + ".bpf";
+        break;
+    case 3:
+        profilerLabel = "eBPF";
         cout << "[agent] 选择采集器: eBPF/bpftrace (profilerType=3)" << endl;
-        int result = drop::run_bpf(task, path);
-        if (result != 0)
-        {
-            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
-            {
-                cout << "[agent] eBPF 采集失败(result=" << result
-                     << ")，默认不生成 mock。评分演示要求 eBPF 必须真跑；"
-                     << "如仅本地开发要看页面链路，可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
-                return {result, "eBPF"};
-            }
+        break;
+    default:
+        profilerLabel = "perf(回退)";
+        cerr << "[agent] 未知的 profilerType=" << profilerType << "，回退到 perf" << endl;
+        break;
+    }
 
+    static drop::RealProcessExecutor s_executor;
+    static drop::RealClock s_clock;
+    static drop::MinioObjectStore s_objectStore;
+    static drop::RealLogger s_logger;
+
+    drop_agent::TaskContext ctx;
+    ctx.task = task;
+    ctx.taskDir = outputPath;
+    ctx.executor = &s_executor;
+    ctx.clock = &s_clock;
+    ctx.objectStore = &s_objectStore;
+    ctx.logger = &s_logger;
+
+    auto runner = drop_agent::CreateRunner(profilerType);
+
+    cout << "[runner] stage=Prepare taskID=" << task.taskid() << endl;
+    int resultCode = 0;
+    auto validation = runner->Validate(ctx);
+    if (!validation.ok)
+    {
+        resultCode = validation.resultCode;
+    }
+    else
+    {
+        auto prepare = runner->Prepare(ctx);
+        if (!prepare.ok)
+        {
+            resultCode = prepare.resultCode;
+        }
+        else
+        {
+            cout << "[runner] stage=Start taskID=" << task.taskid() << endl;
+            auto start = runner->Start(ctx);
+            if (!start.ok)
+            {
+                resultCode = start.resultCode;
+            }
+            else
+            {
+                while (true)
+                {
+                    auto poll = runner->Poll(ctx);
+                    if (poll.status != drop_agent::PollStatus::kRunning)
+                    {
+                        resultCode = poll.resultCode;
+                        break;
+                    }
+                    this_thread::sleep_for(milliseconds(200));
+                }
+                cout << "[runner] stage=Monitor taskID=" << task.taskid()
+                     << " resultCode=" << resultCode << endl;
+                auto collect = runner->Collect(ctx);
+                resultCode = collect.resultCode; // Collect() 可能在文件校验/后处理阶段进一步改判定(如 -6/-2)
+            }
+        }
+    }
+
+    string profilerName = profilerLabel;
+    if (resultCode != 0)
+    {
+        if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
+        {
+            cout << "[agent] " << profilerLabel << " 采集失败(result=" << resultCode
+                 << ")，默认不生成 mock。如仅本地开发要看页面链路，"
+                 << "可设置 DROP_ALLOW_EBPF_MOCK=1。" << endl;
+        }
+        else if (profilerType == 3)
+        {
             cout << "[agent] eBPF 不可用，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
-            // eBPF IO 模式生成模拟 IO 直方图
+            string bpfPath = outputPath + ".bpf";
             if (task.sampleargv().event() == "io" || task.sampleargv().event() == "blk")
             {
-                ofstream mockIO(path);
+                ofstream mockIO(bpfPath);
                 mockIO << "# Mini-Drop eBPF IO Latency (MOCK)\n";
                 mockIO << "@io_lat_us:\n";
                 mockIO << "[1, 2)        42 |@@@@@@@@@\n";
@@ -729,11 +795,12 @@ static pair<int, string> run_profiler(
                 mockIO << "[128, 256)     3 |@\n";
                 mockIO << "# Total IO: 665\n";
                 mockIO.close();
-                return {0, "eBPF(mock-io)"};
+                resultCode = 0;
+                profilerName = "eBPF(mock-io)";
             }
-            if (task.sampleargv().event() == "sched" || task.sampleargv().event() == "schedule")
+            else if (task.sampleargv().event() == "sched" || task.sampleargv().event() == "schedule")
             {
-                ofstream mockSched(path);
+                ofstream mockSched(bpfPath);
                 mockSched << "# Mini-Drop eBPF Scheduler Latency (MOCK)\n";
                 mockSched << "@sched_lat_us:\n";
                 mockSched << "[0, 10)      520 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
@@ -744,189 +811,36 @@ static pair<int, string> run_profiler(
                 mockSched << "[500, 1K)      2 |\n";
                 mockSched << "# Total Scheduler Wakeups: 831\n";
                 mockSched.close();
-                return {0, "eBPF(mock-sched)"};
+                resultCode = 0;
+                profilerName = "eBPF(mock-sched)";
             }
+            else
+            {
+                generate_mock_collapsed_stacks(outputPath);
+                resultCode = 0;
+                profilerName = "eBPF(mock)";
+            }
+        }
+        else
+        {
+            cout << "[agent] " << profilerLabel << " 不可用，DROP_ALLOW_EBPF_MOCK=1，启用 mock 模式" << endl;
             generate_mock_collapsed_stacks(outputPath);
-            return {0, "eBPF(mock)"};
+            resultCode = 0;
+            profilerName = profilerLabel + "(mock)";
         }
-        return {result, "eBPF"};
     }
-    default:
-        cerr << "[agent] 未知的 profilerType=" << profilerType << "，回退到 perf" << endl;
-        int result = drop::run_perf(task, path);
-        if (result != 0)
-        {
-            if (!env_enabled("DROP_ALLOW_EBPF_MOCK"))
-            {
-                return {result, "perf(回退)"};
-            }
-            generate_mock_collapsed_stacks(path);
-            return {0, "perf(mock,回退)"};
-        }
-        return {result, "perf(回退)"};
-    }
+
+    out.resultCode = resultCode;
+    out.profilerName = profilerName;
+    out.outputPath = drop_agent::ResolveOutputPath(outputPath);
+    out.partial = out.resultCode != 0 && file_exists(out.outputPath);
+    cout << "[runner] stage=Collect taskID=" << task.taskid()
+         << " outputPath=" << out.outputPath
+         << " partial=" << (out.partial ? "true" : "false") << endl;
+    out.remoteKey = task.taskid() + "/" + drop_agent::RemoteKeyFor(profilerName);
+    out.contentType = drop_agent::ContentTypeFor(profilerName);
+    return out;
 }
-
-// ============================================================
-// 错误消息映射
-// ============================================================
-static string get_error_message(int resultCode, const string &profilerName,
-                                const hotmethod::TaskDesc &task)
-{
-    switch (resultCode)
-    {
-    case 0:
-        return ""; // 成功
-    case -4:
-        if (profilerName == "pprof")
-            return "无法连接 Go pprof：请确认 pprof_url 可从 Agent 访问并已启用 /debug/pprof/profile";
-        return "目标 PID " + to_string(task.sampleargv().pid()) + " 不存在";
-    case -3:
-        return profilerName + " 采集超时（" + to_string(task.timeoutsec()) + "秒）";
-    case -6:
-        if (profilerName == "pprof")
-            return "pprof 返回的不是有效 gzip profile；请确认 /debug/pprof/profile 已启用且未被代理改写";
-        return profilerName + " 未生成有效采集文件";
-    case -1:
-    case -2:
-    case -5:
-        if (profilerName == "eBPF")
-        {
-            string event = task.sampleargv().event();
-            if (event.empty())
-                event = "cpu";
-            if (resultCode == -5)
-                return "eBPF 采集失败：BPFTRACE_UNAVAILABLE，请确认 Agent 容器内已安装 bpftrace，resultCode=" + to_string(resultCode);
-            if (event == "cpu")
-                return "eBPF CPU 采集失败：NO_EBPF_SAMPLES，请提高采样频率/加长 duration，或确认 kstack/ustack 权限可用，resultCode=" + to_string(resultCode);
-            return "eBPF 采集失败：NO_EBPF_SAMPLES，请确认 bpftrace/tracefs 权限可用，并在采集窗口内制造 " + event + " 负载，resultCode=" + to_string(resultCode);
-        }
-        return profilerName + " 进程异常, resultCode=" + to_string(resultCode);
-    default:
-        return profilerName + " 采集失败, exitCode=" + to_string(resultCode);
-    }
-}
-
-static string get_error_code(int resultCode, const string &profilerName)
-{
-    if (resultCode == 0)
-        return "";
-    if (resultCode == -3)
-        return "TASK_TIMEOUT";
-    if (resultCode == -4)
-        return "TARGET_NOT_FOUND";
-    if (resultCode == -6)
-        return "ARTIFACT_MISSING";
-    if (profilerName.find("eBPF") != string::npos)
-    {
-        if (resultCode == -2)
-            return "NO_EBPF_SAMPLES";
-        if (resultCode == -5)
-            return "BPFTRACE_UNAVAILABLE";
-        return "EBPF_UNAVAILABLE";
-    }
-    if (profilerName.find("pprof") != string::npos)
-        return "PPROF_UNAVAILABLE";
-    return "TASK_EXECUTION_FAILED";
-}
-
-struct RunnerOutcome
-{
-    int resultCode = 0;
-    string profilerName;
-    string outputPath;
-    string remoteKey;
-    string contentType;
-    bool partial = false;
-};
-
-class Runner
-{
-public:
-    Runner(uint32_t profilerType, const hotmethod::TaskDesc &task, string outputPath)
-        : profilerType_(profilerType), task_(task), outputPath_(std::move(outputPath)) {}
-
-    RunnerOutcome Run()
-    {
-        cout << "[runner] stage=Validate taskID=" << task_.taskid()
-             << " attemptID=" << task_.attempt_id() << endl;
-        RunnerOutcome out;
-        out.outputPath = outputPath_;
-        if (task_.taskid().empty())
-        {
-            out.resultCode = -1;
-            out.profilerName = "unknown";
-            return out;
-        }
-        if (task_.deadline_unix_ms() > 0)
-        {
-            int64_t nowMs = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-            if (task_.deadline_unix_ms() <= nowMs)
-            {
-                out.resultCode = -3;
-                out.profilerName = "deadline";
-                return out;
-            }
-        }
-
-        cout << "[runner] stage=Prepare taskID=" << task_.taskid() << endl;
-        cout << "[runner] stage=Start taskID=" << task_.taskid() << endl;
-        auto profilerResult = run_profiler(profilerType_, task_, outputPath_, "");
-        out.resultCode = profilerResult.first;
-        out.profilerName = profilerResult.second;
-        cout << "[runner] stage=Monitor taskID=" << task_.taskid()
-             << " resultCode=" << out.resultCode << endl;
-        out.outputPath = ResolveOutputPath();
-        out.partial = out.resultCode != 0 && file_exists(out.outputPath);
-        cout << "[runner] stage=Collect taskID=" << task_.taskid()
-             << " outputPath=" << out.outputPath
-             << " partial=" << (out.partial ? "true" : "false") << endl;
-        out.remoteKey = RemoteKeyFor(out.outputPath, out.profilerName);
-        out.contentType = ContentTypeFor(out.outputPath, out.profilerName);
-        return out;
-    }
-
-private:
-    string ResolveOutputPath() const
-    {
-        if (file_exists(outputPath_))
-            return outputPath_;
-        if (file_exists(outputPath_ + ".collapsed"))
-            return outputPath_ + ".collapsed";
-        if (file_exists(outputPath_ + ".pb.gz"))
-            return outputPath_ + ".pb.gz";
-        if (file_exists(outputPath_ + ".bpf"))
-            return outputPath_ + ".bpf";
-        if (file_exists(outputPath_ + ".bpf.raw"))
-            return outputPath_ + ".bpf.raw";
-        return outputPath_;
-    }
-
-    string RemoteKeyFor(const string &path, const string &profilerName) const
-    {
-        string tid = task_.taskid();
-        if (profilerName.find("eBPF") != string::npos || path.find(".bpf") != string::npos)
-            return tid + "/raw.bpf";
-        if (profilerName.find("async-profiler") != string::npos || path.find(".collapsed") != string::npos)
-            return tid + "/profile.collapsed";
-        if (profilerName.find("pprof") != string::npos || path.find(".pb.gz") != string::npos)
-            return tid + "/profile.pb.gz";
-        return tid + "/perf.data";
-    }
-
-    string ContentTypeFor(const string &path, const string &profilerName) const
-    {
-        if (profilerName.find("eBPF") != string::npos || path.find(".bpf") != string::npos || path.find(".collapsed") != string::npos)
-            return "text/plain; charset=utf-8";
-        if (profilerName.find("pprof") != string::npos || path.find(".pb.gz") != string::npos)
-            return "application/gzip";
-        return "application/octet-stream";
-    }
-
-    uint32_t profilerType_;
-    const hotmethod::TaskDesc &task_;
-    string outputPath_;
-};
 
 // ============================================================
 // 采集后处理：读取输出文件 → 上传 MinIO → 构建 TaskResult
@@ -943,11 +857,11 @@ static hotmethod::TaskResult build_task_result(
     taskResult.set_attempt_id(task.attempt_id());
     taskResult.set_partial(outcome.partial);
 
-    string errorMsg = get_error_message(outcome.resultCode, outcome.profilerName, task);
+    string errorMsg = drop_agent::GetErrorMessage(outcome.resultCode, outcome.profilerName, task);
     if (!errorMsg.empty())
     {
         taskResult.set_errormessage(errorMsg);
-        taskResult.set_error_code(get_error_code(outcome.resultCode, outcome.profilerName));
+        taskResult.set_error_code(drop_agent::GetErrorCode(outcome.resultCode, outcome.profilerName));
     }
 
     if (outcome.resultCode == 0 || outcome.partial)
@@ -1222,8 +1136,7 @@ int main(int argc, char **argv)
             runningAttempts.push_back(currentAttempt);
 
             auto collectStart = chrono::steady_clock::now();
-            Runner runner(ptype, task, outputPath);
-            RunnerOutcome outcome = runner.Run();
+            RunnerOutcome outcome = run_task_lifecycle(ptype, task, outputPath);
             auto collectMs = chrono::duration_cast<chrono::milliseconds>(
                                   chrono::steady_clock::now() - collectStart)
                                   .count();

@@ -58,11 +58,10 @@ set(PROTO_GRPC_SRCS
 )
 
 # ---------- common 模块源文件 ----------
+# 注：perf/async-profiler/pprof/eBPF 的采集实现已经从 common/Perf.cpp 等
+# 文件迁移到 agent/runners/*Runner.cpp（drop_agent::Runner 生命周期接口），
+# 旧文件已删除，不再是 drop_server 也链接的"共享"代码。
 set(COMMON_SRCS
-    common/Perf.cpp
-    common/AsyncProfilerProfiler.cpp
-    common/PprofProfiler.cpp
-    common/BpfProfiler.cpp
     common/CapabilityDetector.cpp
     common/ContinuousSampler.cpp
     common/Process.cpp

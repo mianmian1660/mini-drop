@@ -32,14 +32,25 @@ namespace drop_agent
     {
         int targetPid = ctx.task.sampleargv().pid();
         if (targetPid > 0 && !drop::pid_exists(targetPid))
-            return {false, GetErrorCode(-4, "perf"), GetErrorMessage(-4, "perf", ctx.task)};
-        return {true, "", ""};
+        {
+            ValidationResult r;
+            r.ok = false;
+            r.resultCode = -4;
+            r.errorCode = GetErrorCode(-4, "perf");
+            r.errorMessage = GetErrorMessage(-4, "perf", ctx.task);
+            return r;
+        }
+        ValidationResult r;
+        r.ok = true;
+        return r;
     }
 
     PrepareResult PerfRunner::Prepare(TaskContext &ctx)
     {
         outputPath_ = ctx.taskDir;
-        return {true, "", ""};
+        PrepareResult r;
+        r.ok = true;
+        return r;
     }
 
     StartResult PerfRunner::Start(TaskContext &ctx)
@@ -90,14 +101,23 @@ namespace drop_agent
         drop::ExecHandle handle;
         string err;
         if (!ctx.executor->Start(args, &handle, &err))
-            return {false, "RUNNER_NOT_AVAILABLE", err};
+        {
+            StartResult r;
+            r.ok = false;
+            r.resultCode = -1;
+            r.errorCode = "RUNNER_NOT_AVAILABLE";
+            r.errorMessage = err;
+            return r;
+        }
 
         uint32_t timeout = ctx.task.timeoutsec();
         if (timeout == 0)
             timeout = 60;
         poller_.reset(new drop::TimedProcessPoller(ctx.executor, ctx.clock, timeout));
         poller_->Attach(handle);
-        return {true, "", ""};
+        StartResult r;
+        r.ok = true;
+        return r;
     }
 
     PollResult PerfRunner::Poll(TaskContext &)

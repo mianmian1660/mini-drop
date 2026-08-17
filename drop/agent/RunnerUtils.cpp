@@ -16,6 +16,28 @@ using namespace std;
 namespace drop_agent
 {
 
+    string ResolveOutputPath(const string &basePath)
+    {
+        auto exists = [](const string &p)
+        {
+            struct stat st
+            {
+            };
+            return stat(p.c_str(), &st) == 0;
+        };
+        if (exists(basePath))
+            return basePath;
+        if (exists(basePath + ".collapsed"))
+            return basePath + ".collapsed";
+        if (exists(basePath + ".pb.gz"))
+            return basePath + ".pb.gz";
+        if (exists(basePath + ".bpf"))
+            return basePath + ".bpf";
+        if (exists(basePath + ".bpf.raw"))
+            return basePath + ".bpf.raw";
+        return basePath;
+    }
+
     string RemoteKeyFor(const string &profilerName)
     {
         if (profilerName.find("eBPF") != string::npos)

@@ -282,14 +282,37 @@ namespace drop_agent
         mode_ = ParseBpfMode(ctx.task.sampleargv().event());
         if (mode_ == BpfMode::IO_LATENCY &&
             (!TracepointAvailable("block:block_rq_issue") || !TracepointAvailable("block:block_rq_complete")))
-            return {false, GetErrorCode(-2, "eBPF"), GetErrorMessage(-2, "eBPF", ctx.task)};
+        {
+            ValidationResult r;
+            r.ok = false;
+            r.resultCode = -2;
+            r.errorCode = GetErrorCode(-2, "eBPF");
+            r.errorMessage = GetErrorMessage(-2, "eBPF", ctx.task);
+            return r;
+        }
         if (mode_ == BpfMode::SCHED_LATENCY &&
             (!TracepointAvailable("sched:sched_wakeup") || !TracepointAvailable("sched:sched_switch")))
-            return {false, GetErrorCode(-2, "eBPF"), GetErrorMessage(-2, "eBPF", ctx.task)};
+        {
+            ValidationResult r;
+            r.ok = false;
+            r.resultCode = -2;
+            r.errorCode = GetErrorCode(-2, "eBPF");
+            r.errorMessage = GetErrorMessage(-2, "eBPF", ctx.task);
+            return r;
+        }
         int targetPid = ctx.task.sampleargv().pid();
         if (mode_ == BpfMode::CPU && targetPid > 0 && !drop::pid_exists(targetPid))
-            return {false, GetErrorCode(-4, "eBPF"), GetErrorMessage(-4, "eBPF", ctx.task)};
-        return {true, "", ""};
+        {
+            ValidationResult r;
+            r.ok = false;
+            r.resultCode = -4;
+            r.errorCode = GetErrorCode(-4, "eBPF");
+            r.errorMessage = GetErrorMessage(-4, "eBPF", ctx.task);
+            return r;
+        }
+        ValidationResult r;
+        r.ok = true;
+        return r;
     }
 
     PrepareResult BpfRunner::Prepare(TaskContext &ctx)
@@ -301,10 +324,19 @@ namespace drop_agent
         string script = MakeScript(mode_, ctx.task);
         ofstream f(scriptPath_);
         if (!f.is_open())
-            return {false, "RUNNER_NOT_AVAILABLE", "无法写 bpftrace 脚本: " + scriptPath_};
+        {
+            PrepareResult r;
+            r.ok = false;
+            r.resultCode = -2;
+            r.errorCode = GetErrorCode(-2, "eBPF");
+            r.errorMessage = GetErrorMessage(-2, "eBPF", ctx.task);
+            return r;
+        }
         f << script;
         f.close();
-        return {true, "", ""};
+        PrepareResult r;
+        r.ok = true;
+        return r;
     }
 
     StartResult BpfRunner::Start(TaskContext &ctx)
@@ -318,7 +350,14 @@ namespace drop_agent
         drop::ExecHandle handle;
         string err;
         if (!ctx.executor->Start(args, &handle, &err))
-            return {false, "RUNNER_NOT_AVAILABLE", err};
+        {
+            StartResult r;
+            r.ok = false;
+            r.resultCode = -1;
+            r.errorCode = "RUNNER_NOT_AVAILABLE";
+            r.errorMessage = err;
+            return r;
+        }
 
         uint32_t timeout = ctx.task.timeoutsec();
         if (timeout == 0)
@@ -326,7 +365,9 @@ namespace drop_agent
         // gracePeriodSec=1：对齐旧 exec_bpftrace() 里比其他采集器更短的 grace period。
         poller_.reset(new drop::TimedProcessPoller(ctx.executor, ctx.clock, timeout, /*gracePeriodSec=*/1));
         poller_->Attach(handle);
-        return {true, "", ""};
+        StartResult r;
+        r.ok = true;
+        return r;
     }
 
     PollResult BpfRunner::Poll(TaskContext &)
