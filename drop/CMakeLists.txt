@@ -98,6 +98,12 @@ find_library(gRPC_REFLECTION_LIB grpc++_reflection
 add_executable(drop_agent
     agent/main.cpp
     agent/Config.cpp
+    agent/RunnerUtils.cpp
+    agent/RunnerRegistry.cpp
+    agent/runners/PerfRunner.cpp
+    agent/runners/AsyncProfilerRunner.cpp
+    agent/runners/PprofRunner.cpp
+    agent/runners/BpfRunner.cpp
     ${COMMON_SRCS}
     ${PROTO_SRCS} ${PROTO_GRPC_SRCS}
 )
@@ -146,8 +152,15 @@ if(GTest_FOUND)
     add_executable(drop_tests EXCLUDE_FROM_ALL
         tests/test_task_queue.cpp
         tests/test_process_executor.cpp
+        tests/test_runners.cpp
         server/TaskQueue.cpp
         common/ProcessExecutor.cpp
+        common/Process.cpp
+        agent/RunnerUtils.cpp
+        agent/runners/PerfRunner.cpp
+        agent/runners/AsyncProfilerRunner.cpp
+        agent/runners/PprofRunner.cpp
+        agent/runners/BpfRunner.cpp
         ${PROTO_SRCS}
     )
     target_include_directories(drop_tests PRIVATE
