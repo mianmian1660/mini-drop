@@ -370,9 +370,16 @@ namespace drop_agent
         // ============================================================
         // run_task_lifecycle — 用 drop_agent::Runner 的
         // Validate->Prepare->Start->(Poll循环)->Collect 生命周期跑一次采集。
+        //
+        // runningFlag 是 Agent 的全局运行标志：Poll 循环里每一轮都会检查，
+        // 一旦 Agent 收到关闭信号（SIGTERM/SIGINT），就调用 Runner::Stop
+        // (StopReason::kAgentShutdown) 中断正在跑的采集进程，而不是傻等它
+        // 自然结束或超时——否则 WorkerThread::Stop() 的 join() 会被一个
+        // 几十秒的任务拖住，SIGTERM 就成了摆设。
         // ============================================================
         RunnerOutcome RunTaskLifecycle(uint32_t profilerType, const hotmethod::TaskDesc &task,
-                                        const string &outputPath)
+                                        const string &outputPath,
+                                        const std::atomic<bool> &runningFlag)
         {
             RunnerOutcome out;
             out.outputPath = outputPath;
@@ -466,6 +473,18 @@ namespace drop_agent
                             if (poll.status != drop_agent::PollStatus::kRunning)
                             {
                                 resultCode = poll.resultCode;
+                                break;
+                            }
+                            if (!runningFlag)
+                            {
+                                cout << "[runner] stage=Stop taskID=" << task.taskid()
+                                     << " reason=AgentShutdown，中断采集" << endl;
+                                runner->Stop(ctx, drop_agent::StopReason::kAgentShutdown);
+                                // 再 Poll 一次，让 Runner 观察到进程已被终止并
+                                // 更新内部状态，这样下面的 Collect() 才能拿到
+                                // 正确的 resultCode，而不是残留的"仍在运行"状态。
+                                auto afterStop = runner->Poll(ctx);
+                                resultCode = afterStop.resultCode;
                                 break;
                             }
                             this_thread::sleep_for(milliseconds(200));
@@ -722,7 +741,7 @@ namespace drop_agent
             string outputPath = "/tmp/" + to_string(ptype) + "_" + task.taskid() + "_output";
 
             auto collectStart = steady_clock::now();
-            RunnerOutcome outcome = RunTaskLifecycle(ptype, task, outputPath);
+            RunnerOutcome outcome = RunTaskLifecycle(ptype, task, outputPath, running_);
             auto collectMs = duration_cast<milliseconds>(steady_clock::now() - collectStart).count();
             drop::log_event("drop_agent",
                              outcome.resultCode == 0 ? "collection_succeeded" : "collection_failed",
