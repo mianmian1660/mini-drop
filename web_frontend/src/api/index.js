@@ -108,15 +108,6 @@ export const continuous = {
     histogram: (params = {}) => client.get('/api/v1/continuous/histogram', { params }),
 };
 
-export const continuous = {
-    createSession: (data) => client.post('/api/v1/continuous/sessions', data),
-    sessions: (params = {}) => client.get('/api/v1/continuous/sessions', { params }),
-    stopSession: (sid) => client.post(`/api/v1/continuous/sessions/${sid}/stop`),
-    timeline: (sid, params = {}) => client.get(`/api/v1/continuous/sessions/${sid}/timeline`, { params }),
-    query: (params = {}) => client.get('/api/v1/continuous/query', { params }),
-    histogram: (params = {}) => client.get('/api/v1/continuous/histogram', { params }),
-};
-
 // ---------- 分析结果 ----------
 // 当前后端将建议、归因和产物汇总在任务详情中；在这里收敛为结果页可复用的数据接口。
 export const analysisResults = {
