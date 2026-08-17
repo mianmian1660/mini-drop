@@ -70,6 +70,9 @@ set(COMMON_SRCS
     common/Utils.cpp
     common/SymbolCollector.cpp
     common/Log.cpp
+    common/ProcessExecutor.cpp
+    common/ObjectStore.cpp
+    common/LoggerIface.cpp
 )
 
 # ---------- server 模块源文件 ----------
@@ -142,7 +145,9 @@ find_package(GTest)
 if(GTest_FOUND)
     add_executable(drop_tests EXCLUDE_FROM_ALL
         tests/test_task_queue.cpp
+        tests/test_process_executor.cpp
         server/TaskQueue.cpp
+        common/ProcessExecutor.cpp
         ${PROTO_SRCS}
     )
     target_include_directories(drop_tests PRIVATE
