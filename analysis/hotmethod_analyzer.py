@@ -58,6 +58,14 @@ TASK_TYPE_BPF       = 5   # eBPF 内核探针 (IO/调度延迟)
 TASK_TYPE_JAVA_HEAP = 6   # Java 堆 dump
 
 
+def env_enabled(name: str) -> bool:
+    """
+    与 drop/agent/main.cpp 的 env_enabled() 对齐：DROP_ALLOW_EBPF_MOCK 等
+    开关变量取值为 1/true/yes/on（大小写不敏感）才视为开启，默认关闭。
+    """
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_config(config_path: str) -> dict:
     """
     加载配置文件（ini 格式）并支持环境变量覆盖
@@ -1098,17 +1106,26 @@ def _analyze_memleak(conn, storage_cfg: dict, task: dict,
                 print(f"[analysis] 下载 memtrace.txt 失败: {e}", file=sys.stderr)
 
     if not has_data:
-        # MinIO 不可用或无数据时，使用内置模拟数据
-        memtrace_text = generate_mock_memtrace()
-        has_data = True
-        print(f"[analysis] 使用内置模拟内存追踪数据 "
-              f"({len(memtrace_text)} chars)",
-              file=sys.stderr)
-
-    if not has_data:
-        print(f"[analysis] 错误: 无内存追踪数据", file=sys.stderr)
-        return {"outputs": outputs, "presigned_urls": presigned_urls,
-                "local_files": local_files}
+        # 默认不再静默造假：MinIO 不可用或对象缺失时如实报错，
+        # 和 drop/agent/main.cpp 里 eBPF/perf/async-profiler 的门控策略保持一致，
+        # 避免把"数据丢了"伪装成"这就是真实分析结果"。
+        # 只有本地开发想看页面链路时，才显式设置 DROP_ALLOW_EBPF_MOCK=1。
+        if env_enabled("DROP_ALLOW_EBPF_MOCK"):
+            memtrace_text = generate_mock_memtrace()
+            has_data = True
+            print(f"[analysis] MinIO 不可用或无 memtrace.txt，"
+                  f"DROP_ALLOW_EBPF_MOCK=1，使用内置模拟内存追踪数据 "
+                  f"({len(memtrace_text)} chars，仅限本地开发)",
+                  file=sys.stderr)
+        elif not storage_ok:
+            exit_error(ErrorCode.ERR_STORAGE_CONNECT,
+                       "内存泄漏分析失败：对象存储不可用，且未设置 DROP_ALLOW_EBPF_MOCK=1",
+                       f"tid={tid}")
+        else:
+            exit_error(ErrorCode.ERR_FILE_NOT_FOUND,
+                       f"内存泄漏分析失败：{tid}/memtrace.txt 不存在，"
+                       f"且未设置 DROP_ALLOW_EBPF_MOCK=1",
+                       f"tid={tid}")
 
     # --- 3. 执行内存泄漏分析 ---
     print(f"[analysis] 开始内存泄漏分析 ...", file=sys.stderr)

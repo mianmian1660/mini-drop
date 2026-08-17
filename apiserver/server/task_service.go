@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -213,6 +214,16 @@ func (svc *TaskService) CancelTask(tid string, auth AuthContext) (gin.H, *Servic
 		"end_time":         &now,
 	}
 	if err := s.transitionTaskStatus(&task, TaskStatusCanceled, "用户请求取消任务", "apiserver_cancel", extra); err != nil {
+		if errors.Is(err, ErrTaskStatusStale) {
+			// 竞态丢失：在我们判断"未终态"和真正写入之间，任务已经被
+			// notify 回调/outbox/巡检器之一推进到了终态，语义上等同于
+			// 上面 isTerminalTaskStatus 分支，不是内部错误。
+			var latest model.HotmethodTask
+			if err := s.DB.Where("tid = ?", task.TID).First(&latest).Error; err == nil {
+				return gin.H{"tid": latest.TID, "status": latest.Status, "already_terminal": true}, nil
+			}
+			return gin.H{"tid": task.TID, "status": task.Status, "already_terminal": true}, nil
+		}
 		return nil, serviceError(http.StatusInternalServerError, ErrCodeDependencyUnavailable, "取消任务失败")
 	}
 	s.finishLatestTaskAttempt(task.TID, ErrCodeTaskExecutionFailed, "用户请求取消任务", nil)

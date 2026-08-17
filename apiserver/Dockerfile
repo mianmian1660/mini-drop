@@ -9,6 +9,8 @@
 # FROM：以哪个镜像为基础。这里用装了 Go 1.19 的精简 Linux
 # AS builder：起个名字叫 builder，后面可以引用
 FROM golang:1.19-alpine AS builder
+ENV GOPROXY=https://goproxy.cn,direct
+RUN sed -i "s/dl-cdn.alpinelinux.org/mirrors.tencentyun.com/g" /etc/apk/repositories 2>/dev/null || true
 
 # WORKDIR：设定工作目录（相当于 cd）
 WORKDIR /app

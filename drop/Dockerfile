@@ -9,6 +9,9 @@
 # ---------- 阶段1：编译 ----------
 FROM ubuntu:22.04 AS builder
 
+# 腾讯云内网镜像加速 apt（服务器上构建更快，其他网络环境 sed 失败不影响）
+RUN sed -i s@/archive.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && sed -i s@/security.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list
+
 # 禁止 apt 安装时弹出交互式界面（Docker 里没有终端）
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -18,6 +21,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   protobuf-compiler = protoc，把 .proto 文件编译成 C++ 代码
 #   libprotobuf-dev   = protobuf 的 C++ 开发库
 #   libgrpc++-dev     = gRPC 的 C++ 开发库（含 grpc_cpp_plugin）
+#   libgtest-dev      = gtest 单元测试框架（可选，drop_tests 目标用；
+#                        找不到也不影响 drop_server/drop_agent 的构建）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -27,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libprotobuf-dev \
     libgrpc++-dev \
     libgrpc-dev \
+    libgtest-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

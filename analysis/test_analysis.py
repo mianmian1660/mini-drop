@@ -272,6 +272,61 @@ def t_generate_mock_memtrace():
     trace = generate_mock_memtrace()
     assert "alloc:" in trace and len(trace) > 100
 
+class _FakeMemleakCursor:
+    def execute(self, sql, args=None):
+        pass
+    def close(self):
+        pass
+
+class _FakeMemleakConn:
+    def cursor(self):
+        return _FakeMemleakCursor()
+
+class _FakeMemleakStorage:
+    def __init__(self, has_object=False):
+        self.has_object = has_object
+        self.writes = {}
+    def object_exists(self, bucket, key):
+        return self.has_object
+    def get_object(self, bucket, key):
+        return None
+    def put_object(self, bucket, key, data, content_type):
+        self.writes[key] = content_type
+    def presigned_get_url(self, bucket, key):
+        return "http://example/" + key
+
+def t_analyze_memleak_missing_data_fails_without_mock_flag():
+    import hotmethod_analyzer as hm
+    original_connect = hm._connect_storage
+    original_env = os.environ.pop("DROP_ALLOW_EBPF_MOCK", None)
+    try:
+        hm._connect_storage = lambda cfg: (_FakeMemleakStorage(has_object=False), True)
+        try:
+            hm._analyze_memleak(_FakeMemleakConn(), {}, {"name": "leak"}, "drop-data", "tid-leak", "/tmp")
+            assert False, "缺数据且未开 mock 开关时应该报错退出"
+        except SystemExit as e:
+            assert e.code != 0
+    finally:
+        hm._connect_storage = original_connect
+        if original_env is not None:
+            os.environ["DROP_ALLOW_EBPF_MOCK"] = original_env
+
+def t_analyze_memleak_uses_mock_when_flag_enabled():
+    import hotmethod_analyzer as hm
+    original_connect = hm._connect_storage
+    original_env = os.environ.get("DROP_ALLOW_EBPF_MOCK")
+    try:
+        hm._connect_storage = lambda cfg: (_FakeMemleakStorage(has_object=False), True)
+        os.environ["DROP_ALLOW_EBPF_MOCK"] = "1"
+        result = hm._analyze_memleak(_FakeMemleakConn(), {}, {"name": "leak"}, "drop-data", "tid-leak", "/tmp")
+        assert "memleak.json" in "".join(result["outputs"]) or any("memleak" in o for o in result["outputs"])
+    finally:
+        hm._connect_storage = original_connect
+        if original_env is None:
+            os.environ.pop("DROP_ALLOW_EBPF_MOCK", None)
+        else:
+            os.environ["DROP_ALLOW_EBPF_MOCK"] = original_env
+
 def t_advisor_load_rules():
     from analysis_advisor import AnalysisAdvisor
     a = AnalysisAdvisor()
@@ -311,8 +366,16 @@ def t_error_info():
 def t_analyzer_registry_defaults():
     from analyzer_registry import build_default_registry
     r = build_default_registry()
-    for task_type in [0, 1, 2, 4, 5, 6]:
+    for task_type in [0, 1, 2, 4, 5]:
         assert r.get(task_type) is not None
+    # task_type=6 (java_heap) 只在 collector_declarations() 里声明为
+    # enabled=False，真实分析器未实现，不应注册进 build_default_registry()。
+    assert r.get(6) is None
+    try:
+        r.require(6)
+        assert False, "未注册的 task_type=6 应该抛错"
+    except KeyError:
+        pass
     try:
         r.require(999)
         assert False, "未知 task_type 应该抛错"

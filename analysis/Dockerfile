@@ -11,6 +11,7 @@ FROM python:3.10-slim
 #   perl            = 火焰图生成脚本 flamegraph.pl 是 Perl 写的
 #   procps          = ps 等进程工具
 #   linux-perf      = perf script 解析 perf.data，生成 CPU 火焰图
+RUN sed -i s@/deb.debian.org/@/mirrors.tencentyun.com/@g /etc/apt/sources.list.d/debian.sources 2>/dev/null || sed -i s@/deb.debian.org/@/mirrors.tencentyun.com/@g /etc/apt/sources.list 2>/dev/null || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     perl \
     procps \
@@ -23,7 +24,7 @@ WORKDIR /app
 
 # 先复制依赖清单，利用 Docker 缓存
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -i http://mirrors.tencentyun.com/pypi/simple --trusted-host mirrors.tencentyun.com -r requirements.txt
 
 # 复制所有分析脚本
 COPY . .

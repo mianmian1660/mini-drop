@@ -58,17 +58,20 @@ set(PROTO_GRPC_SRCS
 )
 
 # ---------- common 模块源文件 ----------
+# 注：perf/async-profiler/pprof/eBPF 的采集实现已经从 common/Perf.cpp 等
+# 文件迁移到 agent/runners/*Runner.cpp（drop_agent::Runner 生命周期接口），
+# 旧文件已删除，不再是 drop_server 也链接的"共享"代码。
 set(COMMON_SRCS
-    common/Perf.cpp
-    common/AsyncProfilerProfiler.cpp
-    common/PprofProfiler.cpp
-    common/BpfProfiler.cpp
     common/CapabilityDetector.cpp
     common/ContinuousSampler.cpp
     common/Process.cpp
     common/COSClient.cpp
     common/Utils.cpp
     common/SymbolCollector.cpp
+    common/Log.cpp
+    common/ProcessExecutor.cpp
+    common/ObjectStore.cpp
+    common/LoggerIface.cpp
 )
 
 # ---------- server 模块源文件 ----------
@@ -94,6 +97,12 @@ find_library(gRPC_REFLECTION_LIB grpc++_reflection
 add_executable(drop_agent
     agent/main.cpp
     agent/Config.cpp
+    agent/RunnerUtils.cpp
+    agent/RunnerRegistry.cpp
+    agent/runners/PerfRunner.cpp
+    agent/runners/AsyncProfilerRunner.cpp
+    agent/runners/PprofRunner.cpp
+    agent/runners/BpfRunner.cpp
     ${COMMON_SRCS}
     ${PROTO_SRCS} ${PROTO_GRPC_SRCS}
 )
@@ -129,3 +138,43 @@ target_link_libraries(drop_server
     Threads::Threads
     ${gRPC_REFLECTION_LIB}
 )
+
+# ============================================================
+# 单元测试：drop_tests（gtest，只覆盖不依赖真实进程/网络的纯逻辑）
+# ============================================================
+# 找不到 gtest 也不影响 drop_server/drop_agent 的正常构建（不用 REQUIRED）；
+# EXCLUDE_FROM_ALL 让 `make`/`make -j$(nproc)`（不指定目标时的默认行为）
+# 不会顺带编译测试目标，只有显式 `cmake --build . --target drop_tests`
+# 才会碰到它——测试代码的任何问题都不会拖累主构建/部署。
+find_package(GTest)
+if(GTest_FOUND)
+    add_executable(drop_tests EXCLUDE_FROM_ALL
+        tests/test_task_queue.cpp
+        tests/test_process_executor.cpp
+        tests/test_runners.cpp
+        server/TaskQueue.cpp
+        common/ProcessExecutor.cpp
+        common/Process.cpp
+        agent/RunnerUtils.cpp
+        agent/runners/PerfRunner.cpp
+        agent/runners/AsyncProfilerRunner.cpp
+        agent/runners/PprofRunner.cpp
+        agent/runners/BpfRunner.cpp
+        ${PROTO_SRCS}
+    )
+    target_include_directories(drop_tests PRIVATE
+        ${PROTO_GEN_DIR}
+        ${CMAKE_SOURCE_DIR}
+        ${Protobuf_INCLUDE_DIRS}
+    )
+    target_link_libraries(drop_tests
+        GTest::gtest
+        GTest::gtest_main
+        ${Protobuf_LIBRARIES}
+        Threads::Threads
+    )
+    enable_testing()
+    add_test(NAME drop_tests COMMAND drop_tests)
+else()
+    message(STATUS "GTest 未找到，跳过 drop_tests 目标（不影响 drop_server/drop_agent 构建）")
+endif()

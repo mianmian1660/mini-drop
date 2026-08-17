@@ -9,6 +9,7 @@
 // ============================================================
 
 #include "server/ResultNotifier.h"
+#include "common/Log.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -93,11 +94,13 @@ namespace drop_server
         if (ok)
         {
             cout << "[notify] 已通知 apiserver: taskID=" << result.taskid() << endl;
+            drop::log_event("drop_server", "apiserver_notify_succeeded", {{"task_id", result.taskid()}});
         }
         else
         {
             cerr << "[notify] 通知 apiserver 失败（不影响主流程，apiserver 轮询仍会兜底发现）: "
                  << "taskID=" << result.taskid() << endl;
+            drop::log_event("drop_server", "apiserver_notify_failed", {{"task_id", result.taskid()}});
         }
         return ok;
     }

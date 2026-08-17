@@ -142,20 +142,26 @@ def run_stackcollapse(perf_script_output: str) -> str:
         折叠后的栈文本
     """
     print(f"[flamegraph] 执行 stackcollapse-perf.pl ...", file=sys.stderr)
+    # 用字节流传输 stdin/stdout，不用 text=True：Windows 上文本模式会把管道里
+    # 的 \n 转成 \r\n，stackcollapse-perf.pl/flamegraph.pl 只用 chomp 去掉
+    # \n，残留的 \r 会让它们的行格式正则匹配失败（整份输入被当无效数据丢弃）。
+    # Linux 部署环境不受影响，但本地/CI 在 Windows 上跑分析管线时会误报失败。
     result = subprocess.run(
         ["perl", STACKCOLLAPSE_SCRIPT],
-        input=perf_script_output,
-        capture_output=True, text=True,
+        input=perf_script_output.encode("utf-8"),
+        capture_output=True,
         timeout=60
     )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
     if result.returncode != 0:
-        error_msg = result.stderr.strip() or "stackcollapse 返回非零退出码"
+        error_msg = stderr.strip() or "stackcollapse 返回非零退出码"
         raise subprocess.CalledProcessError(
             result.returncode, ["perl", STACKCOLLAPSE_SCRIPT],
-            output=result.stdout, stderr=result.stderr
+            output=stdout, stderr=stderr
         )
 
-    lines = result.stdout.strip()
+    lines = stdout.strip()
     line_count = len(lines.split("\n")) if lines else 0
     print(f"[flamegraph] 折叠栈输出 {line_count} 行", file=sys.stderr)
     return lines
@@ -180,24 +186,28 @@ def run_flamegraph(folded_stacks: str, title: str = "Flame Graph",
         SVG 字符串
     """
     print(f"[flamegraph] 生成火焰图 SVG (title='{title}', width={width}) ...", file=sys.stderr)
+    # 同 run_stackcollapse()：用字节流传输，避免 Windows 文本模式的 \n->\r\n
+    # 转换破坏 flamegraph.pl 的行解析。
     result = subprocess.run(
         ["perl", FLAMEGRAPH_SCRIPT,
          "--title", title,
          "--width", str(width),
          "--colors", colors],
-        input=folded_stacks,
-        capture_output=True, text=True,
+        input=folded_stacks.encode("utf-8"),
+        capture_output=True,
         timeout=60
     )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
     if result.returncode != 0:
-        error_msg = result.stderr.strip() or "flamegraph 返回非零退出码"
+        error_msg = stderr.strip() or "flamegraph 返回非零退出码"
         raise subprocess.CalledProcessError(
             result.returncode,
             ["perl", FLAMEGRAPH_SCRIPT, "--title", title],
-            output=result.stdout, stderr=result.stderr
+            output=stdout, stderr=stderr
         )
 
-    svg = result.stdout
+    svg = stdout
     svg_size = len(svg)
     print(f"[flamegraph] SVG 生成完成 ({svg_size} bytes)", file=sys.stderr)
     return svg

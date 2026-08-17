@@ -1,4 +1,5 @@
 FROM golang:1.24-alpine AS builder
+ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /app
 COPY main.go .
 RUN CGO_ENABLED=0 go build -o pprof-demo main.go

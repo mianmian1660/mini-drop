@@ -5,6 +5,7 @@
 #include "server/HotmethodService.h"
 #include "server/ResultNotifier.h"
 #include "server/TaskQueue.h"
+#include "common/Log.h"
 
 #include <iostream>
 #include <mutex>
@@ -55,6 +56,11 @@ namespace drop_server
             lock_guard<mutex> lock(tasks_mutex);
             mark_attempt_completed_locked(*request);
         }
+        drop::log_event("drop_server", "task_result_received",
+                         {{"task_id", request->taskid()},
+                          {"attempt_id", to_string(request->attempt_id())},
+                          {"error_code", request->error_code()},
+                          {"partial", request->partial() ? "true" : "false"}});
 
         // A3: 主动通知 apiserver（"锦上添花"，失败不影响本 RPC 返回成功）
         bool notified = notify_apiserver_task_result(*request);
