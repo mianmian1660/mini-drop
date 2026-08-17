@@ -18,6 +18,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   protobuf-compiler = protoc，把 .proto 文件编译成 C++ 代码
 #   libprotobuf-dev   = protobuf 的 C++ 开发库
 #   libgrpc++-dev     = gRPC 的 C++ 开发库（含 grpc_cpp_plugin）
+#   libgtest-dev      = gtest 单元测试框架（可选，drop_tests 目标用；
+#                        找不到也不影响 drop_server/drop_agent 的构建）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -27,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libprotobuf-dev \
     libgrpc++-dev \
     libgrpc-dev \
+    libgtest-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

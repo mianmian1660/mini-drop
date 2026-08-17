@@ -130,3 +130,34 @@ target_link_libraries(drop_server
     Threads::Threads
     ${gRPC_REFLECTION_LIB}
 )
+
+# ============================================================
+# 单元测试：drop_tests（gtest，只覆盖不依赖真实进程/网络的纯逻辑）
+# ============================================================
+# 找不到 gtest 也不影响 drop_server/drop_agent 的正常构建（不用 REQUIRED）；
+# EXCLUDE_FROM_ALL 让 `make`/`make -j$(nproc)`（不指定目标时的默认行为）
+# 不会顺带编译测试目标，只有显式 `cmake --build . --target drop_tests`
+# 才会碰到它——测试代码的任何问题都不会拖累主构建/部署。
+find_package(GTest)
+if(GTest_FOUND)
+    add_executable(drop_tests EXCLUDE_FROM_ALL
+        tests/test_task_queue.cpp
+        server/TaskQueue.cpp
+        ${PROTO_SRCS}
+    )
+    target_include_directories(drop_tests PRIVATE
+        ${PROTO_GEN_DIR}
+        ${CMAKE_SOURCE_DIR}
+        ${Protobuf_INCLUDE_DIRS}
+    )
+    target_link_libraries(drop_tests
+        GTest::gtest
+        GTest::gtest_main
+        ${Protobuf_LIBRARIES}
+        Threads::Threads
+    )
+    enable_testing()
+    add_test(NAME drop_tests COMMAND drop_tests)
+else()
+    message(STATUS "GTest 未找到，跳过 drop_tests 目标（不影响 drop_server/drop_agent 构建）")
+endif()
