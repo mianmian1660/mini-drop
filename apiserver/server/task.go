@@ -1493,6 +1493,10 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 
 // DownloadCOSFile 通过 apiserver 代理下载对象存储产物，强制 attachment。
 // GET /api/v1/cosfiles/download?key=tid/top.json
+// key 一般以 tid/ 为前缀，可以直接猜出所属任务；但像 kallsyms 这类跨任务
+// 去重共享对象，key 是 kernel-symbols/<sha256>/kallsyms，猜不出真实 tid。
+// 调用方（DownloadArtifact）已经用真实 tid 做过鉴权，这里优先信任显式传入
+// 的 tid 参数，没传时才回退到从 key 里猜（兼容旧链接/ListCOSFiles 场景）。
 func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 	key := c.Query("key")
 	if key == "" {
@@ -1503,7 +1507,11 @@ func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "非法对象路径")
 		return
 	}
-	if _, serr := s.taskService().requireReadableTask(objectKeyTID(key), s.AuthContext(c)); serr != nil {
+	tid := strings.TrimSpace(c.Query("tid"))
+	if tid == "" {
+		tid = objectKeyTID(key)
+	}
+	if _, serr := s.taskService().requireReadableTask(tid, s.AuthContext(c)); serr != nil {
 		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}

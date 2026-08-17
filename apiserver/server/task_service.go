@@ -285,7 +285,8 @@ func (svc *TaskService) DownloadArtifact(tid string, artifactIDRaw string, auth 
 	if !svc.server.StorageConnected() {
 		return nil, serviceError(http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接")
 	}
-	downloadURL := "/api/v1/cosfiles/download?key=" + url.QueryEscape(artifact.ObjectKey)
+	downloadURL := "/api/v1/cosfiles/download?key=" + url.QueryEscape(artifact.ObjectKey) +
+		"&tid=" + url.QueryEscape(task.TID)
 	expires := 5 * time.Minute
 	svc.server.Logger.Info("生成产物下载链接",
 		zap.String("task_id", task.TID),
