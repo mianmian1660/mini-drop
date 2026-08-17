@@ -126,6 +126,10 @@ namespace drop_agent
         if (!regTimeout.empty())
             cfg.registerTimeoutSec = (uint32_t)stoul(regTimeout);
 
+        string hbTimeout = json_get_string(content, "heartbeatTimeoutSec");
+        if (!hbTimeout.empty())
+            cfg.heartbeatTimeoutSec = (uint32_t)stoul(hbTimeout);
+
         // 默认值填充
         const char *envHost = getenv("DROP_AGENT_HOSTNAME");
         if (envHost && *envHost)
@@ -169,6 +173,8 @@ namespace drop_agent
             cfg.heartbeatIntervalSec = 5;
         if (cfg.registerTimeoutSec == 0)
             cfg.registerTimeoutSec = 10;
+        if (cfg.heartbeatTimeoutSec == 0)
+            cfg.heartbeatTimeoutSec = 10;
 
         cout << "[config] 加载配置文件: " << configPath << endl;
         cout << "[config]   hostname=" << cfg.hostname << endl;
@@ -210,6 +216,7 @@ namespace drop_agent
         cfg.serverAddrs.push_back(serverAddr);
         cfg.heartbeatIntervalSec = 5;
         cfg.registerTimeoutSec = 10;
+        cfg.heartbeatTimeoutSec = 10;
         return cfg;
     }
 

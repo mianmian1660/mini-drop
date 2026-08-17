@@ -36,6 +36,7 @@ namespace drop_agent
         // 运行时参数
         uint32_t heartbeatIntervalSec = 5; // 心跳间隔（秒）
         uint32_t registerTimeoutSec = 10;  // 注册超时（秒）
+        uint32_t heartbeatTimeoutSec = 10; // 心跳 RPC 超时（秒），Phase 3：优雅关闭时避免心跳线程无限阻塞
 
         /// 从 JSON 文件加载配置
         static AgentConfig LoadFromFile(const std::string &configPath);

@@ -21,8 +21,8 @@ namespace drop_agent
 
     // resultCode 和旧 run_*() 系列函数的返回码约定保持一致（-1 fork失败，
     // -2 等待出错/无eBPF样本，-3 超时，-4 目标不存在，-5 信号终止/bpftrace不可用，
-    // -6 产物缺失），调用方（agent/main.cpp）靠它构建 RunnerOutcome 喂给未改动
-    // 的 build_task_result()，不需要重新猜测每种失败对应的数值。
+    // -6 产物缺失），调用方（agent/WorkerThread.cpp）靠它构建 RunnerOutcome
+    // 喂给 build_task_result()，不需要重新猜测每种失败对应的数值。
     struct ValidationResult
     {
         bool ok = false;

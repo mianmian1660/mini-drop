@@ -97,6 +97,12 @@ find_library(gRPC_REFLECTION_LIB grpc++_reflection
 add_executable(drop_agent
     agent/main.cpp
     agent/Config.cpp
+    agent/AgentUtils.cpp
+    agent/TaskQueue.cpp
+    agent/AttemptTracker.cpp
+    agent/ServerChannelHolder.cpp
+    agent/HeartbeatThread.cpp
+    agent/WorkerThread.cpp
     agent/RunnerUtils.cpp
     agent/RunnerRegistry.cpp
     agent/runners/PerfRunner.cpp
@@ -152,10 +158,14 @@ if(GTest_FOUND)
         tests/test_task_queue.cpp
         tests/test_process_executor.cpp
         tests/test_runners.cpp
+        tests/test_agent_task_queue.cpp
+        tests/test_attempt_tracker.cpp
         server/TaskQueue.cpp
         common/ProcessExecutor.cpp
         common/Process.cpp
         agent/RunnerUtils.cpp
+        agent/TaskQueue.cpp
+        agent/AttemptTracker.cpp
         agent/runners/PerfRunner.cpp
         agent/runners/AsyncProfilerRunner.cpp
         agent/runners/PprofRunner.cpp
