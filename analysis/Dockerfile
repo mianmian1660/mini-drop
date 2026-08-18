@@ -22,7 +22,7 @@ RUN (sed -i s@/deb.debian.org/@/mirrors.tencentyun.com/@g /etc/apt/sources.list.
         sed -i s@/mirrors.tencentyun.com/@/mirrors.aliyun.com/@g /etc/apt/sources.list 2>/dev/null; \
         true; \
     fi
-RUN apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     perl \
     procps \
     linux-perf \
