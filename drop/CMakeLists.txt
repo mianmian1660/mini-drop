@@ -67,6 +67,7 @@ set(COMMON_SRCS
     common/Process.cpp
     common/COSClient.cpp
     common/Utils.cpp
+    common/BuildId.cpp
     common/SymbolCollector.cpp
     common/Log.cpp
     common/ProcessExecutor.cpp

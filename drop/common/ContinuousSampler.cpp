@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "common/ContinuousSampler.h"
+#include "common/BuildId.h"
 #include "common/Utils.h"
 
 #include <algorithm>
@@ -15,11 +16,13 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
 
 namespace drop
 {
@@ -211,11 +214,30 @@ static std::string parse_frame_name(const std::string &raw)
     std::getline(iss, rest);
     std::string name = rest.empty() ? first : drop::trim(rest);
     size_t paren = name.find(" (");
+    std::string dso;
     if (paren != std::string::npos)
+    {
+        // perf script 解析失败时格式是 "[unknown] (<dso路径>)"——括号内的
+        // DSO 路径先取出来，符号解析成功时用不上（行为和之前一致，丢弃）。
+        size_t close = name.rfind(')');
+        if (close != std::string::npos && close > paren + 2)
+            dso = name.substr(paren + 2, close - paren - 2);
         name = name.substr(0, paren);
+    }
     if (name.empty())
         name = first;
-    return drop::trim(name);
+    name = drop::trim(name);
+
+    // 子项1.2：解析失败时不再丢弃 DSO 信息，展示 "0x<addr> [<模块名>]"
+    // 而不是裸 [unknown]——只展示确定知道的信息（地址、DSO 归属），不猜
+    // 函数名，遵循 symbolization-design.md 的"宁可标记未解析"原则。
+    if (name == "[unknown]" && !dso.empty())
+    {
+        size_t slash = dso.rfind('/');
+        std::string base = slash == std::string::npos ? dso : dso.substr(slash + 1);
+        return "0x" + first + " [" + base + "]";
+    }
+    return name;
 }
 
 static bool parse_sample_header(const std::string &line, std::string *comm, int *pid)
@@ -313,6 +335,129 @@ static std::vector<AggregatedSample> parse_perf_script(const std::string &script
     return out;
 }
 
+// ------------------------------------------------------------
+// 任务1 + 子项1.1：perf script 解析之前的本地 build-id 缓存预热。
+// 详见 docs/continuous-symbolization-design.md 任务1。
+// ------------------------------------------------------------
+
+// 子项1.1：Agent 本地三态尝试缓存，避免每个窗口对已知读不到的 build-id
+// 反复做无用功。PerfEventSampler::Loop 和 DualTrackContinuousSampler::Loop
+// (经 std::async 调用 collect_window) 两条路径都可能触发预热，未确认二者
+// 是否会在同一进程内并发运行，加锁保安全。
+enum class BuildIdAttemptState
+{
+    TransientFail, // 这次没定位到，之后可能有别的进程映射同一二进制，值得重试
+    PermanentFail, // 确认读到的内容不是合法 ELF，再等也不会变好
+};
+
+struct BuildIdAttempt
+{
+    BuildIdAttemptState state;
+    int64_t retryAfterMs; // 仅 TransientFail 有意义
+};
+
+static std::mutex g_buildIdAttemptMutex;
+static std::map<std::string, BuildIdAttempt> g_buildIdAttempts;
+static constexpr int64_t kBuildIdTransientRetryMs = 5 * 60 * 1000; // 5 分钟
+
+static bool should_skip_build_id_attempt(const std::string &buildId, int64_t nowMs)
+{
+    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
+    auto it = g_buildIdAttempts.find(buildId);
+    if (it == g_buildIdAttempts.end())
+        return false;
+    if (it->second.state == BuildIdAttemptState::PermanentFail)
+        return true;
+    if (nowMs < it->second.retryAfterMs)
+        return true;
+    g_buildIdAttempts.erase(it); // 过期了，允许重试
+    return false;
+}
+
+static void record_build_id_transient_fail(const std::string &buildId, int64_t nowMs)
+{
+    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
+    g_buildIdAttempts[buildId] = {BuildIdAttemptState::TransientFail, nowMs + kBuildIdTransientRetryMs};
+}
+
+static void record_build_id_permanent_fail(const std::string &buildId)
+{
+    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
+    g_buildIdAttempts[buildId] = {BuildIdAttemptState::PermanentFail, 0};
+}
+
+static void clear_build_id_attempt(const std::string &buildId)
+{
+    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
+    g_buildIdAttempts.erase(buildId);
+}
+
+static bool looks_like_elf(const std::string &path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open())
+        return false;
+    char magic[4] = {0};
+    f.read(magic, 4);
+    return f.gcount() == 4 && magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+}
+
+// 任务1核心：perf script 之前，把能拿到的用户态二进制预热进本地 build-id
+// 缓存，让 perf script 自带的缓存回退机制命中，当场生效不依赖网络往返。
+static void warm_build_id_cache(const std::string &perf, const std::string &dataPath)
+{
+    std::string listOutput;
+    int rc = drop::exec_capture({perf, "buildid-list", "-i", dataPath}, &listOutput, 65536);
+    if (rc != 0)
+        return;
+
+    std::vector<drop::BuildIdEntry> entries = drop::parse_buildid_list(listOutput);
+    if (entries.empty())
+        return;
+
+    int64_t nowMs = now_ms();
+    std::vector<drop::BuildIdEntry> pending;
+    for (auto &e : entries)
+    {
+        if (drop::build_id_cached_locally(e.buildId))
+            continue;
+        if (should_skip_build_id_attempt(e.buildId, nowMs))
+            continue;
+        pending.push_back(e);
+    }
+    if (pending.empty())
+        return;
+
+    // 只在确实有需要解析的 build-id 时才建索引——O(进程数) 的一次性开销
+    // 不针对每个 build-id 重复付出（详见设计文档任务1"技术方案依据"）。
+    std::unordered_map<std::string, int> dsoIndex = drop::build_dso_path_index();
+
+    for (auto &e : pending)
+    {
+        auto it = dsoIndex.find(e.dsoPath);
+        if (it == dsoIndex.end())
+        {
+            record_build_id_transient_fail(e.buildId, nowMs);
+            continue;
+        }
+        std::string resolved = drop::resolve_via_pid(e.dsoPath, it->second);
+        if (resolved.empty())
+        {
+            record_build_id_transient_fail(e.buildId, nowMs);
+            continue;
+        }
+        if (!looks_like_elf(resolved))
+        {
+            record_build_id_permanent_fail(e.buildId);
+            continue;
+        }
+        if (drop::cache_build_id_locally(e.buildId, resolved))
+            clear_build_id_attempt(e.buildId);
+        else
+            record_build_id_transient_fail(e.buildId, nowMs);
+    }
+}
+
 static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
 {
     WindowPayload window;
@@ -328,6 +473,7 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
         ::remove(dataPath.c_str());
         return window;
     }
+    warm_build_id_cache(perf, dataPath);
     std::string scriptOutput;
     rc = drop::exec_capture({perf, "script", "-i", dataPath}, &scriptOutput, 32 * 1024 * 1024);
     ::remove(dataPath.c_str());

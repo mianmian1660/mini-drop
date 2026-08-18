@@ -2,13 +2,13 @@
 // common/SymbolCollector.cpp — 用户态符号按 build-id 去重上传（阶段三）
 // ============================================================
 #include "common/SymbolCollector.h"
+#include "common/BuildId.h"
 #include "common/Utils.h"
 
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <sstream>
 #include <sys/stat.h>
 #include <vector>
 
@@ -52,44 +52,9 @@ namespace drop
             return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
         }
 
-        struct SymbolEntry
-        {
-            string buildId;
-            string dsoPath;
-        };
-
-        // 解析 `perf buildid-list -i <perf.data>` 的输出，格式是每行
-        // "<build-id> <dso-path>"。过滤掉 [kernel.kallsyms]/[vdso]/[stack]/
-        // [heap] 这类伪 DSO（内核符号走单独的 kallsyms 快照机制，不归这里管；
-        // 判断很简单：真实文件路径一定以 / 开头，伪 DSO 都是 [xxx] 形式）。
-        // 同一个 build-id 可能因为共享库被挂载在多个路径下重复出现，
-        // 只保留第一次出现的路径，避免发一堆重复条目给服务端。
-        vector<SymbolEntry> parse_buildid_list(const string &output)
-        {
-            vector<SymbolEntry> entries;
-            map<string, bool> seen;
-            istringstream iss(output);
-            string line;
-            while (getline(iss, line))
-            {
-                while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-                    line.pop_back();
-                size_t sp = line.find(' ');
-                if (sp == string::npos)
-                    continue;
-                string buildId = line.substr(0, sp);
-                string dsoPath = line.substr(sp + 1);
-                if (buildId.empty() || dsoPath.empty())
-                    continue;
-                if (dsoPath[0] != '/') // 过滤伪 DSO
-                    continue;
-                if (seen.count(buildId))
-                    continue;
-                seen[buildId] = true;
-                entries.push_back({buildId, dsoPath});
-            }
-            return entries;
-        }
+        // parse_buildid_list 现在是 common/BuildId.h 里的共享函数
+        // （drop::parse_buildid_list，返回 drop::BuildIdEntry），
+        // 持续采集(ContinuousSampler.cpp)复用同一份实现。
 
         // dso_path 是目标进程视角的路径，drop_agent 自己的文件系统里不一定有。
         // 先试字面路径（覆盖 host 上确实共享可见的情况），不行就用
@@ -110,7 +75,7 @@ namespace drop
             return "";
         }
 
-        string build_check_request(const string &tid, const vector<SymbolEntry> &entries)
+        string build_check_request(const string &tid, const vector<BuildIdEntry> &entries)
         {
             string body = "{\"tid\":\"" + json_escape(tid) + "\",\"entries\":[";
             for (size_t i = 0; i < entries.size(); ++i)
@@ -197,7 +162,7 @@ namespace drop
             return false;
         }
 
-        vector<SymbolEntry> entries = parse_buildid_list(listOutput);
+        vector<BuildIdEntry> entries = parse_buildid_list(listOutput);
         if (entries.empty())
         {
             cout << "[symbols] 未发现可上传的用户态符号" << endl;
