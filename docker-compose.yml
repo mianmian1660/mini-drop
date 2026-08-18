@@ -149,6 +149,9 @@ services:
       - /sys/kernel/tracing:/sys/kernel/debug/tracing:rw
       - /sys/fs/bpf:/sys/fs/bpf:rw
       - /lib/modules:/lib/modules:ro
+      # async-profiler 的 collapsed 输出由宿主 JVM 直接写文件（JVM 命名空间），
+      # 共享 /tmp 让容器内 agent 能读到 asprof 产物（否则 resultCode=-6 产物缺失）。
+      - /tmp:/tmp
     depends_on:
       - drop_server
 

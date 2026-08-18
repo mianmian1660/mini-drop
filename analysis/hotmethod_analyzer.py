@@ -931,7 +931,12 @@ def _analyze_java_async_profiler(conn, storage_cfg: dict, task: dict,
     has_profile = False
 
     if storage_ok:
-        has_profile = _download_perf_data(storage, bucket, tid, local_profile)
+        # Java async-profiler 的原始产物是 {tid}/profile.collapsed（collapsed 折叠栈），
+        # 而不是 perf.data。优先按 RAW artifact 元数据找 .collapsed，找不到再回退 perf.data。
+        keys = _raw_artifact_keys(conn, tid, suffixes=[".collapsed"])
+        keys.append(f"{tid}/perf.data")
+        has_profile = _download_first_existing(
+            storage, bucket, keys, local_profile, "Java profile")
 
     if not has_profile:
         test_files = [

@@ -119,7 +119,10 @@ int main(int argc, char **argv)
     drop_agent::TaskQueue taskQueue;
     drop_agent::AttemptTracker attemptTracker;
     drop_agent::ServerChannelHolder channelHolder;
-    channelHolder.Update(channel, hotmethodStub, cosConfig);
+    // NewStub 返回 unique_ptr，Update 期望 shared_ptr；hotmethodStub 之后不再
+    // 被 main.cpp 直接使用（Worker/Heartbeat 都通过 channelHolder 取 stub），
+    // 所以这里 std::move 转移所有权即可。
+    channelHolder.Update(channel, std::move(hotmethodStub), cosConfig);
 
     drop_agent::WorkerThread worker(taskQueue, attemptTracker, channelHolder, agent_running);
     drop_agent::HeartbeatThread heartbeat(cfg, channel, cosConfig, taskQueue, attemptTracker, channelHolder, agent_running);
