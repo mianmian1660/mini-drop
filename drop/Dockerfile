@@ -9,8 +9,15 @@
 # ---------- 阶段1：编译 ----------
 FROM ubuntu:22.04 AS builder
 
-# 腾讯云内网镜像加速 apt（服务器上构建更快，其他网络环境 sed 失败不影响）
-RUN sed -i s@/archive.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && sed -i s@/security.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list
+# 优先用腾讯云内网镜像加速 apt（腾讯云环境下更快）；mirrors.tencentyun.com
+# 只有腾讯云内网机器能解析，非腾讯云环境 apt-get update 会直接挂掉（sed 本身
+# 会成功替换，不是"sed 失败不影响"这种安全失败模式）。这里不覆盖原有腾讯云
+# 配置，先按原样试一次，解析不到再回退到阿里云公网镜像重试。
+RUN sed -i s@/archive.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && \
+    sed -i s@/security.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && \
+    (apt-get update -qq || \
+     (sed -i s@/mirrors.tencentyun.com/@/mirrors.aliyun.com/@g /etc/apt/sources.list && \
+      apt-get update -qq))
 
 # 禁止 apt 安装时弹出交互式界面（Docker 里没有终端）
 ENV DEBIAN_FRONTEND=noninteractive

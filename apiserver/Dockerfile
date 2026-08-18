@@ -10,7 +10,10 @@
 # AS builder：起个名字叫 builder，后面可以引用
 FROM golang:1.19-alpine AS builder
 ENV GOPROXY=https://goproxy.cn,direct
-RUN sed -i "s/dl-cdn.alpinelinux.org/mirrors.tencentyun.com/g" /etc/apk/repositories 2>/dev/null || true
+# 注：这里原来有一行替换 apk 源的 sed，实际是死代码——本阶段(builder)从没
+# 执行过 apk add，真正用到 apk 的是下面阶段2(FROM alpine:3.18)，两个阶段
+# 是独立镜像，这里改的源对阶段2毫无影响。阶段2走的是 alpine 默认公网源，
+# 本来就能连，不需要额外替换，删掉这行死代码。
 
 # WORKDIR：设定工作目录（相当于 cd）
 WORKDIR /app
