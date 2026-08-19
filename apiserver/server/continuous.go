@@ -25,10 +25,9 @@ import (
 const continuousMaxDBCount = uint64(1<<63 - 1)
 const continuousMaxReasonableProfileSampleCount = uint64(1_000_000_000)
 
-// 查询保护：最大时间窗口 6h，最大窗口数 2160（10s 窗口 × 6h = 2160），
-// max_nodes 默认 5000，上限 20000。借鉴 Pyroscope query API 的 maxNodes 保护。
-const continuousMaxQueryWindow = 6 * time.Hour
-const continuousMaxWindowCount = 2160
+// 查询跨度由当前 Session retention_hours 决定；匹配窗口超过上限时返回错误，
+// 绝不静默截断。max_nodes 默认 5000，上限 20000。
+const continuousMaxWindowCount = 20000
 const continuousDefaultMaxNodes = 5000
 const continuousMaxNodesCap = 20000
 
@@ -687,6 +686,9 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 	if err != nil {
 		return continuousAggregate{}, false, err
 	}
+	if len(windows) > continuousMaxWindowCount {
+		return continuousAggregate{}, true, errContinuousWindowLimit
+	}
 	if len(windows) == 0 {
 		return continuousAggregate{}, false, nil
 	}
@@ -843,9 +845,13 @@ func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q Profil
 		Where("signal_type = ?", signalType).
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
 		Order("window_start ASC").
+		Limit(continuousMaxWindowCount + 1).
 		Find(&windows).Error
 	if err != nil {
 		return nil, false, err
+	}
+	if len(windows) > continuousMaxWindowCount {
+		return nil, true, errContinuousWindowLimit
 	}
 	if len(windows) == 0 {
 		return nil, false, nil

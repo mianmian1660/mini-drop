@@ -1,0 +1,67 @@
+jest.mock('./InteractiveFlamegraph', () => ({
+    __esModule: true,
+    default: () => null,
+    countProfileNodes: () => 0,
+}));
+
+import {
+    makeSequentialDiffWindows,
+    makeTimeWindow,
+    rangeOptionsForRetention,
+    validateCustomTimeWindow,
+} from './ContinuousProfilingPanel';
+
+function toLocalInput(value) {
+    const date = new Date(value);
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60 * 1000);
+    return local.toISOString().slice(0, 16);
+}
+
+test('quick ranges are recalculated from the supplied current time', () => {
+    const first = makeTimeWindow('30m', new Date('2026-08-19T10:00:00Z'));
+    const second = makeTimeWindow('30m', new Date('2026-08-19T10:05:00Z'));
+    expect(first).toEqual({ from: '2026-08-19T09:30:00.000Z', to: '2026-08-19T10:00:00.000Z' });
+    expect(second.to).toBe('2026-08-19T10:05:00.000Z');
+});
+
+test('custom ranges enforce future and retention boundaries', () => {
+    const now = new Date('2026-08-19T12:00:00Z');
+    const valid = validateCustomTimeWindow(
+        toLocalInput('2026-08-19T11:00:00Z'),
+        toLocalInput('2026-08-19T12:00:00Z'),
+        24,
+        '',
+        now,
+    );
+    expect(valid.error).toBe('');
+    expect(valid.window).toEqual({ from: '2026-08-19T11:00:00.000Z', to: '2026-08-19T12:00:00.000Z' });
+
+    const future = validateCustomTimeWindow(
+        toLocalInput('2026-08-19T11:00:00Z'),
+        toLocalInput('2026-08-19T12:01:00Z'),
+        24,
+        '',
+        now,
+    );
+    expect(future.error).toContain('不能晚于当前时间');
+
+    const expired = validateCustomTimeWindow(
+        toLocalInput('2026-08-18T11:00:00Z'),
+        toLocalInput('2026-08-18T12:00:00Z'),
+        24,
+        '',
+        now,
+    );
+    expect(expired.error).toContain('数据保留边界');
+});
+
+test('diff quick windows are adjacent, equal, and filtered by total retention', () => {
+    const windows = makeSequentialDiffWindows('15m', new Date('2026-08-19T12:00:00Z'));
+    expect(windows.baseWindow.to).toBe(windows.compareWindow.from);
+    expect(new Date(windows.baseWindow.to) - new Date(windows.baseWindow.from))
+        .toBe(new Date(windows.compareWindow.to) - new Date(windows.compareWindow.from));
+
+    expect(rangeOptionsForRetention(24).map(([value]) => value)).toContain('24h');
+    expect(rangeOptionsForRetention(24, true).map(([value]) => value)).toContain('12h');
+    expect(rangeOptionsForRetention(24, true).map(([value]) => value)).not.toContain('24h');
+});

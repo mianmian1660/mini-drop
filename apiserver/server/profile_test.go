@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -877,23 +878,151 @@ func (m *continuousMemoryStorage) ObjectExists(_ context.Context, _, key string)
 	return ok, nil
 }
 
-func TestProfileQueryRejectsOversizedTimeWindow(t *testing.T) {
+func TestProfileQueryUsesSessionRetentionWindow(t *testing.T) {
 	s := newTestAPIServer(t)
 	now := time.Now().UTC()
+	_ = s.DB.Create(&model.AgentInfo{Hostname: "node-a", IPAddr: "10.0.0.1", UID: "owner", Online: true, LastSeen: now}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID: "cps-retention-query", Name: "test", TargetIP: "10.0.0.1", ServiceName: "hotmethod",
+		SampleRateHz: 19, AggregationWindowSec: 10, UploadBatchSec: 60, RetentionHours: 24,
+		Status: model.ContinuousSessionStatusRunning, UID: "owner",
+		StartedAt: now.Add(-24 * time.Hour), CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now,
+	}).Error
+	router := profileRouter(s)
+
 	from := now.Add(-7 * time.Hour)
-	to := now
 	req := httptest.NewRequest(http.MethodGet,
 		"/api/v1/profile/flamegraph?target_id=10.0.0.1:hotmethod&from="+
-			url.QueryEscape(from.Format(time.RFC3339))+"&to="+url.QueryEscape(to.Format(time.RFC3339)), nil)
+			url.QueryEscape(from.Format(time.RFC3339))+"&to="+url.QueryEscape(now.Format(time.RFC3339)), nil)
 	req.Header.Set("Drop-User-Uid", "owner")
 	w := httptest.NewRecorder()
-	router := profileRouter(s)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 7h query inside retention to pass, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet,
+		"/api/v1/profile/flamegraph?target_id=10.0.0.1:hotmethod&from="+
+			url.QueryEscape(now.Add(-25*time.Hour).Format(time.RFC3339))+"&to="+url.QueryEscape(now.Format(time.RFC3339)), nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for >6h window, got %d body=%s", w.Code, w.Body.String())
+		t.Fatalf("expected 400 beyond retention, got %d body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "6 小时") {
-		t.Fatalf("expected 6h limit message, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "24 小时") {
+		t.Fatalf("expected retention limit message, got %s", w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet,
+		"/api/v1/profile/flamegraph?target_id=10.0.0.1:hotmethod&from="+
+			url.QueryEscape(now.Add(-time.Hour).Format(time.RFC3339))+"&to="+url.QueryEscape(now.Add(2*time.Minute).Format(time.RFC3339)), nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不能晚于当前时间") {
+		t.Fatalf("expected future time rejection, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestContinuousAggregateWindowLimitIsNotPartial(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID: "cps-window-limit", Name: "test", TargetIP: "10.0.0.1", ServiceName: "hotmethod",
+		RetentionHours: 24, Status: model.ContinuousSessionStatusRunning, StartedAt: now.Add(-time.Hour), CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
+	}).Error
+	windows := make([]model.ProfileWindow, 0, continuousMaxWindowCount)
+	for i := 0; i < continuousMaxWindowCount; i++ {
+		windows = append(windows, model.ProfileWindow{
+			SessionSID: "cps-window-limit", BatchBID: fmt.Sprintf("batch-%d", i),
+			WindowStart: now.Add(-time.Minute), WindowEnd: now, SignalType: "cpu_profile",
+		})
+	}
+	if err := s.DB.CreateInBatches(windows, 500).Error; err != nil {
+		t.Fatalf("create windows: %v", err)
+	}
+	q := ProfileQuery{Host: "10.0.0.1", From: now.Add(-2 * time.Minute), To: now, CanReadAll: true}
+	if _, found, err := s.queryNativeContinuousAggregate(context.Background(), q); err != nil || !found {
+		t.Fatalf("20000 windows should be accepted, found=%v err=%v", found, err)
+	}
+	if err := s.DB.Create(&model.ProfileWindow{
+		SessionSID: "cps-window-limit", BatchBID: "batch-over-limit",
+		WindowStart: now.Add(-time.Minute), WindowEnd: now, SignalType: "cpu_profile",
+	}).Error; err != nil {
+		t.Fatalf("create extra window: %v", err)
+	}
+	if _, _, err := s.queryNativeContinuousAggregate(context.Background(), q); !errors.Is(err, errContinuousWindowLimit) {
+		t.Fatalf("20001 windows should fail without partial data, err=%v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/profile/flamegraph?host=10.0.0.1&from="+url.QueryEscape(q.From.Format(time.RFC3339))+"&to="+url.QueryEscape(q.To.Format(time.RFC3339)), nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	profileRouter(s).ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "20000") {
+		t.Fatalf("window limit should return actionable 400, status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+type recordingProfileClient struct {
+	diffQuery ProfileDiffQuery
+}
+
+func (r *recordingProfileClient) Flamegraph(context.Context, ProfileQuery) (ProfileFlamegraph, error) {
+	return emptyFlamegraph("empty"), nil
+}
+func (r *recordingProfileClient) TopN(context.Context, ProfileQuery) (ProfileTopN, error) {
+	return emptyTopN("empty"), nil
+}
+func (r *recordingProfileClient) Diff(_ context.Context, q ProfileDiffQuery) (ProfileDiff, error) {
+	r.diffQuery = q
+	return ProfileDiff{Items: []ProfileDiffItem{}, Empty: true}, nil
+}
+func (r *recordingProfileClient) LabelValues(context.Context, ProfileQuery, string) (ProfileLabelValues, error) {
+	return ProfileLabelValues{}, nil
+}
+
+func TestProfileDiffPassesStackScopeAndFilters(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now().UTC()
+	_ = s.DB.Create(&model.AgentInfo{Hostname: "node-a", IPAddr: "10.0.0.2", UID: "owner", Online: true, LastSeen: now}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID: "cps-diff-query", Name: "test", TargetIP: "10.0.0.2", ServiceName: "hotmethod",
+		RetentionHours: 24, Status: model.ContinuousSessionStatusRunning, UID: "owner",
+		StartedAt: now.Add(-time.Hour), CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
+	}).Error
+	recorder := &recordingProfileClient{}
+	s.ProfileCli = recorder
+	query := fmt.Sprintf("/api/v1/profile/diff?target_id=10.0.0.2:hotmethod&stack_scope=user&filters=%s&base_from=%s&base_to=%s&compare_from=%s&compare_to=%s",
+		url.QueryEscape(`{"comm":"worker"}`),
+		url.QueryEscape(now.Add(-30*time.Minute).Format(time.RFC3339)),
+		url.QueryEscape(now.Add(-15*time.Minute).Format(time.RFC3339)),
+		url.QueryEscape(now.Add(-15*time.Minute).Format(time.RFC3339)),
+		url.QueryEscape(now.Format(time.RFC3339)))
+	req := httptest.NewRequest(http.MethodGet, query, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	profileRouter(s).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("diff status=%d body=%s", w.Code, w.Body.String())
+	}
+	if recorder.diffQuery.StackScope != "user" || recorder.diffQuery.Filters["comm"] != "worker" {
+		t.Fatalf("diff query did not preserve scope/filter: %+v", recorder.diffQuery)
+	}
+
+	unequal := fmt.Sprintf("/api/v1/profile/diff?target_id=10.0.0.2:hotmethod&base_from=%s&base_to=%s&compare_from=%s&compare_to=%s",
+		url.QueryEscape(now.Add(-45*time.Minute).Format(time.RFC3339)),
+		url.QueryEscape(now.Add(-15*time.Minute).Format(time.RFC3339)),
+		url.QueryEscape(now.Add(-15*time.Minute).Format(time.RFC3339)),
+		url.QueryEscape(now.Format(time.RFC3339)))
+	req = httptest.NewRequest(http.MethodGet, unequal, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	profileRouter(s).ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "等长") {
+		t.Fatalf("unequal diff windows should be rejected, status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

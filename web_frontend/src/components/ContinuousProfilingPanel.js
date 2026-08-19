@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { continuous, profiles } from '../api';
 import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
+import { localDateTimeToISO } from '../utils/time';
 import {
     formatMetricValue,
     formatRawMetric,
@@ -18,6 +19,7 @@ const S = {
     subtitle: { margin: '5px 0 0', color: '#667085', fontSize: 13 },
     actions: { display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' },
     controls: { display: 'flex', gap: 12, alignItems: 'end', flexWrap: 'wrap' },
+    customRange: { display: 'flex', gap: 10, alignItems: 'end', flexWrap: 'wrap', marginTop: 10, paddingTop: 10, borderTop: '1px solid #eef2f6' },
     field: { minWidth: 180, flex: '1 1 180px' },
     fieldWide: { minWidth: 260, flex: '2 1 300px' },
     label: { display: 'block', color: '#475467', fontSize: 12, fontWeight: 700, marginBottom: 6 },
@@ -27,6 +29,8 @@ const S = {
     segmented: { display: 'inline-flex', border: '1px solid #d0d7de', borderRadius: 6, overflow: 'hidden', height: 36, background: '#fff' },
     segment: (active) => ({ border: 'none', borderRight: '1px solid #d0d7de', background: active ? '#eef2ff' : '#fff', color: active ? '#315efb' : '#475467', padding: '0 12px', cursor: 'pointer', fontSize: 13, fontWeight: 700 }),
     textInput: { width: '100%', padding: '8px 10px', border: '1px solid #d0d7de', borderRadius: 6, background: '#fff', fontSize: 13, height: 36, boxSizing: 'border-box' },
+    searchInput: { width: 210, maxWidth: '100%', padding: '7px 10px', border: '1px solid #d0d7de', borderRadius: 6, background: '#fff', fontSize: 13, height: 34, boxSizing: 'border-box' },
+    flameActions: { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 10, flexWrap: 'wrap' },
     stateBadge: { display: 'inline-flex', alignItems: 'center', border: '1px solid #abefc6', background: '#ecfdf3', color: '#067647', borderRadius: 999, padding: '3px 8px', fontSize: 12, fontWeight: 700 },
     summaryGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 0, borderTop: '1px solid #eef2f6', borderBottom: '1px solid #eef2f6' },
     metric: { padding: '10px 14px 10px 0', minWidth: 0 },
@@ -57,14 +61,20 @@ const S = {
 };
 
 const RANGE_OPTIONS = [
-    ['15m', '最近 15 分钟'],
-    ['30m', '最近 30 分钟'],
-    ['1h', '最近 1 小时'],
-    ['6h', '最近 6 小时'],
+    ['15m', '最近 15 分钟', 15],
+    ['30m', '最近 30 分钟', 30],
+    ['1h', '最近 1 小时', 60],
+    ['6h', '最近 6 小时', 360],
+    ['12h', '最近 12 小时', 720],
+    ['24h', '最近 24 小时', 1440],
 ];
 
 export default function ContinuousProfilingPanel({ target, targets = [], targetId = '', onTargetChange, showTargetSelect = false }) {
     const [range, setRange] = useState('30m');
+    const [timeWindow, setTimeWindow] = useState(() => makeTimeWindow('30m'));
+    const [customFrom, setCustomFrom] = useState('');
+    const [customTo, setCustomTo] = useState('');
+    const [appliedCustomWindow, setAppliedCustomWindow] = useState(null);
     const [profileType, setProfileType] = useState('cpu');
     const [signalTab, setSignalTab] = useState('cpu');
     const [stackScope, setStackScope] = useState('all');
@@ -81,21 +91,31 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [commMessage, setCommMessage] = useState('');
     const [commLoading, setCommLoading] = useState(false);
     const [maxNodes, setMaxNodes] = useState(5000);
+    const [flameSearchInput, setFlameSearchInput] = useState('');
+    const [flameSearchText, setFlameSearchText] = useState('');
+    const [renderStats, setRenderStats] = useState({ rendered: 0, total: 0, mode: 'full' });
+    const [searchStats, setSearchStats] = useState({ matches: 0, samplePercent: 0 });
     // diff selector state (baseline vs compare)
     const [diffOpen, setDiffOpen] = useState(false);
-    const [diffBaseRange, setDiffBaseRange] = useState('30m');
-    const [diffCompareRange, setDiffCompareRange] = useState('15m');
+    const [diffMode, setDiffMode] = useState('quick');
+    const [diffRange, setDiffRange] = useState('15m');
+    const [diffBaseFrom, setDiffBaseFrom] = useState('');
+    const [diffBaseTo, setDiffBaseTo] = useState('');
+    const [diffCompareFrom, setDiffCompareFrom] = useState('');
+    const [diffCompareTo, setDiffCompareTo] = useState('');
+    const [appliedDiffCustomWindows, setAppliedDiffCustomWindows] = useState(null);
     const [diffResult, setDiffResult] = useState(null);
     const [diffLoading, setDiffLoading] = useState(false);
     const [diffError, setDiffError] = useState('');
     // Memory tab: recent Go pprof heap tasks
     const [heapTasks, setHeapTasks] = useState([]);
     const [heapTasksLoading, setHeapTasksLoading] = useState(false);
-    const timeWindow = useMemo(() => makeTimeWindow(range), [range]);
     const profileURL = flamegraph?.profile_url || topn?.profile_url || target?.profile_url;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
     const sampleState = sampleStateForTarget(target, flamegraph, topn);
     const sessionMeta = continuousSessionMeta(target);
+    const rangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours), [sessionMeta.retentionHours]);
+    const diffRangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours, true), [sessionMeta.retentionHours]);
     const uploadState = uploadFreshness(sessionMeta);
     const unit = flamegraph?.unit || topn?.unit || '';
     const activeFilters = useMemo(() => (scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}), [scope, selectedComm]);
@@ -103,7 +123,23 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const stackScopeLabel = stackScope === 'user' ? '用户栈' : stackScope === 'kernel' ? '内核栈' : '混合栈';
     const scopeLabel = activeFilters.comm ? `进程级 Native Continuous Profiling / ${activeFilterText} / ${stackScopeLabel}` : `整机 Native Continuous Profiling / ${stackScopeLabel}`;
 
-    const refresh = useCallback(async () => {
+    useEffect(() => {
+        const timer = setTimeout(() => setFlameSearchText(flameSearchInput.trim()), 250);
+        return () => clearTimeout(timer);
+    }, [flameSearchInput]);
+
+    useEffect(() => {
+        if (range !== 'custom' && !rangeOptions.some(([value]) => value === range)) {
+            const fallback = rangeOptions.some(([value]) => value === '30m') ? '30m' : rangeOptions[0]?.[0] || '15m';
+            setRange(fallback);
+            setTimeWindow(makeTimeWindow(fallback));
+        }
+        if (!diffRangeOptions.some(([value]) => value === diffRange)) {
+            setDiffRange(diffRangeOptions[0]?.[0] || '15m');
+        }
+    }, [diffRange, diffRangeOptions, range, rangeOptions]);
+
+    const queryProfiles = useCallback(async (queryWindow) => {
         if (!target) return;
         setQuerying(true);
         setError('');
@@ -111,8 +147,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             target_id: target.id,
             host: target.ip,
             service: target.service_name || 'hotmethod',
-            from: timeWindow.from,
-            to: timeWindow.to,
+            from: queryWindow.from,
+            to: queryWindow.to,
             profile_type: profileType,
             max_nodes: maxNodes,
         };
@@ -151,11 +187,43 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setQuerying(false);
         }
-    }, [target, timeWindow, profileType, activeFilters, signalTab, stackScope, maxNodes]);
+    }, [target, profileType, activeFilters, signalTab, stackScope, maxNodes]);
 
     useEffect(() => {
-        refresh();
-    }, [refresh]);
+        queryProfiles(timeWindow);
+    }, [queryProfiles, timeWindow]);
+
+    const refresh = useCallback(() => {
+        if (range === 'custom') {
+            queryProfiles(timeWindow);
+            return;
+        }
+        setTimeWindow(makeTimeWindow(range));
+    }, [queryProfiles, range, timeWindow]);
+
+    const changeRange = useCallback((nextRange) => {
+        setRange(nextRange);
+        setError('');
+        if (nextRange === 'custom') {
+            const source = appliedCustomWindow || timeWindow;
+            setCustomFrom(toLocalDateTimeInput(source.from));
+            setCustomTo(toLocalDateTimeInput(source.to));
+            return;
+        }
+        setTimeWindow(makeTimeWindow(nextRange));
+    }, [appliedCustomWindow, timeWindow]);
+
+    const applyCustomRange = useCallback(() => {
+        const result = validateCustomTimeWindow(customFrom, customTo, sessionMeta.retentionHours);
+        if (result.error) {
+            setError(result.error);
+            return;
+        }
+        setError('');
+        setRange('custom');
+        setAppliedCustomWindow(result.window);
+        setTimeWindow(result.window);
+    }, [customFrom, customTo, sessionMeta.retentionHours]);
 
     // Load recent Go pprof heap tasks for the Memory tab link.
     const loadHeapTasks = useCallback(async () => {
@@ -183,7 +251,29 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         setDiffError('');
         setDiffResult(null);
         try {
-            const { baseWindow, compareWindow } = makeSequentialDiffWindows(diffBaseRange, diffCompareRange);
+            let baseWindow;
+            let compareWindow;
+            if (diffMode === 'custom') {
+                const baseResult = validateCustomTimeWindow(diffBaseFrom, diffBaseTo, sessionMeta.retentionHours, 'Baseline');
+                const compareResult = validateCustomTimeWindow(diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, 'Compare');
+                if (baseResult.error || compareResult.error) {
+                    setDiffError(baseResult.error || compareResult.error);
+                    return;
+                }
+                baseWindow = baseResult.window;
+                compareWindow = compareResult.window;
+                const durationDelta = Math.abs(
+                    (new Date(baseWindow.to).getTime() - new Date(baseWindow.from).getTime())
+                    - (new Date(compareWindow.to).getTime() - new Date(compareWindow.from).getTime()),
+                );
+                if (durationDelta >= 1000) {
+                    setDiffError('Baseline 与 Compare 必须使用等长时间窗');
+                    return;
+                }
+                setAppliedDiffCustomWindows({ baseWindow, compareWindow });
+            } else {
+                ({ baseWindow, compareWindow } = makeSequentialDiffWindows(diffRange));
+            }
             const params = {
                 target_id: target.id,
                 host: target.ip,
@@ -195,6 +285,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 compare_to: compareWindow.to,
                 max_nodes: maxNodes,
             };
+            if (stackScope !== 'all') params.stack_scope = stackScope;
+            if (Object.keys(activeFilters).length > 0) params.filters = JSON.stringify(activeFilters);
             const res = await profiles.diff(params);
             if (res.code === 0) {
                 setDiffResult(res.data);
@@ -206,7 +298,19 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setDiffLoading(false);
         }
-    }, [target, diffBaseRange, diffCompareRange, maxNodes]);
+    }, [target, diffMode, diffRange, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFilters]);
+
+    const changeDiffMode = useCallback((nextMode) => {
+        setDiffMode(nextMode);
+        setDiffError('');
+        if (nextMode === 'custom') {
+            const { baseWindow, compareWindow } = appliedDiffCustomWindows || makeSequentialDiffWindows(diffRange);
+            setDiffBaseFrom(toLocalDateTimeInput(baseWindow.from));
+            setDiffBaseTo(toLocalDateTimeInput(baseWindow.to));
+            setDiffCompareFrom(toLocalDateTimeInput(compareWindow.from));
+            setDiffCompareTo(toLocalDateTimeInput(compareWindow.to));
+        }
+    }, [appliedDiffCustomWindows, diffRange]);
 
     useEffect(() => {
         setSelectedComm('');
@@ -290,8 +394,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         </Field>
                     )}
                     <Field label="时间范围">
-                        <select style={S.select} value={range} onChange={e => setRange(e.target.value)}>
-                            {RANGE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                        <select style={S.select} value={range} onChange={e => changeRange(e.target.value)}>
+                            {rangeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                            <option value="custom">自定义时间</option>
                         </select>
                     </Field>
                     <Field label="Profile 类型">
@@ -348,6 +453,17 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         </Field>
                     )}
                 </div>
+                {range === 'custom' && (
+                    <div style={S.customRange}>
+                        <Field label="开始时间">
+                            <input type="datetime-local" step="60" style={S.textInput} value={customFrom} onChange={e => setCustomFrom(e.target.value)} />
+                        </Field>
+                        <Field label="结束时间">
+                            <input type="datetime-local" step="60" style={S.textInput} value={customTo} onChange={e => setCustomTo(e.target.value)} />
+                        </Field>
+                        <button type="button" style={S.btn} onClick={applyCustomRange} disabled={querying}>查询</button>
+                    </div>
+                )}
                 <div style={{ ...S.summaryGrid, marginTop: 14 }}>
                     <Metric label="采集方式" value={sessionMeta.sampler} />
                     <Metric label="采样频率" value={formatRateHz(sessionMeta.sampleRateHz)} />
@@ -380,7 +496,24 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             {flamegraph?.source || 'mini-drop'} · {profileUnitLabel(flamegraph?.unit || unit)} · backend {flamegraph?.backend || topn?.backend || signalBackend(sessionMeta, 'cpu') || sessionMeta.sampler} · 宽度按 {isCPUTimeUnit(flamegraph?.unit || unit) ? 'CPU 占用时长' : '原始 value'} 计算
                         </div>
                     </div>
-                    <span style={S.subtle}>{hasFlamegraph ? `${countProfileNodes(flamegraph.nodes)} 个栈帧节点` : '暂无栈帧节点'}</span>
+                    <div style={S.flameActions}>
+                        <input
+                            type="search"
+                            style={S.searchInput}
+                            value={flameSearchInput}
+                            onChange={e => setFlameSearchInput(e.target.value)}
+                            placeholder="搜索函数名"
+                            aria-label="搜索火焰图函数名"
+                            disabled={!hasFlamegraph}
+                        />
+                        <span style={S.subtle}>
+                            {flameSearchText
+                                ? `${searchStats.matches} 帧 · ${formatSearchPercent(searchStats.samplePercent)}`
+                                : hasFlamegraph
+                                    ? `已渲染 ${renderStats.rendered}/${renderStats.total || countProfileNodes(flamegraph.nodes)}`
+                                    : '暂无栈帧节点'}
+                        </span>
+                    </div>
                 </div>
                 <InteractiveFlamegraph
                     key={resetKey}
@@ -392,6 +525,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     emptyMessage="所选时间范围没有 profile 数据"
                     loadingMessage="正在查询 Native profiling..."
                     boxStyle={S.flameBox}
+                    searchText={flameSearchText}
+                    onRenderStats={setRenderStats}
+                    onSearchStats={setSearchStats}
                 />
             </section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? 'IO 延迟' : '调度延迟'} />}
 
@@ -426,18 +562,32 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     </div>
                     {diffOpen && (
                         <div>
-                            <div style={{ ...S.summaryGrid, marginTop: 0 }}>
-                                <Field label="Baseline 时间窗">
-                                    <select style={S.select} value={diffBaseRange} onChange={e => setDiffBaseRange(e.target.value)}>
-                                        {RANGE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-                                    </select>
-                                </Field>
-                                <Field label="Compare 时间窗">
-                                    <select style={S.select} value={diffCompareRange} onChange={e => setDiffCompareRange(e.target.value)}>
-                                        {RANGE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-                                    </select>
-                                </Field>
+                            <div style={{ marginBottom: 12 }}>
+                                <span style={S.segmented}>
+                                    <button type="button" style={S.segment(diffMode === 'quick')} onClick={() => changeDiffMode('quick')}>快捷</button>
+                                    <button type="button" style={{ ...S.segment(diffMode === 'custom'), borderRight: 'none' }} onClick={() => changeDiffMode('custom')}>自定义</button>
+                                </span>
                             </div>
+                            {diffMode === 'quick' ? (
+                                <div style={S.controls}>
+                                    <Field label="相邻窗口时长">
+                                        <select style={S.select} value={diffRange} onChange={e => setDiffRange(e.target.value)}>
+                                            {diffRangeOptions.map(([v, l]) => <option key={v} value={v}>{l.replace('最近 ', '')}</option>)}
+                                        </select>
+                                    </Field>
+                                </div>
+                            ) : (
+                                <div style={{ display: 'grid', gap: 10 }}>
+                                    <div style={S.controls}>
+                                        <Field label="Baseline 开始"><input type="datetime-local" step="60" style={S.textInput} value={diffBaseFrom} onChange={e => setDiffBaseFrom(e.target.value)} /></Field>
+                                        <Field label="Baseline 结束"><input type="datetime-local" step="60" style={S.textInput} value={diffBaseTo} onChange={e => setDiffBaseTo(e.target.value)} /></Field>
+                                    </div>
+                                    <div style={S.controls}>
+                                        <Field label="Compare 开始"><input type="datetime-local" step="60" style={S.textInput} value={diffCompareFrom} onChange={e => setDiffCompareFrom(e.target.value)} /></Field>
+                                        <Field label="Compare 结束"><input type="datetime-local" step="60" style={S.textInput} value={diffCompareTo} onChange={e => setDiffCompareTo(e.target.value)} /></Field>
+                                    </div>
+                                </div>
+                            )}
                             <div style={{ marginTop: 10 }}>
                                 <button type="button" style={S.btn} onClick={runDiff} disabled={diffLoading || !target}>
                                     {diffLoading ? '查询中...' : '执行 Diff'}
@@ -848,24 +998,67 @@ function formatNum(n) {
     return String(n);
 }
 
-function makeTimeWindow(range) {
-    const to = new Date();
-    const minutes = { '15m': 15, '30m': 30, '1h': 60, '6h': 360 }[range] || 30;
+export function makeTimeWindow(range, now = new Date()) {
+    const to = new Date(now);
+    const minutes = rangeMinutes(range) || 30;
     const from = new Date(to.getTime() - minutes * 60 * 1000);
     return { from: from.toISOString(), to: to.toISOString() };
 }
 
-function makeSequentialDiffWindows(baseRange, compareRange) {
-    const compareMinutes = { '15m': 15, '30m': 30, '1h': 60, '6h': 360 }[compareRange] || 15;
-    const baseMinutes = { '15m': 15, '30m': 30, '1h': 60, '6h': 360 }[baseRange] || 30;
-    const compareTo = new Date();
-    const compareFrom = new Date(compareTo.getTime() - compareMinutes * 60 * 1000);
+export function makeSequentialDiffWindows(range, now = new Date()) {
+    const minutes = rangeMinutes(range) || 15;
+    const compareTo = new Date(now);
+    const compareFrom = new Date(compareTo.getTime() - minutes * 60 * 1000);
     const baseTo = compareFrom;
-    const baseFrom = new Date(baseTo.getTime() - baseMinutes * 60 * 1000);
+    const baseFrom = new Date(baseTo.getTime() - minutes * 60 * 1000);
     return {
         baseWindow: { from: baseFrom.toISOString(), to: baseTo.toISOString() },
         compareWindow: { from: compareFrom.toISOString(), to: compareTo.toISOString() },
     };
+}
+
+export function validateCustomTimeWindow(fromInput, toInput, retentionHours = 24, label = '', nowValue = new Date()) {
+    const prefix = label ? `${label} ` : '';
+    if (!fromInput || !toInput) return { error: `请选择${prefix}开始时间和结束时间` };
+    const from = localDateTimeToISO(fromInput);
+    const to = localDateTimeToISO(toInput);
+    if (!from || !to) return { error: `${prefix}时间格式无效` };
+    const fromDate = new Date(from);
+    const toDate = new Date(to);
+    if (fromDate >= toDate) return { error: `${prefix}结束时间必须晚于开始时间` };
+    const now = new Date(nowValue);
+    if (toDate > now) return { error: `${prefix}结束时间不能晚于当前时间` };
+    const retentionMs = Math.max(1, Number(retentionHours) || 24) * 60 * 60 * 1000;
+    const earliest = new Date(now.getTime() - retentionMs);
+    if (fromDate < earliest) {
+        return { error: `${prefix}开始时间不能早于数据保留边界 ${formatTime(earliest.toISOString())}` };
+    }
+    if (toDate.getTime() - fromDate.getTime() > retentionMs) {
+        return { error: `${prefix}时间跨度不能超过 ${formatHours(retentionHours)}` };
+    }
+    return { window: { from, to }, error: '' };
+}
+
+export function rangeOptionsForRetention(retentionHours = 24, forDiff = false) {
+    const retentionMinutes = Math.max(1, Number(retentionHours) || 24) * 60;
+    return RANGE_OPTIONS.filter(([, , minutes]) => minutes * (forDiff ? 2 : 1) <= retentionMinutes);
+}
+
+function rangeMinutes(range) {
+    return RANGE_OPTIONS.find(([value]) => value === range)?.[2] || 0;
+}
+
+function toLocalDateTimeInput(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60 * 1000);
+    return local.toISOString().slice(0, 16);
+}
+
+function formatSearchPercent(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '0%';
+    return `${num >= 10 ? num.toFixed(1) : num.toFixed(2)}%`;
 }
 
 function formatTime(value) {
