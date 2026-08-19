@@ -7,7 +7,7 @@ TARGET_IP ?= 127.0.0.1
 DURATION ?= 15
 FREQUENCY ?= 99
 
-.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof health test coverage e2e verify
+.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof health test test-drop coverage e2e verify
 
 health:
 	@echo "[health] API: $(API)"
@@ -67,11 +67,13 @@ demo-pprof:
 		if [[ -n "$$TID" ]]; then echo "[demo-pprof] result: http://localhost/task/result?tid=$$TID"; fi
 
 test:
-	cmake -S drop -B drop/build
-	$(MAKE) -C drop/build
+	$(MAKE) test-drop
 	cd apiserver && go test ./...
 	cd analysis && python3 test_analysis.py
 	cd web_frontend && npm run build
+
+test-drop:
+	docker build --target test -t mini-drop-drop-tests drop
 
 coverage:
 	cd apiserver && go test ./... -coverprofile=/tmp/mini-drop-apiserver.cover

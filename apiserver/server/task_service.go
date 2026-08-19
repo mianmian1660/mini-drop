@@ -226,7 +226,7 @@ func (svc *TaskService) CancelTask(tid string, auth AuthContext) (gin.H, *Servic
 		}
 		return nil, serviceError(http.StatusInternalServerError, ErrCodeDependencyUnavailable, "取消任务失败")
 	}
-	s.finishLatestTaskAttempt(task.TID, ErrCodeTaskExecutionFailed, "用户请求取消任务", nil)
+	s.finishLatestTaskAttempt(task.TID, ErrCodeTaskCanceled, "用户请求取消任务", nil)
 	_ = s.DB.Model(&model.Outbox{}).
 		Where("aggregate = ? AND aggregate_id = ? AND event = ? AND published_at IS NULL", model.OutboxAggregateTask, task.TID, model.OutboxEventDispatchTask).
 		Updates(map[string]interface{}{"published_at": &now, "status": model.OutboxStatusPending, "last_error": "任务已取消，跳过下发"}).Error

@@ -49,6 +49,12 @@ COPY . .
 # CMake 构建（先清理本地残留的 CMakeCache，避免路径冲突）
 RUN rm -rf build && mkdir -p build && cd build && cmake .. && make -j$(nproc)
 
+# Explicit test target for CI/local verification. The production runtime stage
+# does not depend on this stage, so normal image builds remain unchanged.
+FROM builder AS test
+RUN cmake --build build --target drop_tests -j$(nproc) \
+    && ctest --test-dir build --output-on-failure
+
 # ---------- 阶段2：运行 ----------
 FROM ubuntu:22.04
 

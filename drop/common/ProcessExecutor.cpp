@@ -86,6 +86,11 @@ namespace drop
         }
 
         // ==== 父进程 ====
+        // Establish the process group from the parent too. Without this, an
+        // immediate cancellation can race the child's setpgid() and killpg()
+        // may miss the process before it has entered its own group.
+        if (::setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH)
+            cerr << "setpgid(" << pid << ") failed: " << strerror(errno) << endl;
         if (stdoutFd >= 0)
             ::close(stdoutFd);
         if (stderrFd >= 0 && stderrFd != stdoutFd)

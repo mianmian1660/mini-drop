@@ -9,7 +9,9 @@
 #include "common/ProcessExecutor.h"
 
 #include <csignal>
+#include <cerrno>
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace drop;
@@ -170,4 +172,26 @@ TEST(TimedProcessPoller, ForcedRunningProcessIsUnregisteredAfterReap)
     EXPECT_EQ(exec.signalsSent[1], SIGKILL);
     EXPECT_EQ(exec.waitBlockingCalls, 1);
     EXPECT_TRUE(registry.Snapshot().empty());
+}
+
+TEST(RealProcessExecutor, ImmediateForceStopReapsProcessGroup)
+{
+    RealClock clock;
+    RealProcessExecutor exec;
+    PidRegistry registry;
+    TimedProcessPoller poller(&exec, &clock, 60, 0, &registry);
+    ExecHandle handle;
+    ExecArgs args;
+    args.argv = {"/bin/sh", "-c", "sleep 30"};
+    std::string error;
+
+    ASSERT_TRUE(exec.Start(args, &handle, &error)) << error;
+    poller.Attach(handle);
+    auto stopped = poller.ForceStop();
+
+    EXPECT_NE(stopped.state, PollState::kRunning);
+    EXPECT_TRUE(registry.Snapshot().empty());
+    errno = 0;
+    EXPECT_EQ(::kill(handle.pid, 0), -1);
+    EXPECT_EQ(errno, ESRCH);
 }

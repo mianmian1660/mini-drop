@@ -111,6 +111,7 @@ add_executable(drop_agent
     agent/HeartbeatThread.cpp
     agent/WorkerThread.cpp
     agent/UploadWorker.cpp
+    agent/ResultDelivery.cpp
     agent/CleanupWorker.cpp
     agent/RunnerUtils.cpp
     agent/RunnerRegistry.cpp
@@ -170,6 +171,8 @@ if(GTest_FOUND)
         tests/test_agent_task_queue.cpp
         tests/test_attempt_tracker.cpp
         tests/test_upload_queue.cpp
+        tests/test_result_delivery.cpp
+        tests/test_agent_utils.cpp
         tests/test_pid_registry.cpp
         tests/test_runtime_symbol_map.cpp
         tests/test_continuous_sampler.cpp
@@ -184,6 +187,8 @@ if(GTest_FOUND)
         agent/TaskQueue.cpp
         agent/UploadQueue.cpp
         agent/AttemptTracker.cpp
+        agent/ResultDelivery.cpp
+        agent/AgentUtils.cpp
         agent/runners/PerfRunner.cpp
         agent/runners/AsyncProfilerRunner.cpp
         agent/runners/PprofRunner.cpp

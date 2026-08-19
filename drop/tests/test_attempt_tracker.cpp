@@ -73,3 +73,19 @@ TEST(AttemptTracker, MarkCompletedClearsCancelFlag)
     tracker.MarkCompleted("task-1", 1);
     EXPECT_FALSE(tracker.IsCancelRequested("task-1", 1));
 }
+
+TEST(AttemptTracker, RepeatedTransitionsAreIdempotent)
+{
+    AttemptTracker tracker;
+    tracker.MarkRunning("task-idempotent", 9);
+    tracker.MarkRunning("task-idempotent", 9);
+    ASSERT_EQ(tracker.RunningSnapshot().size(), 1u);
+
+    tracker.MarkCompleted("task-idempotent", 9);
+    tracker.MarkCompleted("task-idempotent", 9);
+    EXPECT_TRUE(tracker.RunningSnapshot().empty());
+    ASSERT_EQ(tracker.CompletedSnapshot().size(), 1u);
+
+    tracker.MarkRunning("task-idempotent", 9);
+    EXPECT_TRUE(tracker.RunningSnapshot().empty());
+}

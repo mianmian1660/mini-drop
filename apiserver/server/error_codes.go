@@ -26,6 +26,7 @@ const (
 	ErrCodeRunnerNotAvailable      = "RUNNER_NOT_AVAILABLE"
 	ErrCodeRunnerPermissionDenied  = "RUNNER_PERMISSION_DENIED"
 	ErrCodeRunnerTimeout           = "RUNNER_TIMEOUT"
+	ErrCodeTaskCanceled            = "TASK_CANCELED"
 	ErrCodeTaskExecutionFailed     = "TASK_EXECUTION_FAILED"
 	ErrCodeArtifactUploadFailed    = "ARTIFACT_UPLOAD_FAILED"
 	ErrCodeAnalysisCorruptInput    = "ANALYSIS_CORRUPT_INPUT"
@@ -53,6 +54,7 @@ var errorCodeRegistry = map[string]ErrorCode{
 	ErrCodeRunnerNotAvailable:      {ErrCodeRunnerNotAvailable, "collection", true, http.StatusServiceUnavailable, "采集工具不可用"},
 	ErrCodeRunnerPermissionDenied:  {ErrCodeRunnerPermissionDenied, "collection", false, http.StatusForbidden, "采集权限不足"},
 	ErrCodeRunnerTimeout:           {ErrCodeRunnerTimeout, "collection", true, http.StatusGatewayTimeout, "采集超时"},
+	ErrCodeTaskCanceled:            {ErrCodeTaskCanceled, "collection", false, http.StatusConflict, "任务已取消"},
 	ErrCodeTaskExecutionFailed:     {ErrCodeTaskExecutionFailed, "collection", true, http.StatusBadGateway, "采集执行失败"},
 	ErrCodeArtifactUploadFailed:    {ErrCodeArtifactUploadFailed, "upload", true, http.StatusBadGateway, "产物上传失败"},
 	ErrCodeAnalysisCorruptInput:    {ErrCodeAnalysisCorruptInput, "analysis", false, http.StatusUnprocessableEntity, "分析输入数据损坏"},
