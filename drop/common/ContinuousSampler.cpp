@@ -4,6 +4,7 @@
 
 #include "common/ContinuousSampler.h"
 #include "common/BuildId.h"
+#include "common/RuntimeSymbolMap.h"
 #include "common/Utils.h"
 
 #include <algorithm>
@@ -128,6 +129,9 @@ struct WindowPayload
     std::string backendReason;                   // human-readable reason
     std::vector<std::string> attemptedBackends;  // ["core","bpftrace","perf"]
     std::string selectedBackend;                 // "bpftrace" | "perf" | ""
+    // runtime map 符号化诊断（Java/Node/Python JIT perf map），序列化后写入
+    // 批次/窗口 JSON 的 symbol_refs，服务端据此推断 symbol_status。
+    std::string symbolRefsJson;
 };
 
 static int64_t now_ms()
@@ -471,19 +475,42 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     window.startMs = now_ms();
     std::string dataPath = "/tmp/mini_drop_native_cp_" + std::to_string(window.startMs) + ".data";
     std::string perf = perf_bin();
+    // 云 VM 上硬件 cycles 计数器可能冻结（perf stat 读到 2^50 固定值），
+    // perf 默认的 cycles 事件会采不到任何样本。默认改用软件事件 cpu-clock，
+    // 可用 DROP_NATIVE_CP_PERF_EVENT 覆盖（Step 1 实测结论）。
+    std::string perfEvent = "cpu-clock";
+    if (const char *env = std::getenv("DROP_NATIVE_CP_PERF_EVENT"))
+        if (*env)
+            perfEvent = env;
     std::string recordOutput;
-    int rc = drop::exec_capture({perf, "record", "--no-buildid-cache", "-q", "-a", "-F", std::to_string(cfg.sampleRateHz), "-g", "-o", dataPath, "--", "sleep", std::to_string(cfg.aggregationWindowSec)}, &recordOutput, 4096);
+    int64_t tRecordStart = now_ms();
+    int rc = drop::exec_capture({perf, "record", "--no-buildid-cache", "-q", "-a", "-e", perfEvent, "-F", std::to_string(cfg.sampleRateHz), "-g", "-o", dataPath, "--", "sleep", std::to_string(cfg.aggregationWindowSec)}, &recordOutput, 4096);
     window.endMs = now_ms();
+    int64_t recordMs = window.endMs - tRecordStart;
     if (rc != 0)
     {
         std::cout << "[native-cp] perf record failed rc=" << rc << " output=" << recordOutput << std::endl;
         ::remove(dataPath.c_str());
         return window;
     }
+    int64_t tWarmStart = now_ms();
     warm_build_id_cache(perf, dataPath);
+    int64_t warmMs = now_ms() - tWarmStart;
+    // Java/Node/Python JIT perf map 定位/校验/搬运 + Java map 刷新，
+    // 必须在 perf script 前完成，让同一份 perf.data 能解析出用户函数名。
+    int64_t tRtStart = now_ms();
+    drop::RuntimeSymbolReport runtimeReport = drop::collect_runtime_maps(perf, dataPath);
+    window.symbolRefsJson = drop::runtime_report_to_json(runtimeReport);
+    int64_t rtMs = now_ms() - tRtStart;
+    int64_t tScriptStart = now_ms();
     std::string scriptOutput;
     rc = drop::exec_capture({perf, "script", "-i", dataPath}, &scriptOutput, 32 * 1024 * 1024);
     ::remove(dataPath.c_str());
+    int64_t scriptMs = now_ms() - tScriptStart;
+    std::cout << "[native-cp] perf window record_ms=" << recordMs
+              << " buildid_ms=" << warmMs
+              << " runtime_map_ms=" << rtMs
+              << " script_ms=" << scriptMs << std::endl;
     if (rc != 0)
     {
         std::cout << "[native-cp] perf script failed rc=" << rc << std::endl;
@@ -812,9 +839,23 @@ static HistogramPayload collect_bpftrace_latency_histogram(const ContinuousSampl
                 << "tracepoint:block:block_rq_complete /@rq_start[args->dev, args->sector]/ { $lat = (nsecs - @rq_start[args->dev, args->sector]) / 1000; @lat = hist($lat); @events = count(); delete(@rq_start[args->dev, args->sector]); }\n";
         }
     }
+    // io/sched histogram 用比 CPU 窗口略短的采集时长（默认 aggregationWindowSec-3），
+    // 让它们总能先于 perf 路径完成；即使偶发被搁置（超预算），后台 bpftrace 也能
+    // 更早自灭，减少与后续窗口的 tracepoint 竞争级联。可用 DROP_NATIVE_CP_HISTOGRAM_SEC 覆盖。
+    int histSec = std::max(1, cfg.aggregationWindowSec - 3);
+    if (const char *env = std::getenv("DROP_NATIVE_CP_HISTOGRAM_SEC"))
+    {
+        int v = std::atoi(env);
+        if (v > 0)
+            histSec = v;
+    }
     std::string output;
-    int rc = drop::exec_capture({"timeout", "-s", "INT", "-k", "2", std::to_string(std::max(1, cfg.aggregationWindowSec)), "bpftrace", scriptPath}, &output, 8 * 1024 * 1024);
+    int64_t tExecStart = now_ms();
+    int rc = drop::exec_capture({"timeout", "-s", "INT", "-k", "2", std::to_string(histSec), "bpftrace", scriptPath}, &output, 8 * 1024 * 1024);
+    int64_t execMs = now_ms() - tExecStart;
     ::remove(scriptPath.c_str());
+    std::cout << "[native-cp] " << signalType << " exec_ms=" << execMs
+              << " out_bytes=" << output.size() << " rc=" << rc << std::endl;
     hist = parse_bpftrace_histogram(output, signalType, "bpftrace");
     if (rc != 0 && hist.buckets.empty())
     {
@@ -943,6 +984,19 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
     body += "\"end_time\":\"" + end + "\",";
     body += "\"window_count\":" + std::to_string(windows.size()) + ",";
     body += "\"sample_count\":" + std::to_string(sampleCount) + ",";
+    // Batch-level symbol_refs：取最后一个非空窗口的 runtime map 报告（反映最新
+    // 运行时状态；runtime map 是进程生命周期相关，用最新比用首个更有代表性）。
+    std::string batchSymbolRefs;
+    for (auto it = windows.rbegin(); it != windows.rend(); ++it)
+    {
+        if (!it->symbolRefsJson.empty())
+        {
+            batchSymbolRefs = it->symbolRefsJson;
+            break;
+        }
+    }
+    if (!batchSymbolRefs.empty())
+        body += "\"symbol_refs\":" + batchSymbolRefs + ",";
     body += "\"windows\":[";
     for (size_t wi = 0; wi < windows.size(); ++wi)
     {
@@ -968,6 +1022,8 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
         }
         body += "],";
         body += "\"selected_backend\":\"" + json_escape(window.selectedBackend) + "\",";
+        if (!window.symbolRefsJson.empty())
+            body += "\"symbol_refs\":" + window.symbolRefsJson + ",";
         body += "\"samples\":[";
         for (size_t si = 0; si < window.samples.size(); ++si)
         {
@@ -1100,100 +1156,129 @@ static std::string core_unavailable_reason()
     return "CO-RE CPU sampler object is not enabled in this build";
 }
 
+// 等待 io/sched future 的预算：超出则标记该信号本轮 unavailable，不阻塞 CPU 窗口
+static constexpr int64_t kIoWaitBudgetMs = 3000;
+
+// std::async 返回的 future 析构会阻塞直到任务完成；超出预算时不能直接丢弃，
+// 否则析构照样把窗口拖长。把超预算的 future 移入该列表，后续窗口迭代惰性
+// 回收（wait_for(0) 就绪才 get()+erase），其后台 bpftrace 会按自身 timeout
+// 在 ~10s 内退出，不会无限增长。
+static std::mutex g_abandonedFuturesMutex;
+static std::vector<std::future<HistogramPayload>> g_abandonedFutures;
+
+static void reap_abandoned_hist_futures()
+{
+    std::lock_guard<std::mutex> lock(g_abandonedFuturesMutex);
+    for (auto it = g_abandonedFutures.begin(); it != g_abandonedFutures.end();)
+    {
+        if (it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        {
+            try
+            {
+                it->get(); // 丢弃结果
+            }
+            catch (...)
+            {
+                // 忽略后台任务异常
+            }
+            it = g_abandonedFutures.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+// 等待 io/sched histogram future，带预算；超预算标记 unavailable 并移入
+// abandoned 列表（不阻塞窗口）。
+static HistogramPayload wait_histogram_budgeted(std::future<HistogramPayload> &f,
+                                                const std::string &signalType)
+{
+    if (!f.valid())
+    {
+        HistogramPayload h;
+        h.signalType = signalType;
+        h.backend = "bpftrace";
+        h.unavailable = true;
+        h.reason = "not started";
+        return h;
+    }
+    if (f.wait_for(std::chrono::milliseconds(kIoWaitBudgetMs)) == std::future_status::ready)
+        return f.get();
+    // 超预算：不阻塞 CPU 窗口，本轮标记 unavailable，后台任务继续（自身 timeout 会退出）
+    {
+        std::lock_guard<std::mutex> lock(g_abandonedFuturesMutex);
+        g_abandonedFutures.push_back(std::move(f));
+    }
+    HistogramPayload h;
+    h.signalType = signalType;
+    h.backend = "bpftrace";
+    h.unavailable = true;
+    h.reason = "not ready within " + std::to_string(kIoWaitBudgetMs) + "ms budget";
+    std::cout << "[native-cp] " << signalType << " exceeded budget, marked unavailable" << std::endl;
+    return h;
+}
+
 static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cfg)
 {
     WindowPayload window;
     window.startMs = now_ms();
     int64_t captureEndMs = window.startMs + static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1000;
+    // 回收上一轮超预算被搁置的 io/sched future（它们已完成后台任务则清理）
+    reap_abandoned_hist_futures();
     std::string signals = env_string_local("DROP_NATIVE_CP_SIGNALS", "cpu,io,sched");
     bool ebpfEnabled = env_enabled_local("DROP_NATIVE_CP_EBPF_ENABLED");
-
-    // Strict fallback strategy (5-8): core(probe only) -> bpftrace -> perf
-    // bpftrace success (user OR kernel) skips perf entirely.
     std::vector<std::string> &attempted = window.attemptedBackends;
+
+    // ============================================================
+    // 同窗并发：perf CPU / io / sched 三个采集 future 在窗口开始时同时启动，
+    // 保证 CPU、IO、sched 覆盖同一个真实 ~10s 区间（修复窗口被串行拉长到
+    // ~32-34s 的问题）。默认 CPU 后端固定为 perf；bpftrace CPU 仅作为实验性
+    // 路径保留（显式配置只含 bpftrace 时才使用）。
+    // ============================================================
+    bool cpuStarted = false;
+    bool cpuUsePerf = false;
+    std::future<WindowPayload> perfCpuFuture;
+    std::future<ProfilePayload> bpftraceUserFuture;
+    std::future<ProfilePayload> bpftraceKernelFuture;
 
     if (signal_enabled(signals, "cpu"))
     {
-        std::string backends = env_string_local("DROP_NATIVE_CP_CPU_BACKENDS", "core,bpftrace,perf");
+        std::string backends = env_string_local("DROP_NATIVE_CP_CPU_BACKENDS", "perf");
         bool coreAllowed = backends.find("core") != std::string::npos;
         bool bpftraceAllowed = backends.find("bpftrace") != std::string::npos;
         bool perfAllowed = backends.find("perf") != std::string::npos;
 
-        // Stage 1: CO-RE probe only (no sampler implemented in this build)
-        if (coreAllowed && ebpfEnabled)
+        if (perfAllowed)
+        {
+            // 生产路径：perf 直接并发启动，不再等 bpftrace 失败再 fallback。
+            attempted.push_back("perf");
+            perfCpuFuture = std::async(std::launch::async, collect_window, cfg);
+            cpuStarted = true;
+            cpuUsePerf = true;
+        }
+        else if (bpftraceAllowed && ebpfEnabled && command_available("bpftrace"))
+        {
+            // 实验性路径：bpftrace user/kernel（不参与本轮生产验收）。
+            attempted.push_back("bpftrace");
+            bpftraceUserFuture = std::async(std::launch::async, collect_bpftrace_cpu_profile, cfg, "user");
+            bpftraceKernelFuture = std::async(std::launch::async, collect_bpftrace_cpu_profile, cfg, "kernel");
+            cpuStarted = true;
+        }
+        else if (coreAllowed && ebpfEnabled)
         {
             attempted.push_back("core");
             std::cout << "[native-cp] CO-RE CPU backend unavailable: " << core_unavailable_reason() << std::endl;
         }
-
-        // Stage 2: bpftrace user/kernel (strict: only start perf if bpftrace fails)
-        bool bpftraceStarted = false;
-        std::future<ProfilePayload> userFuture;
-        std::future<ProfilePayload> kernelFuture;
-        if (bpftraceAllowed && ebpfEnabled && command_available("bpftrace"))
-        {
-            attempted.push_back("bpftrace");
-            userFuture = std::async(std::launch::async, collect_bpftrace_cpu_profile, cfg, "user");
-            kernelFuture = std::async(std::launch::async, collect_bpftrace_cpu_profile, cfg, "kernel");
-            bpftraceStarted = true;
-        }
-
-        bool cpuCollected = false;
-        if (bpftraceStarted)
-        {
-            ProfilePayload user = userFuture.get();
-            if (!user.samples.empty())
-            {
-                window.profiles.push_back(user);
-                cpuCollected = true;
-            }
-            ProfilePayload kernel = kernelFuture.get();
-            if (!kernel.samples.empty())
-            {
-                window.profiles.push_back(kernel);
-                cpuCollected = true;
-            }
-        }
-
-        // Stage 3: perf fallback ONLY if bpftrace did not yield samples
-        if (!cpuCollected && perfAllowed)
-        {
-            attempted.push_back("perf");
-            std::future<WindowPayload> perfFuture = std::async(std::launch::async, collect_window, cfg);
-            WindowPayload perfWindow = perfFuture.get();
-            if (perfWindow.endMs > 0)
-                captureEndMs = std::max(captureEndMs, perfWindow.endMs);
-            window.samples = perfWindow.samples;
-            for (auto &sample : window.samples)
-                sample.backend = "perf";
-            cpuCollected = !window.samples.empty();
-        }
-
-        // Populate backend metadata
-        if (cpuCollected)
-        {
-            window.backendStatus = "ok";
-            // Determine selected backend from samples/profiles
-            for (const auto &profile : window.profiles)
-            {
-                if (!profile.backend.empty())
-                {
-                    window.selectedBackend = profile.backend;
-                    break;
-                }
-            }
-            if (window.selectedBackend.empty() && !window.samples.empty())
-                window.selectedBackend = "perf";
-        }
         else
         {
             window.backendStatus = "failed";
-            window.backendReason = "no CPU samples collected by any backend";
-            std::cout << "[native-cp] no CPU profile samples collected in this window" << std::endl;
+            window.backendReason = "no CPU backend enabled";
         }
     }
 
-    // IO/sched histograms still use bpftrace; no mock generation.
+    // IO/sched histograms（bpftrace）与 CPU 同窗并发。
     std::future<HistogramPayload> ioFuture;
     std::future<HistogramPayload> schedFuture;
     bool ioStarted = false;
@@ -1208,15 +1293,101 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
         schedFuture = std::async(std::launch::async, collect_bpftrace_latency_histogram, cfg, "sched_latency");
         schedStarted = true;
     }
+
+    // ============================================================
+    // 等待所有本窗采集任务完成
+    // ============================================================
+    uint64_t cpuSamples = 0;
+    if (cpuStarted)
+    {
+        if (cpuUsePerf)
+        {
+            WindowPayload perfWindow = perfCpuFuture.get();
+            window.samples = perfWindow.samples;
+            if (perfWindow.endMs > 0)
+                captureEndMs = perfWindow.endMs;
+            for (auto &sample : window.samples)
+                sample.backend = "perf";
+            window.symbolRefsJson = perfWindow.symbolRefsJson; // runtime map 诊断
+            for (const auto &sample : window.samples)
+                cpuSamples = add_count(cpuSamples, sample.count);
+            window.selectedBackend = "perf";
+        }
+        else
+        {
+            ProfilePayload user = bpftraceUserFuture.get();
+            if (!user.samples.empty())
+            {
+                window.profiles.push_back(user);
+                for (const auto &s : user.samples)
+                    cpuSamples = add_count(cpuSamples, s.count);
+            }
+            ProfilePayload kernel = bpftraceKernelFuture.get();
+            if (!kernel.samples.empty())
+            {
+                window.profiles.push_back(kernel);
+                for (const auto &s : kernel.samples)
+                    cpuSamples = add_count(cpuSamples, s.count);
+            }
+            if (cpuSamples > 0)
+                window.selectedBackend = "bpftrace";
+        }
+
+        if (cpuSamples > 0)
+        {
+            window.backendStatus = "ok";
+        }
+        else
+        {
+            window.backendStatus = "failed";
+            window.backendReason = "no CPU samples collected by any backend";
+            std::cout << "[native-cp] no CPU profile samples collected in this window" << std::endl;
+        }
+    }
+    else if (window.backendStatus.empty())
+    {
+        window.backendStatus = "failed";
+        window.backendReason = "CPU backend not enabled";
+    }
+
+    // IO/sched 结果；各自带预算等待，超预算不阻塞 CPU 窗口（标记 unavailable）。
+    uint64_t ioEvents = 0;
+    uint64_t schedEvents = 0;
+    int64_t ioMs = 0;
+    int64_t schedMs = 0;
     if (ioStarted)
-        window.histograms.push_back(ioFuture.get());
+    {
+        int64_t t0 = now_ms();
+        HistogramPayload hist = wait_histogram_budgeted(ioFuture, "io_latency");
+        ioMs = now_ms() - t0;
+        ioEvents = hist.eventCount;
+        window.histograms.push_back(hist);
+    }
     if (schedStarted)
-        window.histograms.push_back(schedFuture.get());
+    {
+        int64_t t0 = now_ms();
+        HistogramPayload hist = wait_histogram_budgeted(schedFuture, "sched_latency");
+        schedMs = now_ms() - t0;
+        schedEvents = hist.eventCount;
+        window.histograms.push_back(hist);
+    }
 
     window.endMs = captureEndMs;
+    int64_t elapsedMs = now_ms() - window.startMs;
+    std::cout << "[native-cp] window start_ms=" << window.startMs
+              << " wall_elapsed_ms=" << elapsedMs
+              << " capture_elapsed_ms=" << (window.endMs - window.startMs)
+              << " cpu_samples=" << cpuSamples
+              << " io_events=" << ioEvents
+              << " sched_events=" << schedEvents
+              << " io_ms=" << ioMs
+              << " sched_ms=" << schedMs
+              << " backend=" << window.selectedBackend
+              << " status=" << window.backendStatus << std::endl;
     return window;
 }
-} // namespace
+
+} // namespace (anonymous)
 
 PerfEventSampler::~PerfEventSampler()
 {

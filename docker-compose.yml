@@ -123,7 +123,12 @@ services:
       DROP_NATIVE_CP_ENABLED: "${DROP_NATIVE_CP_ENABLED:-true}"
       DROP_NATIVE_CP_EBPF_ENABLED: "${DROP_NATIVE_CP_EBPF_ENABLED:-true}"
       DROP_NATIVE_CP_SIGNALS: "${DROP_NATIVE_CP_SIGNALS:-cpu,io,sched}"
-      DROP_NATIVE_CP_CPU_BACKENDS: "${DROP_NATIVE_CP_CPU_BACKENDS:-core,bpftrace,perf}"
+      DROP_NATIVE_CP_CPU_BACKENDS: "${DROP_NATIVE_CP_CPU_BACKENDS:-perf}"
+      # 云 VM 硬件 cycles 计数器可能冻结，perf 默认 cycles 采不到样本；
+      # 默认改用软件事件 cpu-clock（Step 1 实测），可覆盖。
+      DROP_NATIVE_CP_PERF_EVENT: "${DROP_NATIVE_CP_PERF_EVENT:-cpu-clock}"
+      # io/sched histogram 采集时长（秒），默认比 CPU 窗口短 3s，避免拖长窗口
+      DROP_NATIVE_CP_HISTOGRAM_SEC: "${DROP_NATIVE_CP_HISTOGRAM_SEC:-}"
       DROP_BTF_PATH: "${DROP_BTF_PATH:-}"
       DROP_NATIVE_CP_API_BASE_URL: "${DROP_NATIVE_CP_API_BASE_URL:-http://127.0.0.1:8191}"
       DROP_NATIVE_CP_SESSION_ID: "${DROP_NATIVE_CP_SESSION_ID:-}"

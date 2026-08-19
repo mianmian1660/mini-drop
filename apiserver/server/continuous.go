@@ -725,7 +725,6 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			return continuousAggregate{}, true, err
 		}
 		agg.ObjectKeys = append(agg.ObjectKeys, objectKey)
-		continuousAggregateSymbolStatus(&agg, batch.SymbolRefs)
 		for _, window := range batch.Windows {
 			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 				continue
@@ -742,11 +741,25 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 	return agg, true, nil
 }
 
-// continuousAggregateSymbolStatus 根据 symbol_refs 推断符号化状态。
-// 借鉴 Pyroscope 查询时 symbolization 状态展示：complete/partial/missing/not_applicable。
+// continuousAggregateSymbolStatus 根据 symbol_refs 推断并合并符号化状态。
+// 范围查询保留最差状态：missing > partial > complete > not_applicable。
 func continuousAggregateSymbolStatus(agg *continuousAggregate, refs map[string]interface{}) {
 	if len(refs) == 0 {
 		return
+	}
+	mergeStatus := func(status string) {
+		priority := map[string]int{"not_applicable": 0, "complete": 1, "partial": 2, "missing": 3}
+		if priority[status] > priority[agg.SymbolStatus] {
+			agg.SymbolStatus = status
+		}
+	}
+	// 优先读取 Agent 显式填充的 symbol_status（Java/Node/Python runtime map 诊断，
+	// ContinuousSampler 的 symbol_refs 结构）。
+	if st, ok := refs["symbol_status"].(string); ok && st != "" {
+		if st == "complete" || st == "partial" || st == "missing" || st == "not_applicable" {
+			mergeStatus(st)
+			return
+		}
 	}
 	hasBuildID := false
 	hasKallsyms := false
@@ -772,20 +785,14 @@ func continuousAggregateSymbolStatus(agg *continuousAggregate, refs map[string]i
 		}
 	}
 	if missing {
-		if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
-			agg.SymbolStatus = "partial"
-		}
+		mergeStatus("partial")
 		return
 	}
 	if hasBuildID || hasKallsyms {
-		if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
-			agg.SymbolStatus = "complete"
-		}
+		mergeStatus("complete")
 		return
 	}
-	if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
-		agg.SymbolStatus = "missing"
-	}
+	mergeStatus("missing")
 }
 
 func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
