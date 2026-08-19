@@ -29,6 +29,11 @@ namespace drop_agent
 
         void Shutdown();
 
+        // Phase 7：从队列里移除匹配的任务（还没被 WorkerThread 取走）。命中
+        // 返回 true。已经被取走、正在跑的任务不受影响——那种情况走
+        // AttemptTracker::RequestCancel，由 WorkerThread 的 Poll 循环感知。
+        bool CancelQueued(const std::string &taskID, uint64_t attemptID);
+
     private:
         mutable std::mutex mutex_;
         std::condition_variable cv_;

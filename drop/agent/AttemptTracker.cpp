@@ -31,6 +31,25 @@ namespace drop_agent
         completed_.push_back(attempt);
         if (completed_.size() > 50)
             completed_.erase(completed_.begin());
+
+        cancelRequested_.erase(Key(taskID, attemptID));
+    }
+
+    std::string AttemptTracker::Key(const std::string &taskID, uint64_t attemptID)
+    {
+        return taskID + "#" + std::to_string(attemptID);
+    }
+
+    void AttemptTracker::RequestCancel(const std::string &taskID, uint64_t attemptID)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelRequested_.insert(Key(taskID, attemptID));
+    }
+
+    bool AttemptTracker::IsCancelRequested(const std::string &taskID, uint64_t attemptID) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cancelRequested_.find(Key(taskID, attemptID)) != cancelRequested_.end();
     }
 
     std::vector<common::AttemptStatus> AttemptTracker::RunningSnapshot() const

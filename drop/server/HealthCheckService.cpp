@@ -99,6 +99,22 @@ namespace drop_server
                 response->set_pending(true);
                 response->mutable_taskdesc()->Swap(&task);
             }
+
+            // Phase 7：把这个 Agent 汇报的 running_attempts 转成 key 集合，
+            // 和 pending_cancels_ 比对，下发这次心跳要取消的 attempt 列表。
+            unordered_set<string> runningKeys;
+            for (const auto &attempt : request->running_attempts())
+                runningKeys.insert(task_attempt_key(attempt.taskid(), attempt.attempt_id()));
+            auto cancelList = collect_cancel_attempts_locked(request->ipaddr(), runningKeys);
+            for (const auto &item : cancelList)
+            {
+                auto *entry = response->add_cancel_attempts();
+                entry->set_taskid(item.first);
+                entry->set_attempt_id(item.second);
+                cout << "[server] 下发取消指令: taskID=" << item.first
+                     << " attemptID=" << item.second
+                     << " targetIP=" << request->ipaddr() << endl;
+            }
         }
 
         return grpc::Status::OK;

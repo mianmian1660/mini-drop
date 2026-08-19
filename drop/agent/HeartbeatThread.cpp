@@ -342,6 +342,40 @@ namespace drop_agent
                     attemptTracker_.MarkRunning(task.taskid(), task.attempt_id());
                     taskQueue_.Push(task);
                 }
+
+                // Phase 7：处理 Server 下发的取消指令。每次心跳都会重发直到
+                // Server 不再把它算作 running，所以这里的处理必须幂等——
+                // 重复收到同一个 taskID/attemptID 不会有副作用。
+                for (const auto &cancelReq : resp.cancel_attempts())
+                {
+                    const string &taskID = cancelReq.taskid();
+                    uint64_t attemptID = cancelReq.attempt_id();
+                    if (taskQueue_.CancelQueued(taskID, attemptID))
+                    {
+                        // 命中还在排队、Worker 线程根本没开始跑的任务：直接摘除，
+                        // 不会产生任何采集/上传行为。已知限制：这条路径不会走
+                        // NotifyResult 上报一个带 TASK_CANCELED 错误码的
+                        // TaskResult——只是心跳快照里不再算 running/直接算
+                        // completed，analysis 侧看不到这次 attempt 的记录。
+                        cout << "[heartbeat] 取消指令命中排队中任务(尚未开始采集)，直接摘除: taskID="
+                             << taskID << " attemptID=" << attemptID << endl;
+                        attemptTracker_.MarkCompleted(taskID, attemptID);
+                        drop::log_event("drop_agent", "task_canceled_before_start",
+                                         {{"task_id", taskID}, {"attempt_id", to_string(attemptID)}});
+                    }
+                    else
+                    {
+                        // 要么已经在 WorkerThread 里跑着，要么这个 attempt 根本
+                        // 没在这台 Agent 上（比如 Server/Agent 状态有时间差）。
+                        // 统一登记取消标记：如果确实在跑，WorkerThread 的 Poll
+                        // 循环下一轮就会感知到并触发 Runner::Stop(kCancel)；如果
+                        // 根本不存在，这个标记是无害的死数据，等 MarkCompleted
+                        // 或从来不会触发时也不会造成任何影响。
+                        attemptTracker_.RequestCancel(taskID, attemptID);
+                        cout << "[heartbeat] 取消指令已登记，等待 Worker 线程下一轮 Poll 感知: taskID="
+                             << taskID << " attemptID=" << attemptID << endl;
+                    }
+                }
             }
 
             for (uint32_t i = 0; i < intervalMs / 100 && running_; i++)

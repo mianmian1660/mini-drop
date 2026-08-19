@@ -77,7 +77,8 @@ namespace drop_agent
         RunnerOutcome RunTaskLifecycle(uint32_t profilerType, const hotmethod::TaskDesc &task,
                                         const string &outputPath,
                                         const std::atomic<bool> &runningFlag,
-                                        drop::PidRegistry &pidRegistry)
+                                        drop::PidRegistry &pidRegistry,
+                                        AttemptTracker &attemptTracker)
         {
             RunnerOutcome out;
             out.outputPath = outputPath;
@@ -166,6 +167,7 @@ namespace drop_agent
                     }
                     else
                     {
+                        bool canceled = false;
                         while (true)
                         {
                             auto poll = runner->Poll(ctx);
@@ -186,12 +188,27 @@ namespace drop_agent
                                 resultCode = afterStop.resultCode;
                                 break;
                             }
+                            if (attemptTracker.IsCancelRequested(task.taskid(), task.attempt_id()))
+                            {
+                                cout << "[runner] stage=Stop taskID=" << task.taskid()
+                                     << " reason=Cancel，中断采集" << endl;
+                                runner->Stop(ctx, drop_agent::StopReason::kCancel);
+                                auto afterStop = runner->Poll(ctx);
+                                resultCode = afterStop.resultCode;
+                                canceled = true;
+                                break;
+                            }
                             this_thread::sleep_for(milliseconds(200));
                         }
                         cout << "[runner] stage=Monitor taskID=" << task.taskid()
                              << " resultCode=" << resultCode << endl;
                         auto collect = runner->Collect(ctx);
                         resultCode = collect.resultCode; // Collect() 可能在文件校验/后处理阶段进一步改判定(如 -6/-2)
+                        // 主动取消时统一报 -7(TASK_CANCELED)，不用 Collect() 给出的
+                        // 信号终止码——那个码含糊(超时/关闭/取消都可能落到同一个
+                        // -5)，调用方需要能明确区分"这是用户/Server 主动取消的"。
+                        if (canceled)
+                            resultCode = -7;
                     }
                 }
             }
@@ -276,10 +293,12 @@ namespace drop_agent
     WorkerThread::WorkerThread(TaskQueue &taskQueue,
                                UploadQueue &uploadQueue,
                                drop::PidRegistry &pidRegistry,
+                               AttemptTracker &attemptTracker,
                                std::atomic<bool> &runningFlag)
         : taskQueue_(taskQueue),
           uploadQueue_(uploadQueue),
           pidRegistry_(pidRegistry),
+          attemptTracker_(attemptTracker),
           running_(runningFlag)
     {
     }
@@ -322,7 +341,7 @@ namespace drop_agent
             string outputPath = taskDir + "output";
 
             auto collectStart = steady_clock::now();
-            RunnerOutcome outcome = RunTaskLifecycle(ptype, task, outputPath, running_, pidRegistry_);
+            RunnerOutcome outcome = RunTaskLifecycle(ptype, task, outputPath, running_, pidRegistry_, attemptTracker_);
             auto collectMs = duration_cast<milliseconds>(steady_clock::now() - collectStart).count();
             drop::log_event("drop_agent",
                              outcome.resultCode == 0 ? "collection_succeeded" : "collection_failed",

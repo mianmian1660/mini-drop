@@ -168,26 +168,48 @@ namespace drop_server
         const control::CancelTaskRequest *request,
         control::CancelTaskResponse *response)
     {
-        bool canceled = false;
+        bool queuedCanceled = false;
         bool alreadyTerminal = false;
+        bool dispatchedCancelRequested = false;
         {
             lock_guard<mutex> lock(tasks_mutex);
-            canceled = cancel_task_locked(request->targetip(), request->taskid(), request->attempt_id());
+            queuedCanceled = cancel_task_locked(request->targetip(), request->taskid(), request->attempt_id());
             hotmethod::TaskDesc probe;
             probe.set_taskid(request->taskid());
             probe.set_attempt_id(request->attempt_id());
             alreadyTerminal = is_attempt_completed_locked(probe);
+
+            // Phase 7：还没在队列里找到（说明已经派发给 Agent 了），且不是
+            // 已经跑完的老任务——登记进 pending_cancels_，下次心跳
+            // HealthCheckService::Do 会把它下发给 Agent，由 Agent 侧触发
+            // Runner::Stop(kCancel)。没有 targetIP 就没法知道该通知哪个
+            // Agent，跳过。
+            if (!queuedCanceled && !alreadyTerminal && !request->targetip().empty())
+            {
+                request_cancel_locked(request->targetip(), request->taskid(), request->attempt_id());
+                dispatchedCancelRequested = true;
+            }
         }
 
+        bool canceled = queuedCanceled || dispatchedCancelRequested;
         response->set_code(0);
-        response->set_msg(canceled ? "queued task canceled" : "task not queued or already delivered");
+        if (alreadyTerminal)
+            response->set_msg("attempt already terminal");
+        else if (queuedCanceled)
+            response->set_msg("queued task canceled");
+        else if (dispatchedCancelRequested)
+            response->set_msg("cancel request relayed to agent, will take effect within grace period on next heartbeat");
+        else
+            response->set_msg("task not found");
         response->set_canceled(canceled);
         response->set_already_terminal(alreadyTerminal);
 
         cout << "[server] CancelTask: taskID=" << request->taskid()
              << " attemptID=" << request->attempt_id()
              << " targetIP=" << request->targetip()
-             << " canceled=" << (canceled ? "true" : "false") << endl;
+             << " queuedCanceled=" << (queuedCanceled ? "true" : "false")
+             << " dispatchedCancelRequested=" << (dispatchedCancelRequested ? "true" : "false")
+             << " alreadyTerminal=" << (alreadyTerminal ? "true" : "false") << endl;
         return grpc::Status::OK;
     }
 

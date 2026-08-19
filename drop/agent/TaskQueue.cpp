@@ -1,5 +1,6 @@
 #include "agent/TaskQueue.h"
 
+#include <algorithm>
 #include <chrono>
 
 namespace drop_agent
@@ -33,6 +34,18 @@ namespace drop_agent
             shuttingDown_ = true;
         }
         cv_.notify_all();
+    }
+
+    bool TaskQueue::CancelQueued(const std::string &taskID, uint64_t attemptID)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = std::find_if(queue_.begin(), queue_.end(),
+                                [&](const hotmethod::TaskDesc &t)
+                                { return t.taskid() == taskID && t.attempt_id() == attemptID; });
+        if (it == queue_.end())
+            return false;
+        queue_.erase(it);
+        return true;
     }
 
 } // namespace drop_agent

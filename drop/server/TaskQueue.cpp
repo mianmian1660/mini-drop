@@ -24,6 +24,7 @@ namespace drop_server
     std::mutex tasks_mutex;
     std::unordered_map<std::string, std::deque<QueuedTask>> tasks_;
     std::unordered_set<std::string> completed_attempts_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> pending_cancels_;
 
     namespace
     {
@@ -81,9 +82,49 @@ namespace drop_server
         }
     }
 
+    string task_attempt_key(const string &taskID, uint64_t attemptID)
+    {
+        return taskID + "#" + to_string(attemptID);
+    }
+
     string task_attempt_key(const hotmethod::TaskDesc &task)
     {
-        return task.taskid() + "#" + to_string(task.attempt_id());
+        return task_attempt_key(task.taskid(), task.attempt_id());
+    }
+
+    void request_cancel_locked(const string &targetIP, const string &taskID, uint64_t attemptID)
+    {
+        pending_cancels_[targetIP].insert(task_attempt_key(taskID, attemptID));
+    }
+
+    vector<pair<string, uint64_t>> collect_cancel_attempts_locked(
+        const string &targetIP,
+        const unordered_set<string> &currentlyRunningKeys)
+    {
+        vector<pair<string, uint64_t>> out;
+        auto it = pending_cancels_.find(targetIP);
+        if (it == pending_cancels_.end())
+            return out;
+
+        auto &keys = it->second;
+        for (auto keyIt = keys.begin(); keyIt != keys.end();)
+        {
+            if (currentlyRunningKeys.find(*keyIt) == currentlyRunningKeys.end())
+            {
+                // Agent 已经不再汇报这个 attempt 为 running：取消已生效，
+                // 或者这个 attempt 本来就没在这台 Agent 上跑，清理掉。
+                keyIt = keys.erase(keyIt);
+                continue;
+            }
+            size_t hashPos = keyIt->rfind('#');
+            string taskID = keyIt->substr(0, hashPos);
+            uint64_t attemptID = static_cast<uint64_t>(stoull(keyIt->substr(hashPos + 1)));
+            out.emplace_back(taskID, attemptID);
+            ++keyIt;
+        }
+        if (keys.empty())
+            pending_cancels_.erase(it);
+        return out;
     }
 
     bool is_attempt_completed_locked(const hotmethod::TaskDesc &task)

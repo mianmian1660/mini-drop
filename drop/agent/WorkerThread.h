@@ -7,8 +7,14 @@
 //
 // Phase 4：上传/NotifyResult 进一步拆到 UploadWorker。WorkerThread 采集
 // 一结束就把 UploadJob 丢进 UploadQueue，立刻去拿下一个任务——不再需要
-// AttemptTracker（MarkCompleted 移到 UploadWorker）或 ServerChannelHolder
-// （上传/NotifyResult 用的 stub/CosConfig 也移到 UploadWorker）。
+// ServerChannelHolder（上传/NotifyResult 用的 stub/CosConfig 也移到
+// UploadWorker）。
+//
+// Phase 7：AttemptTracker 又加回来了，但用途和 Phase 3 之前不同——不是为
+// 了 MarkCompleted（那还在 UploadWorker），而是只读查询
+// IsCancelRequested()：HeartbeatThread 收到 Server 下发的取消指令后调用
+// AttemptTracker::RequestCancel()，这里的 Poll 循环每轮检查一次，一旦命中
+// 就调用 Runner::Stop(kCancel) 中断采集。
 //
 // 内部仍然复用 Phase 2 落地的 drop_agent::Runner 生命周期（Validate->
 // Prepare->Start->Poll->Collect），只是编排它的调用方从 main() 的循环体
@@ -21,6 +27,7 @@
 #include <thread>
 #include "agent/TaskQueue.h"
 #include "agent/UploadQueue.h"
+#include "agent/AttemptTracker.h"
 #include "common/PidRegistry.h"
 
 namespace drop_agent
@@ -32,6 +39,7 @@ namespace drop_agent
         WorkerThread(TaskQueue &taskQueue,
                      UploadQueue &uploadQueue,
                      drop::PidRegistry &pidRegistry,
+                     AttemptTracker &attemptTracker,
                      std::atomic<bool> &runningFlag);
 
         void Start();
@@ -46,6 +54,7 @@ namespace drop_agent
         TaskQueue &taskQueue_;
         UploadQueue &uploadQueue_;
         drop::PidRegistry &pidRegistry_;
+        AttemptTracker &attemptTracker_;
         std::atomic<bool> &running_;
         std::thread thread_;
     };

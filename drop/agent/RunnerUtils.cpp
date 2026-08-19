@@ -64,6 +64,8 @@ namespace drop_agent
         {
         case 0:
             return "";
+        case -7:
+            return "任务已被取消（Server 下发取消指令或用户主动取消）";
         case -4:
             if (profilerName == "pprof")
                 return "无法连接 Go pprof：请确认 pprof_url 可从 Agent 访问并已启用 /debug/pprof/profile";
@@ -98,6 +100,8 @@ namespace drop_agent
     {
         if (resultCode == 0)
             return "";
+        if (resultCode == -7)
+            return "TASK_CANCELED";
         if (resultCode == -3)
             return "TASK_TIMEOUT";
         if (resultCode == -4)

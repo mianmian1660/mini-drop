@@ -12,6 +12,7 @@
 
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <cstdint>
 #include "common/proto/common.pb.h" // common::AttemptStatus
@@ -31,10 +32,20 @@ namespace drop_agent
         std::vector<common::AttemptStatus> RunningSnapshot() const;
         std::vector<common::AttemptStatus> CompletedSnapshot() const;
 
+        // Phase 7：HeartbeatThread 收到 Server 下发的 cancel_attempts 后调用，
+        // WorkerThread 的 Poll 循环每轮检查一次——和 kAgentShutdown 分支
+        // 复用同一套"发现信号→Runner::Stop→再 Poll 一次拿真实终态"路径，
+        // 只是 StopReason 换成 kCancel。
+        void RequestCancel(const std::string &taskID, uint64_t attemptID);
+        bool IsCancelRequested(const std::string &taskID, uint64_t attemptID) const;
+
     private:
+        static std::string Key(const std::string &taskID, uint64_t attemptID);
+
         mutable std::mutex mutex_;
         std::vector<common::AttemptStatus> running_;
         std::vector<common::AttemptStatus> completed_;
+        std::unordered_set<std::string> cancelRequested_;
     };
 
 } // namespace drop_agent

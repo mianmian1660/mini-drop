@@ -138,7 +138,7 @@ int main(int argc, char **argv)
     // stub），所以这里 std::move 转移所有权即可。
     channelHolder.Update(channel, std::move(hotmethodStub), cosConfig);
 
-    drop_agent::WorkerThread worker(taskQueue, uploadQueue, pidRegistry, agent_running);
+    drop_agent::WorkerThread worker(taskQueue, uploadQueue, pidRegistry, attemptTracker, agent_running);
     drop_agent::UploadWorker uploader(uploadQueue, attemptTracker, channelHolder);
     drop_agent::HeartbeatThread heartbeat(cfg, channel, cosConfig, taskQueue, attemptTracker, channelHolder, agent_running);
     drop_agent::CleanupWorker cleanup(cfg, pidRegistry, agent_running);

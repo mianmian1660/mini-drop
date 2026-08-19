@@ -55,4 +55,9 @@ message HealthCheckResponse {
   ServingStatus status      = 1;  // Server 当前状态
   bool          pending     = 2;  // 是否有待执行的任务？
   hotmethod.TaskDesc taskDesc = 3;  // 如果有任务，这里放着任务详情
+  // Phase 7：Server 要求 Agent 取消的 attempt 列表（已派发、正在跑的任务）。
+  // Server 每次心跳都会重发，直到 Agent 不再把它汇报在 running_attempts
+  // 里为止——这样即使某一次响应丢了，下次心跳还会再收到一次，不需要
+  // apiserver 重新调用 CancelTask。
+  repeated common.AttemptStatus cancel_attempts = 4;
 }
