@@ -6,6 +6,7 @@
 #include "common/Utils.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -44,6 +45,17 @@ namespace drop
                 }
             }
             return out;
+        }
+
+        // 与 PerfRunner/ContinuousSampler 保持一致：录制用 DROP_PERF_BIN
+        // (= perf-real)，这里 buildid-list 也走同一二进制，避免命中 /usr/bin/perf
+        // 包装脚本因内核版本不匹配而 rc=2 的问题。
+        string resolve_perf_bin()
+        {
+            const char *configured = getenv("DROP_PERF_BIN");
+            if (configured && configured[0] != '\0')
+                return string(configured);
+            return "perf";
         }
 
         bool file_readable(const string &path)
@@ -155,7 +167,7 @@ namespace drop
                                      const string &apiBaseURL)
     {
         string listOutput;
-        int rc = drop::exec_capture({"perf", "buildid-list", "-i", perfDataPath}, &listOutput, 65536);
+        int rc = drop::exec_capture({resolve_perf_bin(), "buildid-list", "-i", perfDataPath}, &listOutput, 65536);
         if (rc != 0)
         {
             cout << "[symbols] perf buildid-list 失败(rc=" << rc << ")，跳过符号上传" << endl;
