@@ -128,3 +128,52 @@ TEST(TaskQueue, IsAttemptCompletedLockedReflectsMarking)
 
     EXPECT_TRUE(drop_server::is_attempt_completed_locked(task));
 }
+
+// ============================================================
+// Phase 7：pending_cancels_ / request_cancel_locked / collect_cancel_attempts_locked
+// ============================================================
+
+TEST(TaskQueue, CollectCancelAttemptsReturnsEntryStillRunning)
+{
+    const std::string ip = "10.0.0.201";
+    std::lock_guard<std::mutex> lock(drop_server::tasks_mutex);
+
+    drop_server::request_cancel_locked(ip, "tq-cancel-dispatched", 1);
+
+    std::unordered_set<std::string> stillRunning = {drop_server::task_attempt_key("tq-cancel-dispatched", 1)};
+    auto out = drop_server::collect_cancel_attempts_locked(ip, stillRunning);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].first, "tq-cancel-dispatched");
+    EXPECT_EQ(out[0].second, 1u);
+}
+
+TEST(TaskQueue, CollectCancelAttemptsResendsUntilAgentStopsReportingRunning)
+{
+    const std::string ip = "10.0.0.202";
+    std::lock_guard<std::mutex> lock(drop_server::tasks_mutex);
+
+    drop_server::request_cancel_locked(ip, "tq-cancel-resend", 1);
+    std::unordered_set<std::string> stillRunning = {drop_server::task_attempt_key("tq-cancel-resend", 1)};
+
+    // 还在跑：每次心跳都应该重新收到，不会因为读取过一次就被摘除
+    EXPECT_EQ(drop_server::collect_cancel_attempts_locked(ip, stillRunning).size(), 1u);
+    EXPECT_EQ(drop_server::collect_cancel_attempts_locked(ip, stillRunning).size(), 1u);
+
+    // Agent 不再汇报为 running：视为取消已生效，之后不再下发
+    std::unordered_set<std::string> empty;
+    EXPECT_TRUE(drop_server::collect_cancel_attempts_locked(ip, empty).empty());
+    EXPECT_TRUE(drop_server::collect_cancel_attempts_locked(ip, stillRunning).empty());
+}
+
+TEST(TaskQueue, CollectCancelAttemptsIgnoresOtherTargetIP)
+{
+    const std::string ip = "10.0.0.203";
+    const std::string otherIP = "10.0.0.204";
+    std::lock_guard<std::mutex> lock(drop_server::tasks_mutex);
+
+    drop_server::request_cancel_locked(ip, "tq-cancel-scoped", 1);
+
+    std::unordered_set<std::string> stillRunning = {drop_server::task_attempt_key("tq-cancel-scoped", 1)};
+    EXPECT_TRUE(drop_server::collect_cancel_attempts_locked(otherIP, stillRunning).empty());
+    EXPECT_EQ(drop_server::collect_cancel_attempts_locked(ip, stillRunning).size(), 1u);
+}

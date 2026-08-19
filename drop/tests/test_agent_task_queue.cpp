@@ -62,3 +62,45 @@ TEST(TaskQueue, ShutdownDoesNotDropAlreadyQueuedTask)
     hotmethod::TaskDesc out2;
     EXPECT_FALSE(q.WaitPop(50, &out2));
 }
+
+// ============================================================
+// Phase 7：CancelQueued
+// ============================================================
+
+TEST(TaskQueue, CancelQueuedRemovesMatchingTask)
+{
+    TaskQueue q;
+    hotmethod::TaskDesc task;
+    task.set_taskid("cancel-me");
+    task.set_attempt_id(3);
+    q.Push(task);
+
+    EXPECT_TRUE(q.CancelQueued("cancel-me", 3));
+
+    hotmethod::TaskDesc out;
+    EXPECT_FALSE(q.WaitPop(50, &out)); // 已摘除，取不到
+}
+
+TEST(TaskQueue, CancelQueuedReturnsFalseWhenNotFound)
+{
+    TaskQueue q;
+    EXPECT_FALSE(q.CancelQueued("never-queued", 1));
+}
+
+TEST(TaskQueue, CancelQueuedOnlyRemovesMatchingAttempt)
+{
+    TaskQueue q;
+    hotmethod::TaskDesc t1, t2;
+    t1.set_taskid("same-task");
+    t1.set_attempt_id(1);
+    t2.set_taskid("same-task");
+    t2.set_attempt_id(2);
+    q.Push(t1);
+    q.Push(t2);
+
+    EXPECT_TRUE(q.CancelQueued("same-task", 1));
+
+    hotmethod::TaskDesc out;
+    ASSERT_TRUE(q.WaitPop(1000, &out));
+    EXPECT_EQ(out.attempt_id(), 2u); // attempt 1 被摘除，attempt 2 还在
+}

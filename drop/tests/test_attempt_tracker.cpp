@@ -43,3 +43,30 @@ TEST(AttemptTracker, CompletedSnapshotCapsAtFiftyDroppingOldest)
     EXPECT_EQ(completed.front().attempt_id(), 2u);
     EXPECT_EQ(completed.back().attempt_id(), 51u);
 }
+
+// ============================================================
+// Phase 7：RequestCancel / IsCancelRequested
+// ============================================================
+
+TEST(AttemptTracker, IsCancelRequestedFalseByDefault)
+{
+    AttemptTracker tracker;
+    EXPECT_FALSE(tracker.IsCancelRequested("task-1", 1));
+}
+
+TEST(AttemptTracker, RequestCancelMarksAttempt)
+{
+    AttemptTracker tracker;
+    tracker.RequestCancel("task-1", 1);
+    EXPECT_TRUE(tracker.IsCancelRequested("task-1", 1));
+    EXPECT_FALSE(tracker.IsCancelRequested("task-1", 2)); // 不同 attemptID 不受影响
+}
+
+TEST(AttemptTracker, MarkCompletedClearsCancelFlag)
+{
+    AttemptTracker tracker;
+    tracker.MarkRunning("task-1", 1);
+    tracker.RequestCancel("task-1", 1);
+    tracker.MarkCompleted("task-1", 1);
+    EXPECT_FALSE(tracker.IsCancelRequested("task-1", 1));
+}
