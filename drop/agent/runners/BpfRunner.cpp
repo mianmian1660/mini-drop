@@ -363,7 +363,7 @@ namespace drop_agent
         if (timeout == 0)
             timeout = 60;
         // gracePeriodSec=1：对齐旧 exec_bpftrace() 里比其他采集器更短的 grace period。
-        poller_.reset(new drop::TimedProcessPoller(ctx.executor, ctx.clock, timeout, /*gracePeriodSec=*/1));
+        poller_.reset(new drop::TimedProcessPoller(ctx.executor, ctx.clock, timeout, /*gracePeriodSec=*/1, ctx.pidRegistry));
         poller_->Attach(handle);
         StartResult r;
         r.ok = true;

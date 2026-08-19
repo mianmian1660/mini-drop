@@ -73,6 +73,7 @@ set(COMMON_SRCS
     common/ProcessExecutor.cpp
     common/ObjectStore.cpp
     common/LoggerIface.cpp
+    common/PidRegistry.cpp
 )
 
 # ---------- server 模块源文件 ----------
@@ -106,6 +107,7 @@ add_executable(drop_agent
     agent/HeartbeatThread.cpp
     agent/WorkerThread.cpp
     agent/UploadWorker.cpp
+    agent/CleanupWorker.cpp
     agent/RunnerUtils.cpp
     agent/RunnerRegistry.cpp
     agent/runners/PerfRunner.cpp
@@ -164,9 +166,11 @@ if(GTest_FOUND)
         tests/test_agent_task_queue.cpp
         tests/test_attempt_tracker.cpp
         tests/test_upload_queue.cpp
+        tests/test_pid_registry.cpp
         server/TaskQueue.cpp
         common/ProcessExecutor.cpp
         common/Process.cpp
+        common/PidRegistry.cpp
         agent/RunnerUtils.cpp
         agent/TaskQueue.cpp
         agent/UploadQueue.cpp

@@ -38,6 +38,11 @@ namespace drop_agent
         uint32_t registerTimeoutSec = 10;  // 注册超时（秒）
         uint32_t heartbeatTimeoutSec = 10; // 心跳 RPC 超时（秒），Phase 3：优雅关闭时避免心跳线程无限阻塞
 
+        // Phase 5：CleanupWorker 参数
+        uint32_t cleanupIntervalSec = 60;    // CleanupWorker 扫描周期（秒）
+        uint32_t taskDirRetentionSec = 3600; // 任务目录保留时长（秒），超过此时长的 /tmp/drop_agent/tasks/<taskID>/<attemptID>/ 会被清理
+        uint32_t orphanPidGraceSec = 300;    // pid 登记表宽限期（秒），远大于任何 Runner 自身的 timeoutSec+gracePeriodSec，超过仍未摘牌视为孤儿进程
+
         /// 从 JSON 文件加载配置
         static AgentConfig LoadFromFile(const std::string &configPath);
 

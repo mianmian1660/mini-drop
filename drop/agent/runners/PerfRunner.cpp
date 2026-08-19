@@ -113,7 +113,7 @@ namespace drop_agent
         uint32_t timeout = ctx.task.timeoutsec();
         if (timeout == 0)
             timeout = 60;
-        poller_.reset(new drop::TimedProcessPoller(ctx.executor, ctx.clock, timeout));
+        poller_.reset(new drop::TimedProcessPoller(ctx.executor, ctx.clock, timeout, /*gracePeriodSec=*/5, ctx.pidRegistry));
         poller_->Attach(handle);
         StartResult r;
         r.ok = true;

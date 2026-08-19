@@ -21,6 +21,7 @@
 #include <thread>
 #include "agent/TaskQueue.h"
 #include "agent/UploadQueue.h"
+#include "common/PidRegistry.h"
 
 namespace drop_agent
 {
@@ -30,6 +31,7 @@ namespace drop_agent
     public:
         WorkerThread(TaskQueue &taskQueue,
                      UploadQueue &uploadQueue,
+                     drop::PidRegistry &pidRegistry,
                      std::atomic<bool> &runningFlag);
 
         void Start();
@@ -43,6 +45,7 @@ namespace drop_agent
 
         TaskQueue &taskQueue_;
         UploadQueue &uploadQueue_;
+        drop::PidRegistry &pidRegistry_;
         std::atomic<bool> &running_;
         std::thread thread_;
     };

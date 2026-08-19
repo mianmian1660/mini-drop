@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <sys/stat.h>
 
 using namespace std;
@@ -14,6 +15,27 @@ namespace drop_agent
     {
         struct stat st;
         return stat(path.c_str(), &st) == 0;
+    }
+
+    bool EnsureDirRecursive(const string &path)
+    {
+        if (path.empty())
+            return false;
+
+        string cur;
+        cur.reserve(path.size());
+        for (size_t i = 0; i < path.size(); ++i)
+        {
+            cur += path[i];
+            bool lastChar = (i + 1 == path.size());
+            if (path[i] != '/' && !lastChar)
+                continue;
+            if (cur == "/" || cur.empty())
+                continue;
+            if (::mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST)
+                return false;
+        }
+        return true;
     }
 
     string JsonEscape(const string &s)

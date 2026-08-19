@@ -130,8 +130,9 @@ namespace drop
     }
 
     TimedProcessPoller::TimedProcessPoller(ProcessExecutor *executor, Clock *clock,
-                                            uint32_t timeoutSec, uint32_t gracePeriodSec)
-        : executor_(executor), clock_(clock), gracePeriodSec_(gracePeriodSec)
+                                            uint32_t timeoutSec, uint32_t gracePeriodSec,
+                                            PidRegistry *pidRegistry)
+        : executor_(executor), clock_(clock), pidRegistry_(pidRegistry), gracePeriodSec_(gracePeriodSec)
     {
         deadline_ = clock_->Now() + chrono::seconds(timeoutSec);
     }
@@ -139,6 +140,17 @@ namespace drop
     void TimedProcessPoller::Attach(ExecHandle handle)
     {
         handle_ = handle;
+        if (pidRegistry_)
+            pidRegistry_->Register(handle_.pid);
+    }
+
+    PollOutcome TimedProcessPoller::MarkReaped(PollOutcome o)
+    {
+        reaped_ = true;
+        lastOutcome_ = o;
+        if (pidRegistry_)
+            pidRegistry_->Unregister(handle_.pid);
+        return lastOutcome_;
     }
 
     PollOutcome TimedProcessPoller::Poll()
@@ -150,28 +162,18 @@ namespace drop
         {
             auto o = executor_->Poll(handle_);
             if (o.state != PollState::kRunning)
-            {
-                reaped_ = true;
-                lastOutcome_ = o;
-                return lastOutcome_;
-            }
+                return MarkReaped(o);
             if (clock_->Now() >= sigtermSentAt_ + chrono::seconds(gracePeriodSec_))
             {
                 executor_->SendSignal(handle_, SIGKILL);
-                lastOutcome_ = executor_->WaitBlocking(handle_);
-                reaped_ = true;
-                return lastOutcome_;
+                return MarkReaped(executor_->WaitBlocking(handle_));
             }
             return o;
         }
 
         auto o = executor_->Poll(handle_);
         if (o.state != PollState::kRunning)
-        {
-            reaped_ = true;
-            lastOutcome_ = o;
-            return lastOutcome_;
-        }
+            return MarkReaped(o);
         if (clock_->Now() >= deadline_)
         {
             timedOut_ = true;
@@ -189,11 +191,7 @@ namespace drop
 
         auto o = executor_->Poll(handle_);
         if (o.state != PollState::kRunning)
-        {
-            reaped_ = true;
-            lastOutcome_ = o;
-            return lastOutcome_;
-        }
+            return MarkReaped(o);
 
         executor_->SendSignal(handle_, SIGTERM);
         auto graceDeadline = clock_->Now() + chrono::seconds(gracePeriodSec_);
@@ -201,18 +199,12 @@ namespace drop
         {
             o = executor_->Poll(handle_);
             if (o.state != PollState::kRunning)
-            {
-                reaped_ = true;
-                lastOutcome_ = o;
-                return lastOutcome_;
-            }
+                return MarkReaped(o);
             this_thread::sleep_for(chrono::milliseconds(200));
         }
 
         executor_->SendSignal(handle_, SIGKILL);
-        lastOutcome_ = executor_->WaitBlocking(handle_);
-        reaped_ = true;
-        return lastOutcome_;
+        return MarkReaped(executor_->WaitBlocking(handle_));
     }
 
 } // namespace drop

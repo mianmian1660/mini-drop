@@ -76,7 +76,8 @@ namespace drop_agent
         // ============================================================
         RunnerOutcome RunTaskLifecycle(uint32_t profilerType, const hotmethod::TaskDesc &task,
                                         const string &outputPath,
-                                        const std::atomic<bool> &runningFlag)
+                                        const std::atomic<bool> &runningFlag,
+                                        drop::PidRegistry &pidRegistry)
         {
             RunnerOutcome out;
             out.outputPath = outputPath;
@@ -137,6 +138,7 @@ namespace drop_agent
             ctx.clock = &s_clock;
             ctx.objectStore = &s_objectStore;
             ctx.logger = &s_logger;
+            ctx.pidRegistry = &pidRegistry;
 
             auto runner = drop_agent::CreateRunner(profilerType);
 
@@ -273,9 +275,11 @@ namespace drop_agent
 
     WorkerThread::WorkerThread(TaskQueue &taskQueue,
                                UploadQueue &uploadQueue,
+                               drop::PidRegistry &pidRegistry,
                                std::atomic<bool> &runningFlag)
         : taskQueue_(taskQueue),
           uploadQueue_(uploadQueue),
+          pidRegistry_(pidRegistry),
           running_(runningFlag)
     {
     }
@@ -310,10 +314,15 @@ namespace drop_agent
                  << " hz=" << task.sampleargv().hz()
                  << " duration=" << task.sampleargv().duration() << endl;
 
-            string outputPath = "/tmp/" + to_string(ptype) + "_" + task.taskid() + "_output";
+            // Phase 5：统一任务目录隔离，每个 (taskID, attemptID) 各有独立目录，
+            // 不再靠文件名拼接 profilerType+taskID 去重（同一 taskID 的重试
+            // attempt 用子目录区分，不会互相覆盖产物）。
+            string taskDir = "/tmp/drop_agent/tasks/" + task.taskid() + "/" + to_string(task.attempt_id()) + "/";
+            EnsureDirRecursive(taskDir);
+            string outputPath = taskDir + "output";
 
             auto collectStart = steady_clock::now();
-            RunnerOutcome outcome = RunTaskLifecycle(ptype, task, outputPath, running_);
+            RunnerOutcome outcome = RunTaskLifecycle(ptype, task, outputPath, running_, pidRegistry_);
             auto collectMs = duration_cast<milliseconds>(steady_clock::now() - collectStart).count();
             drop::log_event("drop_agent",
                              outcome.resultCode == 0 ? "collection_succeeded" : "collection_failed",

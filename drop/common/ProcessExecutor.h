@@ -16,6 +16,7 @@
 #pragma once
 
 #include "common/Clock.h"
+#include "common/PidRegistry.h"
 
 #include <cstdint>
 #include <string>
@@ -94,8 +95,11 @@ namespace drop
     class TimedProcessPoller
     {
     public:
+        /// pidRegistry 为 nullptr 时（如单测里的 FakeProcessExecutor 驱动场景）
+        /// 完全不登记，行为和 Phase 5 之前一致。
         TimedProcessPoller(ProcessExecutor *executor, Clock *clock,
-                            uint32_t timeoutSec, uint32_t gracePeriodSec = 5);
+                            uint32_t timeoutSec, uint32_t gracePeriodSec = 5,
+                            PidRegistry *pidRegistry = nullptr);
 
         void Attach(ExecHandle handle);
 
@@ -112,8 +116,14 @@ namespace drop
         pid_t Pid() const { return handle_.pid; }
 
     private:
+        /// 统一的"进程已收割"落点：设 reaped_/lastOutcome_，并在 pidRegistry_
+        /// 非空时把 pid 从登记表摘牌。Poll()/ForceStop() 里所有到达终态的
+        /// 分支都走这里，不再各自重复设置。
+        PollOutcome MarkReaped(PollOutcome o);
+
         ProcessExecutor *executor_;
         Clock *clock_;
+        PidRegistry *pidRegistry_;
         ExecHandle handle_;
         std::chrono::steady_clock::time_point deadline_;
         uint32_t gracePeriodSec_;

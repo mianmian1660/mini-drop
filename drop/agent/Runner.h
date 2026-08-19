@@ -11,6 +11,7 @@
 #include "common/Clock.h"
 #include "common/LoggerIface.h"
 #include "common/ObjectStore.h"
+#include "common/PidRegistry.h"
 #include "common/ProcessExecutor.h"
 #include "common/proto/hotmethod.pb.h"
 
@@ -93,12 +94,13 @@ namespace drop_agent
     /// 必须是独立所有权对象，不能引用一个可能已经析构的栈帧。
     struct TaskContext
     {
-        std::string taskDir; // 任务输出文件的基础路径（不含后缀），Phase 5 之前只是一个文件前缀，不是真正的隔离目录
+        std::string taskDir; // 任务输出文件的基础路径（不含后缀）。Phase 5 起落在 /tmp/drop_agent/tasks/<taskID>/<attemptID>/ 隔离目录下
         hotmethod::TaskDesc task;
         drop::ProcessExecutor *executor = nullptr;
         drop::Clock *clock = nullptr;
         drop::ObjectStore *objectStore = nullptr;
         drop::Logger *logger = nullptr;
+        drop::PidRegistry *pidRegistry = nullptr; // Phase 5：Runner 的 TimedProcessPoller 用它登记/摘牌子进程 pid，供 CleanupWorker 兜底回收孤儿进程
     };
 
     class Runner

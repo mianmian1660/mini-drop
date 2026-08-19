@@ -14,6 +14,10 @@ namespace drop_agent
 
     bool FileExists(const std::string &path);
 
+    /// mkdir -p 语义：逐级创建目录，已存在的目录段不报错。path 可以带
+    /// 或不带结尾斜杠。成功（含"已经存在"）返回 true。
+    bool EnsureDirRecursive(const std::string &path);
+
     /// JSON 字符串转义（引号/反斜杠/换行）
     std::string JsonEscape(const std::string &s);
 
