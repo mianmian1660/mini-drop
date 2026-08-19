@@ -9,8 +9,16 @@
 # ---------- 阶段1：编译 ----------
 FROM ubuntu:22.04 AS builder
 
-# 腾讯云内网镜像加速 apt（服务器上构建更快，其他网络环境 sed 失败不影响）
-RUN sed -i s@/archive.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && sed -i s@/security.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list
+# 优先用腾讯云内网镜像加速 apt（腾讯云环境下更快）；mirrors.tencentyun.com
+# 只有腾讯云内网机器能解析，非腾讯云环境会挂掉。这里不覆盖原有腾讯云配置，
+# 先按原样替换，用 getent hosts 显式探测能不能解析，不能就回退阿里云公网
+# 镜像——不能靠 apt-get update 自己的退出码判断，它遇到源不可达时默认只是
+# 打 warning、照样返回 0（真正的硬失败要等后面 apt-get install 才会暴露）。
+RUN sed -i s@/archive.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && \
+    sed -i s@/security.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && \
+    if ! getent hosts mirrors.tencentyun.com > /dev/null 2>&1; then \
+        sed -i s@/mirrors.tencentyun.com/@/mirrors.aliyun.com/@g /etc/apt/sources.list; \
+    fi
 
 # 禁止 apt 安装时弹出交互式界面（Docker 里没有终端）
 ENV DEBIAN_FRONTEND=noninteractive
