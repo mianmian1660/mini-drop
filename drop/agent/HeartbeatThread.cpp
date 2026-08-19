@@ -251,6 +251,10 @@ namespace drop_agent
     {
         if (thread_.joinable())
             thread_.join();
+    }
+
+    void HeartbeatThread::StopSampler()
+    {
         nativeSampler_.Stop();
     }
 

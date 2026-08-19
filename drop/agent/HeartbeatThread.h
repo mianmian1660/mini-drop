@@ -47,8 +47,15 @@ namespace drop_agent
 
         void Start();
 
-        /// join 线程并停止内部持有的 Native CP 采样器。幂等。
+        /// 只 join 心跳循环线程，不碰 Native CP 采样器——Phase 6 起，主循环
+        /// 收尾顺序对齐指南要求的 Heartbeat→Worker→Upload→Cleanup→
+        /// NativeSampler，采样器要活到最后一步才停，所以从这里拆出去，
+        /// 见 StopSampler()。幂等。
         void Stop();
+
+        /// 停止内部持有的 Native CP 采样器。必须在 Stop() 之后调用（心跳
+        /// 循环线程已经 join，不会再有并发访问）。幂等。
+        void StopSampler();
 
     private:
         void Loop();

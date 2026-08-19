@@ -1,8 +1,8 @@
 // ============================================================
 // drop_agent (Agent 主程序) — 精简入口
 // ============================================================
-// Phase 3/4/5 起，Agent 内部拆成四个线程，通过两条队列 + 一张 pid 登记表
-// 解耦（新复刻指南 5.7 节）：
+// Phase 3/4/5/6 起，Agent 内部拆成四个线程 + 一个独立的 Native CP 采样器，
+// 通过两条队列 + 一张 pid 登记表解耦（新复刻指南 5.7 节）：
 //   agent/HeartbeatThread.h/cpp — 心跳、故障转移、把 Server 派发的任务
 //                                  塞进 TaskQueue
 //   agent/WorkerThread.h/cpp    — 消费 TaskQueue，跑 Runner 全生命周期
@@ -21,7 +21,8 @@
 //
 // main() 现在只做：加载配置 → 首次注册（失败即退出）→ 组装上面几个对象 →
 // 启动四个线程 → 等待退出信号 → 按 Heartbeat→Worker→UploadWorker→
-// CleanupWorker 顺序收尾（对齐指南要求的最终收尾顺序）。
+// CleanupWorker→NativeSampler 顺序收尾——这是 Phase 6 落地的最终收尾顺序，
+// 对齐新复刻指南要求。
 //
 // 采集器实现（drop_agent::Runner 生命周期接口）仍是：
 //   agent/Runner.h / RunnerRegistry.h / RunnerUtils.h / runners/*Runner.cpp
@@ -151,16 +152,24 @@ int main(int argc, char **argv)
     while (agent_running)
         this_thread::sleep_for(milliseconds(200));
 
-    // ---------- 5. 优雅关闭：Heartbeat 先停（不再有新任务入队）→
-    //              Worker 再停（跑完/中断当前任务后退出循环，把结果丢进
-    //              UploadQueue）→ UploadWorker 再停（排空 UploadQueue，
-    //              确保"采集刚结束还在排队等上传"的任务不被丢弃）→
-    //              CleanupWorker 最后停（不参与任务生命周期，什么时候停
-    //              都不影响正确性，放最后收尾即可）----------
+    // ---------- 5. 优雅关闭：Phase 6 最终顺序，对齐新复刻指南——
+    //              Heartbeat → Worker → Upload → Cleanup → NativeSampler：
+    //              1) Heartbeat 心跳循环先停（不再有新任务入队、不再有
+    //                 故障转移打断后面几步）
+    //              2) Worker 再停（跑完/中断当前任务后退出循环，把结果
+    //                 丢进 UploadQueue）
+    //              3) UploadWorker 再停（排空 UploadQueue，确保"采集刚
+    //                 结束还在排队等上传"的任务不被丢弃）
+    //              4) CleanupWorker 再停（不参与任务生命周期，放在业务
+    //                 线程之后收尾即可）
+    //              5) Native CP 采样器最后停——它走独立的 HTTP 通道上报，
+    //                 不依赖心跳的 gRPC 连接，让它活到最后一刻，尽量不
+    //                 丢失关闭过程中的采样数据 ----------
     cout << "[agent] 收到退出信号，正在关闭..." << endl;
     heartbeat.Stop();
     worker.Stop();
     uploader.Stop();
     cleanup.Stop();
+    heartbeat.StopSampler();
     return 0;
 }
