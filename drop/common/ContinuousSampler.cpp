@@ -235,6 +235,13 @@ static std::string parse_frame_name(const std::string &raw)
     {
         size_t slash = dso.rfind('/');
         std::string base = slash == std::string::npos ? dso : dso.substr(slash + 1);
+        // perf 退化输出时 DSO 位置可能本身就是方括号占位符，比如
+        // "0x... [unknown] ([unknown])" 或 "[kernel.kallsyms]"——先剥掉外层
+        // 方括号，避免拼出 "0x... [[unknown]]" 这类双层括号。
+        if (base.size() >= 2 && base.front() == '[' && base.back() == ']')
+            base = base.substr(1, base.size() - 2);
+        if (base.empty() || base == "unknown")
+            return "0x" + first;
         return "0x" + first + " [" + base + "]";
     }
     return name;
