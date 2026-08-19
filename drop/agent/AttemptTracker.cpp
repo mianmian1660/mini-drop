@@ -52,6 +52,17 @@ namespace drop_agent
         return cancelRequested_.find(Key(taskID, attemptID)) != cancelRequested_.end();
     }
 
+    bool AttemptTracker::IsRunning(const std::string &taskID, uint64_t attemptID) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return std::any_of(running_.begin(), running_.end(),
+                           [&](const common::AttemptStatus &attempt)
+                           {
+                               return attempt.taskid() == taskID &&
+                                      attempt.attempt_id() == attemptID;
+                           });
+    }
+
     std::vector<common::AttemptStatus> AttemptTracker::RunningSnapshot() const
     {
         std::lock_guard<std::mutex> lock(mutex_);

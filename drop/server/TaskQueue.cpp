@@ -99,31 +99,28 @@ namespace drop_server
 
     vector<pair<string, uint64_t>> collect_cancel_attempts_locked(
         const string &targetIP,
-        const unordered_set<string> &currentlyRunningKeys)
+        const unordered_set<string> & /*currentlyRunningKeys*/)
     {
         vector<pair<string, uint64_t>> out;
         auto it = pending_cancels_.find(targetIP);
         if (it == pending_cancels_.end())
             return out;
 
-        auto &keys = it->second;
-        for (auto keyIt = keys.begin(); keyIt != keys.end();)
+        // 不以本次 running_attempts 是否包含该 attempt 作为删除依据。
+        // CancelTask 可能恰好发生在 Server 已派发、Agent 尚未通过下一次
+        // 心跳汇报 running 的窗口；若此时删除，取消指令会永久丢失。
+        // pending_cancels_ 只由 mark_attempt_completed_locked() 在收到 Agent
+        // completed_attempts 明确确认后清理。在确认前每次心跳都重发，Agent
+        // 侧的 CancelQueued/RequestCancel 都是幂等操作。
+        for (const auto &key : it->second)
         {
-            if (currentlyRunningKeys.find(*keyIt) == currentlyRunningKeys.end())
-            {
-                // Agent 已经不再汇报这个 attempt 为 running：取消已生效，
-                // 或者这个 attempt 本来就没在这台 Agent 上跑，清理掉。
-                keyIt = keys.erase(keyIt);
+            size_t hashPos = key.rfind('#');
+            if (hashPos == string::npos)
                 continue;
-            }
-            size_t hashPos = keyIt->rfind('#');
-            string taskID = keyIt->substr(0, hashPos);
-            uint64_t attemptID = static_cast<uint64_t>(stoull(keyIt->substr(hashPos + 1)));
+            string taskID = key.substr(0, hashPos);
+            uint64_t attemptID = static_cast<uint64_t>(stoull(key.substr(hashPos + 1)));
             out.emplace_back(taskID, attemptID);
-            ++keyIt;
         }
-        if (keys.empty())
-            pending_cancels_.erase(it);
         return out;
     }
 
@@ -134,7 +131,20 @@ namespace drop_server
 
     void mark_attempt_completed_locked(const hotmethod::TaskResult &result)
     {
-        completed_attempts_.insert(result.taskid() + "#" + to_string(result.attempt_id()));
+        const string key = result.taskid() + "#" + to_string(result.attempt_id());
+        completed_attempts_.insert(key);
+
+        // completed_attempts 是 Agent 对任务已结束（包括取消已生效）的明确
+        // 确认。收到确认后再清除所有 target 下对应的取消意图，避免派发到
+        // 首次 running 心跳之间的竞态窗口吞掉取消请求。
+        for (auto it = pending_cancels_.begin(); it != pending_cancels_.end();)
+        {
+            it->second.erase(key);
+            if (it->second.empty())
+                it = pending_cancels_.erase(it);
+            else
+                ++it;
+        }
     }
 
     EnqueueResult enqueue_task_locked(const string &targetIP, const hotmethod::TaskDesc &task)
@@ -385,9 +395,42 @@ namespace drop_server
 
             {
                 lock_guard<mutex> lock(tasks_mutex);
-                (void)enqueue_task_locked(ip, item.task);
+                if (item.task.taskid().empty() || is_attempt_completed_locked(item.task))
+                    continue;
+
+                auto &queue = tasks_[ip];
+                const string key = task_attempt_key(item.task);
+                bool duplicate = false;
+                for (const auto &queued : queue)
+                {
+                    if (task_attempt_key(queued.task) == key)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate || queue.size() >= MAX_QUEUE_LENGTH_PER_AGENT)
+                    continue;
+
+                // 直接恢复完整 QueuedTask，而不是重新调用 enqueue_task_locked。
+                // 后者会重建元数据，导致 canceled/enqueued_unix_ms 等快照状态
+                // 丢失，已取消任务在重启后可能被重新派发。
+                queue.push_back(item);
+                stable_sort(queue.begin(), queue.end(), [](const QueuedTask &a, const QueuedTask &b) {
+                    if (a.priority != b.priority)
+                        return a.priority > b.priority;
+                    if (a.deadline_unix_ms != b.deadline_unix_ms)
+                    {
+                        if (a.deadline_unix_ms == 0)
+                            return false;
+                        if (b.deadline_unix_ms == 0)
+                            return true;
+                        return a.deadline_unix_ms < b.deadline_unix_ms;
+                    }
+                    return a.enqueued_unix_ms < b.enqueued_unix_ms;
+                });
+                restored++;
             }
-            restored++;
         }
 
         if (restored > 0)

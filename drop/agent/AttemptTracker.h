@@ -38,6 +38,7 @@ namespace drop_agent
         // 只是 StopReason 换成 kCancel。
         void RequestCancel(const std::string &taskID, uint64_t attemptID);
         bool IsCancelRequested(const std::string &taskID, uint64_t attemptID) const;
+        bool IsRunning(const std::string &taskID, uint64_t attemptID) const;
 
     private:
         static std::string Key(const std::string &taskID, uint64_t attemptID);

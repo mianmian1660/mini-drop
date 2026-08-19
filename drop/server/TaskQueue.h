@@ -38,8 +38,8 @@ namespace drop_server
 
     /// Phase 7：已派发（不在 tasks_ 队列里）、待取消的 attempt，按 targetIP
     /// 索引，值是 task_attempt_key() 集合。CancelTask 对已派发任务写入这里，
-    /// HealthCheckService::Do 每次心跳都从这里取出还在 running_attempts 里
-    /// 的条目下发给 Agent，直到 Agent 不再汇报为 running 才摘除。
+    /// HealthCheckService::Do 每次心跳都从这里取出并下发给 Agent，直到
+    /// Agent 通过 completed_attempts 明确确认任务结束才摘除。
     extern std::unordered_map<std::string, std::unordered_set<std::string>> pending_cancels_;
 
     std::string task_attempt_key(const std::string &taskID, uint64_t attemptID);
@@ -53,11 +53,10 @@ namespace drop_server
     /// Phase 7：登记"这个已派发 attempt 需要被取消"，供下次心跳下发。
     void request_cancel_locked(const std::string &targetIP, const std::string &taskID, uint64_t attemptID);
 
-    /// Phase 7：currentlyRunningKeys 是本次心跳里 Agent 汇报的
-    /// running_attempts 对应的 task_attempt_key 集合。返回这次要下发给
-    /// Agent 的 (taskID, attemptID) 取消列表；同时清理掉 pending_cancels_
-    /// 里已经不在 running_attempts 里的旧条目（取消已生效，或者这个
-    /// attempt 本来就没有在这台 Agent 上跑）。
+    /// Phase 7：返回这次要下发给 Agent 的 (taskID, attemptID) 取消列表。
+    /// currentlyRunningKeys 保留在接口中用于兼容调用方，但不能作为删除
+    /// 依据：派发后首次 running 心跳前集合也会为空。取消项只在收到 Agent
+    /// completed_attempts 后由 mark_attempt_completed_locked 清理。
     std::vector<std::pair<std::string, uint64_t>> collect_cancel_attempts_locked(
         const std::string &targetIP,
         const std::unordered_set<std::string> &currentlyRunningKeys);

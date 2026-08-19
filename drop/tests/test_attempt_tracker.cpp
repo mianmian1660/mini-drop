@@ -17,6 +17,8 @@ TEST(AttemptTracker, MarkRunningAppearsInRunningSnapshot)
     EXPECT_EQ(running[0].taskid(), "task-1");
     EXPECT_EQ(running[0].attempt_id(), 1u);
     EXPECT_TRUE(tracker.CompletedSnapshot().empty());
+    EXPECT_TRUE(tracker.IsRunning("task-1", 1));
+    EXPECT_FALSE(tracker.IsRunning("task-1", 2));
 }
 
 TEST(AttemptTracker, MarkCompletedMovesFromRunningToCompleted)
@@ -26,6 +28,7 @@ TEST(AttemptTracker, MarkCompletedMovesFromRunningToCompleted)
     tracker.MarkCompleted("task-1", 1);
 
     EXPECT_TRUE(tracker.RunningSnapshot().empty());
+    EXPECT_FALSE(tracker.IsRunning("task-1", 1));
     auto completed = tracker.CompletedSnapshot();
     ASSERT_EQ(completed.size(), 1u);
     EXPECT_EQ(completed[0].taskid(), "task-1");
