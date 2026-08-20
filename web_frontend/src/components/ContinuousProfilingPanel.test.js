@@ -7,6 +7,7 @@ jest.mock('./InteractiveFlamegraph', () => ({
 import {
     makeSequentialDiffWindows,
     makeTimeWindow,
+    coverageSegments,
     rangeOptionsForRetention,
     runtimeLabel,
     validateCustomTimeWindow,
@@ -23,6 +24,24 @@ test('quick ranges are recalculated from the supplied current time', () => {
     const second = makeTimeWindow('30m', new Date('2026-08-19T10:05:00Z'));
     expect(first).toEqual({ from: '2026-08-19T09:30:00.000Z', to: '2026-08-19T10:00:00.000Z' });
     expect(second.to).toBe('2026-08-19T10:05:00.000Z');
+});
+
+test('coverage segments preserve covered and gap proportions', () => {
+    const coverage = { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z' };
+    const segments = coverageSegments(coverage, [{
+        start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z',
+    }]);
+    expect(segments.map(item => item.type)).toEqual(['covered', 'gap', 'covered']);
+    expect(segments.map(item => Math.round(item.percent))).toEqual([40, 20, 40]);
+});
+
+test('coverage segments clip gaps to the selected range', () => {
+    const coverage = { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z' };
+    const segments = coverageSegments(coverage, [{
+        start: '2026-08-19T09:59:00Z', end: '2026-08-19T10:01:00Z',
+    }]);
+    expect(segments[0].type).toBe('gap');
+    expect(Math.round(segments[0].percent)).toBe(10);
 });
 
 test('runtime labels cover supported languages', () => {

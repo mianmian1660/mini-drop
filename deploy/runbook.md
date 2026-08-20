@@ -40,6 +40,13 @@
 
 1. 默认开关为 `DROP_NATIVE_CP_ENABLED=true`、`DROP_NATIVE_CP_EBPF_ENABLED=true`、`DROP_NATIVE_CP_SIGNALS=cpu,io,sched`、`DROP_NATIVE_CP_CPU_BACKENDS=core,bpftrace,perf`。
 2. 先检查 `curl -fsS http://111.230.29.115/healthz` 和 `docker compose logs --tail=160 drop_agent apiserver`。
+
+### 持续采集 spool 与时钟
+
+- Agent 待传批次位于宿主机 `/var/lib/mini-drop/continuous-spool`，文件应为 `0600`；收到服务端相同 `batch_id` 的明确 ACK 后才会删除。
+- 默认配额 5 GiB，并保留至少 2 GiB 文件系统空间；达到任一阈值时 Agent 暂停新采样并继续补传，禁止手工删除 spool 规避背压。
+- 检查 `timedatectl status` 与 `chronyc tracking`。所有采集节点必须启用 NTP/chrony；时钟偏差超过 5 秒为 warning，超过 30 秒为 critical，但服务端仍保留原始数据。
+- API/MinIO 恢复后，确认日志出现 `batch ACK received`、spool 逐步清空，并在 Native Profiling 覆盖时间带检查真实采集缺口。
 3. Web 主机详情页的 Native Profiling 应显示 CPU、IO 延迟、调度延迟三类视图；CPU 轨显示当前 backend，IO/sched 显示 histogram 与 P95/P99 趋势。
 4. 如果日志出现 `CO-RE BTF unavailable`，确认 `/sys/kernel/btf/vmlinux` 或显式 `DROP_BTF_PATH`；当前版本会继续 fallback 到 bpftrace/perf。
 5. 如果日志出现 `bpftrace failed`、`tracepoints unavailable` 或 `Operation not permitted`，确认 `privileged`、`pid: host`、`tracefs/debugfs` 挂载、`BPF/PERFMON/SYS_RESOURCE` capability 和 memlock。

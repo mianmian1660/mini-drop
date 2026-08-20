@@ -6,6 +6,7 @@
 #include "common/Log.h"               // drop::log_event
 
 #include <iostream>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -104,6 +105,16 @@ namespace drop_agent
     namespace
     {
 
+        uint64_t EnvUint64(const char *name, uint64_t fallback)
+        {
+            string value = EnvString(name);
+            if (value.empty())
+                return fallback;
+            char *end = nullptr;
+            unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+            return end && *end == '\0' ? static_cast<uint64_t>(parsed) : fallback;
+        }
+
         string ExtractJsonString(const string &json, const string &key)
         {
             string needle = "\"" + key + "\"";
@@ -201,6 +212,10 @@ namespace drop_agent
             nativeCfg.aggregationWindowSec = 10;
             nativeCfg.uploadBatchSec = 60;
             nativeCfg.retentionHours = 24;
+            nativeCfg.spoolDirectory = EnvString("DROP_NATIVE_CP_SPOOL_DIR", "/var/lib/mini-drop/continuous-spool");
+            nativeCfg.spoolMaxBytes = EnvUint64("DROP_NATIVE_CP_SPOOL_MAX_BYTES", 5ULL * 1024 * 1024 * 1024);
+            nativeCfg.spoolMinFreeBytes = EnvUint64("DROP_NATIVE_CP_SPOOL_MIN_FREE_BYTES", 2ULL * 1024 * 1024 * 1024);
+            nativeCfg.retryMaxSec = static_cast<int>(EnvUint64("DROP_NATIVE_CP_RETRY_MAX_SEC", 300));
             nativeCfg.sessionSID = sessionSID;
             nativeCfg.targetIP = cfg.ipAddr;
             nativeCfg.hostname = cfg.hostname;

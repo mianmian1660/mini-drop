@@ -51,6 +51,11 @@ const S = {
     error: { background: '#fff3f3', border: '1px solid #ffcdd2', color: '#b42318', borderRadius: 8, padding: 12 },
     warn: { color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '9px 12px', fontSize: 13 },
     info: { color: '#475467', background: '#fff', border: '1px solid #eaecf0', borderRadius: 6, padding: '8px 10px', fontSize: 12, lineHeight: 1.55 },
+    coverage: { marginTop: 14, borderTop: '1px solid #eaecf0', paddingTop: 12 },
+    coverageBar: { display: 'flex', width: '100%', height: 14, overflow: 'hidden', borderRadius: 4, background: '#f2f4f7', border: '1px solid #d0d5dd' },
+    coverageOK: { height: '100%', background: '#12b76a' },
+    coverageGap: { height: '100%', background: '#d92d20', minWidth: 2 },
+    gapList: { display: 'grid', gap: 5, marginTop: 8, color: '#b42318', fontSize: 12 },
     tableWrap: { overflowX: 'auto' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '9px 10px', borderBottom: '1px solid #eaecf0', color: '#475467', fontSize: 12, background: '#fff' },
@@ -83,6 +88,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [histogram, setHistogram] = useState(null);
     const [querying, setQuerying] = useState(false);
     const [error, setError] = useState('');
+    const [reliability, setReliability] = useState(null);
     const [resetKey, setResetKey] = useState(0);
     const [scope, setScope] = useState('host');
     const [selectedComm, setSelectedComm] = useState('');
@@ -117,6 +123,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
     const sampleState = sampleStateForTarget(target, flamegraph, topn);
     const sessionMeta = continuousSessionMeta(target);
+    const sessionSID = sessionMeta.sid;
     const rangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours), [sessionMeta.retentionHours]);
     const diffRangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours, true), [sessionMeta.retentionHours]);
     const uploadState = uploadFreshness(sessionMeta);
@@ -162,6 +169,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             params.filters = JSON.stringify(activeFilters);
         }
         try {
+            const timelinePromise = sessionSID
+                ? continuous.timeline(sessionSID, { from: queryWindow.from, to: queryWindow.to }).catch(() => null)
+                : Promise.resolve(null);
             if (signalTab === 'cpu') {
                 setHistogram(null);
                 const cpuParams = { ...params };
@@ -171,7 +181,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     profiles.topn(cpuParams),
                 ];
                 if (profileType === 'memory') requests.push(profiles.timeseries({ ...cpuParams, metric: 'rss_bytes' }));
-                const [fgRes, topRes, rssRes] = await Promise.all(requests);
+                const [profileResults, timelineRes] = await Promise.all([Promise.all(requests), timelinePromise]);
+                const [fgRes, topRes, rssRes] = profileResults;
+                setReliability(timelineRes?.code === 0 ? timelineRes.data : null);
                 if (fgRes.code === 0) setFlamegraph(fgRes.data);
                 if (topRes.code === 0) setTopn(topRes.data);
                 if (profileType === 'memory') setRssSeries(rssRes?.code === 0 ? (rssRes.data?.series || []) : []);
@@ -182,7 +194,11 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 setFlamegraph(null);
                 setTopn(null);
                 const signalType = signalTab === 'io' ? 'io_latency' : 'sched_latency';
-                const histRes = await continuous.histogram({ ...params, signal_type: signalType });
+                const [histRes, timelineRes] = await Promise.all([
+                    continuous.histogram({ ...params, signal_type: signalType }),
+                    timelinePromise,
+                ]);
+                setReliability(timelineRes?.code === 0 ? timelineRes.data : null);
                 if (histRes.code === 0) setHistogram(histRes.data);
                 if (histRes.code !== 0) {
                     setError(histRes.message || 'Native Continuous eBPF histogram 查询失败');
@@ -193,11 +209,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setTopn(null);
             setHistogram(null);
             setRssSeries([]);
+            setReliability(null);
             setError(err?.message || 'Native Continuous Profiling 查询失败');
         } finally {
             setQuerying(false);
         }
-    }, [target, profileType, activeFilters, signalTab, stackScope, maxNodes]);
+    }, [target, profileType, activeFilters, signalTab, stackScope, maxNodes, sessionSID]);
 
     useEffect(() => {
         queryProfiles(timeWindow);
@@ -517,6 +534,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     {signalTab === 'cpu' ? ' comm 是 Linux task comm，可能被截断到约 15 字符。' : ` 当前 backend：${histogram?.backend || signalBackend(sessionMeta, signalTab) || '-'}`}
                     {scope === 'process' && commMessage ? ` ${commMessage}` : ''}
                 </div>
+                <CoverageBand reliability={reliability} />
                 <LabelChips target={target} />
             </section>
 
@@ -719,6 +737,50 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 <summary style={S.detailsSummary}>诊断信息</summary>
                 <pre style={S.mono}>{diagnosticText({ target, flamegraph, topn, timeWindow, profileType, stackScope, filters: activeFilters })}</pre>
             </details>
+        </div>
+    );
+}
+
+function CoverageBand({ reliability }) {
+    if (!reliability?.coverage) return null;
+    const segments = coverageSegments(reliability.coverage, reliability.gaps || []);
+    const ratio = Math.max(0, Math.min(1, Number(reliability.coverage.ratio) || 0));
+    const clock = reliability.clock || {};
+    const clockStatus = clock.status || 'unknown';
+    const clockBad = clockStatus === 'warning' || clockStatus === 'critical';
+    return (
+        <div style={S.coverage}>
+            <div style={S.sectionHead}>
+                <strong style={{ fontSize: 13 }}>采集覆盖</strong>
+                <span style={S.subtle}>
+                    {(ratio * 100).toFixed(1)}% · {reliability.gaps?.length || 0} 个缺口
+                </span>
+            </div>
+            <div style={S.coverageBar} role="img" aria-label={`采集覆盖率 ${(ratio * 100).toFixed(1)}%`}>
+                {segments.map((segment, index) => (
+                    <span
+                        key={`${segment.type}-${index}`}
+                        style={{ ...(segment.type === 'gap' ? S.coverageGap : S.coverageOK), width: `${segment.percent}%` }}
+                        title={`${segment.type === 'gap' ? '缺口' : '已覆盖'} ${formatTime(segment.start)} - ${formatTime(segment.end)}`}
+                    />
+                ))}
+            </div>
+            <div style={S.metaLine}>
+                <span style={clockBad ? { ...S.metaItem, ...S.metaItemWarn } : S.metaItem}>
+                    <span style={S.metaKey}>Agent 时钟</span>
+                    {clockStatus === 'unknown' ? '未观测' : `${clockStatus} · ${formatClockOffset(clock.offset_ms)}`}
+                </span>
+            </div>
+            {Array.isArray(reliability.gaps) && reliability.gaps.length > 0 && (
+                <div style={S.gapList}>
+                    {reliability.gaps.slice(0, 6).map((gap, index) => (
+                        <span key={`${gap.start}-${index}`}>
+                            {formatTime(gap.start)} - {formatTime(gap.end)} · {formatGapDuration(gap.duration_seconds)}
+                        </span>
+                    ))}
+                    {reliability.gaps.length > 6 && <span>另有 {reliability.gaps.length - 6} 个缺口</span>}
+                </div>
+            )}
         </div>
     );
 }
@@ -1148,6 +1210,41 @@ export function validateCustomTimeWindow(fromInput, toInput, retentionHours = 24
 export function rangeOptionsForRetention(retentionHours = 24, forDiff = false) {
     const retentionMinutes = Math.max(1, Number(retentionHours) || 24) * 60;
     return RANGE_OPTIONS.filter(([, , minutes]) => minutes * (forDiff ? 2 : 1) <= retentionMinutes);
+}
+
+export function coverageSegments(coverage, gaps = []) {
+    const from = new Date(coverage?.from).getTime();
+    const to = new Date(coverage?.to).getTime();
+    const total = to - from;
+    if (!Number.isFinite(total) || total <= 0) return [];
+    const normalized = (gaps || []).map(gap => ({
+        start: Math.max(from, new Date(gap.start).getTime()),
+        end: Math.min(to, new Date(gap.end).getTime()),
+    })).filter(gap => Number.isFinite(gap.start) && Number.isFinite(gap.end) && gap.start < gap.end)
+        .sort((a, b) => a.start - b.start);
+    const segments = [];
+    let cursor = from;
+    normalized.forEach(gap => {
+        if (gap.start > cursor) segments.push({ type: 'covered', start: cursor, end: gap.start });
+        if (gap.end > cursor) segments.push({ type: 'gap', start: Math.max(cursor, gap.start), end: gap.end });
+        cursor = Math.max(cursor, gap.end);
+    });
+    if (cursor < to) segments.push({ type: 'covered', start: cursor, end: to });
+    return segments.map(segment => ({ ...segment, percent: ((segment.end - segment.start) / total) * 100 }));
+}
+
+function formatClockOffset(value) {
+    const milliseconds = Number(value);
+    if (!Number.isFinite(milliseconds)) return '-';
+    if (Math.abs(milliseconds) < 1000) return `${milliseconds} ms`;
+    return `${(milliseconds / 1000).toFixed(2)} s`;
+}
+
+function formatGapDuration(value) {
+    const seconds = Math.max(0, Number(value) || 0);
+    if (seconds < 60) return `${seconds.toFixed(1)} 秒`;
+    if (seconds < 3600) return `${(seconds / 60).toFixed(1)} 分钟`;
+    return `${(seconds / 3600).toFixed(1)} 小时`;
 }
 
 function rangeMinutes(range) {

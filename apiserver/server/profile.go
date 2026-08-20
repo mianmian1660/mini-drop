@@ -53,6 +53,9 @@ type ContinuousSessionMeta struct {
 	UploadBatchSec       uint32                 `json:"upload_batch_sec"`
 	RetentionHours       uint32                 `json:"retention_hours"`
 	LastUploadAt         *time.Time             `json:"last_upload_at"`
+	AgentClockOffsetMs   int64                  `json:"agent_clock_offset_ms"`
+	AgentClockStatus     string                 `json:"agent_clock_status"`
+	AgentClockObservedAt *time.Time             `json:"agent_clock_observed_at"`
 	StartedAt            time.Time              `json:"started_at"`
 	StoppedAt            *time.Time             `json:"stopped_at"`
 	Capabilities         map[string]interface{} `json:"capabilities"`
@@ -778,6 +781,9 @@ func continuousSessionMeta(session model.ContinuousSession) *ContinuousSessionMe
 		UploadBatchSec:       firstNonZeroUint32(session.UploadBatchSec, 60),
 		RetentionHours:       firstNonZeroUint32(session.RetentionHours, 24),
 		LastUploadAt:         session.LastUploadAt,
+		AgentClockOffsetMs:   session.AgentClockOffsetMs,
+		AgentClockStatus:     continuousSessionClockStatus(session),
+		AgentClockObservedAt: session.AgentClockObservedAt,
 		StartedAt:            session.StartedAt,
 		StoppedAt:            session.StoppedAt,
 		Capabilities:         capabilities,

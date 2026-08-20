@@ -112,6 +112,7 @@ services:
   # ========================================================
   drop_agent:
     logging: *default-logging
+    stop_grace_period: 30s
     build:
       context: ./drop
       dockerfile: Dockerfile
@@ -138,6 +139,10 @@ services:
       DROP_BTF_PATH: "${DROP_BTF_PATH:-}"
       DROP_NATIVE_CP_API_BASE_URL: "${DROP_NATIVE_CP_API_BASE_URL:-http://127.0.0.1:8191}"
       DROP_NATIVE_CP_SESSION_ID: "${DROP_NATIVE_CP_SESSION_ID:-}"
+      DROP_NATIVE_CP_SPOOL_DIR: "/var/lib/mini-drop/continuous-spool"
+      DROP_NATIVE_CP_SPOOL_MAX_BYTES: "${DROP_NATIVE_CP_SPOOL_MAX_BYTES:-5368709120}"
+      DROP_NATIVE_CP_SPOOL_MIN_FREE_BYTES: "${DROP_NATIVE_CP_SPOOL_MIN_FREE_BYTES:-2147483648}"
+      DROP_NATIVE_CP_RETRY_MAX_SEC: "${DROP_NATIVE_CP_RETRY_MAX_SEC:-300}"
       DROP_GO_SYMBOL_CACHE_DIR: "/var/lib/mini-drop/symbol-cache"
       DROP_GO_SYMBOL_TIMEOUT_SEC: "${DROP_GO_SYMBOL_TIMEOUT_SEC:-120}"
       # GoReSym 解析大型 stripped Go ELF 时可能占用数 GiB；用 Go runtime
@@ -178,6 +183,7 @@ services:
       # cleanupIntervalSec/taskDirRetentionSec/orphanPidGraceSec 等参数
       # 能在验收时调整生效（镜像本身未打包 etc/agent_config.json）。
       - ./drop/etc/agent_config.json:/app/etc/agent_config.json:ro
+      - /var/lib/mini-drop/continuous-spool:/var/lib/mini-drop/continuous-spool
       - gosymbolcache:/var/lib/mini-drop/symbol-cache
     depends_on:
       - drop_server
