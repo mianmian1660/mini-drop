@@ -652,11 +652,13 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 	for _, item := range agg.Top {
 		items = append(items, *item)
 	}
+	// 按栈顶（self）排序，不是按 value（inclusive，函数在调用链任意位置出现都算）。
+	// value 会把"调用了很多耗时子函数的胶水代码"排到热点函数前面，self 才是"这行代码本身在烧 CPU"。
 	sort.Slice(items, func(i, j int) bool {
-		if items[i].Value == items[j].Value {
+		if items[i].Self == items[j].Self {
 			return items[i].Name < items[j].Name
 		}
-		return items[i].Value > items[j].Value
+		return items[i].Self > items[j].Self
 	})
 	maxNodes := q.MaxNodes
 	if maxNodes == 0 {

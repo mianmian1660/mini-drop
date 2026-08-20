@@ -149,11 +149,18 @@ Mini-Drop 没有 eBPF 映射事件驱动，没法完全照搬"事件配对"，�
 - **改动**：读取 `/proc/sys/kernel/kptr_restrict`，纳入能力报告；>0 时在批次里标注 `kernel_symbol_degraded`，写入 `symbol_refs`
 - **效果**：内核帧大面积 `[unknown]` 时能诊断出"权限不够"而不是沉默
 - **风险**：这条本身修不了（需要提升 Agent 权限 `CAP_SYSLOG`，属于部署/运维范畴），代码层面只能做到检测+告警，不能当成"修复"汇报
+- **展示延伸（2026-08-18 用户复盘补充，尚未细化）**：任务3 原设计只到"写入 `symbol_refs`"，用户提出应该进一步把诊断结果**标记在火焰图和 TopN 函数表**里（不只是后端字段，要让使用者在界面上直接看到"这是权限问题，不是解析不出来"）。这是任务3的延伸方向，具体展示方式（图例/颜色/提示文案）还没设计，属于待办，需要先确认前端 `ContinuousProfilingPanel.js` 怎么消费 `symbol_refs` 字段。
 
 ### 任务 4（可选，配合任务 2，优先级最低）—— 持续采集也做 kallsyms 快照
 
 - **改动**：复用 `WorkerThread.cpp` 里已验证过的 `SnapshotKallsyms`/`EnsureKernelSymbolUploaded`，建议重构成 `common/` 共享函数供两条链路使用；每个 `ContinuousSession` 启动时或定期做一次
 - **风险**：涉及重构一次性任务里已经验证通过的文件，按铁律要单独走一遍确认，且价值有限——持续采集的内核解析本来就是本机当场读 `/proc/kallsyms`，快照上传主要用于事后审计，不直接改善当次解析结果
+
+---
+
+## 4.1 不在本文档范围内的相关问题（待单独立题）
+
+**Java/Go pprof CPU 采集器的 bug**（2026-08-18 用户复盘提出）——涉及 `drop/agent/runners/AsyncProfilerRunner.cpp`（Java，async-profiler）和 `drop/agent/runners/PprofRunner.cpp`（Go pprof），是完全独立的采集器实现问题，不属于符号化范畴，也不是持续采集链路。本文档不覆盖，需要单独开一次问题定位再决定方案，不要和任务1-4混着做。
 
 ---
 
@@ -251,9 +258,9 @@ Mini-Drop 没有 eBPF 映射事件驱动，没法完全照搬"事件配对"，�
 **执行后**
 - 改了什么代码文件：新建 `drop/common/BuildId.h`（声明）+ `drop/common/BuildId.cpp`（实现），提供 `BuildIdEntry`、`parse_buildid_list`、`build_id_cached_locally`、`cache_build_id_locally`、`build_dso_path_index`、`resolve_via_pid` 六个共享能力。
 - 实现了什么功能：`build_dso_path_index()` 遍历 `/proc/*/maps` 建出"DSO 路径→pid"索引；`resolve_via_pid` 用索引查到的 pid 尝试字面路径和 `/proc/<pid>/root/<path>`；`cache_build_id_locally` 用"写临时文件再 `rename`"的方式把解析到的二进制拷进 `~/.debug/.build-id/<id[:2]>/<id[2:]>/elf`，`rename` 是原子操作，避免并发预热同一 build-id 时读到写一半的文件。
-- 风险：①`make_dirs`/`getenv("HOME")` 没有单元测试覆盖，纯新写代码从未编译过（本机无 C++ 工具链）；②`build_dso_path_index()` 遍历全部 `/proc/*/maps` 的实际耗时未实测，进程数很多的宿主机上可能比预期慢；③读取权限依赖 Agent 本身以特权模式运行（读别的进程的 `/proc/<pid>/maps`/`/proc/<pid>/root` 需要权限），如果 Agent 权限不够，`build_dso_path_index` 会静默拿到空索引而不是报错。
-- 风险怎么解决：①②需要在 VM/Docker 环境里先做 `docker compose build drop_agent` 验证能编译，再实测一次 `build_dso_path_index()` 耗时（可以在 `warm_build_id_cache` 里临时加日志打印耗时）；③目前是已知限制，权限不够时预热直接跳过、不影响其他逻辑，后续可以在 `CapabilityDetector` 里一并检测（不在本次范围）。
-- 验收步骤：①`docker compose build drop_agent` 编译通过；②手动验证 `~/.debug/.build-id/` 下确实出现了新缓存的 ELF 文件，且 `readelf -h` 能正常解析（证明拷贝没有截断/损坏）；③对一个容器化目标进程做一次持续采集，对比改动前后同一目标的 unknown 帧占比是否下降。
+- 风险：①（已解决，见下）；②`build_dso_path_index()` 遍历全部 `/proc/*/maps` 的实际耗时未实测，进程数很多的宿主机上可能比预期慢；③读取权限依赖 Agent 本身以特权模式运行（读别的进程的 `/proc/<pid>/maps`/`/proc/<pid>/root` 需要权限），如果 Agent 权限不够，`build_dso_path_index` 会静默拿到空索引而不是报错；④（2026-08-18 用户复盘补充）三态尝试缓存 `g_buildIdAttempts` 没有上限，只有成功时清、失败不淘汰，长时间运行的 Agent 可能积累大量 build-id 条目，占用内存无限增长。
+- 风险怎么解决：①**已解决**——`docker compose build drop_agent` 实测编译通过（2026-08-18，`builder 6/6` cmake+make 步骤 31.7s 成功，`drop_agent` 镜像导出成功）；②需要实测一次 `build_dso_path_index()` 耗时（可以在 `warm_build_id_cache` 里临时加日志打印耗时）；③目前是已知限制，权限不够时预热直接跳过、不影响其他逻辑，后续可以在 `CapabilityDetector` 里一并检测（不在本次范围）；④参考 Parca Agent 的 `retry *lru.SyncedLRU` 设计（见调研笔记），给 `g_buildIdAttempts` 加 LRU 淘汰上限（比如固定容量，超过后淘汰最久未访问的条目），本次实现暂未做，记为已知待办。
+- 验收步骤：①**已通过**，`docker compose build drop_agent` 编译成功；②手动验证 `~/.debug/.build-id/` 下确实出现了新缓存的 ELF 文件，且 `readelf -h` 能正常解析（证明拷贝没有截断/损坏）；③对一个容器化目标进程做一次持续采集，对比改动前后同一目标的 unknown 帧占比是否下降；④（新增）长时间运行后检查 `g_buildIdAttempts` 内存占用是否随时间无限增长，验证 LRU 待办是否必要立即做。
 
 ### #15 `SymbolCollector.cpp` 改为复用 `BuildId.h`
 
@@ -324,3 +331,19 @@ Mini-Drop 没有 eBPF 映射事件驱动，没法完全照搬"事件配对"，�
 - 风险：这一步本身很难出错（就是加一行文件路径），真正的风险是前面 5 项改动本身能不能编译过，这条任务不能单独验证，要跟其他改动一起过一遍完整构建。
 - 风险怎么解决：无需单独处理，随 `docker compose build drop_agent` 一起验证。
 - 验收步骤：`docker compose build drop_agent` 和 `docker compose build drop_server` 都编译成功（不仅是链了 `BuildId.cpp`，还要确认没有因为两个可执行文件的其他源文件冲突导致的重复符号等问题）。
+
+### #20（2026-08-18 补做）`g_buildIdAttempts` 加 LRU 淘汰上限
+
+**背景**：2026-08-18 全面复核代码时发现，`ContinuousSampler.cpp` 在 #14-19 之后被组员大幅扩展（新增 `GoSymbolizer.cpp`/`RuntimeSymbolMap.cpp`/`PythonRuntimeProfiler.cpp`/`MemrayProfileIngest.cpp` 等，`symbol_refs` 已经在填充，覆盖 Go/Java/Node/Python 全部走本地解析路线，没有接服务端符号库）。核对下来 #14-19 六项本身没有回归，但 #16 遗留的"三态缓存无上限"问题依然存在，且发现同文件里 `RuntimeSymbolMap.cpp:296-309` 的 `g_javaLastRefreshMap` 已经用同款"超上限淘汰最老一条"手法解决过一次同类问题，这次直接照抄这个已验证的模式。
+
+**执行前**
+- 存在什么问题：`g_buildIdAttempts` 只有成功时清、失败（临时/永久）都不淘汰，长时间运行的 Agent 遇到越来越多不同 build-id 会无限堆积，内存占用只增不减。
+- 要实现什么功能：给这张表加个上限，超过就淘汰最久没被碰过的一条。
+- 解决方案：仿照 `RuntimeSymbolMap.cpp` 里 `g_javaLastRefreshMap` 的做法——`BuildIdAttempt` 加一个 `lastTouchedMs` 字段（不能复用 `retryAfterMs`，永久失败那个字段固定是 0，会导致排序永远先淘汰永久失败条目，正好淘反了），插入时更新这个字段，超过 4096 条（跟 `g_javaLastRefreshMap` 用同一个上限，保持全仓库风格一致）就线性扫一遍找最小值淘汰。
+
+**执行后**
+- 改了什么代码文件：`drop/common/ContinuousSampler.cpp`——`BuildIdAttempt` 结构体加 `lastTouchedMs` 字段；新增 `kBuildIdAttemptMaxEntries`(4096) 常量和 `evict_oldest_build_id_attempt_locked()`；`record_build_id_transient_fail`/`record_build_id_permanent_fail` 写入时同步记录 `lastTouchedMs` 并调用淘汰函数。
+- 实现了什么功能：表大小有了硬上限，长跑 Agent 不会无限增长。
+- 风险：①线性扫描找最小值是 O(n)，每次插入都要跑一遍，4096 条量级下可忽略，但如果以后上限调大要重新评估；②未编译验证（这次修改在教练/组员那批新代码基础上做的，是否和新架构有冲突，需要重新走一遍 `docker compose build drop_agent`）。
+- 风险怎么解决：①4096 是跟随 `g_javaLastRefreshMap` 的既有约定，暂不需要额外优化，真出现性能问题再考虑换 LRU 链表结构；②需要用户在 VM 上重新编译验证。
+- 验收步骤：`docker compose build drop_agent` 编译通过；长时间运行后（或者写个小工具批量灌不同 build-id）观察 `g_buildIdAttempts` 是否稳定在 4096 条上限，不再无限增长。

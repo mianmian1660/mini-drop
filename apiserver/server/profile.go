@@ -958,16 +958,18 @@ func diffTopN(base, compare ProfileTopN) ProfileDiff {
 	items := []ProfileDiffItem{}
 	seen := map[string]bool{}
 	unit := firstNonEmpty(base.Unit, compare.Unit, "samples")
+	// 按栈顶（self）对比，不是 value（inclusive）——道理同 queryNativeContinuousTopN 的排序：
+	// diff 要回答"哪个函数自己变热/变冷了"，用 inclusive 值会被调用链形状变化干扰。
 	for _, item := range compare.Items {
-		baseValue := baseMap[item.Name].Value
-		items = append(items, ProfileDiffItem{Name: item.Name, BaseValue: baseValue, CompareValue: item.Value, Delta: item.Value - baseValue, Unit: unit})
+		baseValue := baseMap[item.Name].Self
+		items = append(items, ProfileDiffItem{Name: item.Name, BaseValue: baseValue, CompareValue: item.Self, Delta: item.Self - baseValue, Unit: unit})
 		seen[item.Name] = true
 	}
 	for _, item := range base.Items {
 		if seen[item.Name] {
 			continue
 		}
-		items = append(items, ProfileDiffItem{Name: item.Name, BaseValue: item.Value, CompareValue: 0, Delta: -item.Value, Unit: unit})
+		items = append(items, ProfileDiffItem{Name: item.Name, BaseValue: item.Self, CompareValue: 0, Delta: -item.Self, Unit: unit})
 	}
 	sort.Slice(items, func(i, j int) bool {
 		return absFloat(items[i].Delta) > absFloat(items[j].Delta)
