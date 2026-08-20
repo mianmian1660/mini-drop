@@ -82,6 +82,7 @@ type ProfileDiffQuery struct {
 	CompareFrom time.Time              `json:"compare_from"`
 	CompareTo   time.Time              `json:"compare_to"`
 	ProfileType string                 `json:"profile_type"`
+	StackScope  string                 `json:"stack_scope"`
 	Labels      map[string]interface{} `json:"labels"`
 	Filters     map[string]interface{} `json:"filters"`
 	MaxNodes    int                    `json:"max_nodes"`
@@ -97,20 +98,29 @@ type ProfileNode struct {
 	Children []ProfileNode `json:"children,omitempty"`
 }
 
+type ProfileSymbolDiagnostics struct {
+	TotalFrameWeight      float64  `json:"total_frame_weight"`
+	UnresolvedFrameWeight float64  `json:"unresolved_frame_weight"`
+	UnresolvedPercent     float64  `json:"unresolved_percent"`
+	GoSymbolState         string   `json:"go_symbol_state"`
+	Reasons               []string `json:"reasons"`
+}
+
 type ProfileFlamegraph struct {
-	Nodes         []ProfileNode `json:"nodes"`
-	Total         float64       `json:"total"`
-	Unit          string        `json:"unit"`
-	Backend       string        `json:"backend,omitempty"`
-	Empty         bool          `json:"empty"`
-	Message       string        `json:"message"`
-	Source        string        `json:"source"`
-	ProfileSource string        `json:"profile_source"`
-	ProfileURL    string        `json:"profile_url,omitempty"`
-	Query         string        `json:"query,omitempty"`
-	SymbolStatus  string        `json:"symbol_status,omitempty"`
-	Truncated     bool          `json:"truncated"`
-	GeneratedAt   time.Time     `json:"generated_at"`
+	Nodes             []ProfileNode            `json:"nodes"`
+	Total             float64                  `json:"total"`
+	Unit              string                   `json:"unit"`
+	Backend           string                   `json:"backend,omitempty"`
+	Empty             bool                     `json:"empty"`
+	Message           string                   `json:"message"`
+	Source            string                   `json:"source"`
+	ProfileSource     string                   `json:"profile_source"`
+	ProfileURL        string                   `json:"profile_url,omitempty"`
+	Query             string                   `json:"query,omitempty"`
+	SymbolStatus      string                   `json:"symbol_status,omitempty"`
+	SymbolDiagnostics ProfileSymbolDiagnostics `json:"symbol_diagnostics"`
+	Truncated         bool                     `json:"truncated"`
+	GeneratedAt       time.Time                `json:"generated_at"`
 }
 
 type ProfileTopItem struct {
@@ -121,19 +131,20 @@ type ProfileTopItem struct {
 }
 
 type ProfileTopN struct {
-	Items         []ProfileTopItem `json:"items"`
-	Total         float64          `json:"total"`
-	Unit          string           `json:"unit"`
-	Backend       string           `json:"backend,omitempty"`
-	Empty         bool             `json:"empty"`
-	Message       string           `json:"message"`
-	Source        string           `json:"source"`
-	ProfileSource string           `json:"profile_source"`
-	ProfileURL    string           `json:"profile_url,omitempty"`
-	Query         string           `json:"query,omitempty"`
-	SymbolStatus  string           `json:"symbol_status,omitempty"`
-	Truncated     bool             `json:"truncated"`
-	GeneratedAt   time.Time        `json:"generated_at"`
+	Items             []ProfileTopItem         `json:"items"`
+	Total             float64                  `json:"total"`
+	Unit              string                   `json:"unit"`
+	Backend           string                   `json:"backend,omitempty"`
+	Empty             bool                     `json:"empty"`
+	Message           string                   `json:"message"`
+	Source            string                   `json:"source"`
+	ProfileSource     string                   `json:"profile_source"`
+	ProfileURL        string                   `json:"profile_url,omitempty"`
+	Query             string                   `json:"query,omitempty"`
+	SymbolStatus      string                   `json:"symbol_status,omitempty"`
+	SymbolDiagnostics ProfileSymbolDiagnostics `json:"symbol_diagnostics"`
+	Truncated         bool                     `json:"truncated"`
+	GeneratedAt       time.Time                `json:"generated_at"`
 }
 
 type ProfileLabelValues struct {
@@ -163,6 +174,7 @@ type ProfileDiff struct {
 }
 
 var errProfileUnavailable = errors.New("native continuous profiling unavailable")
+var errContinuousWindowLimit = errors.New("匹配的持续采集窗口超过 20000 个，请缩小时间范围")
 
 type nativeProfileClient struct{}
 
@@ -265,11 +277,13 @@ func (s *APIServer) GetProfileDiff(c *gin.Context) {
 	}
 	if baseTop, baseFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
 		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+		StackScope: q.StackScope,
 	}); err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
 	} else if compareTop, compareFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
 		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+		StackScope: q.StackScope,
 	}); err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
@@ -339,7 +353,7 @@ func (s *APIServer) profileQueryFromRequest(c *gin.Context) (ProfileQuery, bool)
 		Filters:     parseProfileFilters(c.Query("filters")),
 		MaxNodes:    parseMaxNodes(c, "max_nodes"),
 	}
-	if !s.validateProfileQuery(c, &q) {
+	if _, ok := s.validateProfileQuery(c, &q); !ok {
 		return ProfileQuery{}, false
 	}
 	return q, true
@@ -372,53 +386,48 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 		CompareFrom: compareFrom,
 		CompareTo:   compareTo,
 		ProfileType: strings.ToLower(strings.TrimSpace(c.DefaultQuery("profile_type", "cpu"))),
+		StackScope:  strings.ToLower(strings.TrimSpace(c.DefaultQuery("stack_scope", ""))),
 		Labels:      parseProfileLabels(c.Query("labels")),
 		Filters:     parseProfileFilters(c.Query("filters")),
 		MaxNodes:    parseMaxNodes(c, "max_nodes"),
 	}
-	if !baseFrom.Before(baseTo) || !compareFrom.Before(compareTo) {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "对比时间范围不合法")
+	pq := ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, StackScope: q.StackScope, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes}
+	target, ok := s.validateProfileQuery(c, &pq)
+	if !ok {
 		return ProfileDiffQuery{}, false
 	}
-	if compareTo.Sub(compareFrom) > continuousMaxQueryWindow {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
-			"查询时间窗口过大，最大支持 6 小时，请缩小时间范围")
+	if !s.validateProfileTimeRange(c, compareFrom, compareTo, profileRetentionDuration(target)) {
 		return ProfileDiffQuery{}, false
 	}
-	pq := ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes}
-	if !s.validateProfileQuery(c, &pq) {
+	if baseTo.Sub(baseFrom) != compareTo.Sub(compareFrom) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "Baseline 与 Compare 必须使用等长时间窗")
 		return ProfileDiffQuery{}, false
 	}
 	q.Host, q.TargetID, q.Service, q.Labels, q.Filters = pq.Host, pq.TargetID, pq.Service, pq.Labels, pq.Filters
+	q.StackScope = pq.StackScope
 	q.OwnerUIDs, q.CanReadAll = pq.OwnerUIDs, pq.CanReadAll
 	return q, true
 }
 
-func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) bool {
+func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) (ProfileTarget, bool) {
 	if q.ProfileType == "" {
 		q.ProfileType = "cpu"
 	}
 	if q.ProfileType != "cpu" && q.ProfileType != "memory" {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "不支持的 profile_type: "+q.ProfileType)
-		return false
-	}
-	if !q.From.Before(q.To) {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "时间范围不合法")
-		return false
-	}
-	if q.To.Sub(q.From) > continuousMaxQueryWindow {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
-			"查询时间窗口过大，最大支持 6 小时，请缩小时间范围")
-		return false
+		return ProfileTarget{}, false
 	}
 	if q.TargetID == "" && q.Host == "" {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "target_id 或 host 至少提供一个")
-		return false
+		return ProfileTarget{}, false
 	}
 	target, err := s.resolveProfileTarget(s.AuthContext(c), q.TargetID, q.Host)
 	if err != nil {
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "可观测对象不存在或无权限访问")
-		return false
+		return ProfileTarget{}, false
+	}
+	if !s.validateProfileTimeRange(c, q.From, q.To, profileRetentionDuration(target)) {
+		return ProfileTarget{}, false
 	}
 	q.TargetID = target.ID
 	q.Host = target.IP
@@ -435,7 +444,48 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) bool {
 			q.OwnerUIDs = []string{auth.UID}
 		}
 	}
+	return target, true
+}
+
+func profileRetentionDuration(target ProfileTarget) time.Duration {
+	hours := uint32(24)
+	if target.ContinuousSession != nil && target.ContinuousSession.RetentionHours > 0 {
+		hours = target.ContinuousSession.RetentionHours
+	}
+	return time.Duration(hours) * time.Hour
+}
+
+func (s *APIServer) validateProfileTimeRange(c *gin.Context, from, to time.Time, retention time.Duration) bool {
+	if !from.Before(to) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "时间范围不合法")
+		return false
+	}
+	if retention <= 0 {
+		retention = 24 * time.Hour
+	}
+	if to.Sub(from) > retention {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
+			fmt.Sprintf("查询时间窗口过大，当前 Session 最多支持 %s，请缩小时间范围", formatProfileDuration(retention)))
+		return false
+	}
+	now := time.Now()
+	if to.After(now.Add(time.Minute)) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "结束时间不能晚于当前时间")
+		return false
+	}
+	if from.Before(now.Add(-retention).Add(-time.Minute)) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
+			fmt.Sprintf("开始时间已超出当前 Session 的 %s 数据保留期", formatProfileDuration(retention)))
+		return false
+	}
 	return true
+}
+
+func formatProfileDuration(value time.Duration) string {
+	if value%time.Hour == 0 {
+		return fmt.Sprintf("%d 小时", int(value/time.Hour))
+	}
+	return value.String()
 }
 
 func parseMaxNodes(c *gin.Context, name string) int {
@@ -474,6 +524,10 @@ func (s *APIServer) respondReservedProfileType(c *gin.Context, profileType strin
 }
 
 func (s *APIServer) respondProfileDependencyError(c *gin.Context, err error) {
+	if errors.Is(err, errContinuousWindowLimit) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, err.Error())
+		return
+	}
 	s.Logger.Warn("Native Continuous Profiling 查询失败", zap.Error(err))
 	s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, err.Error())
 }

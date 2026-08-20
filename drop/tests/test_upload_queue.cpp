@@ -9,6 +9,8 @@
 #include <gtest/gtest.h>
 #include "agent/UploadQueue.h"
 
+#include <thread>
+
 using drop_agent::UploadQueue;
 using drop_agent::UploadJob;
 
@@ -66,4 +68,18 @@ TEST(UploadQueue, ShutdownDoesNotDropAlreadyQueuedJob)
 
     UploadJob out2;
     EXPECT_FALSE(q.WaitPop(50, &out2));
+}
+
+TEST(UploadQueue, ShutdownWakesBlockedConsumer)
+{
+    UploadQueue q;
+    bool popped = true;
+    std::thread consumer([&]
+                         {
+                             UploadJob out;
+                             popped = q.WaitPop(5000, &out);
+                         });
+    q.Shutdown();
+    consumer.join();
+    EXPECT_FALSE(popped);
 }

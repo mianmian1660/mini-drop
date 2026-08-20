@@ -17,6 +17,8 @@ TEST(AttemptTracker, MarkRunningAppearsInRunningSnapshot)
     EXPECT_EQ(running[0].taskid(), "task-1");
     EXPECT_EQ(running[0].attempt_id(), 1u);
     EXPECT_TRUE(tracker.CompletedSnapshot().empty());
+    EXPECT_TRUE(tracker.IsRunning("task-1", 1));
+    EXPECT_FALSE(tracker.IsRunning("task-1", 2));
 }
 
 TEST(AttemptTracker, MarkCompletedMovesFromRunningToCompleted)
@@ -26,6 +28,7 @@ TEST(AttemptTracker, MarkCompletedMovesFromRunningToCompleted)
     tracker.MarkCompleted("task-1", 1);
 
     EXPECT_TRUE(tracker.RunningSnapshot().empty());
+    EXPECT_FALSE(tracker.IsRunning("task-1", 1));
     auto completed = tracker.CompletedSnapshot();
     ASSERT_EQ(completed.size(), 1u);
     EXPECT_EQ(completed[0].taskid(), "task-1");
@@ -69,4 +72,20 @@ TEST(AttemptTracker, MarkCompletedClearsCancelFlag)
     tracker.RequestCancel("task-1", 1);
     tracker.MarkCompleted("task-1", 1);
     EXPECT_FALSE(tracker.IsCancelRequested("task-1", 1));
+}
+
+TEST(AttemptTracker, RepeatedTransitionsAreIdempotent)
+{
+    AttemptTracker tracker;
+    tracker.MarkRunning("task-idempotent", 9);
+    tracker.MarkRunning("task-idempotent", 9);
+    ASSERT_EQ(tracker.RunningSnapshot().size(), 1u);
+
+    tracker.MarkCompleted("task-idempotent", 9);
+    tracker.MarkCompleted("task-idempotent", 9);
+    EXPECT_TRUE(tracker.RunningSnapshot().empty());
+    ASSERT_EQ(tracker.CompletedSnapshot().size(), 1u);
+
+    tracker.MarkRunning("task-idempotent", 9);
+    EXPECT_TRUE(tracker.RunningSnapshot().empty());
 }

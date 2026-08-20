@@ -9,7 +9,9 @@
 #include "common/ProcessExecutor.h"
 
 #include <csignal>
+#include <cerrno>
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace drop;
@@ -65,13 +67,15 @@ TEST(TimedProcessPoller, NormalExitDoesNotSendSignal)
 {
     FakeClock clock;
     FakeProcessExecutor exec;
+    PidRegistry registry;
     exec.pollSequence = {{PollState::kRunning, -1, 0}, {PollState::kExited, 0, 0}};
 
-    TimedProcessPoller poller(&exec, &clock, /*timeoutSec=*/60, /*gracePeriodSec=*/5);
+    TimedProcessPoller poller(&exec, &clock, /*timeoutSec=*/60, /*gracePeriodSec=*/5, &registry);
     ExecHandle handle;
     std::string err;
     ASSERT_TRUE(exec.Start({}, &handle, &err));
     poller.Attach(handle);
+    ASSERT_EQ(registry.Snapshot().size(), 1u);
 
     auto o1 = poller.Poll();
     EXPECT_EQ(o1.state, PollState::kRunning);
@@ -80,6 +84,7 @@ TEST(TimedProcessPoller, NormalExitDoesNotSendSignal)
     EXPECT_EQ(o2.exitCode, 0);
     EXPECT_TRUE(exec.signalsSent.empty());
     EXPECT_FALSE(poller.TimedOut());
+    EXPECT_TRUE(registry.Snapshot().empty());
 }
 
 TEST(TimedProcessPoller, TimeoutEscalatesToSigtermThenSigkill)
@@ -124,20 +129,69 @@ TEST(TimedProcessPoller, ForceStopIsIdempotent)
 {
     FakeClock clock;
     FakeProcessExecutor exec;
+    PidRegistry registry;
     // ForceStop 第一次内部 Poll 就发现已退出：不应该再发任何信号。
     exec.pollSequence = {{PollState::kExited, 0, 0}};
 
-    TimedProcessPoller poller(&exec, &clock, /*timeoutSec=*/60, /*gracePeriodSec=*/0);
+    TimedProcessPoller poller(&exec, &clock, /*timeoutSec=*/60, /*gracePeriodSec=*/0, &registry);
     ExecHandle handle;
     std::string err;
     ASSERT_TRUE(exec.Start({}, &handle, &err));
     poller.Attach(handle);
+    ASSERT_EQ(registry.Snapshot().size(), 1u);
 
     auto o1 = poller.ForceStop();
     EXPECT_EQ(o1.state, PollState::kExited);
     EXPECT_TRUE(exec.signalsSent.empty());
+    EXPECT_TRUE(registry.Snapshot().empty());
 
     auto o2 = poller.ForceStop(); // 幂等：直接返回缓存，不再调用 executor
     EXPECT_EQ(o2.state, PollState::kExited);
     EXPECT_EQ(exec.waitBlockingCalls, 0);
+}
+
+TEST(TimedProcessPoller, ForcedRunningProcessIsUnregisteredAfterReap)
+{
+    FakeClock clock;
+    FakeProcessExecutor exec;
+    PidRegistry registry;
+    exec.pollSequence = {{PollState::kRunning, -1, 0}};
+    exec.waitBlockingResult = {PollState::kSignaled, -1, SIGKILL};
+
+    TimedProcessPoller poller(&exec, &clock, /*timeoutSec=*/60, /*gracePeriodSec=*/0, &registry);
+    ExecHandle handle;
+    std::string err;
+    ASSERT_TRUE(exec.Start({}, &handle, &err));
+    poller.Attach(handle);
+    ASSERT_EQ(registry.Snapshot().size(), 1u);
+
+    auto stopped = poller.ForceStop();
+    EXPECT_EQ(stopped.state, PollState::kSignaled);
+    ASSERT_EQ(exec.signalsSent.size(), 2u);
+    EXPECT_EQ(exec.signalsSent[0], SIGTERM);
+    EXPECT_EQ(exec.signalsSent[1], SIGKILL);
+    EXPECT_EQ(exec.waitBlockingCalls, 1);
+    EXPECT_TRUE(registry.Snapshot().empty());
+}
+
+TEST(RealProcessExecutor, ImmediateForceStopReapsProcessGroup)
+{
+    RealClock clock;
+    RealProcessExecutor exec;
+    PidRegistry registry;
+    TimedProcessPoller poller(&exec, &clock, 60, 0, &registry);
+    ExecHandle handle;
+    ExecArgs args;
+    args.argv = {"/bin/sh", "-c", "sleep 30"};
+    std::string error;
+
+    ASSERT_TRUE(exec.Start(args, &handle, &error)) << error;
+    poller.Attach(handle);
+    auto stopped = poller.ForceStop();
+
+    EXPECT_NE(stopped.state, PollState::kRunning);
+    EXPECT_TRUE(registry.Snapshot().empty());
+    errno = 0;
+    EXPECT_EQ(::kill(handle.pid, 0), -1);
+    EXPECT_EQ(errno, ESRCH);
 }

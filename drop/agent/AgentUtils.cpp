@@ -38,6 +38,14 @@ namespace drop_agent
         return true;
     }
 
+    string TaskAttemptDir(const string &root, const string &taskID, uint64_t attemptID)
+    {
+        string base = root;
+        while (base.size() > 1 && base.back() == '/')
+            base.pop_back();
+        return base + "/" + taskID + "/" + to_string(attemptID) + "/";
+    }
+
     string JsonEscape(const string &s)
     {
         string out;

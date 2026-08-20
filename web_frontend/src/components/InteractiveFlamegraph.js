@@ -27,17 +27,20 @@ export default function InteractiveFlamegraph({
     filterText = '',
     boxStyle = {},
     minWidth = 1120,
+    searchText = '',
+    onRenderStats,
+    onSearchStats,
 }) {
     const graphRef = useRef(null);
     const chartRef = useRef(null);
     const [renderError, setRenderError] = useState('');
     const [renderMode, setRenderMode] = useState('full');
+    const [renderedNodes, setRenderedNodes] = useState(0);
     const hasData = data && !data.empty && Array.isArray(data.nodes) && data.nodes.length > 0;
     const profileStats = useMemo(() => hasData ? {
         nodes: countProfileNodes(data.nodes),
         depth: maxProfileDepth(data.nodes),
     } : { nodes: 0, depth: 0 }, [data, hasData]);
-    const shouldUseSafeView = hasData && (profileStats.nodes > SAFE_MAX_NODES || profileStats.depth > SAFE_MAX_DEPTH);
     const renderData = useMemo(() => {
         if (!hasData) return null;
         return renderMode === 'safe' ? pruneFlamegraphForRender(data, SAFE_MAX_DEPTH, SAFE_MAX_NODES) : data;
@@ -45,9 +48,10 @@ export default function InteractiveFlamegraph({
     const d3Data = useMemo(() => renderData ? miniDropToD3Flamegraph(renderData) : null, [renderData]);
 
     useEffect(() => {
-        setRenderMode(shouldUseSafeView ? 'safe' : 'full');
+        setRenderMode('full');
         setRenderError('');
-    }, [data, shouldUseSafeView]);
+        setRenderedNodes(0);
+    }, [data]);
 
     useEffect(() => {
         if (!graphRef.current || !hasData || !renderData || !d3Data) return undefined;
@@ -57,17 +61,32 @@ export default function InteractiveFlamegraph({
         try {
             const width = Math.max(graphRef.current.clientWidth - 16 || minWidth, minWidth);
             const height = Math.max(320, Math.min(MAX_CHART_HEIGHT, (maxProfileDepth(renderData.nodes) + 3) * 18));
+            const renderNodeCount = countProfileNodes(renderData.nodes);
+            const renderConfig = flamegraphRenderConfig(renderNodeCount);
             const chart = createFlamegraph()
                 .width(width)
                 .height(height)
                 .cellHeight(17)
-                .transitionDuration(120)
-                .minFrameSize(0.8)
+                .transitionDuration(renderConfig.transitionDuration)
+                .minFrameSize(renderConfig.minFrameSize)
                 .sort(true)
+                .setSearchMatch((node, term) => matchesFlamegraphFrame(node?.data?.name, term))
+                .setSearchHandler((results, searchSum, totalValue) => {
+                    const matches = (results || []).filter(node => node.depth > 0).length;
+                    const samplePercent = totalValue > 0 ? (Number(searchSum || 0) / Number(totalValue)) * 100 : 0;
+                    onSearchStats?.({ matches, samplePercent });
+                })
                 .label(d => formatFlamegraphLabel(d, data.unit))
                 .title('');
             chartRef.current = chart;
             selection.datum(d3Data).call(chart);
+            const actualNodes = Math.max(0, selection.selectAll('g.frame').size() - 1);
+            setRenderedNodes(actualNodes);
+            onRenderStats?.({
+                rendered: actualNodes,
+                total: profileStats.nodes,
+                mode: renderMode,
+            });
         } catch (err) {
             chartRef.current = null;
             if (renderMode === 'full') {
@@ -80,7 +99,11 @@ export default function InteractiveFlamegraph({
             chartRef.current = null;
             selection.selectAll('*').remove();
         };
-    }, [data, d3Data, hasData, minWidth, renderData, renderMode]);
+    }, [data, d3Data, hasData, minWidth, onRenderStats, onSearchStats, profileStats.nodes, renderData, renderMode]);
+
+    useEffect(() => {
+        chartRef.current?.search(String(searchText || '').trim());
+    }, [d3Data, renderMode, searchText]);
 
     if (loading && !hasData) return <div style={BASE.empty}>{loadingMessage}</div>;
     if (!hasData) {
@@ -92,9 +115,9 @@ export default function InteractiveFlamegraph({
             <div ref={graphRef} style={{ ...BASE.flameBox, ...boxStyle }} />
             {renderMode === 'safe' && !renderError && (
                 <div style={BASE.note}>
-                    全量数据节点 {profileStats.nodes}、深度 {profileStats.depth}，已使用安全视图保证渲染稳定。
+                    完整渲染失败，安全视图已渲染 {renderedNodes}/{profileStats.nodes} 个节点，原始深度 {profileStats.depth}。
                     <div style={BASE.actions}>
-                        <button type="button" style={BASE.button} onClick={() => setRenderMode('full')}>重试全量渲染</button>
+                        <button type="button" style={BASE.button} onClick={() => setRenderMode('full')}>重试完整渲染</button>
                         {(data?.profile_url || externalUrl) && <a href={data?.profile_url || externalUrl} target="_blank" rel="noreferrer" style={BASE.button}>{externalLabel}</a>}
                     </div>
                 </div>
@@ -167,11 +190,24 @@ export function maxProfileDepth(nodes) {
     return maxDepth;
 }
 
+export function flamegraphRenderConfig(nodeCount) {
+    return {
+        minFrameSize: 0,
+        transitionDuration: Number(nodeCount) > SAFE_MAX_NODES ? 0 : 120,
+    };
+}
+
+export function matchesFlamegraphFrame(name, term) {
+    const needle = String(term || '').trim().toLocaleLowerCase();
+    if (!needle) return false;
+    return String(name || '').toLocaleLowerCase().includes(needle);
+}
+
 function sumProfileNodeValues(nodes) {
     return (nodes || []).reduce((sum, node) => sum + Number(node.value || 0), 0);
 }
 
-function pruneFlamegraphForRender(data, maxDepth, maxNodes) {
+export function pruneFlamegraphForRender(data, maxDepth, maxNodes) {
     let used = 0;
     const rootTotal = Number(data?.total || sumProfileNodeValues(data?.nodes || [])) || 1;
     const pruneNode = (node, depth) => {

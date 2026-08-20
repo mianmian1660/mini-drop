@@ -6,6 +6,10 @@
 #   阶段2：只复制编译好的二进制文件到干净环境
 # ============================================================
 
+# Reuse the already-published client image instead of following a large GitHub
+# redirect during every Agent runtime build.
+FROM minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 AS minio-client
+
 # ---------- 阶段1：编译 ----------
 FROM ubuntu:22.04 AS builder
 
@@ -41,18 +45,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgrpc++-dev \
     libgrpc-dev \
     libgtest-dev \
+    nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
 
 # CMake 构建（先清理本地残留的 CMakeCache，避免路径冲突）
-RUN rm -rf build && mkdir -p build && cd build && cmake .. && make -j$(nproc)
+ARG DROP_BUILD_JOBS=2
+RUN rm -rf build && mkdir -p build && cd build && cmake .. && make -j"${DROP_BUILD_JOBS}"
+
+# Explicit test target for CI/local verification. The production runtime stage
+# does not depend on this stage, so normal image builds remain unchanged.
+FROM builder AS test
+ARG DROP_BUILD_JOBS=2
+RUN cmake --build build --target drop_tests -j"${DROP_BUILD_JOBS}" \
+    && ctest --test-dir build --output-on-failure
 
 # ---------- 阶段2：运行 ----------
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime is a fresh stage, so repeat the builder's reachable mirror selection.
+RUN sed -i s@/archive.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && \
+    sed -i s@/security.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.list && \
+    if ! getent hosts mirrors.tencentyun.com > /dev/null 2>&1; then \
+        sed -i s@/mirrors.tencentyun.com/@/mirrors.aliyun.com/@g /etc/apt/sources.list; \
+    fi
 
 # 只安装"运行时"需要的库（不需要编译器了，镜像更小）
 #   libgrpc++1      = gRPC C++ 运行时库
@@ -71,12 +91,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bpftrace \
     perl \
     curl \
-    wget \
+    unzip \
     ca-certificates \
     && perf_real="$(find /usr/lib -type f -path '*/linux-tools*/perf' | sort -V | tail -n 1)" \
     && test -n "$perf_real" \
     && ln -sf "$perf_real" /usr/local/bin/perf-real \
     && rm -rf /var/lib/apt-lists/*
+
+# Recover function ranges from stripped Go binaries. Pin and verify the release
+# artifact so profiling behavior cannot change underneath an image rebuild.
+ARG GORESYM_VERSION=3.4
+ARG GORESYM_ZIP_SHA256=cdcbda1273de4a502044520af3cbdb73149e74847aa1c515b413de4243e972f4
+RUN curl -fsSL "https://github.com/mandiant/GoReSym/releases/download/v${GORESYM_VERSION}/GoReSym-linux.zip" -o /tmp/goresym.zip \
+    && echo "${GORESYM_ZIP_SHA256}  /tmp/goresym.zip" | sha256sum -c - \
+    && unzip -p /tmp/goresym.zip GoReSym > /usr/local/bin/GoReSym \
+    && chmod 0755 /usr/local/bin/GoReSym \
+    && rm -f /tmp/goresym.zip
 
 # Pin async-profiler so Java collection is available in every Agent image.
 # The launcher is placed on PATH and emits collapsed stacks in the Agent code.
@@ -86,9 +116,8 @@ RUN curl -fsSL "https://github.com/async-profiler/async-profiler/releases/downlo
     && ln -s "/opt/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64/bin/asprof" /usr/local/bin/asprof \
     && asprof --version
 
-# 安装 MinIO Client (mc)，用于上传采集结果到 MinIO
-RUN wget -q https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc \
-    && chmod +x /usr/local/bin/mc
+# 安装 MinIO Client (mc)，用于上传采集结果到 MinIO。
+COPY --from=minio-client /usr/bin/mc /usr/local/bin/mc
 
 WORKDIR /app
 # 从阶段1复制编译好的两个程序

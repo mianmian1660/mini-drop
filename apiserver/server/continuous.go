@@ -25,10 +25,9 @@ import (
 const continuousMaxDBCount = uint64(1<<63 - 1)
 const continuousMaxReasonableProfileSampleCount = uint64(1_000_000_000)
 
-// 查询保护：最大时间窗口 6h，最大窗口数 2160（10s 窗口 × 6h = 2160），
-// max_nodes 默认 5000，上限 20000。借鉴 Pyroscope query API 的 maxNodes 保护。
-const continuousMaxQueryWindow = 6 * time.Hour
-const continuousMaxWindowCount = 2160
+// 查询跨度由当前 Session retention_hours 决定；匹配窗口超过上限时返回错误，
+// 绝不静默截断。max_nodes 默认 5000，上限 20000。
+const continuousMaxWindowCount = 20000
 const continuousDefaultMaxNodes = 5000
 const continuousMaxNodesCap = 20000
 
@@ -152,14 +151,20 @@ type continuousStoredBatch struct {
 }
 
 type continuousAggregate struct {
-	Total        float64
-	Top          map[string]*ProfileTopItem
-	Root         *continuousTreeNode
-	LabelValue   map[string]map[string]bool
-	ObjectKeys   []string
-	Backends     map[string]bool
-	SymbolStatus string
-	WindowCount  int
+	Total                 float64
+	Top                   map[string]*ProfileTopItem
+	Root                  *continuousTreeNode
+	LabelValue            map[string]map[string]bool
+	ObjectKeys            []string
+	Backends              map[string]bool
+	SymbolStatus          string
+	TotalFrameWeight      float64
+	UnresolvedFrameWeight float64
+	GoSymbolReady         bool
+	GoSymbolPending       bool
+	GoSymbolFailed        bool
+	SymbolReasons         map[string]bool
+	WindowCount           int
 }
 
 type continuousTreeNode struct {
@@ -570,18 +575,19 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 	}
 	nodes, truncated := continuousTreeToProfileNodesTruncated(agg.Root, "", maxNodes)
 	out := ProfileFlamegraph{
-		Nodes:         nodes,
-		Total:         agg.Total,
-		Unit:          "samples",
-		Backend:       continuousBackendList(agg.Backends),
-		Empty:         len(nodes) == 0 || agg.Total == 0,
-		Source:        "mini-drop-native",
-		ProfileSource: "native",
-		ProfileURL:    s.continuousProfileURL(ctx, agg.ObjectKeys),
-		Query:         profileLabelSelector(q),
-		SymbolStatus:  agg.SymbolStatus,
-		Truncated:     truncated,
-		GeneratedAt:   time.Now(),
+		Nodes:             nodes,
+		Total:             agg.Total,
+		Unit:              "samples",
+		Backend:           continuousBackendList(agg.Backends),
+		Empty:             len(nodes) == 0 || agg.Total == 0,
+		Source:            "mini-drop-native",
+		ProfileSource:     "native",
+		ProfileURL:        s.continuousProfileURL(ctx, agg.ObjectKeys),
+		Query:             profileLabelSelector(q),
+		SymbolStatus:      agg.SymbolStatus,
+		SymbolDiagnostics: continuousSymbolDiagnostics(agg),
+		Truncated:         truncated,
+		GeneratedAt:       time.Now(),
 	}
 	if out.Empty {
 		out.Message = "Native Continuous Profiling 暂无匹配样本"
@@ -614,18 +620,19 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 		truncated = true
 	}
 	out := ProfileTopN{
-		Items:         items,
-		Total:         agg.Total,
-		Unit:          "samples",
-		Backend:       continuousBackendList(agg.Backends),
-		Empty:         len(items) == 0 || agg.Total == 0,
-		Source:        "mini-drop-native",
-		ProfileSource: "native",
-		ProfileURL:    s.continuousProfileURL(ctx, agg.ObjectKeys),
-		Query:         profileLabelSelector(q),
-		SymbolStatus:  agg.SymbolStatus,
-		Truncated:     truncated,
-		GeneratedAt:   time.Now(),
+		Items:             items,
+		Total:             agg.Total,
+		Unit:              "samples",
+		Backend:           continuousBackendList(agg.Backends),
+		Empty:             len(items) == 0 || agg.Total == 0,
+		Source:            "mini-drop-native",
+		ProfileSource:     "native",
+		ProfileURL:        s.continuousProfileURL(ctx, agg.ObjectKeys),
+		Query:             profileLabelSelector(q),
+		SymbolStatus:      agg.SymbolStatus,
+		SymbolDiagnostics: continuousSymbolDiagnostics(agg),
+		Truncated:         truncated,
+		GeneratedAt:       time.Now(),
 	}
 	if out.Empty {
 		out.Message = "Native Continuous Profiling 暂无匹配样本"
@@ -687,6 +694,9 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 	if err != nil {
 		return continuousAggregate{}, false, err
 	}
+	if len(windows) > continuousMaxWindowCount {
+		return continuousAggregate{}, true, errContinuousWindowLimit
+	}
 	if len(windows) == 0 {
 		return continuousAggregate{}, false, nil
 	}
@@ -704,9 +714,10 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			"pid":  {},
 			"exe":  {},
 		},
-		Backends:     map[string]bool{},
-		SymbolStatus: "not_applicable",
-		WindowCount:  len(windows),
+		Backends:      map[string]bool{},
+		SymbolStatus:  "not_applicable",
+		SymbolReasons: map[string]bool{},
+		WindowCount:   len(windows),
 	}
 	byObject := map[string][]model.ProfileWindow{}
 	objectOrder := []string{}
@@ -725,66 +736,93 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			return continuousAggregate{}, true, err
 		}
 		agg.ObjectKeys = append(agg.ObjectKeys, objectKey)
-		continuousAggregateSymbolStatus(&agg, batch.SymbolRefs)
 		for _, window := range batch.Windows {
 			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 				continue
 			}
-			continuousAggregateSymbolStatus(&agg, window.SymbolRefs)
+			matched := make([]ContinuousStackSample, 0)
+			relevantDSOs := map[string]bool{}
 			for _, sample := range continuousProfileSamplesForQuery(window, q) {
 				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
 					continue
 				}
+				matched = append(matched, sample)
+				if exe := strings.TrimSpace(continuousSampleLabel(sample, window.Labels, "exe")); exe != "" {
+					relevantDSOs[exe] = true
+				}
+			}
+			continuousAggregateSymbolMetadata(&agg, window.SymbolRefs, relevantDSOs)
+			for _, sample := range matched {
 				continuousAddSample(&agg, sample, window.Labels)
 			}
 		}
 	}
+	continuousFinalizeSymbolStatus(&agg)
 	return agg, true, nil
 }
 
-// continuousAggregateSymbolStatus 根据 symbol_refs 推断符号化状态。
-// 借鉴 Pyroscope 查询时 symbolization 状态展示：complete/partial/missing/not_applicable。
-func continuousAggregateSymbolStatus(agg *continuousAggregate, refs map[string]interface{}) {
+// continuousAggregateSymbolMetadata only carries extraction state/reasons.
+// Resolution status itself is derived from filtered frames below.
+func continuousAggregateSymbolMetadata(agg *continuousAggregate, refs map[string]interface{}, relevantDSOs map[string]bool) {
 	if len(refs) == 0 {
 		return
 	}
-	hasBuildID := false
-	hasKallsyms := false
-	missing := false
-	for key, v := range refs {
-		lk := strings.ToLower(key)
-		if strings.Contains(lk, "build_id") || strings.Contains(lk, "buildid") {
-			if s, ok := v.(string); ok && s != "" {
-				hasBuildID = true
-			} else if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
-				hasBuildID = true
+	native, _ := refs["native_go"].(map[string]interface{})
+	collect := func(key string) int {
+		values, _ := native[key].([]interface{})
+		matched := 0
+		for _, value := range values {
+			item, _ := value.(map[string]interface{})
+			dso, _ := item["dso"].(string)
+			if !relevantDSOs[dso] {
+				continue
+			}
+			matched++
+			if reason, _ := item["reason"].(string); reason != "" && len(agg.SymbolReasons) < 5 {
+				agg.SymbolReasons[reason] = true
 			}
 		}
-		if strings.Contains(lk, "kallsyms") || strings.Contains(lk, "kernel") {
-			if s, ok := v.(string); ok && s != "" {
-				hasKallsyms = true
-			} else if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
-				hasKallsyms = true
-			}
-		}
-		if strings.Contains(lk, "missing") || strings.Contains(lk, "unresolved") {
-			missing = true
-		}
+		return matched
 	}
-	if missing {
-		if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
-			agg.SymbolStatus = "partial"
-		}
-		return
-	}
-	if hasBuildID || hasKallsyms {
-		if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
-			agg.SymbolStatus = "complete"
-		}
-		return
-	}
-	if agg.SymbolStatus == "" || agg.SymbolStatus == "not_applicable" {
+	agg.GoSymbolReady = agg.GoSymbolReady || collect("ready") > 0
+	agg.GoSymbolPending = agg.GoSymbolPending || collect("pending") > 0
+	agg.GoSymbolFailed = agg.GoSymbolFailed || collect("failed") > 0
+}
+
+func continuousFinalizeSymbolStatus(agg *continuousAggregate) {
+	switch {
+	case agg.TotalFrameWeight == 0:
+		agg.SymbolStatus = "not_applicable"
+	case agg.UnresolvedFrameWeight == 0:
+		agg.SymbolStatus = "complete"
+	case agg.UnresolvedFrameWeight >= agg.TotalFrameWeight:
 		agg.SymbolStatus = "missing"
+	default:
+		agg.SymbolStatus = "partial"
+	}
+}
+
+func continuousSymbolDiagnostics(agg continuousAggregate) ProfileSymbolDiagnostics {
+	state := "not_applicable"
+	if agg.GoSymbolPending {
+		state = "pending"
+	} else if agg.GoSymbolFailed {
+		state = "failed"
+	} else if agg.GoSymbolReady {
+		state = "ready"
+	}
+	reasons := make([]string, 0, len(agg.SymbolReasons))
+	for reason := range agg.SymbolReasons {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	percent := 0.0
+	if agg.TotalFrameWeight > 0 {
+		percent = agg.UnresolvedFrameWeight * 100 / agg.TotalFrameWeight
+	}
+	return ProfileSymbolDiagnostics{
+		TotalFrameWeight: agg.TotalFrameWeight, UnresolvedFrameWeight: agg.UnresolvedFrameWeight,
+		UnresolvedPercent: percent, GoSymbolState: state, Reasons: reasons,
 	}
 }
 
@@ -836,9 +874,13 @@ func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q Profil
 		Where("signal_type = ?", signalType).
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
 		Order("window_start ASC").
+		Limit(continuousMaxWindowCount + 1).
 		Find(&windows).Error
 	if err != nil {
 		return nil, false, err
+	}
+	if len(windows) > continuousMaxWindowCount {
+		return nil, true, errContinuousWindowLimit
 	}
 	if len(windows) == 0 {
 		return nil, false, nil
@@ -1059,6 +1101,10 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		if frame == "" {
 			frame = "unknown"
 		}
+		agg.TotalFrameWeight += count
+		if continuousFrameLooksUnresolved(frame) {
+			agg.UnresolvedFrameWeight += count
+		}
 		item := agg.Top[frame]
 		if item == nil {
 			item = &ProfileTopItem{Name: frame, Unit: "samples"}
@@ -1091,6 +1137,30 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		}
 		node = child
 	}
+}
+
+func continuousFrameLooksUnresolved(frame string) bool {
+	frame = strings.TrimSpace(frame)
+	lower := strings.ToLower(frame)
+	if lower == "" || lower == "unknown" || lower == "[unknown]" {
+		return true
+	}
+	if strings.HasPrefix(frame, "[") && strings.HasSuffix(frame, "]") {
+		return true
+	}
+	address := lower
+	if strings.HasPrefix(address, "0x") {
+		address = address[2:]
+	}
+	hexLen := 0
+	for _, c := range address {
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			hexLen++
+			continue
+		}
+		break
+	}
+	return hexLen >= 6 && (hexLen == len(address) || address[hexLen] == ' ' || address[hexLen] == '\t')
 }
 
 func continuousBackendList(backends map[string]bool) string {

@@ -8,6 +8,10 @@
 #include <gtest/gtest.h>
 #include "agent/TaskQueue.h"
 
+#include <set>
+#include <thread>
+#include <vector>
+
 using drop_agent::TaskQueue;
 
 TEST(TaskQueue, WaitPopTimesOutOnEmptyQueue)
@@ -103,4 +107,50 @@ TEST(TaskQueue, CancelQueuedOnlyRemovesMatchingAttempt)
     hotmethod::TaskDesc out;
     ASSERT_TRUE(q.WaitPop(1000, &out));
     EXPECT_EQ(out.attempt_id(), 2u); // attempt 1 被摘除，attempt 2 还在
+}
+
+TEST(TaskQueue, ShutdownWakesBlockedConsumer)
+{
+    TaskQueue q;
+    bool popped = true;
+    std::thread consumer([&]
+                         {
+                             hotmethod::TaskDesc out;
+                             popped = q.WaitPop(5000, &out);
+                         });
+    q.Shutdown();
+    consumer.join();
+    EXPECT_FALSE(popped);
+}
+
+TEST(TaskQueue, ConcurrentProducersDoNotLoseTasks)
+{
+    TaskQueue q;
+    constexpr int kProducers = 4;
+    constexpr int kTasksPerProducer = 25;
+    std::vector<std::thread> producers;
+    for (int producer = 0; producer < kProducers; ++producer)
+    {
+        producers.emplace_back([&, producer]
+                               {
+                                   for (int i = 0; i < kTasksPerProducer; ++i)
+                                   {
+                                       hotmethod::TaskDesc task;
+                                       task.set_taskid(std::to_string(producer) + "-" + std::to_string(i));
+                                       task.set_attempt_id(static_cast<uint64_t>(i + 1));
+                                       q.Push(task);
+                                   }
+                               });
+    }
+    for (auto &producer : producers)
+        producer.join();
+
+    std::set<std::string> ids;
+    for (int i = 0; i < kProducers * kTasksPerProducer; ++i)
+    {
+        hotmethod::TaskDesc out;
+        ASSERT_TRUE(q.WaitPop(1000, &out));
+        ids.insert(out.taskid());
+    }
+    EXPECT_EQ(ids.size(), static_cast<size_t>(kProducers * kTasksPerProducer));
 }

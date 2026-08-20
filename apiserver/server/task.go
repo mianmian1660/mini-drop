@@ -272,7 +272,14 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 			errorCode = ErrCodeTaskExecutionFailed
 		}
 		s.finishTaskAttemptForNotify(task.TID, req.AttemptID, errorCode, req.ErrorMessage, nil, 0)
-		if task.Status != TaskStatusFailed {
+		if task.Status == TaskStatusCanceled {
+			// Cancellation is terminal. The Agent still reports TASK_CANCELED so
+			// the attempt can record its real outcome, but that late notification
+			// must not overwrite CANCELED with FAILED.
+			s.Logger.Info("保留已取消任务状态，记录迟到的 Agent 结果",
+				zap.String("tid", task.TID),
+				zap.String("error_code", errorCode))
+		} else if task.Status != TaskStatusFailed {
 			_ = s.transitionTaskStatus(
 				&task,
 				TaskStatusFailed,

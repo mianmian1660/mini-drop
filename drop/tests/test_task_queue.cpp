@@ -10,6 +10,7 @@
 #include "server/TaskQueue.h"
 
 #include <gtest/gtest.h>
+#include <cstdio>
 #include <mutex>
 #include <string>
 
@@ -147,21 +148,30 @@ TEST(TaskQueue, CollectCancelAttemptsReturnsEntryStillRunning)
     EXPECT_EQ(out[0].second, 1u);
 }
 
-TEST(TaskQueue, CollectCancelAttemptsResendsUntilAgentStopsReportingRunning)
+TEST(TaskQueue, CollectCancelAttemptsSurvivesDispatchToRunningRaceUntilCompletionAck)
 {
     const std::string ip = "10.0.0.202";
     std::lock_guard<std::mutex> lock(drop_server::tasks_mutex);
 
     drop_server::request_cancel_locked(ip, "tq-cancel-resend", 1);
+    std::unordered_set<std::string> notReportedRunningYet;
     std::unordered_set<std::string> stillRunning = {drop_server::task_attempt_key("tq-cancel-resend", 1)};
 
-    // 还在跑：每次心跳都应该重新收到，不会因为读取过一次就被摘除
+    // CancelTask 可能发生在 Server 已派发、Agent 尚未来得及通过下一次心跳
+    // 汇报 running 的窗口。取消意图不能因为这一拍 running 集合为空就丢失。
+    EXPECT_EQ(drop_server::collect_cancel_attempts_locked(ip, notReportedRunningYet).size(), 1u);
+
+    // Agent 开始汇报 running 后仍持续重发，抵抗心跳响应丢失。
     EXPECT_EQ(drop_server::collect_cancel_attempts_locked(ip, stillRunning).size(), 1u);
     EXPECT_EQ(drop_server::collect_cancel_attempts_locked(ip, stillRunning).size(), 1u);
 
-    // Agent 不再汇报为 running：视为取消已生效，之后不再下发
-    std::unordered_set<std::string> empty;
-    EXPECT_TRUE(drop_server::collect_cancel_attempts_locked(ip, empty).empty());
+    // completed_attempts 是 Agent 对取消已生效的明确确认；收到确认后才清理。
+    hotmethod::TaskResult completed;
+    completed.set_taskid("tq-cancel-resend");
+    completed.set_attempt_id(1);
+    drop_server::mark_attempt_completed_locked(completed);
+
+    EXPECT_TRUE(drop_server::collect_cancel_attempts_locked(ip, notReportedRunningYet).empty());
     EXPECT_TRUE(drop_server::collect_cancel_attempts_locked(ip, stillRunning).empty());
 }
 
@@ -176,4 +186,36 @@ TEST(TaskQueue, CollectCancelAttemptsIgnoresOtherTargetIP)
     std::unordered_set<std::string> stillRunning = {drop_server::task_attempt_key("tq-cancel-scoped", 1)};
     EXPECT_TRUE(drop_server::collect_cancel_attempts_locked(otherIP, stillRunning).empty());
     EXPECT_EQ(drop_server::collect_cancel_attempts_locked(ip, stillRunning).size(), 1u);
+}
+
+TEST(TaskQueue, CanceledTaskRemainsCanceledAcrossSnapshotRestore)
+{
+    const std::string ip = "10.0.0.205";
+    const std::string path = "/tmp/drop_task_queue_canceled_restore_test.bin";
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+
+    {
+        std::lock_guard<std::mutex> lock(drop_server::tasks_mutex);
+        auto task = make_task("tq-cancel-persisted", 1);
+        ASSERT_TRUE(drop_server::enqueue_task_locked(ip, task).ok);
+        ASSERT_TRUE(drop_server::cancel_task_locked(ip, task.taskid(), task.attempt_id()));
+    }
+
+    drop_server::snapshot_tasks_to_disk(path);
+    {
+        std::lock_guard<std::mutex> lock(drop_server::tasks_mutex);
+        drop_server::tasks_.erase(ip);
+    }
+    drop_server::restore_tasks_from_disk(path);
+
+    {
+        std::lock_guard<std::mutex> lock(drop_server::tasks_mutex);
+        hotmethod::TaskDesc out;
+        EXPECT_FALSE(drop_server::pop_next_dispatchable_task_locked(ip, &out));
+        drop_server::tasks_.erase(ip);
+    }
+
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
 }

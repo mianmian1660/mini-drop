@@ -10,7 +10,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(mini-drop VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 14)
+# 新版 grpc/absl 头文件依赖 C++17（本机 Homebrew grpc 1.83 实测）；
+# 服务器 Ubuntu g++11 完全支持 C++17，兼容。
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------- 依赖 ----------
@@ -18,7 +20,8 @@ find_package(Protobuf REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(gRPC REQUIRED IMPORTED_TARGET grpc++ grpc)
-set(gRPC_CPP_PLUGIN /usr/bin/grpc_cpp_plugin)
+# 跨平台查找 grpc 的 protoc 插件：Ubuntu 在 /usr/bin，Homebrew(macOS) 在 /opt/homebrew/bin
+find_program(gRPC_CPP_PLUGIN NAMES grpc_cpp_plugin REQUIRED)
 
 # ---------- Proto 路径 ----------
 set(PROTO_DIR ${CMAKE_SOURCE_DIR}/common/proto)
@@ -64,6 +67,8 @@ set(PROTO_GRPC_SRCS
 set(COMMON_SRCS
     common/CapabilityDetector.cpp
     common/ContinuousSampler.cpp
+    common/RuntimeSymbolMap.cpp
+    common/GoSymbolizer.cpp
     common/Process.cpp
     common/COSClient.cpp
     common/Utils.cpp
@@ -107,6 +112,7 @@ add_executable(drop_agent
     agent/HeartbeatThread.cpp
     agent/WorkerThread.cpp
     agent/UploadWorker.cpp
+    agent/ResultDelivery.cpp
     agent/CleanupWorker.cpp
     agent/RunnerUtils.cpp
     agent/RunnerRegistry.cpp
@@ -166,15 +172,26 @@ if(GTest_FOUND)
         tests/test_agent_task_queue.cpp
         tests/test_attempt_tracker.cpp
         tests/test_upload_queue.cpp
+        tests/test_result_delivery.cpp
+        tests/test_agent_utils.cpp
         tests/test_pid_registry.cpp
+        tests/test_runtime_symbol_map.cpp
+        tests/test_go_symbolizer.cpp
+        tests/test_continuous_sampler.cpp
         server/TaskQueue.cpp
         common/ProcessExecutor.cpp
         common/Process.cpp
+        common/Utils.cpp
+        common/BuildId.cpp
         common/PidRegistry.cpp
+        common/RuntimeSymbolMap.cpp
+        common/GoSymbolizer.cpp
         agent/RunnerUtils.cpp
         agent/TaskQueue.cpp
         agent/UploadQueue.cpp
         agent/AttemptTracker.cpp
+        agent/ResultDelivery.cpp
+        agent/AgentUtils.cpp
         agent/runners/PerfRunner.cpp
         agent/runners/AsyncProfilerRunner.cpp
         agent/runners/PprofRunner.cpp

@@ -625,6 +625,7 @@ func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	router.POST("/api/v1/internal/task-notify", s.NotifyTaskResult)
 	router.POST("/api/v1/tasks/:tid/cancel", s.CancelTask)
 	router.GET("/api/v1/tasks/:tid/artifacts", s.ListTaskArtifacts)
 	router.GET("/api/v1/tasks/:tid/artifacts/:artifact_id/download", s.DownloadTaskArtifact)
@@ -693,6 +694,34 @@ func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 	}
 	if fakeControl.cancelReq == nil || fakeControl.cancelReq.GetTaskID() != task.TID || fakeControl.cancelReq.GetAttemptId() != uint64(attempt.ID) {
 		t.Fatalf("cancel rpc req=%#v, want task and latest attempt", fakeControl.cancelReq)
+	}
+	var canceledAttempt model.TaskAttempt
+	if err := s.DB.Where("id = ?", attempt.ID).First(&canceledAttempt).Error; err != nil {
+		t.Fatalf("load canceled attempt: %v", err)
+	}
+	if canceledAttempt.EndTime == nil || canceledAttempt.ErrorCode != ErrCodeTaskCanceled || canceledAttempt.ExitCode != 1 {
+		t.Fatalf("canceled attempt=%#v, want terminal TASK_CANCELED", canceledAttempt)
+	}
+
+	lateNotifyBody := `{"task_id":"` + task.TID + `","attempt_id":` + strconv.Itoa(int(attempt.ID)) + `,"error_code":"TASK_CANCELED","error_message":"runner observed cancellation"}`
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/internal/task-notify", strings.NewReader(lateNotifyBody))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("late cancel notify status=%d body=%s", w.Code, w.Body.String())
+	}
+	if err := s.DB.Where("tid = ?", task.TID).First(&canceled).Error; err != nil {
+		t.Fatalf("reload canceled task after late notify: %v", err)
+	}
+	if canceled.Status != TaskStatusCanceled {
+		t.Fatalf("late cancel notify changed status to %d, want CANCELED", canceled.Status)
+	}
+	if err := s.DB.Where("id = ?", attempt.ID).First(&canceledAttempt).Error; err != nil {
+		t.Fatalf("reload canceled attempt after late notify: %v", err)
+	}
+	if canceledAttempt.ErrorCode != ErrCodeTaskCanceled || canceledAttempt.ErrorMessage != "runner observed cancellation" {
+		t.Fatalf("late cancel attempt=%#v", canceledAttempt)
 	}
 	var outbox model.Outbox
 	if err := s.DB.Where("aggregate_id = ?", task.TID).First(&outbox).Error; err != nil {

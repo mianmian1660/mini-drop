@@ -2,6 +2,7 @@
 
 #include "agent/RunnerUtils.h"
 #include "agent/AgentUtils.h"
+#include "agent/ResultDelivery.h"
 #include "common/COSClient.h"      // drop::upload_to_minio
 #include "common/Utils.h"          // drop::read_file_content
 #include "common/SymbolCollector.h" // drop::collect_and_upload_symbols
@@ -461,12 +462,31 @@ namespace drop_agent
                 hotmethod::TaskResult taskResult = BuildTaskResult(
                     job.task, job.outcome, channelHolder_.GetCosConfig(), job.selfPs, job.childrenPs);
 
-                auto hotmethodStub = channelHolder_.HotmethodStub();
-                google::protobuf::Empty emptyResp;
-                ClientContext notifyCtx;
-                Status notifyStatus = hotmethodStub->NotifyResult(&notifyCtx, taskResult, &emptyResp);
+                std::string notifyError;
+                bool delivered = DeliverResultAndMarkCompleted(
+                    job.task.taskid(), job.task.attempt_id(), attemptTracker_,
+                    [&](std::string *error)
+                    {
+                        // Fetch a fresh stub on every attempt so heartbeat failover
+                        // can repair an in-flight result notification.
+                        auto hotmethodStub = channelHolder_.HotmethodStub();
+                        if (!hotmethodStub)
+                        {
+                            if (error)
+                                *error = "server channel is unavailable";
+                            return false;
+                        }
+                        google::protobuf::Empty emptyResp;
+                        ClientContext notifyCtx;
+                        notifyCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                        Status status = hotmethodStub->NotifyResult(&notifyCtx, taskResult, &emptyResp);
+                        if (!status.ok() && error)
+                            *error = status.error_message();
+                        return status.ok();
+                    },
+                    ResultDeliveryPolicy{}, RetrySleep{}, &notifyError);
 
-                if (notifyStatus.ok())
+                if (delivered)
                 {
                     cout << "[upload] NotifyResult 上报成功: taskID=" << job.task.taskid()
                          << " profiler=" << job.outcome.profilerName
@@ -477,12 +497,11 @@ namespace drop_agent
                 }
                 else
                 {
-                    cerr << "[upload] NotifyResult 上报失败: " << notifyStatus.error_message() << endl;
+                    cerr << "[upload] NotifyResult 重试耗尽，保留本地产物且不确认 completed: "
+                         << notifyError << endl;
                     drop::log_event("drop_agent", "notify_result_failed",
-                                     {{"task_id", job.task.taskid()}, {"error", notifyStatus.error_message()}});
+                                     {{"task_id", job.task.taskid()}, {"error", notifyError}});
                 }
-
-                attemptTracker_.MarkCompleted(job.task.taskid(), job.task.attempt_id());
                 continue;
             }
 

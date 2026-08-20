@@ -8,6 +8,14 @@ namespace drop_agent
     void AttemptTracker::MarkRunning(const std::string &taskID, uint64_t attemptID)
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        auto matches = [&](const common::AttemptStatus &attempt)
+        {
+            return attempt.taskid() == taskID && attempt.attempt_id() == attemptID;
+        };
+        if (std::any_of(running_.begin(), running_.end(), matches) ||
+            std::any_of(completed_.begin(), completed_.end(), matches))
+            return;
+
         common::AttemptStatus attempt;
         attempt.set_taskid(taskID);
         attempt.set_attempt_id(attemptID);
@@ -25,10 +33,19 @@ namespace drop_agent
                                        }),
                         running_.end());
 
-        common::AttemptStatus attempt;
-        attempt.set_taskid(taskID);
-        attempt.set_attempt_id(attemptID);
-        completed_.push_back(attempt);
+        const bool alreadyCompleted = std::any_of(
+            completed_.begin(), completed_.end(),
+            [&](const common::AttemptStatus &attempt)
+            {
+                return attempt.taskid() == taskID && attempt.attempt_id() == attemptID;
+            });
+        if (!alreadyCompleted)
+        {
+            common::AttemptStatus attempt;
+            attempt.set_taskid(taskID);
+            attempt.set_attempt_id(attemptID);
+            completed_.push_back(attempt);
+        }
         if (completed_.size() > 50)
             completed_.erase(completed_.begin());
 
@@ -50,6 +67,17 @@ namespace drop_agent
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return cancelRequested_.find(Key(taskID, attemptID)) != cancelRequested_.end();
+    }
+
+    bool AttemptTracker::IsRunning(const std::string &taskID, uint64_t attemptID) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return std::any_of(running_.begin(), running_.end(),
+                           [&](const common::AttemptStatus &attempt)
+                           {
+                               return attempt.taskid() == taskID &&
+                                      attempt.attempt_id() == attemptID;
+                           });
     }
 
     std::vector<common::AttemptStatus> AttemptTracker::RunningSnapshot() const

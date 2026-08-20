@@ -336,7 +336,7 @@ namespace drop_agent
             // Phase 5：统一任务目录隔离，每个 (taskID, attemptID) 各有独立目录，
             // 不再靠文件名拼接 profilerType+taskID 去重（同一 taskID 的重试
             // attempt 用子目录区分，不会互相覆盖产物）。
-            string taskDir = "/tmp/drop_agent/tasks/" + task.taskid() + "/" + to_string(task.attempt_id()) + "/";
+            string taskDir = TaskAttemptDir("/tmp/drop_agent/tasks", task.taskid(), task.attempt_id());
             EnsureDirRecursive(taskDir);
             string outputPath = taskDir + "output";
 
