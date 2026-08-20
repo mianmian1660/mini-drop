@@ -26,6 +26,10 @@ struct ContinuousSamplerConfig
     int aggregationWindowSec = 10;
     int uploadBatchSec = 60;
     int retentionHours = 24;
+    uint64_t spoolMaxBytes = 5ULL * 1024 * 1024 * 1024;
+    uint64_t spoolMinFreeBytes = 2ULL * 1024 * 1024 * 1024;
+    int retryMaxSec = 300;
+    std::string spoolDirectory = "/var/lib/mini-drop/continuous-spool";
     std::string sessionSID;
     std::string targetIP;
     std::string hostname;

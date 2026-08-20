@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -358,39 +359,63 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	if req.SchemaVersion == 0 {
 		req.SchemaVersion = 1
 	}
+	receivedAt := time.Now()
+	clockOffsetMS, clockStatus, clockObserved := continuousAgentClock(c, receivedAt)
+
+	var existing model.ProfileBatch
+	if err := s.DB.Where("bid = ?", req.BatchID).First(&existing).Error; err == nil {
+		if existing.SessionSID != req.SessionSID || !existing.StartTime.Equal(req.StartTime) || !existing.EndTime.Equal(req.EndTime) {
+			s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, "batch_id 已被不同采集批次使用")
+			return
+		}
+		s.updateContinuousAgentClock(req.SessionSID, clockOffsetMS, clockStatus, clockObserved)
+		s.respondContinuousBatchACK(c, req, true)
+		return
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 ProfileBatch 失败")
+		return
+	}
 	req.SignalTypes = normalizeContinuousSignalTypes(req)
 	if req.Backends == nil {
 		req.Backends = map[string]string{}
 	}
-	if err := s.storeContinuousBatchPayload(c.Request.Context(), req); err != nil {
-		s.Logger.Error("保存 Continuous ProfileBatch payload 失败", zap.String("sid", req.SessionSID), zap.Error(err))
-		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "保存 Continuous ProfileBatch payload 失败")
-		return
-	}
-	now := time.Now()
+	now := receivedAt
 	batch := model.ProfileBatch{
-		BID:               req.BatchID,
-		SessionSID:        req.SessionSID,
-		TargetIP:          req.TargetIP,
-		ObjectKey:         req.ObjectKey,
-		StartTime:         req.StartTime,
-		EndTime:           req.EndTime,
-		WindowCount:       req.WindowCount,
-		SampleCount:       clampContinuousCount(req.SampleCount),
-		SchemaVersion:     req.SchemaVersion,
-		SignalTypes:       mustJSONBytes(req.SignalTypes),
-		Backends:          mustJSONBytes(req.Backends),
-		Status:            model.ContinuousBatchStatusReady,
-		ProfileFormat:     firstNonEmpty(req.ProfileFormat, "json"),
-		BackendStatus:     firstNonEmpty(req.BackendStatus, "ok"),
-		BackendReason:     req.BackendReason,
-		AttemptedBackends: mustJSONBytes(req.AttemptedBackends),
-		SelectedBackend:   req.SelectedBackend,
-		SymbolRefs:        mustJSONBytes(req.SymbolRefs),
-		CreatedAt:         now,
+		BID:                req.BatchID,
+		SessionSID:         req.SessionSID,
+		TargetIP:           req.TargetIP,
+		ObjectKey:          req.ObjectKey,
+		StartTime:          req.StartTime,
+		EndTime:            req.EndTime,
+		WindowCount:        req.WindowCount,
+		SampleCount:        clampContinuousCount(req.SampleCount),
+		SchemaVersion:      req.SchemaVersion,
+		SignalTypes:        mustJSONBytes(req.SignalTypes),
+		Backends:           mustJSONBytes(req.Backends),
+		Status:             model.ContinuousBatchStatusReady,
+		ProfileFormat:      firstNonEmpty(req.ProfileFormat, "json"),
+		BackendStatus:      firstNonEmpty(req.BackendStatus, "ok"),
+		BackendReason:      req.BackendReason,
+		AttemptedBackends:  mustJSONBytes(req.AttemptedBackends),
+		SelectedBackend:    req.SelectedBackend,
+		SymbolRefs:         mustJSONBytes(req.SymbolRefs),
+		ReceivedAt:         receivedAt,
+		AgentClockOffsetMs: clockOffsetMS,
+		CreatedAt:          now,
 	}
+	duplicate := false
+	var payloadStoreErr error
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "bid"}}, DoNothing: true}).Create(&batch).Error; err != nil {
+		result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "bid"}}, DoNothing: true}).Create(&batch)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			duplicate = true
+			return nil
+		}
+		if err := s.storeContinuousBatchPayload(c.Request.Context(), req); err != nil {
+			payloadStoreErr = err
 			return err
 		}
 		for _, in := range req.Windows {
@@ -426,15 +451,83 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		}
 		return tx.Model(&model.ContinuousSession{}).
 			Where("sid = ?", req.SessionSID).
-			Updates(map[string]interface{}{"last_upload_at": &req.EndTime, "updated_at": now}).Error
+			Updates(map[string]interface{}{
+				"last_upload_at":        gorm.Expr("CASE WHEN last_upload_at IS NULL OR last_upload_at < ? THEN ? ELSE last_upload_at END", req.EndTime, req.EndTime),
+				"updated_at":            now,
+				"agent_clock_offset_ms": clockOffsetMS, "agent_clock_status": clockStatus,
+				"agent_clock_observed_at": clockObserved,
+			}).Error
 	})
 	if err != nil {
+		if payloadStoreErr != nil {
+			s.Logger.Error("保存 Continuous ProfileBatch payload 失败", zap.String("sid", req.SessionSID), zap.Error(payloadStoreErr))
+			s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "保存 Continuous ProfileBatch payload 失败")
+			return
+		}
 		s.Logger.Error("登记 ProfileBatch 失败", zap.String("sid", req.SessionSID), zap.Error(err))
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "登记 ProfileBatch 失败")
 		return
 	}
+	if duplicate {
+		var raced model.ProfileBatch
+		if err := s.DB.Where("bid = ?", req.BatchID).First(&raced).Error; err != nil ||
+			raced.SessionSID != req.SessionSID || !raced.StartTime.Equal(req.StartTime) || !raced.EndTime.Equal(req.EndTime) {
+			s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, "batch_id 并发冲突")
+			return
+		}
+		s.updateContinuousAgentClock(req.SessionSID, clockOffsetMS, clockStatus, clockObserved)
+	}
 	s.cleanupContinuousRetention(c.Request.Context(), session)
-	s.RespondOK(c, gin.H{"batch_id": req.BatchID, "session_sid": req.SessionSID})
+	s.respondContinuousBatchACK(c, req, duplicate)
+}
+
+func continuousAgentClock(c *gin.Context, receivedAt time.Time) (int64, string, *time.Time) {
+	raw := strings.TrimSpace(c.GetHeader("X-Mini-Drop-Agent-Time-Ms"))
+	if raw == "" {
+		return 0, "unknown", nil
+	}
+	agentMS, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || agentMS <= 0 {
+		return 0, "unknown", nil
+	}
+	offset := receivedAt.UnixMilli() - agentMS
+	absOffset := offset
+	if absOffset < 0 {
+		absOffset = -absOffset
+	}
+	status := "ok"
+	if absOffset > 30000 {
+		status = "critical"
+	} else if absOffset > 5000 {
+		status = "warning"
+	}
+	observed := receivedAt
+	return offset, status, &observed
+}
+
+func (s *APIServer) updateContinuousAgentClock(sid string, offset int64, status string, observed *time.Time) {
+	if observed == nil {
+		return
+	}
+	if err := s.DB.Model(&model.ContinuousSession{}).Where("sid = ?", sid).Updates(map[string]interface{}{
+		"agent_clock_offset_ms": offset, "agent_clock_status": status, "agent_clock_observed_at": observed,
+	}).Error; err != nil {
+		s.Logger.Warn("更新 Agent 时钟偏差失败", zap.String("sid", sid), zap.Error(err))
+	}
+}
+
+func continuousSessionClockStatus(session model.ContinuousSession) string {
+	if session.AgentClockObservedAt == nil {
+		return "unknown"
+	}
+	return firstNonEmpty(session.AgentClockStatus, "unknown")
+}
+
+func (s *APIServer) respondContinuousBatchACK(c *gin.Context, req ContinuousBatchIngestReq, duplicate bool) {
+	s.RespondOK(c, gin.H{
+		"accepted": true, "duplicate": duplicate,
+		"batch_id": req.BatchID, "session_sid": req.SessionSID,
+	})
 }
 
 func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
@@ -442,17 +535,36 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 	if !ok {
 		return
 	}
+	now := time.Now()
+	retentionHours := firstNonZeroUint32(session.RetentionHours, 24)
+	boundaryFrom := now.Add(-time.Duration(retentionHours) * time.Hour)
+	if session.StartedAt.After(boundaryFrom) {
+		boundaryFrom = session.StartedAt
+	}
+	boundaryTo := now
+	if session.StoppedAt != nil && session.StoppedAt.Before(boundaryTo) {
+		boundaryTo = *session.StoppedAt
+	}
+	requestedFrom, valid := parseOptionalTime(c, "from")
+	if !valid {
+		return
+	}
+	requestedTo, valid := parseOptionalTime(c, "to")
+	if !valid {
+		return
+	}
+	if !requestedFrom.IsZero() && requestedFrom.After(boundaryFrom) {
+		boundaryFrom = requestedFrom
+	}
+	if !requestedTo.IsZero() && requestedTo.Before(boundaryTo) {
+		boundaryTo = requestedTo
+	}
+	if !boundaryFrom.Before(boundaryTo) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "timeline 时间范围不合法或超出保留边界")
+		return
+	}
 	query := s.DB.Where("session_sid = ?", session.SID).Order("window_start ASC")
-	if from, ok := parseOptionalTime(c, "from"); !ok {
-		return
-	} else if !from.IsZero() {
-		query = query.Where("window_end >= ?", from)
-	}
-	if to, ok := parseOptionalTime(c, "to"); !ok {
-		return
-	} else if !to.IsZero() {
-		query = query.Where("window_start <= ?", to)
-	}
+	query = query.Where("window_end >= ? AND window_start <= ?", boundaryFrom, boundaryTo)
 	var windows []model.ProfileWindow
 	if err := query.Find(&windows).Error; err != nil {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 Continuous timeline 失败")
@@ -461,7 +573,85 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 	if windows == nil {
 		windows = []model.ProfileWindow{}
 	}
-	s.RespondOK(c, gin.H{"session": session, "windows": windows, "total": len(windows)})
+	gaps, coverage := continuousTimelineCoverage(windows, boundaryFrom, boundaryTo, 5*time.Second)
+	s.RespondOK(c, gin.H{
+		"session": session, "windows": windows, "total": len(windows),
+		"gaps": gaps, "coverage": coverage,
+		"clock": gin.H{
+			"offset_ms": session.AgentClockOffsetMs, "status": continuousSessionClockStatus(session),
+			"observed_at": session.AgentClockObservedAt,
+		},
+	})
+}
+
+type continuousTimelineGap struct {
+	Start           time.Time `json:"start"`
+	End             time.Time `json:"end"`
+	DurationSeconds float64   `json:"duration_seconds"`
+	Type            string    `json:"type"`
+}
+
+func continuousTimelineCoverage(windows []model.ProfileWindow, from, to time.Time, tolerance time.Duration) ([]continuousTimelineGap, gin.H) {
+	type interval struct{ start, end time.Time }
+	intervals := make([]interval, 0, len(windows))
+	for _, window := range windows {
+		start, end := window.WindowStart, window.WindowEnd
+		if start.Before(from) {
+			start = from
+		}
+		if end.After(to) {
+			end = to
+		}
+		if start.Before(end) {
+			intervals = append(intervals, interval{start: start, end: end})
+		}
+	}
+	sort.Slice(intervals, func(i, j int) bool { return intervals[i].start.Before(intervals[j].start) })
+	merged := make([]interval, 0, len(intervals))
+	for _, item := range intervals {
+		if len(merged) == 0 || item.start.Sub(merged[len(merged)-1].end) > tolerance {
+			merged = append(merged, item)
+			continue
+		}
+		if item.end.After(merged[len(merged)-1].end) {
+			merged[len(merged)-1].end = item.end
+		}
+	}
+
+	gaps := []continuousTimelineGap{}
+	cursor := from
+	for i, item := range merged {
+		if item.start.Sub(cursor) > tolerance {
+			gapType := "internal"
+			if i == 0 {
+				gapType = "leading"
+			}
+			gaps = append(gaps, continuousTimelineGap{Start: cursor, End: item.start, DurationSeconds: item.start.Sub(cursor).Seconds(), Type: gapType})
+		}
+		if item.end.After(cursor) {
+			cursor = item.end
+		}
+	}
+	if to.Sub(cursor) > tolerance {
+		gaps = append(gaps, continuousTimelineGap{Start: cursor, End: to, DurationSeconds: to.Sub(cursor).Seconds(), Type: "trailing"})
+	}
+	totalSeconds := to.Sub(from).Seconds()
+	gapSeconds := float64(0)
+	for _, gap := range gaps {
+		gapSeconds += gap.DurationSeconds
+	}
+	coveredSeconds := totalSeconds - gapSeconds
+	if coveredSeconds < 0 {
+		coveredSeconds = 0
+	}
+	ratio := float64(0)
+	if totalSeconds > 0 {
+		ratio = coveredSeconds / totalSeconds
+	}
+	return gaps, gin.H{
+		"from": from, "to": to, "total_seconds": totalSeconds,
+		"covered_seconds": coveredSeconds, "gap_seconds": gapSeconds, "ratio": ratio,
+	}
 }
 
 func (s *APIServer) QueryContinuousProfile(c *gin.Context) {

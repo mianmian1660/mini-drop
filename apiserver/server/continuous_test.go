@@ -9,9 +9,129 @@
 package server
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/mini-drop/apiserver/model"
 )
+
+func TestContinuousTimelineCoverageUsesFiveSecondTolerance(t *testing.T) {
+	base := time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)
+	windows := []model.ProfileWindow{
+		{WindowStart: base, WindowEnd: base.Add(10 * time.Second)},
+		{WindowStart: base.Add(15 * time.Second), WindowEnd: base.Add(25 * time.Second)},
+		{WindowStart: base.Add(31 * time.Second), WindowEnd: base.Add(40 * time.Second)},
+	}
+	gaps, coverage := continuousTimelineCoverage(windows, base, base.Add(40*time.Second), 5*time.Second)
+	if len(gaps) != 1 || gaps[0].Start != base.Add(25*time.Second) || gaps[0].DurationSeconds != 6 {
+		t.Fatalf("unexpected gaps: %#v", gaps)
+	}
+	if coverage["gap_seconds"].(float64) != 6 {
+		t.Fatalf("unexpected coverage: %#v", coverage)
+	}
+}
+
+func TestContinuousAgentClockClassification(t *testing.T) {
+	received := time.UnixMilli(100_000)
+	for _, tc := range []struct {
+		offset int64
+		want   string
+	}{{5000, "ok"}, {5001, "warning"}, {30001, "critical"}} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+		c.Request.Header.Set("X-Mini-Drop-Agent-Time-Ms", fmt.Sprint(received.UnixMilli()-tc.offset))
+		offset, status, observed := continuousAgentClock(c, received)
+		if offset != tc.offset || status != tc.want || observed == nil {
+			t.Fatalf("offset=%d status=%s observed=%v, want %d/%s", offset, status, observed, tc.offset, tc.want)
+		}
+	}
+}
+
+func TestContinuousSessionClockStatusRequiresObservation(t *testing.T) {
+	session := model.ContinuousSession{AgentClockStatus: "ok"}
+	if got := continuousSessionClockStatus(session); got != "unknown" {
+		t.Fatalf("unobserved clock status=%q, want unknown", got)
+	}
+	now := time.Now()
+	session.AgentClockObservedAt = &now
+	if got := continuousSessionClockStatus(session); got != "ok" {
+		t.Fatalf("observed clock status=%q, want ok", got)
+	}
+}
+
+func TestContinuousBatchDuplicateReturnsAckWithoutDuplicateWindows(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if err := s.DB.Create(&model.ContinuousSession{
+		SID: "cps-idempotent", TargetIP: "10.0.0.8", RetentionHours: 24,
+		Status: model.ContinuousSessionStatusRunning, StartedAt: now.Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"session_sid":"cps-idempotent","batch_id":"cpb-idempotent","start_time":%q,"end_time":%q,"windows":[{"window_start":%q,"window_end":%q,"samples":[{"stack":["main"],"count":1}]}]}`,
+		now.Add(-20*time.Second).Format(time.RFC3339Nano), now.Add(-10*time.Second).Format(time.RFC3339Nano),
+		now.Add(-20*time.Second).Format(time.RFC3339Nano), now.Add(-10*time.Second).Format(time.RFC3339Nano))
+	router := profileRouter(s)
+	for attempt := 0; attempt < 2; attempt++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Drop-User-Uid", "owner")
+		req.Header.Set("X-Mini-Drop-Agent-Time-Ms", fmt.Sprint(now.UnixMilli()))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"accepted":true`) ||
+			!strings.Contains(w.Body.String(), fmt.Sprintf(`"duplicate":%t`, attempt == 1)) {
+			t.Fatalf("attempt %d status=%d body=%s", attempt, w.Code, w.Body.String())
+		}
+	}
+	var count int64
+	if err := s.DB.Model(&model.ProfileWindow{}).Where("batch_bid = ?", "cpb-idempotent").Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("window count=%d err=%v", count, err)
+	}
+
+	conflictBody := strings.Replace(body, now.Add(-10*time.Second).Format(time.RFC3339Nano), now.Add(-9*time.Second).Format(time.RFC3339Nano), 1)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(conflictBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("conflicting batch status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestContinuousBatchStorageFailureDoesNotAckOrPersist(t *testing.T) {
+	s := newTestAPIServer(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if err := s.DB.Create(&model.ContinuousSession{
+		SID: "cps-no-storage", TargetIP: "10.0.0.9", RetentionHours: 24,
+		Status: model.ContinuousSessionStatusRunning, StartedAt: now.Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"session_sid":"cps-no-storage","batch_id":"cpb-no-storage","start_time":%q,"end_time":%q,"windows":[]}`,
+		now.Add(-20*time.Second).Format(time.RFC3339Nano), now.Add(-10*time.Second).Format(time.RFC3339Nano))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	profileRouter(s).ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), `"accepted":true`) {
+		t.Fatalf("storage failure status=%d body=%s", w.Code, w.Body.String())
+	}
+	var count int64
+	if err := s.DB.Model(&model.ProfileBatch{}).Where("bid = ?", "cpb-no-storage").Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("failed batch persisted count=%d err=%v", count, err)
+	}
+}
 
 func TestContinuousSymbolMetadataCollectsGoState(t *testing.T) {
 	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{}}

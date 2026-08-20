@@ -296,3 +296,103 @@ TEST(ContinuousSampler, SerializesFailedMemrayProfileForMemoryDiagnostics)
     EXPECT_NE(json.find("\"signal_types\":[\"python_memory\"]"), std::string::npos);
     EXPECT_NE(json.find("version mismatch"), std::string::npos);
 }
+
+TEST(ContinuousSpool, PersistsJournalAtomicallyAndRecoversAfterRestart)
+{
+    char directoryTemplate[] = "/tmp/mini-drop-spool-test-XXXXXX";
+    char *directory = ::mkdtemp(directoryTemplate);
+    ASSERT_NE(directory, nullptr);
+    ContinuousSamplerConfig cfg = make_cfg();
+    cfg.spoolDirectory = directory;
+    const std::string batchID = "cpb-1000-test";
+    ASSERT_TRUE(ensure_directory(session_spool_directory(cfg)));
+    ASSERT_TRUE(persist_batch(cfg, batchID, "{\"batch_id\":\"cpb-1000-test\"}"));
+
+    struct stat st = {};
+    ASSERT_EQ(::stat(journal_path(cfg, batchID).c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 0777, 0600);
+    EXPECT_TRUE(list_spool_files(cfg).empty());
+
+    recover_spool_journals(cfg);
+    auto files = list_spool_files(cfg);
+    ASSERT_EQ(files.size(), 1u);
+    EXPECT_EQ(batch_id_from_spool_path(files[0]), batchID);
+    std::string body;
+    EXPECT_TRUE(read_file(files[0], &body));
+    EXPECT_NE(body.find(batchID), std::string::npos);
+
+    ::unlink(files[0].c_str());
+    ::rmdir(session_spool_directory(cfg).c_str());
+    ::rmdir(directory);
+}
+
+TEST(ContinuousSpool, RequiresExplicitMatchingAck)
+{
+    EXPECT_TRUE(response_acknowledges_batch(
+        "{\"code\":0,\"data\":{\"accepted\":true,\"batch_id\":\"cpb-1\"}}", "cpb-1"));
+    EXPECT_FALSE(response_acknowledges_batch(
+        "{\"code\":0,\"data\":{\"batch_id\":\"cpb-1\"}}", "cpb-1"));
+    EXPECT_FALSE(response_acknowledges_batch(
+        "{\"code\":0,\"data\":{\"accepted\":true,\"batch_id\":\"cpb-2\"}}", "cpb-1"));
+}
+
+TEST(ContinuousSpool, BatchIDIsStableAndUniqueAcrossSessions)
+{
+    ContinuousSamplerConfig first = make_cfg();
+    ContinuousSamplerConfig second = first;
+    second.sessionSID = "another-session";
+
+    const std::string firstID = make_batch_id(first, 1234567890);
+    EXPECT_EQ(firstID, make_batch_id(first, 1234567890));
+    EXPECT_NE(firstID, make_batch_id(second, 1234567890));
+    EXPECT_LT(firstID.size(), 64u);
+}
+
+TEST(ContinuousSpool, FindsPendingBatchesFromPreviousSession)
+{
+    char directoryTemplate[] = "/tmp/mini-drop-spool-cross-session-XXXXXX";
+    char *directory = ::mkdtemp(directoryTemplate);
+    ASSERT_NE(directory, nullptr);
+    ContinuousSamplerConfig oldCfg = make_cfg();
+    oldCfg.spoolDirectory = directory;
+    oldCfg.sessionSID = "old-session";
+    ASSERT_TRUE(ensure_directory(session_spool_directory(oldCfg)));
+    ASSERT_TRUE(persist_batch(oldCfg, "cpb-100-old", "{}"));
+    ASSERT_TRUE(finalize_batch(oldCfg, "cpb-100-old"));
+
+    ContinuousSamplerConfig newCfg = oldCfg;
+    newCfg.sessionSID = "new-session";
+    ASSERT_TRUE(ensure_directory(session_spool_directory(newCfg)));
+    auto files = list_spool_files(newCfg);
+    ASSERT_EQ(files.size(), 1u);
+    EXPECT_NE(files[0].find("/old-session/"), std::string::npos);
+
+    ::unlink(files[0].c_str());
+    ::rmdir(session_spool_directory(oldCfg).c_str());
+    ::rmdir(session_spool_directory(newCfg).c_str());
+    ::rmdir(directory);
+}
+
+TEST(ContinuousSpool, AppliesQuotaBackpressureAndCapsRetry)
+{
+    char directoryTemplate[] = "/tmp/mini-drop-spool-quota-XXXXXX";
+    char *directory = ::mkdtemp(directoryTemplate);
+    ASSERT_NE(directory, nullptr);
+    ContinuousSamplerConfig cfg = make_cfg();
+    cfg.spoolDirectory = directory;
+    cfg.spoolMaxBytes = 8;
+    cfg.spoolMinFreeBytes = 1;
+    cfg.retryMaxSec = 5;
+    ASSERT_TRUE(ensure_directory(session_spool_directory(cfg)));
+    ASSERT_TRUE(persist_batch(cfg, "cpb-quota", "0123456789"));
+    EXPECT_FALSE(spool_has_collection_capacity(cfg));
+
+    SpoolRetryState retry;
+    for (int i = 0; i < 10; ++i)
+        schedule_spool_retry(cfg, &retry);
+    EXPECT_EQ(retry.delaySec, 5);
+
+    ::unlink(journal_path(cfg, "cpb-quota").c_str());
+    ::rmdir(session_spool_directory(cfg).c_str());
+    ::rmdir(directory);
+}

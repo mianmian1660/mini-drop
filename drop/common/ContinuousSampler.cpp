@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -24,7 +25,10 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -34,6 +38,196 @@ namespace drop
 namespace
 {
 static constexpr uint64_t kMaxDBCount = (1ULL << 63) - 1;
+
+struct SpoolRetryState
+{
+    int64_t nextAttemptMs = 0;
+    int delaySec = 1;
+};
+
+static std::string safe_spool_component(const std::string &value)
+{
+    std::string out;
+    for (char c : value)
+        out += (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') ? c : '_';
+    return out.empty() ? "unknown" : out;
+}
+
+static uint64_t stable_string_hash(const std::string &value)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char c : value)
+    {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static std::string make_batch_id(const ContinuousSamplerConfig &cfg, int64_t windowStartMs)
+{
+    std::ostringstream id;
+    id << "cpb-" << std::hex << stable_string_hash(cfg.sessionSID)
+       << std::dec << '-' << windowStartMs << '-' << ::getpid();
+    return id.str();
+}
+
+static bool ensure_directory(const std::string &path)
+{
+    if (path.empty())
+        return false;
+    std::string current;
+    if (path.front() == '/')
+        current = "/";
+    std::stringstream parts(path);
+    std::string part;
+    while (std::getline(parts, part, '/'))
+    {
+        if (part.empty())
+            continue;
+        if (current.size() > 1 && current.back() != '/')
+            current += '/';
+        current += part;
+        if (::mkdir(current.c_str(), 0700) != 0 && errno != EEXIST)
+            return false;
+    }
+    return ::chmod(path.c_str(), 0700) == 0;
+}
+
+static std::string session_spool_directory(const ContinuousSamplerConfig &cfg)
+{
+    return cfg.spoolDirectory + "/" + safe_spool_component(cfg.sessionSID);
+}
+
+static bool read_file(const std::string &path, std::string *body)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open())
+        return false;
+    std::ostringstream stream;
+    stream << in.rdbuf();
+    *body = stream.str();
+    return in.good() || in.eof();
+}
+
+static bool atomic_write_file(const std::string &path, const std::string &body)
+{
+    std::string temporary = path + ".tmp." + std::to_string(::getpid());
+    int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+        return false;
+    size_t written = 0;
+    while (written < body.size())
+    {
+        ssize_t count = ::write(fd, body.data() + written, body.size() - written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+        {
+            ::close(fd);
+            ::unlink(temporary.c_str());
+            return false;
+        }
+        written += static_cast<size_t>(count);
+    }
+    bool ok = ::fsync(fd) == 0 && ::close(fd) == 0 &&
+              ::rename(temporary.c_str(), path.c_str()) == 0;
+    if (!ok)
+    {
+        ::unlink(temporary.c_str());
+        return false;
+    }
+    std::string directory = path.substr(0, path.find_last_of('/'));
+    int dirfd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0)
+    {
+        ::fsync(dirfd);
+        ::close(dirfd);
+    }
+    return true;
+}
+
+static void append_spool_files(const std::string &directory,
+                               const std::string &suffix,
+                               std::vector<std::string> *files)
+{
+    DIR *dir = ::opendir(directory.c_str());
+    if (!dir)
+        return;
+    while (dirent *entry = ::readdir(dir))
+    {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..")
+            continue;
+        std::string path = directory + "/" + name;
+        struct stat st = {};
+        if (::stat(path.c_str(), &st) != 0)
+            continue;
+        if (S_ISDIR(st.st_mode))
+            append_spool_files(path, suffix, files);
+        else if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+            files->push_back(path);
+    }
+    ::closedir(dir);
+}
+
+static std::vector<std::string> list_spool_files(const ContinuousSamplerConfig &cfg)
+{
+    std::vector<std::string> files;
+    append_spool_files(cfg.spoolDirectory, ".json", &files);
+    std::sort(files.begin(), files.end(), [](const std::string &a, const std::string &b) {
+        return a.substr(a.find_last_of('/') + 1) < b.substr(b.find_last_of('/') + 1);
+    });
+    return files;
+}
+
+static uint64_t spool_usage_bytes(const ContinuousSamplerConfig &cfg)
+{
+    uint64_t total = 0;
+    std::vector<std::string> files;
+    append_spool_files(cfg.spoolDirectory, ".json", &files);
+    append_spool_files(cfg.spoolDirectory, ".journal", &files);
+    for (const auto &path : files)
+    {
+        struct stat st = {};
+        if (::stat(path.c_str(), &st) == 0 && st.st_size > 0)
+            total += static_cast<uint64_t>(st.st_size);
+    }
+    return total;
+}
+
+static uint64_t spool_free_bytes(const ContinuousSamplerConfig &cfg)
+{
+    struct statvfs fs = {};
+    if (::statvfs(session_spool_directory(cfg).c_str(), &fs) != 0)
+        return 0;
+    return static_cast<uint64_t>(fs.f_bavail) * static_cast<uint64_t>(fs.f_frsize);
+}
+
+static bool spool_has_collection_capacity(const ContinuousSamplerConfig &cfg)
+{
+    return spool_usage_bytes(cfg) < cfg.spoolMaxBytes &&
+           spool_free_bytes(cfg) >= cfg.spoolMinFreeBytes;
+}
+
+static std::string spool_path(const ContinuousSamplerConfig &cfg, const std::string &batchID)
+{
+    return session_spool_directory(cfg) + "/" + safe_spool_component(batchID) + ".json";
+}
+
+static std::string journal_path(const ContinuousSamplerConfig &cfg, const std::string &batchID)
+{
+    return session_spool_directory(cfg) + "/" + safe_spool_component(batchID) + ".journal";
+}
+
+static std::string batch_id_from_spool_path(const std::string &path)
+{
+    size_t slash = path.find_last_of('/');
+    std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (name.size() > 5 && name.compare(name.size() - 5, 5, ".json") == 0)
+        name.resize(name.size() - 5);
+    return name;
+}
 
 static uint64_t clamp_count(uint64_t value)
 {
@@ -1511,30 +1705,120 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
     return body;
 }
 
-static bool post_batch(const ContinuousSamplerConfig &cfg, const std::string &body)
+static bool response_acknowledges_batch(const std::string &response, const std::string &batchID)
 {
-    std::string path = "/tmp/mini_drop_native_cp_batch_" + std::to_string(now_ms()) + ".json";
-    {
-        std::ofstream out(path, std::ios::binary);
-        if (!out.is_open())
-            return false;
-        out << body;
-    }
+    return response.find("\"accepted\":true") != std::string::npos &&
+           response.find("\"batch_id\":\"" + batchID + "\"") != std::string::npos;
+}
+
+static bool post_spooled_batch(const ContinuousSamplerConfig &cfg,
+                               const std::string &path,
+                               const std::string &batchID)
+{
     std::string response;
     int rc = drop::exec_capture({"curl", "-fsS", "-m", "20", "-X", "POST",
                                  "-H", "Content-Type: application/json",
                                  "-H", "Drop-User-Uid: " + cfg.authUID,
+                                 "-H", "X-Mini-Drop-Agent-Time-Ms: " + std::to_string(now_ms()),
                                  "-d", "@" + path,
                                  cfg.apiBaseURL + "/api/v1/internal/continuous/batches"},
                                 &response, 8192);
-    ::remove(path.c_str());
-    if (rc != 0)
+    if (rc != 0 || !response_acknowledges_batch(response, batchID))
     {
-        std::cout << "[native-cp] batch upload failed rc=" << rc << " response=" << response << std::endl;
+        std::cout << "[native-cp] batch upload failed batch=" << batchID
+                  << " rc=" << rc << " response=" << response << std::endl;
         return false;
     }
-    std::cout << "[native-cp] batch uploaded response=" << response << std::endl;
+    std::cout << "[native-cp] batch ACK received batch=" << batchID
+              << " response=" << response << std::endl;
     return true;
+}
+
+static bool persist_batch(const ContinuousSamplerConfig &cfg,
+                          const std::string &batchID,
+                          const std::string &body)
+{
+    if (!ensure_directory(session_spool_directory(cfg)))
+        return false;
+    return atomic_write_file(journal_path(cfg, batchID), body);
+}
+
+static bool finalize_batch(const ContinuousSamplerConfig &cfg, const std::string &batchID)
+{
+    std::string from = journal_path(cfg, batchID);
+    std::string to = spool_path(cfg, batchID);
+    if (::rename(from.c_str(), to.c_str()) != 0)
+        return false;
+    int dirfd = ::open(session_spool_directory(cfg).c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0)
+    {
+        ::fsync(dirfd);
+        ::close(dirfd);
+    }
+    return true;
+}
+
+static void recover_spool_journals(const ContinuousSamplerConfig &cfg)
+{
+    std::vector<std::string> journals;
+    append_spool_files(cfg.spoolDirectory, ".journal", &journals);
+    for (const auto &path : journals)
+    {
+        size_t slash = path.find_last_of('/');
+        std::string directory = path.substr(0, slash);
+        std::string name = path.substr(slash + 1);
+        std::string batchID = name.substr(0, name.size() - 8);
+        std::string destination = directory + "/" + safe_spool_component(batchID) + ".json";
+        if (::rename(path.c_str(), destination.c_str()) != 0)
+            std::cout << "[native-cp] failed to recover spool journal batch=" << batchID << std::endl;
+    }
+}
+
+static void schedule_spool_retry(const ContinuousSamplerConfig &cfg, SpoolRetryState *retry)
+{
+    int jitterMs = retry->delaySec <= 1 ? 0 : std::rand() % (retry->delaySec * 250 + 1);
+    retry->nextAttemptMs = now_ms() + retry->delaySec * 1000LL + jitterMs;
+    retry->delaySec = std::min(std::max(1, cfg.retryMaxSec), retry->delaySec * 2);
+}
+
+static bool drain_one_spooled_batch(const ContinuousSamplerConfig &cfg,
+                                    SpoolRetryState *retry,
+                                    bool force)
+{
+    std::vector<std::string> files = list_spool_files(cfg);
+    if (files.empty())
+    {
+        retry->delaySec = 1;
+        retry->nextAttemptMs = 0;
+        return true;
+    }
+    if (!force && now_ms() < retry->nextAttemptMs)
+        return false;
+
+    const std::string &path = files.front();
+    std::string batchID = batch_id_from_spool_path(path);
+    if (post_spooled_batch(cfg, path, batchID))
+    {
+        if (::unlink(path.c_str()) != 0)
+            std::cout << "[native-cp] ACK received but spool removal failed path=" << path
+                      << " errno=" << errno << std::endl;
+        retry->delaySec = 1;
+        retry->nextAttemptMs = 0;
+        return true;
+    }
+    schedule_spool_retry(cfg, retry);
+    return false;
+}
+
+static void interruptible_wait(const std::atomic<bool> &running, int milliseconds)
+{
+    int remaining = milliseconds;
+    while (running.load() && remaining > 0)
+    {
+        int slice = std::min(remaining, 200);
+        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+        remaining -= slice;
+    }
 }
 
 static void acknowledge_batch_profiles(const std::vector<WindowPayload> &windows)
@@ -1828,6 +2112,12 @@ bool PerfEventSampler::Start(const ContinuousSamplerConfig &config, std::string 
             *error = "missing native continuous session/api/auth config";
         return false;
     }
+    if (!ensure_directory(session_spool_directory(config)))
+    {
+        if (error)
+            *error = "continuous spool directory is not writable";
+        return false;
+    }
     if (running_.load())
         return true;
     config_ = config;
@@ -1838,8 +2128,6 @@ bool PerfEventSampler::Start(const ContinuousSamplerConfig &config, std::string 
 
 void PerfEventSampler::Stop()
 {
-    if (!running_.load())
-        return;
     running_ = false;
     if (worker_.joinable())
         worker_.join();
@@ -1850,32 +2138,89 @@ bool PerfEventSampler::Running() const
     return running_.load();
 }
 
-void PerfEventSampler::Loop()
+template <typename Collector>
+static void run_continuous_spool_loop(std::atomic<bool> &running,
+                                      const ContinuousSamplerConfig &config,
+                                      Collector collector)
 {
-    int windowsPerBatch = std::max(1, config_.uploadBatchSec / config_.aggregationWindowSec);
+    ensure_directory(session_spool_directory(config));
+    recover_spool_journals(config);
+    SpoolRetryState retry;
+    while (running.load() && drain_one_spooled_batch(config, &retry, true))
+    {
+        if (list_spool_files(config).empty())
+            break;
+    }
+
+    int windowsPerBatch = std::max(1, config.uploadBatchSec / config.aggregationWindowSec);
     std::vector<WindowPayload> batch;
     batch.reserve(static_cast<size_t>(windowsPerBatch));
-    while (running_.load())
+    std::string batchID;
+    while (running.load())
     {
-        WindowPayload window = collect_window(config_);
-        if (!running_.load())
+        drain_one_spooled_batch(config, &retry, false);
+        if (!spool_has_collection_capacity(config))
         {
+            std::cout << "[native-cp] spool backpressure usage_bytes=" << spool_usage_bytes(config)
+                      << " max_bytes=" << config.spoolMaxBytes
+                      << " free_bytes=" << spool_free_bytes(config)
+                      << " min_free_bytes=" << config.spoolMinFreeBytes << std::endl;
+            interruptible_wait(running, 1000);
+            continue;
+        }
+
+        WindowPayload window = collector(config);
+        batch.push_back(window);
+        if (batchID.empty())
+            batchID = make_batch_id(config, window.startMs);
+        std::string body = build_batch_json(config, batchID, batch);
+        bool persisted = persist_batch(config, batchID, body);
+        while (!persisted && running.load())
+        {
+            std::cout << "[native-cp] failed to persist batch journal batch=" << batchID
+                      << " errno=" << errno << ", retrying without collecting" << std::endl;
+            drain_one_spooled_batch(config, &retry, false);
+            interruptible_wait(running, 1000);
+            persisted = persist_batch(config, batchID, body);
+        }
+        if (!persisted)
+        {
+            std::cout << "[native-cp] failed to persist batch journal batch=" << batchID
+                      << " errno=" << errno << std::endl;
             release_window_profiles(window);
+            running = false;
             break;
         }
-        batch.push_back(window);
+        acknowledge_batch_profiles({window});
+
         if (static_cast<int>(batch.size()) >= windowsPerBatch)
         {
-            std::string batchID = "cpb-" + std::to_string(now_ms());
-            std::string body = build_batch_json(config_, batchID, batch);
-            if (post_batch(config_, body))
-                acknowledge_batch_profiles(batch);
-            else
-                release_batch_profiles(batch);
+            if (!finalize_batch(config, batchID))
+            {
+                std::cout << "[native-cp] failed to finalize batch journal batch=" << batchID
+                          << " errno=" << errno << std::endl;
+                running = false;
+                break;
+            }
             batch.clear();
+            batchID.clear();
+            drain_one_spooled_batch(config, &retry, false);
         }
     }
-    release_batch_profiles(batch);
+
+    if (!batch.empty() && !batchID.empty())
+    {
+        std::string body = build_batch_json(config, batchID, batch);
+        if (persist_batch(config, batchID, body) && finalize_batch(config, batchID))
+            drain_one_spooled_batch(config, &retry, true);
+        else
+            release_batch_profiles(batch);
+    }
+}
+
+void PerfEventSampler::Loop()
+{
+    run_continuous_spool_loop(running_, config_, collect_window);
 }
 
 DualTrackContinuousSampler::~DualTrackContinuousSampler()
@@ -1902,6 +2247,12 @@ bool DualTrackContinuousSampler::Start(const ContinuousSamplerConfig &config, st
             *error = "missing native continuous session/api/auth config";
         return false;
     }
+    if (!ensure_directory(session_spool_directory(config)))
+    {
+        if (error)
+            *error = "continuous spool directory is not writable";
+        return false;
+    }
     if (running_.load())
         return true;
     config_ = config;
@@ -1912,8 +2263,6 @@ bool DualTrackContinuousSampler::Start(const ContinuousSamplerConfig &config, st
 
 void DualTrackContinuousSampler::Stop()
 {
-    if (!running_.load())
-        return;
     running_ = false;
     if (worker_.joinable())
         worker_.join();
@@ -1926,30 +2275,7 @@ bool DualTrackContinuousSampler::Running() const
 
 void DualTrackContinuousSampler::Loop()
 {
-    int windowsPerBatch = std::max(1, config_.uploadBatchSec / config_.aggregationWindowSec);
-    std::vector<WindowPayload> batch;
-    batch.reserve(static_cast<size_t>(windowsPerBatch));
-    while (running_.load())
-    {
-        WindowPayload window = collect_dual_track_window(config_);
-        if (!running_.load())
-        {
-            release_window_profiles(window);
-            break;
-        }
-        batch.push_back(window);
-        if (static_cast<int>(batch.size()) >= windowsPerBatch)
-        {
-            std::string batchID = "cpb-" + std::to_string(now_ms());
-            std::string body = build_batch_json(config_, batchID, batch);
-            if (post_batch(config_, body))
-                acknowledge_batch_profiles(batch);
-            else
-                release_batch_profiles(batch);
-            batch.clear();
-        }
-    }
-    release_batch_profiles(batch);
+    run_continuous_spool_loop(running_, config_, collect_dual_track_window);
 }
 
 } // namespace drop
