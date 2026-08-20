@@ -37,6 +37,7 @@ struct ExtractionJob
     std::string dsoPath;
     std::string sourcePath;
     std::string cachePath;
+    uint64_t sourceSize = 0;
 };
 
 struct ExtractionResult
@@ -95,6 +96,26 @@ bool regular_file(const std::string &path)
 {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+bool is_process_leader(int pid)
+{
+    std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+    std::string line;
+    while (std::getline(status, line))
+    {
+        if (line.rfind("Tgid:", 0) == 0)
+            return std::atoi(line.substr(5).c_str()) == pid;
+    }
+    return false;
+}
+
+uint64_t regular_file_size(const std::string &path)
+{
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+        return 0;
+    return static_cast<uint64_t>(st.st_size);
 }
 
 size_t align4(size_t value)
@@ -240,6 +261,8 @@ std::map<std::string, std::vector<int>> dso_pid_index()
         if (!end || *end != '\0' || parsed <= 0)
             continue;
         int pid = static_cast<int>(parsed);
+        if (!is_process_leader(pid))
+            continue;
         std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
         std::set<std::string> seen;
         std::string line;
@@ -262,6 +285,20 @@ std::map<std::string, std::vector<int>> dso_pid_index()
 
 std::string resolve_source(const std::string &dsoPath, int pid)
 {
+    std::string procExe = "/proc/" + std::to_string(pid) + "/exe";
+    char target[4096];
+    ssize_t targetLen = ::readlink(procExe.c_str(), target, sizeof(target) - 1);
+    if (targetLen > 0)
+    {
+        target[targetLen] = '\0';
+        std::string mappedPath(target);
+        const std::string deleted = " (deleted)";
+        if (mappedPath.size() > deleted.size() &&
+            mappedPath.compare(mappedPath.size() - deleted.size(), deleted.size(), deleted) == 0)
+            mappedPath.resize(mappedPath.size() - deleted.size());
+        if (mappedPath == dsoPath && regular_file(procExe))
+            return procExe;
+    }
     std::string rooted = "/proc/" + std::to_string(pid) + "/root" + dsoPath;
     if (regular_file(rooted))
         return rooted;
@@ -287,6 +324,64 @@ bool write_relative_cache(const std::string &path, const std::vector<GoRecovered
         return false;
     }
     return true;
+}
+
+void prune_symbol_cache(const std::string &preservePath)
+{
+    uint64_t maxBytes = 512ULL * 1024ULL * 1024ULL;
+    size_t maxFiles = 256;
+    if (const char *configured = std::getenv("DROP_GO_SYMBOL_CACHE_MAX_BYTES"))
+    {
+        uint64_t parsed = std::strtoull(configured, nullptr, 10);
+        if (parsed > 0)
+            maxBytes = parsed;
+    }
+    if (const char *configured = std::getenv("DROP_GO_SYMBOL_CACHE_MAX_FILES"))
+    {
+        unsigned long parsed = std::strtoul(configured, nullptr, 10);
+        if (parsed > 0)
+            maxFiles = static_cast<size_t>(parsed);
+    }
+
+    struct CacheFile
+    {
+        std::string path;
+        uint64_t size;
+        int64_t mtime;
+    };
+    std::vector<CacheFile> files;
+    DIR *dir = ::opendir(cache_root().c_str());
+    if (!dir)
+        return;
+    struct dirent *entry;
+    while ((entry = ::readdir(dir)) != nullptr)
+    {
+        std::string name(entry->d_name);
+        if (name.size() < 5 || name.compare(name.size() - 4, 4, ".map") != 0)
+            continue;
+        std::string path = cache_root() + "/" + name;
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+            files.push_back({path, static_cast<uint64_t>(st.st_size), static_cast<int64_t>(st.st_mtime)});
+    }
+    ::closedir(dir);
+    std::sort(files.begin(), files.end(), [](const CacheFile &a, const CacheFile &b) {
+        return a.mtime > b.mtime;
+    });
+
+    uint64_t keptBytes = 0;
+    size_t keptFiles = 0;
+    for (const auto &file : files)
+    {
+        bool overLimit = keptFiles >= maxFiles || keptBytes >= maxBytes || file.size > maxBytes - keptBytes;
+        if (file.path != preservePath && overLimit)
+        {
+            ::unlink(file.path.c_str());
+            continue;
+        }
+        keptBytes += file.size;
+        ++keptFiles;
+    }
 }
 
 bool read_relative_cache(const std::string &path, std::vector<GoRecoveredFunction> *functions)
@@ -340,6 +435,8 @@ ExtractionResult extract_job(const ExtractionJob &job)
     if (!parse_goresym_json(output, &functions, &result.reason))
         return result;
     result.ok = write_relative_cache(job.cachePath, functions, &result.reason);
+    if (result.ok)
+        prune_symbol_cache(job.cachePath);
     return result;
 }
 
@@ -351,7 +448,7 @@ void start_next_locked()
     g_queue.pop_front();
     g_hasActive = true;
     std::cout << "[native-cp] Go symbol extraction started build_id=" << job.buildId
-              << " dso=" << job.dsoPath << std::endl;
+              << " dso=" << job.dsoPath << " bytes=" << job.sourceSize << std::endl;
     g_active = std::async(std::launch::async, [job]() { return extract_job(job); });
 }
 
@@ -399,6 +496,32 @@ bool read_process_start_ticks(int pid, std::string *ticks)
     return false;
 }
 
+void cleanup_owned_go_perf_maps()
+{
+    DIR *dir = ::opendir("/tmp");
+    if (!dir)
+        return;
+    struct dirent *entry;
+    const std::string prefix = "perf-";
+    const std::string suffix = ".map.mini-drop-go";
+    while ((entry = ::readdir(dir)) != nullptr)
+    {
+        std::string name(entry->d_name);
+        if (name.size() <= prefix.size() + suffix.size() || name.rfind(prefix, 0) != 0 ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        std::string pidText = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        if (pidText.empty() || pidText.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        int pid = std::atoi(pidText.c_str());
+        if (pid > 0 && is_process_leader(pid))
+            continue;
+        ::unlink(("/tmp/" + name).c_str());
+        ::unlink(("/tmp/perf-" + pidText + ".map").c_str());
+    }
+    ::closedir(dir);
+}
+
 bool atomic_write(const std::string &path, const std::string &content)
 {
     return secure_atomic_write(path, content);
@@ -423,8 +546,11 @@ bool go_binary_has_build_info(const std::string &path)
         marker.push_back(static_cast<char>(encodedMarker[i] ^ 0x5a));
     std::string carry;
     char buf[64 * 1024];
-    while (in.read(buf, sizeof(buf)) || in.gcount() > 0)
+    size_t scanned = 0;
+    constexpr size_t kMaxBuildInfoScanBytes = 1024 * 1024;
+    while (scanned < kMaxBuildInfoScanBytes && (in.read(buf, sizeof(buf)) || in.gcount() > 0))
     {
+        scanned += static_cast<size_t>(in.gcount());
         std::string chunk = carry + std::string(buf, static_cast<size_t>(in.gcount()));
         if (chunk.find(marker) != std::string::npos)
             return true;
@@ -484,6 +610,67 @@ bool elf_gnu_build_id(const std::string &path, std::string *buildId)
         }
     }
     return false;
+}
+
+bool go_source_matches_perf_build_id(const std::string &path, const std::string &perfBuildId)
+{
+    std::string elfBuildId;
+    if (elf_gnu_build_id(path, &elfBuildId))
+        return elfBuildId == perfBuildId;
+    return go_binary_has_build_info(path);
+}
+
+bool go_file_build_id(const std::string &path, std::string *buildId)
+{
+    if (!go_binary_has_build_info(path))
+        return false;
+    if (elf_gnu_build_id(path, buildId))
+        return true;
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open())
+        return false;
+    uint64_t hash = 1469598103934665603ULL;
+    char buffer[64 * 1024];
+    while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0)
+    {
+        for (std::streamsize i = 0; i < in.gcount(); ++i)
+        {
+            hash ^= static_cast<unsigned char>(buffer[i]);
+            hash *= 1099511628211ULL;
+        }
+    }
+    std::ostringstream identity;
+    identity << "go-fnv-" << std::hex << std::setfill('0') << std::setw(16) << hash;
+    *buildId = identity.str();
+    return true;
+}
+
+std::vector<BuildIdEntry> discover_sampled_go_build_ids(const std::map<int, int> &sampledPids)
+{
+    std::vector<BuildIdEntry> discovered;
+    std::set<std::string> seenPaths;
+    for (const auto &sampled : sampledPids)
+    {
+        if (sampled.first <= 0 || sampled.second <= 0)
+            continue;
+        std::string procExe = "/proc/" + std::to_string(sampled.first) + "/exe";
+        char target[4096];
+        ssize_t targetLen = ::readlink(procExe.c_str(), target, sizeof(target) - 1);
+        if (targetLen <= 0)
+            continue;
+        target[targetLen] = '\0';
+        std::string dsoPath(target);
+        const std::string deleted = " (deleted)";
+        if (dsoPath.size() > deleted.size() &&
+            dsoPath.compare(dsoPath.size() - deleted.size(), deleted.size(), deleted) == 0)
+            dsoPath.resize(dsoPath.size() - deleted.size());
+        if (dsoPath.empty() || !seenPaths.insert(dsoPath).second)
+            continue;
+        std::string buildId;
+        if (go_file_build_id(procExe, &buildId))
+            discovered.push_back({buildId, dsoPath});
+    }
+    return discovered;
 }
 
 bool parse_goresym_json(const std::string &text,
@@ -644,6 +831,7 @@ bool materialize_go_perf_map(const std::string &relativeMapPath,
 GoSymbolReport prepare_go_symbols(const std::vector<BuildIdEntry> &entries)
 {
     GoSymbolReport report;
+    cleanup_owned_go_perf_maps();
     if (entries.empty())
         return report;
     auto index = dso_pid_index();
@@ -671,8 +859,7 @@ GoSymbolReport prepare_go_symbols(const std::vector<BuildIdEntry> &entries)
             }
             g_knownGoBuildIds.insert(entry.buildId);
         }
-        std::string sourceBuildId;
-        if (!elf_gnu_build_id(source, &sourceBuildId) || sourceBuildId != entry.buildId)
+        if (!go_source_matches_perf_build_id(source, entry.buildId))
         {
             report.failed.push_back({entry.buildId, entry.dsoPath, "source ELF build-id changed"});
             continue;
@@ -726,7 +913,12 @@ GoSymbolReport prepare_go_symbols(const std::vector<BuildIdEntry> &entries)
             }
         }
         g_states[entry.buildId] = {ExtractionState::Pending, 0, ""};
-        g_queue.push_back({entry.buildId, entry.dsoPath, source, cached});
+        ExtractionJob job{entry.buildId, entry.dsoPath, source, cached, regular_file_size(source)};
+        auto insertAt = std::upper_bound(g_queue.begin(), g_queue.end(), job.sourceSize,
+                                         [](uint64_t size, const ExtractionJob &queued) {
+                                             return size < queued.sourceSize;
+                                         });
+        g_queue.insert(insertAt, std::move(job));
         report.pending.push_back({entry.buildId, entry.dsoPath, "background extraction"});
     }
     start_next_locked();

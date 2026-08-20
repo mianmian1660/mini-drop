@@ -5,6 +5,8 @@
 #include "common/ContinuousSampler.h"
 #include "common/BuildId.h"
 #include "common/GoSymbolizer.h"
+#include "common/PythonRuntimeProfiler.h"
+#include "common/MemrayProfileIngest.h"
 #include "common/RuntimeSymbolMap.h"
 #include "common/Utils.h"
 
@@ -83,6 +85,7 @@ struct AggregatedSample
     std::string exe;
     std::string stackScope;
     std::string backend;
+    std::string runtime;
     uint64_t count = 0;
 };
 
@@ -91,7 +94,23 @@ struct ProfilePayload
     std::string signalType = "cpu_profile";
     std::string backend;
     std::string stackScope;
+    std::string profileID;
+    std::string unit = "samples";
+    std::string readyPath;
     std::vector<AggregatedSample> samples;
+};
+
+struct MetricPayload
+{
+    std::string metric;
+    std::string unit;
+    std::string runtime;
+    std::string comm;
+    int pid = 0;
+    int64_t processStartMs = 0;
+    std::string exe;
+    int64_t timestampMs = 0;
+    uint64_t value = 0;
 };
 
 struct HistogramBucket
@@ -125,6 +144,8 @@ struct WindowPayload
     std::vector<AggregatedSample> samples;
     std::vector<ProfilePayload> profiles;
     std::vector<HistogramPayload> histograms;
+    std::vector<MetricPayload> metrics;
+    size_t rssTruncated = 0;
     // Backend metadata (5-8: strict fallback strategy)
     std::string backendStatus;                   // "ok" | "degraded" | "failed"
     std::string backendReason;                   // human-readable reason
@@ -140,6 +161,27 @@ static int64_t now_ms()
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+static bool env_enabled_default(const char *name, bool fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value || !*value)
+        return fallback;
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text == "1" || text == "true" || text == "yes" || text == "on";
+}
+
+static int env_positive_int(const char *name, int fallback)
+{
+    const char *value = std::getenv(name);
+    if (!value || !*value)
+        return fallback;
+    int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : fallback;
 }
 
 static std::string rfc3339_from_ms(int64_t ms)
@@ -490,8 +532,110 @@ static bool unresolved_frame(const std::string &raw)
     return i > 2 && (i == frame.size() || std::isspace(static_cast<unsigned char>(frame[i])));
 }
 
+static std::string path_basename(const std::string &path)
+{
+    size_t slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+static std::string sanitize_python_perf_frame(const std::string &frame)
+{
+    // CPython -X perf names are typically
+    // "py::function:/absolute/path/module.py+0x...". Keep the function,
+    // short file name and offset/line while preventing paths from entering
+    // uploaded batches.
+    if (frame.rfind("py::", 0) != 0)
+        return frame;
+    size_t pathStart = frame.find(':', 4);
+    if (pathStart == std::string::npos)
+        return frame;
+    ++pathStart;
+    size_t slash = frame.find_last_of("/\\");
+    if (slash == std::string::npos || slash < pathStart)
+        return frame;
+    return frame.substr(0, pathStart) + frame.substr(slash + 1);
+}
+
+static std::string sample_runtime_with_go_hint(const AggregatedSample &sample,
+                                               const drop::GoSymbolReport &goReport,
+                                               bool hasGoBuildInfo)
+{
+    std::string base = path_basename(sample.exe);
+    if (base.rfind("python", 0) == 0)
+        return "python";
+    if (base.rfind("java", 0) == 0)
+        return "java";
+    if (base.rfind("node", 0) == 0)
+        return "node";
+    auto isGo = [&](const std::vector<drop::GoSymbolItem> &items) {
+        return std::any_of(items.begin(), items.end(), [&](const auto &item) {
+            return item.dsoPath == sample.exe;
+        });
+    };
+    if (hasGoBuildInfo || isGo(goReport.ready) || isGo(goReport.pending) || isGo(goReport.failed))
+        return "go";
+    if (sample.exe.empty())
+        return sample.pid <= 2 || sample.comm.rfind("kworker", 0) == 0 ? "kernel" : "unknown";
+    return "native";
+}
+
+static std::string sample_runtime(const AggregatedSample &sample,
+                                  const drop::GoSymbolReport &goReport,
+                                  std::map<int, bool> *goBuildInfoCache)
+{
+    bool hasGoBuildInfo = false;
+    if (sample.pid > 0 && !sample.exe.empty())
+    {
+        auto cached = goBuildInfoCache->find(sample.pid);
+        if (cached == goBuildInfoCache->end())
+        {
+            std::string procExe = "/proc/" + std::to_string(sample.pid) + "/exe";
+            hasGoBuildInfo = drop::go_binary_has_build_info(procExe);
+            (*goBuildInfoCache)[sample.pid] = hasGoBuildInfo;
+        }
+        else
+        {
+            hasGoBuildInfo = cached->second;
+        }
+    }
+    return sample_runtime_with_go_hint(sample, goReport, hasGoBuildInfo);
+}
+
+static std::string python_fallback_json(const std::vector<drop::PythonFallbackResult> &results, size_t limitedCount)
+{
+    std::string body = "{\"ready\":[";
+    bool firstReady = true;
+    for (const auto &result : results)
+    {
+        if (!result.ready)
+            continue;
+        if (!firstReady)
+            body += ",";
+        firstReady = false;
+        body += "{\"pid\":" + std::to_string(result.pid) +
+                ",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) + "}";
+    }
+    body += "],\"failed\":[";
+    bool firstFailed = true;
+    for (const auto &result : results)
+    {
+        if (result.ready)
+            continue;
+        if (!firstFailed)
+            body += ",";
+        firstFailed = false;
+        body += "{\"pid\":" + std::to_string(result.pid) +
+                ",\"reason\":\"" + json_escape(result.reason) + "\"}";
+    }
+    body += "],\"limited_count\":" + std::to_string(limitedCount) + "}";
+    return body;
+}
+
 static std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &runtimeReport,
                                              const drop::GoSymbolReport &goReport,
+                                             const std::vector<drop::PythonFallbackResult> &pythonFallback,
+                                             size_t pythonLimitedCount,
+                                             const std::vector<drop::MemrayProfileResult> &memrayResults,
                                              const std::vector<AggregatedSample> &samples)
 {
     uint64_t totalFrames = 0;
@@ -513,7 +657,27 @@ static std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
     body += "\"frame_stats\":{\"total_frame_weight\":" + std::to_string(totalFrames) +
             ",\"unresolved_frame_weight\":" + std::to_string(unresolvedFrames) + "},";
     body += "\"runtime_maps\":" + drop::runtime_maps_to_json(runtimeReport) + ",";
-    body += "\"native_go\":" + drop::go_symbol_report_json(goReport);
+    body += "\"native_go\":" + drop::go_symbol_report_json(goReport) + ",";
+    body += "\"python_fallback\":" + python_fallback_json(pythonFallback, pythonLimitedCount) + ",";
+    body += "\"python_memory\":{\"ready\":[";
+    bool firstMemrayReady = true;
+    for (const auto &result : memrayResults)
+    {
+        if (!result.ready) continue;
+        if (!firstMemrayReady) body += ",";
+        firstMemrayReady = false;
+        body += "{\"pid\":" + std::to_string(result.pid) + ",\"profile_id\":\"" + json_escape(result.profileID) + "\"}";
+    }
+    body += "],\"failed\":[";
+    bool firstMemrayFailed = true;
+    for (const auto &result : memrayResults)
+    {
+        if (result.ready) continue;
+        if (!firstMemrayFailed) body += ",";
+        firstMemrayFailed = false;
+        body += "{\"pid\":" + std::to_string(result.pid) + ",\"reason\":\"" + json_escape(result.reason) + "\"}";
+    }
+    body += "]}";
     body += "}";
     return body;
 }
@@ -524,6 +688,12 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     window.startMs = now_ms();
     std::string dataPath = "/tmp/mini_drop_native_cp_" + std::to_string(window.startMs) + ".data";
     std::string perf = perf_bin();
+    const bool pythonFallbackEnabled = env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
+    const int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+    const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
+    drop::PythonFallbackCapture pythonCapture;
+    if (pythonFallbackEnabled)
+        pythonCapture = drop::start_python_fallback_capture(cfg.aggregationWindowSec, pythonRateHz, pythonMaxProcesses);
     // 云 VM 上硬件 cycles 计数器可能冻结（perf stat 读到 2^50 固定值），
     // perf 默认的 cycles 事件会采不到任何样本。默认改用软件事件 cpu-clock，
     // 可用 DROP_NATIVE_CP_PERF_EVENT 覆盖（Step 1 实测结论）。
@@ -540,19 +710,29 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     {
         std::cout << "[native-cp] perf record failed rc=" << rc << " output=" << recordOutput << std::endl;
         ::remove(dataPath.c_str());
+        // std::future from std::async blocks during destruction. Consume the
+        // concurrent fallback here so an error cannot create an implicit,
+        // unreported wait at function exit.
+        pythonCapture.Finish();
         return window;
     }
     int64_t tWarmStart = now_ms();
     std::vector<drop::BuildIdEntry> buildIds = warm_build_id_cache(perf, dataPath);
     int64_t warmMs = now_ms() - tWarmStart;
-    int64_t tGoStart = now_ms();
-    drop::GoSymbolReport goReport = drop::prepare_go_symbols(buildIds);
-    int64_t goMs = now_ms() - tGoStart;
     // Java/Node/Python JIT perf map 定位/校验/搬运 + Java map 刷新，
     // 必须在 perf script 前完成，让同一份 perf.data 能解析出用户函数名。
     int64_t tRtStart = now_ms();
     drop::RuntimeSymbolReport runtimeReport = drop::collect_runtime_maps(perf, dataPath);
     int64_t rtMs = now_ms() - tRtStart;
+    std::set<std::string> knownDsoPaths;
+    for (const auto &entry : buildIds)
+        knownDsoPaths.insert(entry.dsoPath);
+    for (auto &entry : drop::discover_sampled_go_build_ids(runtimeReport.sampledPids))
+        if (knownDsoPaths.insert(entry.dsoPath).second)
+            buildIds.push_back(std::move(entry));
+    int64_t tGoStart = now_ms();
+    drop::GoSymbolReport goReport = drop::prepare_go_symbols(buildIds);
+    int64_t goMs = now_ms() - tGoStart;
     int64_t tScriptStart = now_ms();
     std::string scriptOutput;
     rc = drop::exec_capture({perf, "script", "-i", dataPath}, &scriptOutput, 32 * 1024 * 1024);
@@ -565,12 +745,133 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     if (rc != 0)
     {
         std::cout << "[native-cp] perf script failed rc=" << rc << std::endl;
+        pythonCapture.Finish();
         return window;
     }
     window.samples = parse_perf_script(scriptOutput);
+    std::map<int, bool> goBuildInfoCache;
     for (auto &sample : window.samples)
+    {
         sample.backend = "perf";
-    window.symbolRefsJson = combined_symbol_refs_json(runtimeReport, goReport, window.samples);
+        sample.runtime = sample_runtime(sample, goReport, &goBuildInfoCache);
+        if (sample.runtime == "python")
+            for (auto &frame : sample.stack)
+                frame = sanitize_python_perf_frame(frame);
+    }
+
+    size_t pythonLimitedCount = pythonCapture.LimitedCount();
+    std::vector<drop::PythonFallbackResult> pythonResults = pythonCapture.Finish();
+    for (auto &result : pythonResults)
+    {
+        if (result.ready && !drop::python_process_is_same(result.pid, result.startMs))
+        {
+            result.ready = false;
+            result.samples.clear();
+            result.reason = "process exited or PID was reused before stack replacement";
+        }
+    }
+    std::set<int> replacedPythonPids;
+    for (const auto &result : pythonResults)
+        if (result.ready)
+            replacedPythonPids.insert(result.pid);
+    if (!replacedPythonPids.empty())
+    {
+        window.samples.erase(std::remove_if(window.samples.begin(), window.samples.end(), [&](const auto &sample) {
+                                 return replacedPythonPids.count(sample.pid) > 0;
+                             }),
+                             window.samples.end());
+        for (const auto &result : pythonResults)
+        {
+            if (!result.ready)
+                continue;
+            for (const auto &raw : result.samples)
+            {
+                AggregatedSample sample;
+                sample.stack = raw.stack;
+                sample.comm = result.comm.empty() ? "python" : result.comm;
+                sample.pid = result.pid;
+                sample.exe = result.exe;
+                sample.backend = "py-spy";
+                sample.runtime = "python";
+                sample.count = clamp_count(raw.count);
+                window.samples.push_back(std::move(sample));
+            }
+        }
+    }
+
+    std::map<int, AggregatedSample> metadata;
+    for (const auto &sample : window.samples)
+        metadata.emplace(sample.pid, sample);
+    std::vector<drop::PythonCandidate> nextCandidates;
+    if (pythonFallbackEnabled)
+    {
+        for (int pid : runtimeReport.python.missingPids)
+        {
+            int64_t startMs = 0;
+            if (!drop::python_process_start_ms(pid, &startMs))
+                continue;
+            drop::PythonCandidate candidate;
+            candidate.pid = pid;
+            candidate.startMs = startMs;
+            candidate.samples = runtimeReport.sampledPids[pid];
+            auto it = metadata.find(pid);
+            candidate.comm = it == metadata.end() ? "python" : it->second.comm;
+            candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
+            nextCandidates.push_back(std::move(candidate));
+        }
+    }
+    drop::schedule_python_fallback(nextCandidates);
+
+    if (env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true))
+    {
+        size_t truncated = 0;
+        auto rss = drop::collect_python_rss(
+            static_cast<size_t>(env_positive_int("DROP_NATIVE_CP_PYTHON_RSS_MAX_PROCESSES", 128)), &truncated);
+        window.rssTruncated = truncated;
+        for (const auto &point : rss)
+        {
+            MetricPayload metric;
+            metric.metric = "rss_bytes";
+            metric.unit = "bytes";
+            metric.runtime = "python";
+            metric.comm = point.comm;
+            metric.pid = point.pid;
+            metric.processStartMs = point.startMs;
+            metric.exe = point.exe;
+            metric.timestampMs = point.timestampMs;
+            metric.value = point.valueBytes;
+            window.metrics.push_back(std::move(metric));
+        }
+    }
+    std::vector<drop::MemrayProfileResult> memrayResults;
+    if (env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true))
+    {
+        memrayResults = drop::collect_memray_profiles();
+        for (const auto &result : memrayResults)
+        {
+            ProfilePayload profile;
+            profile.signalType = "python_memory";
+            profile.backend = "memray";
+            profile.profileID = result.profileID;
+            profile.unit = "bytes";
+            if (result.ready)
+                profile.readyPath = result.readyPath;
+            for (const auto &raw : result.samples)
+            {
+                AggregatedSample sample;
+                sample.stack = raw.stack;
+                sample.comm = result.comm;
+                sample.pid = result.pid;
+                sample.exe = result.exe;
+                sample.backend = "memray";
+                sample.runtime = "python";
+                sample.count = clamp_count(raw.count);
+                profile.samples.push_back(std::move(sample));
+            }
+            window.profiles.push_back(std::move(profile));
+        }
+    }
+    window.symbolRefsJson = combined_symbol_refs_json(runtimeReport, goReport, pythonResults, pythonLimitedCount, memrayResults, window.samples);
     std::cout << "[native-cp] Go symbols ready=" << goReport.ready.size()
               << " pending=" << goReport.pending.size()
               << " failed=" << goReport.failed.size()
@@ -975,6 +1276,11 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             if (!hist.signalType.empty() && !hist.backend.empty())
                 backends[hist.signalType] = hist.backend;
         }
+        if (!window.metrics.empty())
+        {
+            signalTypes.insert("python_rss");
+            backends["python_rss"] = "procfs";
+        }
     }
 
     std::string body = "{";
@@ -1061,7 +1367,10 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             body += ",";
         uint64_t windowSamples = 0;
         for (const auto &sample : window.samples)
-            windowSamples += sample.count;
+            windowSamples = add_count(windowSamples, sample.count);
+        for (const auto &profile : window.profiles)
+            for (const auto &sample : profile.samples)
+                windowSamples = add_count(windowSamples, sample.count);
         body += "{";
         body += "\"window_start\":\"" + rfc3339_from_ms(window.startMs) + "\",";
         body += "\"window_end\":\"" + rfc3339_from_ms(window.endMs) + "\",";
@@ -1090,6 +1399,7 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             body += "\"comm\":\"" + json_escape(sample.comm) + "\",";
             body += "\"pid\":" + std::to_string(sample.pid) + ",";
             body += "\"exe\":\"" + json_escape(sample.exe) + "\",";
+            body += "\"runtime\":\"" + json_escape(sample.runtime) + "\",";
             body += "\"count\":" + std::to_string(sample.count) + ",";
             body += "\"stack_scope\":\"" + json_escape(sample.stackScope) + "\",";
             body += "\"backend\":\"" + json_escape(sample.backend) + "\",";
@@ -1113,6 +1423,8 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             body += "\"signal_type\":\"" + json_escape(profile.signalType.empty() ? "cpu_profile" : profile.signalType) + "\",";
             body += "\"backend\":\"" + json_escape(profile.backend) + "\",";
             body += "\"stack_scope\":\"" + json_escape(profile.stackScope) + "\",";
+            body += "\"profile_id\":\"" + json_escape(profile.profileID) + "\",";
+            body += "\"unit\":\"" + json_escape(profile.unit) + "\",";
             body += "\"samples\":[";
             for (size_t si = 0; si < profile.samples.size(); ++si)
             {
@@ -1123,6 +1435,7 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
                 body += "\"comm\":\"" + json_escape(sample.comm) + "\",";
                 body += "\"pid\":" + std::to_string(sample.pid) + ",";
                 body += "\"exe\":\"" + json_escape(sample.exe) + "\",";
+                body += "\"runtime\":\"" + json_escape(sample.runtime) + "\",";
                 body += "\"count\":" + std::to_string(sample.count) + ",";
                 body += "\"stack_scope\":\"" + json_escape(profile.stackScope) + "\",";
                 body += "\"backend\":\"" + json_escape(profile.backend) + "\",";
@@ -1136,6 +1449,26 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
                 body += "]}";
             }
             body += "]}";
+        }
+        body += "],";
+        body += "\"rss_truncated\":" + std::to_string(window.rssTruncated) + ",";
+        body += "\"metrics\":[";
+        for (size_t mi = 0; mi < window.metrics.size(); ++mi)
+        {
+            const auto &metric = window.metrics[mi];
+            if (mi)
+                body += ",";
+            body += "{";
+            body += "\"metric\":\"" + json_escape(metric.metric) + "\",";
+            body += "\"unit\":\"" + json_escape(metric.unit) + "\",";
+            body += "\"runtime\":\"" + json_escape(metric.runtime) + "\",";
+            body += "\"comm\":\"" + json_escape(metric.comm) + "\",";
+            body += "\"pid\":" + std::to_string(metric.pid) + ",";
+            body += "\"process_start_ms\":" + std::to_string(metric.processStartMs) + ",";
+            body += "\"exe\":\"" + json_escape(metric.exe) + "\",";
+            body += "\"timestamp\":\"" + rfc3339_from_ms(metric.timestampMs) + "\",";
+            body += "\"value\":" + std::to_string(metric.value);
+            body += "}";
         }
         body += "],";
         body += "\"histograms\":[";
@@ -1202,6 +1535,29 @@ static bool post_batch(const ContinuousSamplerConfig &cfg, const std::string &bo
     }
     std::cout << "[native-cp] batch uploaded response=" << response << std::endl;
     return true;
+}
+
+static void acknowledge_batch_profiles(const std::vector<WindowPayload> &windows)
+{
+    for (const auto &window : windows)
+        for (const auto &profile : window.profiles)
+            if (!profile.readyPath.empty() && !drop::acknowledge_memray_profile(profile.readyPath))
+                std::cout << "[native-cp] failed to mark Memray profile done: " << profile.readyPath << std::endl;
+}
+
+static void release_batch_profiles(const std::vector<WindowPayload> &windows)
+{
+    for (const auto &window : windows)
+        for (const auto &profile : window.profiles)
+            if (!profile.readyPath.empty())
+                drop::release_memray_profile(profile.readyPath);
+}
+
+static void release_window_profiles(const WindowPayload &window)
+{
+    for (const auto &profile : window.profiles)
+        if (!profile.readyPath.empty())
+            drop::release_memray_profile(profile.readyPath);
 }
 
 static std::string core_unavailable_reason()
@@ -1360,6 +1716,9 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
         {
             WindowPayload perfWindow = perfCpuFuture.get();
             window.samples = perfWindow.samples;
+            window.profiles = std::move(perfWindow.profiles);
+            window.metrics = std::move(perfWindow.metrics);
+            window.rssTruncated = perfWindow.rssTruncated;
             if (perfWindow.endMs > 0)
                 captureEndMs = perfWindow.endMs;
             for (auto &sample : window.samples)
@@ -1500,16 +1859,23 @@ void PerfEventSampler::Loop()
     {
         WindowPayload window = collect_window(config_);
         if (!running_.load())
+        {
+            release_window_profiles(window);
             break;
+        }
         batch.push_back(window);
         if (static_cast<int>(batch.size()) >= windowsPerBatch)
         {
             std::string batchID = "cpb-" + std::to_string(now_ms());
             std::string body = build_batch_json(config_, batchID, batch);
-            post_batch(config_, body);
+            if (post_batch(config_, body))
+                acknowledge_batch_profiles(batch);
+            else
+                release_batch_profiles(batch);
             batch.clear();
         }
     }
+    release_batch_profiles(batch);
 }
 
 DualTrackContinuousSampler::~DualTrackContinuousSampler()
@@ -1567,16 +1933,23 @@ void DualTrackContinuousSampler::Loop()
     {
         WindowPayload window = collect_dual_track_window(config_);
         if (!running_.load())
+        {
+            release_window_profiles(window);
             break;
+        }
         batch.push_back(window);
         if (static_cast<int>(batch.size()) >= windowsPerBatch)
         {
             std::string batchID = "cpb-" + std::to_string(now_ms());
             std::string body = build_batch_json(config_, batchID, batch);
-            post_batch(config_, body);
+            if (post_batch(config_, body))
+                acknowledge_batch_profiles(batch);
+            else
+                release_batch_profiles(batch);
             batch.clear();
         }
     }
+    release_batch_profiles(batch);
 }
 
 } // namespace drop

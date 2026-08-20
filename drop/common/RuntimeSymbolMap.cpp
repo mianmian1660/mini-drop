@@ -374,6 +374,14 @@ std::string info_to_json(const RuntimeMapInfo &info)
         body += std::to_string(info.missingPids[i]);
     }
     body += "],";
+    body += "\"ready_pids\":[";
+    for (size_t i = 0; i < info.readyPids.size(); ++i)
+    {
+        if (i)
+            body += ",";
+        body += std::to_string(info.readyPids[i]);
+    }
+    body += "],";
     body += "\"reason\":\"" + json_escape_runtime(info.reason) + "\"";
     body += "}";
     return body;
@@ -407,6 +415,7 @@ RuntimeSymbolReport collect_runtime_maps(const std::string &perfBin, const std::
 
     // 1. 提取被采样 PID -> 样本数
     std::map<int, int> sampled = sampled_pids_from_perf_data(perfBin, dataPath);
+    report.sampledPids = sampled;
     if (sampled.empty())
     {
         // perf 无样本：本窗没有可符号化的数据，不把符号问题归因给 runtime map。

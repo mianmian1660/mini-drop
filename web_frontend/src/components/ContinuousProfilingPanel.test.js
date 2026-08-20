@@ -8,6 +8,7 @@ import {
     makeSequentialDiffWindows,
     makeTimeWindow,
     rangeOptionsForRetention,
+    runtimeLabel,
     validateCustomTimeWindow,
 } from './ContinuousProfilingPanel';
 
@@ -22,6 +23,12 @@ test('quick ranges are recalculated from the supplied current time', () => {
     const second = makeTimeWindow('30m', new Date('2026-08-19T10:05:00Z'));
     expect(first).toEqual({ from: '2026-08-19T09:30:00.000Z', to: '2026-08-19T10:00:00.000Z' });
     expect(second.to).toBe('2026-08-19T10:05:00.000Z');
+});
+
+test('runtime labels cover supported languages', () => {
+    expect(runtimeLabel('python')).toBe('Python');
+    expect(runtimeLabel('java')).toBe('Java/JVM');
+    expect(runtimeLabel('native')).toBe('Native');
 });
 
 test('custom ranges enforce future and retention boundaries', () => {

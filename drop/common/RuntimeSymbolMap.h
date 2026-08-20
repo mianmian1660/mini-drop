@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,7 @@ struct RuntimeSymbolReport
     RuntimeMapInfo node;
     RuntimeMapInfo python;
     int skippedRefresh = 0;              // 因预算/冷却跳过的 JVM 刷新次数
+    std::map<int, int> sampledPids;       // perf.data 中 PID -> 样本数，供下一窗 fallback 排序
 };
 
 // ---- 纯函数（可单测） ----

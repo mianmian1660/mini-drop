@@ -306,7 +306,7 @@ func TestProfileFlamegraphUnconfiguredReturnsEmptyState(t *testing.T) {
 	}
 }
 
-func TestProfileTypeValidationAndReservedMemory(t *testing.T) {
+func TestProfileTypeValidationAndContinuousMemoryEmptyState(t *testing.T) {
 	s := newTestAPIServer(t)
 	_ = s.DB.Create(&model.AgentInfo{Hostname: "node-a", IPAddr: "10.0.0.1", UID: "owner", Online: true, LastSeen: time.Now()}).Error
 	router := profileRouter(s)
@@ -326,8 +326,8 @@ func TestProfileTypeValidationAndReservedMemory(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "memory profiling") {
-		t.Fatalf("expected reserved memory message, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "Memray") || !strings.Contains(w.Body.String(), "\"unit\":\"bytes\"") {
+		t.Fatalf("expected Memray bytes empty state, got %s", w.Body.String())
 	}
 }
 

@@ -718,6 +718,7 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/profile/topn", s.GetProfileTopN)
 		api.GET("/profile/diff", s.GetProfileDiff)
 		api.GET("/profile/label-values", s.GetProfileLabelValues)
+		api.GET("/profile/timeseries", s.GetProfileTimeseries)
 		api.POST("/continuous/sessions", s.CreateContinuousSession)
 		api.GET("/continuous/sessions", s.ListContinuousSessions)
 		api.POST("/continuous/sessions/:sid/stop", s.StopContinuousSession)

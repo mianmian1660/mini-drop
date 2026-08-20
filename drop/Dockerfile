@@ -92,6 +92,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     perl \
     curl \
     unzip \
+    python3 \
+    python3-pip \
     ca-certificates \
     && perf_real="$(find /usr/lib -type f -path '*/linux-tools*/perf' | sort -V | tail -n 1)" \
     && test -n "$perf_real" \
@@ -102,7 +104,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # artifact so profiling behavior cannot change underneath an image rebuild.
 ARG GORESYM_VERSION=3.4
 ARG GORESYM_ZIP_SHA256=cdcbda1273de4a502044520af3cbdb73149e74847aa1c515b413de4243e972f4
-RUN curl -fsSL "https://github.com/mandiant/GoReSym/releases/download/v${GORESYM_VERSION}/GoReSym-linux.zip" -o /tmp/goresym.zip \
+RUN (curl --max-time 30 -fsSL "https://github.com/mandiant/GoReSym/releases/download/v${GORESYM_VERSION}/GoReSym-linux.zip" -o /tmp/goresym.zip \
+      || curl --max-time 60 -fsSL "https://ghfast.top/https://github.com/mandiant/GoReSym/releases/download/v${GORESYM_VERSION}/GoReSym-linux.zip" -o /tmp/goresym.zip) \
     && echo "${GORESYM_ZIP_SHA256}  /tmp/goresym.zip" | sha256sum -c - \
     && unzip -p /tmp/goresym.zip GoReSym > /usr/local/bin/GoReSym \
     && chmod 0755 /usr/local/bin/GoReSym \
@@ -111,10 +114,30 @@ RUN curl -fsSL "https://github.com/mandiant/GoReSym/releases/download/v${GORESYM
 # Pin async-profiler so Java collection is available in every Agent image.
 # The launcher is placed on PATH and emits collapsed stacks in the Agent code.
 ARG ASYNC_PROFILER_VERSION=4.4
-RUN curl -fsSL "https://github.com/async-profiler/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64.tar.gz" \
-    | tar -xz -C /opt \
+RUN (curl --max-time 30 -fsSL "https://github.com/async-profiler/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64.tar.gz" -o /tmp/async-profiler.tgz \
+      || curl --max-time 60 -fsSL "https://ghfast.top/https://github.com/async-profiler/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64.tar.gz" -o /tmp/async-profiler.tgz) \
+    && tar -xzf /tmp/async-profiler.tgz -C /opt \
+    && rm -f /tmp/async-profiler.tgz \
     && ln -s "/opt/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64/bin/asprof" /usr/local/bin/asprof \
     && asprof --version
+
+# Pure-Python stack fallback for CPython processes without perf maps. The
+# wheel is pinned by digest and only its standalone Rust binary is installed.
+ARG PYSPY_VERSION=0.4.2
+ARG PYSPY_WHEEL_SHA256=aeb0323409199c785f730645e9f4bb7a7b9ca2c481f2c331a55642b5d13fa52f
+ARG PYSPY_WHEEL_URL=https://files.pythonhosted.org/packages/f9/34/dd7d3c763a00b7b965e25a5eab0acd1a345dbaf0f45fffe595278873a1c0/py_spy-0.4.2-py2.py3-none-manylinux_2_5_x86_64.manylinux1_x86_64.whl
+RUN curl -fsSL "${PYSPY_WHEEL_URL}" -o /tmp/py-spy.whl \
+    && echo "${PYSPY_WHEEL_SHA256}  /tmp/py-spy.whl" | sha256sum -c - \
+    && unzip -q /tmp/py-spy.whl -d /tmp/py-spy-wheel \
+    && pyspy_bin="$(find /tmp/py-spy-wheel -type f -name py-spy | head -n 1)" \
+    && test -n "${pyspy_bin}" \
+    && install -m 0755 "${pyspy_bin}" /usr/local/bin/py-spy \
+    && py-spy --version | grep -F "py-spy ${PYSPY_VERSION}" \
+    && rm -rf /tmp/py-spy.whl /tmp/py-spy-wheel
+
+ARG MEMRAY_VERSION=1.20.0
+RUN python3 -m pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple "memray==${MEMRAY_VERSION}" \
+    && python3 -c "import memray; assert memray.__version__ == '${MEMRAY_VERSION}'"
 
 # 安装 MinIO Client (mc)，用于上传采集结果到 MinIO。
 COPY --from=minio-client /usr/bin/mc /usr/local/bin/mc
@@ -123,6 +146,7 @@ WORKDIR /app
 # 从阶段1复制编译好的两个程序
 COPY --from=builder /app/build/drop_server .
 COPY --from=builder /app/build/drop_agent .
+COPY scripts/memray_converter.py /app/memray_converter.py
 
 # perf 采集需要特权模式（在 docker-compose 里用 privileged: true）
 EXPOSE 50051

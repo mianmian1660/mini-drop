@@ -46,6 +46,25 @@ TEST(GoSymbolizer, ReadsAndValidatesELFBuildID)
     ASSERT_TRUE(elf_gnu_build_id(std::string(exe, static_cast<size_t>(n)), &buildId));
     EXPECT_GE(buildId.size(), 16u);
     EXPECT_EQ(buildId.find_first_not_of("0123456789abcdef"), std::string::npos);
+    EXPECT_TRUE(go_source_matches_perf_build_id(std::string(exe, static_cast<size_t>(n)), buildId));
+    EXPECT_FALSE(go_source_matches_perf_build_id(std::string(exe, static_cast<size_t>(n)), "different-build-id"));
+}
+
+TEST(GoSymbolizer, AcceptsGoBuildInfoWhenGNUBuildIDIsAbsent)
+{
+    std::string path = "/tmp/mini-drop-go-only-buildinfo-" + std::to_string(::getpid());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "prefix\xff Go buildinf:payload";
+    }
+    EXPECT_TRUE(go_source_matches_perf_build_id(path, "perf-provided-build-id"));
+    std::string firstIdentity;
+    std::string secondIdentity;
+    ASSERT_TRUE(go_file_build_id(path, &firstIdentity));
+    ASSERT_TRUE(go_file_build_id(path, &secondIdentity));
+    EXPECT_EQ(firstIdentity, secondIdentity);
+    EXPECT_EQ(firstIdentity.rfind("go-fnv-", 0), 0u);
+    ::remove(path.c_str());
 }
 
 TEST(GoSymbolizer, ParsesStructuredFunctionRanges)

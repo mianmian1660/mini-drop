@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-drop-memray"
+version = "0.1.0"
+description = "Explicit Memray integration for Mini-Drop continuous profiling"
+requires-python = ">=3.9"
+dependencies = ["memray==1.20.0"]
+
+[tool.setuptools]
+packages = ["mini_drop_memray"]
+py-modules = ["sitecustomize"]

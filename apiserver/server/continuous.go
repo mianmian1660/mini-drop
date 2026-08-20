@@ -83,6 +83,8 @@ type ContinuousWindowIngest struct {
 	Samples           []ContinuousStackSample     `json:"samples"`
 	Profiles          []ContinuousProfileIngest   `json:"profiles"`
 	Histograms        []ContinuousHistogramIngest `json:"histograms"`
+	Metrics           []ContinuousMetricIngest    `json:"metrics"`
+	RSSTruncated      int                         `json:"rss_truncated"`
 }
 
 type ContinuousStackSample struct {
@@ -94,6 +96,7 @@ type ContinuousStackSample struct {
 	Exe         string                 `json:"exe"`
 	StackScope  string                 `json:"stack_scope"`
 	Backend     string                 `json:"backend"`
+	Runtime     string                 `json:"runtime"`
 	Labels      map[string]interface{} `json:"labels"`
 }
 
@@ -101,8 +104,40 @@ type ContinuousProfileIngest struct {
 	SignalType string                  `json:"signal_type"`
 	Backend    string                  `json:"backend"`
 	StackScope string                  `json:"stack_scope"`
+	ProfileID  string                  `json:"profile_id"`
+	Unit       string                  `json:"unit"`
 	Samples    []ContinuousStackSample `json:"samples"`
 	Labels     map[string]interface{}  `json:"labels"`
+}
+
+type ContinuousMetricIngest struct {
+	Metric         string                 `json:"metric"`
+	Timestamp      time.Time              `json:"timestamp"`
+	PID            int                    `json:"pid"`
+	ProcessStartMs int64                  `json:"process_start_ms"`
+	Comm           string                 `json:"comm"`
+	Exe            string                 `json:"exe"`
+	Runtime        string                 `json:"runtime"`
+	Value          uint64                 `json:"value"`
+	Unit           string                 `json:"unit"`
+	Labels         map[string]interface{} `json:"labels"`
+}
+
+type ProfileTimeseriesPoint struct {
+	Timestamp time.Time `json:"timestamp"`
+	Value     uint64    `json:"value"`
+}
+
+type ProfileTimeseriesSeries struct {
+	PID            int                      `json:"pid"`
+	ProcessStartMs int64                    `json:"process_start_ms"`
+	Comm           string                   `json:"comm"`
+	Exe            string                   `json:"exe"`
+	Runtime        string                   `json:"runtime"`
+	Metric         string                   `json:"metric"`
+	Unit           string                   `json:"unit"`
+	Peak           uint64                   `json:"peak"`
+	Points         []ProfileTimeseriesPoint `json:"points"`
 }
 
 type ContinuousHistogramIngest struct {
@@ -165,6 +200,18 @@ type continuousAggregate struct {
 	GoSymbolFailed        bool
 	SymbolReasons         map[string]bool
 	WindowCount           int
+	Unit                  string
+	RuntimeDiagnostics    map[string]*runtimeDiagnosticAccumulator
+	SeenProfileIDs        map[string]bool
+}
+
+type runtimeDiagnosticAccumulator struct {
+	Modes    map[string]bool
+	Detected map[string]ProfileRuntimeProcessDiagnostic
+	Ready    map[string]ProfileRuntimeProcessDiagnostic
+	Missing  map[string]ProfileRuntimeProcessDiagnostic
+	Limited  int
+	Reasons  map[string]bool
 }
 
 type continuousTreeNode struct {
@@ -575,19 +622,20 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 	}
 	nodes, truncated := continuousTreeToProfileNodesTruncated(agg.Root, "", maxNodes)
 	out := ProfileFlamegraph{
-		Nodes:             nodes,
-		Total:             agg.Total,
-		Unit:              "samples",
-		Backend:           continuousBackendList(agg.Backends),
-		Empty:             len(nodes) == 0 || agg.Total == 0,
-		Source:            "mini-drop-native",
-		ProfileSource:     "native",
-		ProfileURL:        s.continuousProfileURL(ctx, agg.ObjectKeys),
-		Query:             profileLabelSelector(q),
-		SymbolStatus:      agg.SymbolStatus,
-		SymbolDiagnostics: continuousSymbolDiagnostics(agg),
-		Truncated:         truncated,
-		GeneratedAt:       time.Now(),
+		Nodes:              nodes,
+		Total:              agg.Total,
+		Unit:               firstNonEmpty(agg.Unit, "samples"),
+		Backend:            continuousBackendList(agg.Backends),
+		Empty:              len(nodes) == 0 || agg.Total == 0,
+		Source:             "mini-drop-native",
+		ProfileSource:      "native",
+		ProfileURL:         s.continuousProfileURL(ctx, agg.ObjectKeys),
+		Query:              profileLabelSelector(q),
+		SymbolStatus:       agg.SymbolStatus,
+		SymbolDiagnostics:  continuousSymbolDiagnostics(agg),
+		RuntimeDiagnostics: continuousRuntimeDiagnostics(agg),
+		Truncated:          truncated,
+		GeneratedAt:        time.Now(),
 	}
 	if out.Empty {
 		out.Message = "Native Continuous Profiling 暂无匹配样本"
@@ -620,19 +668,20 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 		truncated = true
 	}
 	out := ProfileTopN{
-		Items:             items,
-		Total:             agg.Total,
-		Unit:              "samples",
-		Backend:           continuousBackendList(agg.Backends),
-		Empty:             len(items) == 0 || agg.Total == 0,
-		Source:            "mini-drop-native",
-		ProfileSource:     "native",
-		ProfileURL:        s.continuousProfileURL(ctx, agg.ObjectKeys),
-		Query:             profileLabelSelector(q),
-		SymbolStatus:      agg.SymbolStatus,
-		SymbolDiagnostics: continuousSymbolDiagnostics(agg),
-		Truncated:         truncated,
-		GeneratedAt:       time.Now(),
+		Items:              items,
+		Total:              agg.Total,
+		Unit:               firstNonEmpty(agg.Unit, "samples"),
+		Backend:            continuousBackendList(agg.Backends),
+		Empty:              len(items) == 0 || agg.Total == 0,
+		Source:             "mini-drop-native",
+		ProfileSource:      "native",
+		ProfileURL:         s.continuousProfileURL(ctx, agg.ObjectKeys),
+		Query:              profileLabelSelector(q),
+		SymbolStatus:       agg.SymbolStatus,
+		SymbolDiagnostics:  continuousSymbolDiagnostics(agg),
+		RuntimeDiagnostics: continuousRuntimeDiagnostics(agg),
+		Truncated:          truncated,
+		GeneratedAt:        time.Now(),
 	}
 	if out.Empty {
 		out.Message = "Native Continuous Profiling 暂无匹配样本"
@@ -646,7 +695,7 @@ func (s *APIServer) queryNativeContinuousLabelValues(ctx context.Context, q Prof
 			Label:       label,
 			Values:      []string{},
 			Available:   false,
-			Message:     "Native Continuous Profiling 仅支持 comm/pid/exe 过滤标签",
+			Message:     "Native Continuous Profiling 仅支持 comm/pid/exe/runtime 过滤标签",
 			Source:      "mini-drop-native",
 			Query:       profileLabelSelector(q),
 			GeneratedAt: time.Now(),
@@ -675,6 +724,140 @@ func (s *APIServer) queryNativeContinuousLabelValues(ctx context.Context, q Prof
 	return out, true, nil
 }
 
+func (s *APIServer) GetProfileTimeseries(c *gin.Context) {
+	q, ok := s.profileQueryFromRequest(c)
+	if !ok {
+		return
+	}
+	metric := strings.ToLower(strings.TrimSpace(c.DefaultQuery("metric", "rss_bytes")))
+	if q.ProfileType != "memory" || metric != "rss_bytes" {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "timeseries 仅支持 profile_type=memory&metric=rss_bytes")
+		return
+	}
+	maxSeries := 20
+	if raw := strings.TrimSpace(c.Query("max_series")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			maxSeries = parsed
+		}
+	}
+	if maxSeries > 128 {
+		maxSeries = 128
+	}
+	series, found, err := s.queryNativeContinuousTimeseries(c.Request.Context(), q, metric, maxSeries)
+	if err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	}
+	if !found {
+		series = []ProfileTimeseriesSeries{}
+	}
+	s.RespondOK(c, gin.H{"series": series, "metric": metric, "unit": "bytes", "empty": len(series) == 0, "generated_at": time.Now()})
+}
+
+func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q ProfileQuery, metricName string, maxSeries int) ([]ProfileTimeseriesSeries, bool, error) {
+	var windows []model.ProfileWindow
+	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
+	if !q.CanReadAll {
+		if len(q.OwnerUIDs) > 0 {
+			sessionQuery = sessionQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", q.OwnerUIDs)
+		} else {
+			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
+		}
+	}
+	err := s.DB.Where("session_sid IN (?)", sessionQuery).Where("signal_type = ?", "python_rss").
+		Where("window_end >= ? AND window_start <= ?", q.From, q.To).Order("window_start ASC").
+		Limit(continuousMaxWindowCount + 1).Find(&windows).Error
+	if err != nil {
+		return nil, false, err
+	}
+	if len(windows) > continuousMaxWindowCount {
+		return nil, true, errContinuousWindowLimit
+	}
+	if len(windows) == 0 {
+		return []ProfileTimeseriesSeries{}, false, nil
+	}
+	if !s.StorageConnected() {
+		return nil, true, errProfileUnavailable
+	}
+
+	byKey := map[string]*ProfileTimeseriesSeries{}
+	loaded := map[string]bool{}
+	for _, row := range windows {
+		if row.ObjectKey == "" || loaded[row.ObjectKey] {
+			continue
+		}
+		loaded[row.ObjectKey] = true
+		batch, err := s.loadContinuousStoredBatch(ctx, row.ObjectKey)
+		if err != nil {
+			return nil, true, err
+		}
+		for _, window := range batch.Windows {
+			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+				continue
+			}
+			for _, metric := range window.Metrics {
+				if metric.Metric != metricName || metric.Timestamp.Before(q.From) || metric.Timestamp.After(q.To) {
+					continue
+				}
+				sample := ContinuousStackSample{PID: metric.PID, Comm: metric.Comm, Exe: metric.Exe, Runtime: metric.Runtime, Labels: metric.Labels}
+				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
+					continue
+				}
+				key := continuousMetricSeriesKey(metric)
+				series := byKey[key]
+				if series == nil {
+					series = &ProfileTimeseriesSeries{PID: metric.PID, ProcessStartMs: metric.ProcessStartMs, Comm: metric.Comm, Exe: metric.Exe, Runtime: firstNonEmpty(metric.Runtime, "python"), Metric: metricName, Unit: firstNonEmpty(metric.Unit, "bytes"), Points: []ProfileTimeseriesPoint{}}
+					byKey[key] = series
+				}
+				series.Points = append(series.Points, ProfileTimeseriesPoint{Timestamp: metric.Timestamp, Value: metric.Value})
+				if metric.Value > series.Peak {
+					series.Peak = metric.Value
+				}
+			}
+		}
+	}
+	out := make([]ProfileTimeseriesSeries, 0, len(byKey))
+	for _, series := range byKey {
+		sort.Slice(series.Points, func(i, j int) bool { return series.Points[i].Timestamp.Before(series.Points[j].Timestamp) })
+		series.Points = downsampleRSSPoints(series.Points, 600)
+		out = append(out, *series)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Peak == out[j].Peak {
+			return out[i].PID < out[j].PID
+		}
+		return out[i].Peak > out[j].Peak
+	})
+	if len(out) > maxSeries {
+		out = out[:maxSeries]
+	}
+	return out, true, nil
+}
+
+func continuousMetricSeriesKey(metric ContinuousMetricIngest) string {
+	return strconv.Itoa(metric.PID) + "|" + strconv.FormatInt(metric.ProcessStartMs, 10) + "|" + metric.Exe
+}
+
+func downsampleRSSPoints(points []ProfileTimeseriesPoint, limit int) []ProfileTimeseriesPoint {
+	if limit <= 0 || len(points) <= limit {
+		return points
+	}
+	out := make([]ProfileTimeseriesPoint, 0, limit)
+	for bucket := 0; bucket < limit; bucket++ {
+		start := bucket * len(points) / limit
+		end := (bucket + 1) * len(points) / limit
+		peak := points[start]
+		for _, point := range points[start+1 : end] {
+			if point.Value > peak.Value {
+				peak = point
+			}
+		}
+		out = append(out, peak)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.Before(out[j].Timestamp) })
+	return out
+}
+
 func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q ProfileQuery) (continuousAggregate, bool, error) {
 	var windows []model.ProfileWindow
 	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
@@ -685,8 +868,12 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
 		}
 	}
+	signalType := "cpu_profile"
+	if q.ProfileType == "memory" {
+		signalType = "python_memory"
+	}
 	err := s.DB.Where("session_sid IN (?)", sessionQuery).
-		Where("signal_type = ?", "cpu_profile").
+		Where("signal_type = ?", signalType).
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
 		Order("window_start ASC").
 		Limit(continuousMaxWindowCount + 1).
@@ -710,14 +897,18 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			Children: map[string]*continuousTreeNode{},
 		},
 		LabelValue: map[string]map[string]bool{
-			"comm": {},
-			"pid":  {},
-			"exe":  {},
+			"comm":    {},
+			"pid":     {},
+			"exe":     {},
+			"runtime": {},
 		},
-		Backends:      map[string]bool{},
-		SymbolStatus:  "not_applicable",
-		SymbolReasons: map[string]bool{},
-		WindowCount:   len(windows),
+		Backends:           map[string]bool{},
+		SymbolStatus:       "not_applicable",
+		SymbolReasons:      map[string]bool{},
+		WindowCount:        len(windows),
+		Unit:               map[bool]string{true: "bytes", false: "samples"}[q.ProfileType == "memory"],
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
+		SeenProfileIDs:     map[string]bool{},
 	}
 	byObject := map[string][]model.ProfileWindow{}
 	objectOrder := []string{}
@@ -742,7 +933,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			}
 			matched := make([]ContinuousStackSample, 0)
 			relevantDSOs := map[string]bool{}
-			for _, sample := range continuousProfileSamplesForQuery(window, q) {
+			for _, sample := range continuousProfileSamplesForQuery(window, q, agg.SeenProfileIDs) {
 				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
 					continue
 				}
@@ -752,6 +943,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 				}
 			}
 			continuousAggregateSymbolMetadata(&agg, window.SymbolRefs, relevantDSOs)
+			continuousAggregateRuntimeMetadata(&agg, window.SymbolRefs)
 			for _, sample := range matched {
 				continuousAddSample(&agg, sample, window.Labels)
 			}
@@ -824,6 +1016,162 @@ func continuousSymbolDiagnostics(agg continuousAggregate) ProfileSymbolDiagnosti
 		TotalFrameWeight: agg.TotalFrameWeight, UnresolvedFrameWeight: agg.UnresolvedFrameWeight,
 		UnresolvedPercent: percent, GoSymbolState: state, Reasons: reasons,
 	}
+}
+
+func continuousRuntimeAccumulator(agg *continuousAggregate, runtimeName string) *runtimeDiagnosticAccumulator {
+	if runtimeName == "" {
+		runtimeName = "unknown"
+	}
+	item := agg.RuntimeDiagnostics[runtimeName]
+	if item == nil {
+		item = &runtimeDiagnosticAccumulator{
+			Modes: map[string]bool{}, Detected: map[string]ProfileRuntimeProcessDiagnostic{},
+			Ready: map[string]ProfileRuntimeProcessDiagnostic{}, Missing: map[string]ProfileRuntimeProcessDiagnostic{},
+			Reasons: map[string]bool{},
+		}
+		agg.RuntimeDiagnostics[runtimeName] = item
+	}
+	return item
+}
+
+func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[string]interface{}) {
+	runtimeMaps, _ := refs["runtime_maps"].(map[string]interface{})
+	for _, runtimeName := range []string{"java", "node", "python"} {
+		raw, _ := runtimeMaps[runtimeName].(map[string]interface{})
+		if len(raw) == 0 {
+			continue
+		}
+		diag := continuousRuntimeAccumulator(agg, runtimeName)
+		if ready, _ := raw["ready"].(bool); ready {
+			diag.Modes["perf-map"] = true
+		}
+		reason, _ := raw["reason"].(string)
+		if reason != "" {
+			diag.Reasons[reason] = true
+		}
+		missing, _ := raw["missing"].([]interface{})
+		for _, value := range missing {
+			pid := int(numberAsFloat64(value))
+			key := strconv.Itoa(pid)
+			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "perf-map", Status: "missing", Reason: reason}
+			diag.Detected[key] = process
+			diag.Missing[key] = process
+		}
+		readyPIDs, _ := raw["ready_pids"].([]interface{})
+		for _, value := range readyPIDs {
+			pid := int(numberAsFloat64(value))
+			key := strconv.Itoa(pid)
+			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "perf-map", Status: "ready"}
+			diag.Detected[key] = process
+			diag.Ready[key] = process
+		}
+	}
+	fallback, _ := refs["python_fallback"].(map[string]interface{})
+	python := continuousRuntimeAccumulator(agg, "python")
+	python.Limited += int(numberAsFloat64(fallback["limited_count"]))
+	for _, field := range []string{"ready", "failed"} {
+		items, _ := fallback[field].([]interface{})
+		for _, value := range items {
+			item, _ := value.(map[string]interface{})
+			pid := int(numberAsFloat64(item["pid"]))
+			key := strconv.Itoa(pid)
+			reason, _ := item["reason"].(string)
+			status := "ready"
+			if field == "failed" {
+				status = "missing"
+				if reason != "" {
+					python.Reasons[reason] = true
+				}
+			}
+			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "py-spy", Status: status, Reason: reason}
+			python.Detected[key] = process
+			python.Modes["py-spy"] = true
+			if status == "ready" {
+				python.Ready[key] = process
+			} else {
+				python.Missing[key] = process
+			}
+		}
+	}
+	memory, _ := refs["python_memory"].(map[string]interface{})
+	for _, field := range []string{"ready", "failed"} {
+		items, _ := memory[field].([]interface{})
+		for _, value := range items {
+			item, _ := value.(map[string]interface{})
+			pid := int(numberAsFloat64(item["pid"]))
+			key := "memory|" + strconv.Itoa(pid)
+			reason, _ := item["reason"].(string)
+			status := "ready"
+			if field == "failed" {
+				status = "missing"
+				if reason != "" {
+					python.Reasons[reason] = true
+				}
+			}
+			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "memray", Status: status, Reason: reason}
+			python.Detected[key] = process
+			python.Modes["memray"] = true
+			if status == "ready" {
+				python.Ready[key] = process
+			} else {
+				python.Missing[key] = process
+			}
+		}
+	}
+}
+
+func continuousRuntimeDiagnostics(agg continuousAggregate) map[string]ProfileRuntimeDiagnostic {
+	out := map[string]ProfileRuntimeDiagnostic{}
+	for _, runtimeName := range []string{"python", "java", "node", "go", "native", "kernel", "unknown"} {
+		item := agg.RuntimeDiagnostics[runtimeName]
+		if item == nil {
+			continue
+		}
+		modes, reasons := boolMapKeys(item.Modes), boolMapKeys(item.Reasons)
+		processes := make([]ProfileRuntimeProcessDiagnostic, 0, len(item.Detected))
+		for _, process := range item.Detected {
+			processes = append(processes, process)
+		}
+		sort.Slice(processes, func(i, j int) bool { return processes[i].PID < processes[j].PID })
+		if len(processes) > 20 {
+			processes = processes[:20]
+		}
+		status := "missing"
+		if len(item.Ready) > 0 && len(item.Missing) == 0 {
+			status = "ready"
+		} else if len(item.Ready) > 0 {
+			status = "partial"
+		}
+		out[runtimeName] = ProfileRuntimeDiagnostic{
+			Status: status, Modes: modes, DetectedCount: len(item.Detected), ReadyCount: len(item.Ready),
+			MissingCount: len(item.Missing), LimitedCount: item.Limited, Reasons: reasons, Processes: processes,
+		}
+	}
+	return out
+}
+
+func boolMapKeys(values map[string]bool) []string {
+	out := []string{}
+	for value := range values {
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func numberAsFloat64(value interface{}) float64 {
+	switch number := value.(type) {
+	case float64:
+		return number
+	case int:
+		return float64(number)
+	case json.Number:
+		parsed, _ := number.Float64()
+		return parsed
+	}
+	return 0
 }
 
 func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
@@ -1009,7 +1357,7 @@ func (s *APIServer) loadContinuousStoredBatch(ctx context.Context, objectKey str
 }
 
 func continuousSampleMatches(sample ContinuousStackSample, windowLabels map[string]interface{}, filters map[string]interface{}) bool {
-	for _, key := range []string{"comm", "pid", "exe"} {
+	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
 		want := labelString(filters, key)
 		if want == "" {
 			continue
@@ -1021,18 +1369,27 @@ func continuousSampleMatches(sample ContinuousStackSample, windowLabels map[stri
 	return true
 }
 
-func continuousProfileSamplesForQuery(window ContinuousWindowIngest, q ProfileQuery) []ContinuousStackSample {
-	if len(window.Profiles) == 0 {
-		return window.Samples
-	}
+func continuousProfileSamplesForQuery(window ContinuousWindowIngest, q ProfileQuery, seenProfileIDs map[string]bool) []ContinuousStackSample {
 	out := []ContinuousStackSample{}
+	wantedSignal := "cpu_profile"
+	if q.ProfileType == "memory" {
+		wantedSignal = "python_memory"
+	} else {
+		out = append(out, window.Samples...)
+	}
 	scope := strings.ToLower(strings.TrimSpace(q.StackScope))
 	if scope == "all" {
 		scope = ""
 	}
 	for _, profile := range window.Profiles {
-		if strings.ToLower(strings.TrimSpace(firstNonEmpty(profile.SignalType, "cpu_profile"))) != "cpu_profile" {
+		if strings.ToLower(strings.TrimSpace(firstNonEmpty(profile.SignalType, "cpu_profile"))) != wantedSignal {
 			continue
+		}
+		if profile.ProfileID != "" && seenProfileIDs != nil {
+			if seenProfileIDs[profile.ProfileID] {
+				continue
+			}
+			seenProfileIDs[profile.ProfileID] = true
 		}
 		profileScope := strings.ToLower(strings.TrimSpace(profile.StackScope))
 		if scope != "" && profileScope != "" && profileScope != scope {
@@ -1047,6 +1404,9 @@ func continuousProfileSamplesForQuery(window ContinuousWindowIngest, q ProfileQu
 			}
 			if sample.Labels == nil {
 				sample.Labels = profile.Labels
+			}
+			if sample.Runtime == "" && wantedSignal == "python_memory" {
+				sample.Runtime = "python"
 			}
 			out = append(out, sample)
 		}
@@ -1071,6 +1431,10 @@ func continuousSampleLabel(sample ContinuousStackSample, windowLabels map[string
 		if sample.Exe != "" {
 			return sample.Exe
 		}
+	case "runtime":
+		if sample.Runtime != "" {
+			return sample.Runtime
+		}
 	}
 	return labelString(windowLabels, key)
 }
@@ -1088,7 +1452,16 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		stack = []string{firstNonEmpty(continuousSampleLabel(sample, windowLabels, "comm"), continuousSampleLabel(sample, windowLabels, "exe"), "unknown")}
 	}
 	agg.Total += count
-	for _, key := range []string{"comm", "pid", "exe"} {
+	runtimeName := firstNonEmpty(continuousSampleLabel(sample, windowLabels, "runtime"), "unknown")
+	diag := continuousRuntimeAccumulator(agg, runtimeName)
+	processKey := strconv.Itoa(sample.PID) + "|" + sample.Exe
+	process := ProfileRuntimeProcessDiagnostic{PID: sample.PID, Comm: sample.Comm, Exe: sample.Exe, Mode: sample.Backend, Status: "ready"}
+	diag.Detected[processKey] = process
+	diag.Ready[processKey] = process
+	if sample.Backend != "" {
+		diag.Modes[sample.Backend] = true
+	}
+	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
 		if value := continuousSampleLabel(sample, windowLabels, key); value != "" {
 			agg.LabelValue[key][value] = true
 		}
@@ -1107,7 +1480,7 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		}
 		item := agg.Top[frame]
 		if item == nil {
-			item = &ProfileTopItem{Name: frame, Unit: "samples"}
+			item = &ProfileTopItem{Name: frame, Unit: firstNonEmpty(agg.Unit, "samples")}
 			agg.Top[frame] = item
 		}
 		item.Value += count
@@ -1395,6 +1768,9 @@ func continuousWindowSignalRows(window ContinuousWindowIngest) []continuousSigna
 	for _, hist := range window.Histograms {
 		add(hist.SignalType, firstNonEmpty(hist.Backend, window.Backend))
 	}
+	if len(window.Metrics) > 0 {
+		add("python_rss", "procfs")
+	}
 	if len(rows) == 0 {
 		add(firstNonEmpty(window.SignalType, "cpu_profile"), window.Backend)
 	}
@@ -1429,12 +1805,19 @@ func continuousWindowSampleCount(window ContinuousWindowIngest, signalType strin
 			}
 		}
 	}
+	if signalType == "python_rss" {
+		for _, metric := range window.Metrics {
+			if metric.Metric == "rss_bytes" {
+				count = addContinuousCount(count, 1)
+			}
+		}
+	}
 	for _, hist := range window.Histograms {
 		if strings.ToLower(strings.TrimSpace(hist.SignalType)) == signalType {
 			count = addContinuousCount(count, hist.EventCount)
 		}
 	}
-	if count == 0 {
+	if count == 0 && signalType == "cpu_profile" {
 		return clampContinuousCount(window.SampleCount)
 	}
 	return count

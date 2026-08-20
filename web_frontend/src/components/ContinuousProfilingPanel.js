@@ -90,6 +90,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [commAvailable, setCommAvailable] = useState(false);
     const [commMessage, setCommMessage] = useState('');
     const [commLoading, setCommLoading] = useState(false);
+    const [selectedRuntime, setSelectedRuntime] = useState('');
+    const [runtimeValues, setRuntimeValues] = useState([]);
+    const [rssSeries, setRssSeries] = useState([]);
     const [maxNodes, setMaxNodes] = useState(5000);
     const [flameSearchInput, setFlameSearchInput] = useState('');
     const [flameSearchText, setFlameSearchText] = useState('');
@@ -118,8 +121,11 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const diffRangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours, true), [sessionMeta.retentionHours]);
     const uploadState = uploadFreshness(sessionMeta);
     const unit = flamegraph?.unit || topn?.unit || '';
-    const activeFilters = useMemo(() => (scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}), [scope, selectedComm]);
-    const activeFilterText = activeFilters.comm ? `comm=${activeFilters.comm}` : '';
+    const activeFilters = useMemo(() => ({
+        ...(scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}),
+        ...(selectedRuntime ? { runtime: selectedRuntime } : {}),
+    }), [scope, selectedComm, selectedRuntime]);
+    const activeFilterText = Object.entries(activeFilters).map(([key, value]) => `${key}=${value}`).join(', ');
     const stackScopeLabel = stackScope === 'user' ? '用户栈' : stackScope === 'kernel' ? '内核栈' : '混合栈';
     const scopeLabel = activeFilters.comm ? `进程级 Native Continuous Profiling / ${activeFilterText} / ${stackScopeLabel}` : `整机 Native Continuous Profiling / ${stackScopeLabel}`;
 
@@ -160,12 +166,15 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 setHistogram(null);
                 const cpuParams = { ...params };
                 if (stackScope !== 'all') cpuParams.stack_scope = stackScope;
-                const [fgRes, topRes] = await Promise.all([
+                const requests = [
                     profiles.flamegraph(cpuParams),
                     profiles.topn(cpuParams),
-                ]);
+                ];
+                if (profileType === 'memory') requests.push(profiles.timeseries({ ...cpuParams, metric: 'rss_bytes' }));
+                const [fgRes, topRes, rssRes] = await Promise.all(requests);
                 if (fgRes.code === 0) setFlamegraph(fgRes.data);
                 if (topRes.code === 0) setTopn(topRes.data);
+                if (profileType === 'memory') setRssSeries(rssRes?.code === 0 ? (rssRes.data?.series || []) : []);
                 if (fgRes.code !== 0 || topRes.code !== 0) {
                     setError(fgRes.message || topRes.message || 'Native Continuous Profiling 查询失败');
                 }
@@ -183,6 +192,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setFlamegraph(null);
             setTopn(null);
             setHistogram(null);
+            setRssSeries([]);
             setError(err?.message || 'Native Continuous Profiling 查询失败');
         } finally {
             setQuerying(false);
@@ -314,11 +324,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 
     useEffect(() => {
         setSelectedComm('');
+        setSelectedRuntime('');
         setScope('host');
     }, [target?.id]);
 
     useEffect(() => {
-        if (!target || profileType !== 'cpu') {
+        if (!target) {
             setCommValues([]);
             setCommAvailable(false);
             setCommMessage('');
@@ -364,6 +375,23 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         };
     }, [target, timeWindow, profileType, selectedComm]);
 
+    useEffect(() => {
+        if (!target) return undefined;
+        let cancelled = false;
+        profiles.labelValues({ target_id: target.id, host: target.ip, service: target.service_name || 'hotmethod', from: timeWindow.from, to: timeWindow.to, profile_type: profileType, label: 'runtime' })
+            .then(res => { if (!cancelled && res.code === 0) setRuntimeValues(res.data?.values || []); })
+            .catch(() => { if (!cancelled) setRuntimeValues([]); });
+        return () => { cancelled = true; };
+    }, [target, timeWindow, profileType]);
+
+    useEffect(() => {
+        if (profileType !== 'memory' || rssSeries.length === 0) return;
+        const names = prioritizeProcessNames(rssSeries.map(series => series.comm));
+        setCommValues(names);
+        setCommAvailable(names.length > 0);
+        setRuntimeValues(values => Array.from(new Set([...values, 'python'])));
+    }, [profileType, rssSeries]);
+
     if (!target) {
         return <div style={S.empty}>暂无可观测对象。启动 drop_agent 或创建过按需任务后会出现在这里。</div>;
     }
@@ -400,9 +428,15 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         </select>
                     </Field>
                     <Field label="Profile 类型">
-                        <select style={S.select} value={profileType} onChange={e => setProfileType(e.target.value)}>
+                        <select style={S.select} value={profileType} onChange={e => { setProfileType(e.target.value); if (e.target.value === 'memory') setSignalTab('cpu'); }}>
                             <option value="cpu">CPU</option>
                             <option value="memory">Memory</option>
+                        </select>
+                    </Field>
+                    <Field label="语言">
+                        <select style={S.select} value={selectedRuntime} onChange={e => setSelectedRuntime(e.target.value)}>
+                            <option value="">全部语言</option>
+                            {runtimeValues.map(value => <option key={value} value={value}>{runtimeLabel(value)}</option>)}
                         </select>
                     </Field>
                     {signalTab === 'cpu' && profileType === 'cpu' && (
@@ -541,6 +575,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 </div>
             )}
 
+            {signalTab === 'cpu' && <RuntimeDiagnostics diagnostics={flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics} />}
+
+            {profileType === 'memory' && signalTab === 'cpu' && <RSSTrend series={rssSeries} loading={querying} />}
+
             {signalTab === 'cpu' && <section style={S.card}>
                 <div style={S.sectionHead}>
                     <h3 style={S.title}>热点 TopN</h3>
@@ -643,10 +681,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 <section style={S.card}>
                     <div style={S.sectionHead}>
                         <h3 style={S.title}>Go pprof Heap 按需任务</h3>
-                        <span style={S.subtle}>Continuous heap profiling 暂未启用</span>
+                        <span style={S.subtle}>保留按需深度采集入口</span>
                     </div>
                     <div style={{ ...S.info, marginTop: 8 }}>
-                        Memory profiling 当前不支持 continuous 模式。请创建 <code>Go pprof Heap</code> 按需任务采集目标进程的堆 profile，结果页将展示 bytes 维度的火焰图与 TopN。
+                        上方持续 Memory 视图显示 Python RSS 与显式 Mini-Drop/Memray SDK 的峰值存活字节。Go 堆仍通过 <code>Go pprof Heap</code> 按需任务采集。
                     </div>
                     <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
                         <a style={{ ...S.btn, textDecoration: 'none', display: 'inline-block' }} href={`/hosts/${encodeURIComponent(target?.id || '')}?tab=tasks`}>
@@ -683,6 +721,64 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             </details>
         </div>
     );
+}
+
+function RuntimeDiagnostics({ diagnostics }) {
+    const entries = Object.entries(diagnostics || {});
+    if (entries.length === 0) return null;
+    return (
+        <section style={S.card}>
+            <div style={S.sectionHead}><h3 style={S.title}>语言采集状态</h3><span style={S.subtle}>{entries.length} runtimes</span></div>
+            <div style={S.tableWrap}><table style={S.table}>
+                <thead><tr><th style={S.th}>语言</th><th style={S.th}>状态</th><th style={S.th}>模式</th><th style={S.th}>进程</th><th style={S.th}>诊断</th></tr></thead>
+                <tbody>{entries.map(([runtime, item]) => (
+                    <tr key={runtime}>
+                        <td style={S.td}>{runtimeLabel(runtime)}</td><td style={S.td}>{item.status}</td>
+                        <td style={S.td}>{(item.modes || []).join(', ') || '-'}</td>
+                        <td style={S.td}>{item.ready_count || 0}/{item.detected_count || 0}{item.limited_count ? ` · 受限 ${item.limited_count}` : ''}</td>
+                        <td style={S.td}>{(item.reasons || []).join('; ') || '-'}</td>
+                    </tr>
+                ))}</tbody>
+            </table></div>
+        </section>
+    );
+}
+
+function RSSTrend({ series = [], loading }) {
+    const width = 900;
+    const height = 240;
+    const allPoints = series.flatMap(item => item.points || []);
+    const times = allPoints.map(point => new Date(point.timestamp).getTime()).filter(Number.isFinite);
+    const maxValue = Math.max(1, ...allPoints.map(point => Number(point.value) || 0));
+    const minTime = times.length ? Math.min(...times) : 0;
+    const maxTime = times.length ? Math.max(...times) : 1;
+    const colors = ['#315efb', '#067647', '#b54708', '#b42318', '#6941c6', '#026aa2'];
+    return (
+        <section style={S.card}>
+            <div style={S.sectionHead}><h3 style={S.title}>Python RSS 趋势</h3><span style={S.subtle}>{series.length} processes · bytes</span></div>
+            {loading ? <div style={S.empty}>正在查询 RSS...</div> : series.length === 0 ? <div style={S.empty}>所选范围没有 Python RSS 数据</div> : (
+                <>
+                    <svg role="img" aria-label="Python RSS 趋势图" viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', height: 240, border: '1px solid #eaecf0', background: '#fff' }}>
+                        {[0.25, 0.5, 0.75].map(value => <line key={value} x1="0" x2={width} y1={height * value} y2={height * value} stroke="#eaecf0" />)}
+                        {series.map((item, index) => {
+                            const points = (item.points || []).map(point => {
+                                const time = new Date(point.timestamp).getTime();
+                                const x = maxTime === minTime ? 0 : ((time - minTime) / (maxTime - minTime)) * width;
+                                const y = height - ((Number(point.value) || 0) / maxValue) * (height - 8);
+                                return `${x},${y}`;
+                            }).join(' ');
+                            return <polyline key={`${item.pid}-${item.process_start_ms || 0}-${item.exe}`} points={points} fill="none" stroke={colors[index % colors.length]} strokeWidth="2" />;
+                        })}
+                    </svg>
+                    <div style={{ ...S.chipWrap, marginTop: 10 }}>{series.slice(0, 20).map((item, index) => <span style={S.chip} key={`${item.pid}-${item.process_start_ms || 0}-${item.exe}`}><span style={{ width: 8, height: 8, background: colors[index % colors.length] }} />{item.comm || 'python'} · PID {item.pid} · peak {formatMetricValue(item.peak || 0, 'bytes')}</span>)}</div>
+                </>
+            )}
+        </section>
+    );
+}
+
+export function runtimeLabel(runtime) {
+    return ({ python: 'Python', java: 'Java/JVM', node: 'Node.js', go: 'Go', native: 'Native', kernel: 'Kernel', unknown: 'Unknown' })[runtime] || runtime;
 }
 
 function Field({ label, children, wide = false }) {
@@ -976,6 +1072,7 @@ function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, sta
         `profile_url: ${flamegraph?.profile_url || topn?.profile_url || target?.profile_url || '-'}`,
         `symbol_status: ${flamegraph?.symbol_status || topn?.symbol_status || 'not_applicable'}`,
         `symbol_diagnostics: ${JSON.stringify(flamegraph?.symbol_diagnostics || topn?.symbol_diagnostics || {})}`,
+        `runtime_diagnostics: ${JSON.stringify(flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics || {})}`,
         `truncated: ${flamegraph?.truncated || topn?.truncated || false}`,
     ].join('\n');
 }

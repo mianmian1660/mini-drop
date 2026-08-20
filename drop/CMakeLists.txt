@@ -68,6 +68,8 @@ set(COMMON_SRCS
     common/CapabilityDetector.cpp
     common/ContinuousSampler.cpp
     common/RuntimeSymbolMap.cpp
+    common/PythonRuntimeProfiler.cpp
+    common/MemrayProfileIngest.cpp
     common/GoSymbolizer.cpp
     common/Process.cpp
     common/COSClient.cpp
@@ -185,6 +187,8 @@ if(GTest_FOUND)
         common/BuildId.cpp
         common/PidRegistry.cpp
         common/RuntimeSymbolMap.cpp
+        common/PythonRuntimeProfiler.cpp
+        common/MemrayProfileIngest.cpp
         common/GoSymbolizer.cpp
         agent/RunnerUtils.cpp
         agent/TaskQueue.cpp

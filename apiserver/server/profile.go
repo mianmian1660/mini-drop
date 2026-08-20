@@ -106,21 +106,42 @@ type ProfileSymbolDiagnostics struct {
 	Reasons               []string `json:"reasons"`
 }
 
+type ProfileRuntimeProcessDiagnostic struct {
+	PID    int    `json:"pid"`
+	Comm   string `json:"comm,omitempty"`
+	Exe    string `json:"exe,omitempty"`
+	Mode   string `json:"mode,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type ProfileRuntimeDiagnostic struct {
+	Status        string                            `json:"status"`
+	Modes         []string                          `json:"modes"`
+	DetectedCount int                               `json:"detected_count"`
+	ReadyCount    int                               `json:"ready_count"`
+	MissingCount  int                               `json:"missing_count"`
+	LimitedCount  int                               `json:"limited_count"`
+	Reasons       []string                          `json:"reasons"`
+	Processes     []ProfileRuntimeProcessDiagnostic `json:"processes"`
+}
+
 type ProfileFlamegraph struct {
-	Nodes             []ProfileNode            `json:"nodes"`
-	Total             float64                  `json:"total"`
-	Unit              string                   `json:"unit"`
-	Backend           string                   `json:"backend,omitempty"`
-	Empty             bool                     `json:"empty"`
-	Message           string                   `json:"message"`
-	Source            string                   `json:"source"`
-	ProfileSource     string                   `json:"profile_source"`
-	ProfileURL        string                   `json:"profile_url,omitempty"`
-	Query             string                   `json:"query,omitempty"`
-	SymbolStatus      string                   `json:"symbol_status,omitempty"`
-	SymbolDiagnostics ProfileSymbolDiagnostics `json:"symbol_diagnostics"`
-	Truncated         bool                     `json:"truncated"`
-	GeneratedAt       time.Time                `json:"generated_at"`
+	Nodes              []ProfileNode                       `json:"nodes"`
+	Total              float64                             `json:"total"`
+	Unit               string                              `json:"unit"`
+	Backend            string                              `json:"backend,omitempty"`
+	Empty              bool                                `json:"empty"`
+	Message            string                              `json:"message"`
+	Source             string                              `json:"source"`
+	ProfileSource      string                              `json:"profile_source"`
+	ProfileURL         string                              `json:"profile_url,omitempty"`
+	Query              string                              `json:"query,omitempty"`
+	SymbolStatus       string                              `json:"symbol_status,omitempty"`
+	SymbolDiagnostics  ProfileSymbolDiagnostics            `json:"symbol_diagnostics"`
+	RuntimeDiagnostics map[string]ProfileRuntimeDiagnostic `json:"runtime_diagnostics"`
+	Truncated          bool                                `json:"truncated"`
+	GeneratedAt        time.Time                           `json:"generated_at"`
 }
 
 type ProfileTopItem struct {
@@ -131,20 +152,21 @@ type ProfileTopItem struct {
 }
 
 type ProfileTopN struct {
-	Items             []ProfileTopItem         `json:"items"`
-	Total             float64                  `json:"total"`
-	Unit              string                   `json:"unit"`
-	Backend           string                   `json:"backend,omitempty"`
-	Empty             bool                     `json:"empty"`
-	Message           string                   `json:"message"`
-	Source            string                   `json:"source"`
-	ProfileSource     string                   `json:"profile_source"`
-	ProfileURL        string                   `json:"profile_url,omitempty"`
-	Query             string                   `json:"query,omitempty"`
-	SymbolStatus      string                   `json:"symbol_status,omitempty"`
-	SymbolDiagnostics ProfileSymbolDiagnostics `json:"symbol_diagnostics"`
-	Truncated         bool                     `json:"truncated"`
-	GeneratedAt       time.Time                `json:"generated_at"`
+	Items              []ProfileTopItem                    `json:"items"`
+	Total              float64                             `json:"total"`
+	Unit               string                              `json:"unit"`
+	Backend            string                              `json:"backend,omitempty"`
+	Empty              bool                                `json:"empty"`
+	Message            string                              `json:"message"`
+	Source             string                              `json:"source"`
+	ProfileSource      string                              `json:"profile_source"`
+	ProfileURL         string                              `json:"profile_url,omitempty"`
+	Query              string                              `json:"query,omitempty"`
+	SymbolStatus       string                              `json:"symbol_status,omitempty"`
+	SymbolDiagnostics  ProfileSymbolDiagnostics            `json:"symbol_diagnostics"`
+	RuntimeDiagnostics map[string]ProfileRuntimeDiagnostic `json:"runtime_diagnostics"`
+	Truncated          bool                                `json:"truncated"`
+	GeneratedAt        time.Time                           `json:"generated_at"`
 }
 
 type ProfileLabelValues struct {
@@ -236,6 +258,13 @@ func (s *APIServer) GetProfileFlamegraph(c *gin.Context) {
 		s.RespondOK(c, data)
 		return
 	}
+	if q.ProfileType == "memory" {
+		data := emptyFlamegraph("尚无 Memray allocation profile；Python RSS 仍可通过 timeseries 查询")
+		data.Unit = "bytes"
+		data.RuntimeDiagnostics = map[string]ProfileRuntimeDiagnostic{"python": {Status: "missing", Modes: []string{"memray"}, Reasons: []string{"Mini-Drop/Memray SDK 未启用或最近没有完整 profile"}, Processes: []ProfileRuntimeProcessDiagnostic{}}}
+		s.RespondOK(c, data)
+		return
+	}
 	data, err := s.profileClient().Flamegraph(c.Request.Context(), q)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
@@ -256,6 +285,13 @@ func (s *APIServer) GetProfileTopN(c *gin.Context) {
 		s.respondProfileDependencyError(c, err)
 		return
 	} else if found {
+		s.RespondOK(c, data)
+		return
+	}
+	if q.ProfileType == "memory" {
+		data := emptyTopN("尚无 Memray allocation profile；Python RSS 仍可通过 timeseries 查询")
+		data.Unit = "bytes"
+		data.RuntimeDiagnostics = map[string]ProfileRuntimeDiagnostic{"python": {Status: "missing", Modes: []string{"memray"}, Reasons: []string{"Mini-Drop/Memray SDK 未启用或最近没有完整 profile"}, Processes: []ProfileRuntimeProcessDiagnostic{}}}
 		s.RespondOK(c, data)
 		return
 	}
@@ -504,23 +540,7 @@ func parseMaxNodes(c *gin.Context, name string) int {
 }
 
 func (s *APIServer) respondReservedProfileType(c *gin.Context, profileType string) bool {
-	if profileType != "memory" {
-		return false
-	}
-	s.RespondOK(c, gin.H{
-		"nodes":          []ProfileNode{},
-		"items":          []ProfileTopItem{},
-		"total":          0,
-		"unit":           "bytes",
-		"empty":          true,
-		"message":        "memory profiling 暂无 continuous 数据，请使用 Go pprof Heap 按需任务采集堆 profile",
-		"source":         "mini-drop-native",
-		"profile_source": "native",
-		"memory_mode":    "go_pprof_heap_task",
-		"create_url":     "/task/create?task_kind=go_pprof_heap",
-		"generated_at":   time.Now(),
-	})
-	return true
+	return false
 }
 
 func (s *APIServer) respondProfileDependencyError(c *gin.Context, err error) {
@@ -787,7 +807,7 @@ func profileTargetID(ip, service string) string {
 func profileLabelSelector(q ProfileQuery) string {
 	labels := mergeProfileLabels(ProfileTarget{IP: q.Host, ServiceName: q.Service, Labels: q.Labels}, q.Labels)
 	parts := make([]string, 0, len(labels)+len(q.Filters))
-	for _, key := range []string{"comm", "pid", "exe"} {
+	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
 		if v := labelString(q.Filters, key); v != "" {
 			parts = append(parts, fmt.Sprintf("%s=%q", key, v))
 		}
@@ -850,7 +870,7 @@ func profileTargetLabels(target ProfileTarget, labels map[string]interface{}) ma
 
 func sanitizeProfileFilters(filters map[string]interface{}) map[string]interface{} {
 	out := map[string]interface{}{}
-	for _, key := range []string{"comm", "pid", "exe"} {
+	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
 		if v := labelString(filters, key); v != "" {
 			out[key] = v
 		}
@@ -860,7 +880,7 @@ func sanitizeProfileFilters(filters map[string]interface{}) map[string]interface
 
 func isAllowedProfileFilterLabel(label string) bool {
 	switch label {
-	case "comm", "pid", "exe":
+	case "comm", "pid", "exe", "runtime":
 		return true
 	default:
 		return false

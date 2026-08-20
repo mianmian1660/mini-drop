@@ -138,8 +138,9 @@ echo "=== [e2e] 4. TopN API（按 comm 过滤） ==="
 FROM_TS=$(date -u -d "-2 minutes" +%Y-%m-%dT%H:%M:%SZ)
 TO_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 for comm in java node python3; do
+    FILTERS=$(python3 -c 'import json,sys,urllib.parse; print(urllib.parse.quote(json.dumps({"comm":sys.argv[1]})))' "$comm")
     RESP=$(curl -sS -H "Drop-User-Uid: $UID_HEADER" \
-      "http://127.0.0.1:8191/api/v1/profile/topn?target_id=$TARGET_IP:hotmethod&profile_type=cpu&from=$FROM_TS&to=$TO_TS&filters=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote('comm=\"$comm\"'))")")
+      "http://127.0.0.1:8191/api/v1/profile/topn?target_id=$TARGET_IP:hotmethod&profile_type=cpu&from=$FROM_TS&to=$TO_TS&filters=$FILTERS")
     CNT=$(echo "$RESP" | grep -oE "javaBurnWorker|nodeBurnWorker|py_burn_worker" | sort -u | tr '\n' ' ')
     if [ -n "$CNT" ]; then ok "TopN comm=$comm 出现: $CNT"; else fail "TopN comm=$comm 无函数名"; fi
 done
