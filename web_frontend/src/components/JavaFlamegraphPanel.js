@@ -45,7 +45,7 @@ export default function JavaFlamegraphPanel({ task, topFunctions = [], files = [
                                         <th style={S.th}>#</th>
                                         <th style={S.th}>方法</th>
                                         <th style={S.th}>Samples</th>
-                                        <th style={S.th}>占比</th>
+                                        <th style={S.th} title="该方法自身（栈顶）采样次数 ÷ 全部方法自身采样总数，不含它调用的子方法">占比（自身 / 总采样）</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -54,7 +54,7 @@ export default function JavaFlamegraphPanel({ task, topFunctions = [], files = [
                                             <td style={S.td}>{item.rank || index + 1}</td>
                                             <td style={S.td}>{item.function || '-'}</td>
                                             <td style={S.td}>{item.samples || 0}</td>
-                                            <td style={S.td}>{formatPercent(item.percentage)}</td>
+                                            <td style={S.td} title="自身采样占比，不含子方法">{formatPercent(item.percentage)}</td>
                                         </tr>
                                     ))}
                                 </tbody>
