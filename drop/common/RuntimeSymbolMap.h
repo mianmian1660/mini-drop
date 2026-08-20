@@ -93,6 +93,9 @@ std::string runtime_aggregate_status(const RuntimeSymbolReport &report);
 /// 序列化为 symbol_refs JSON（供 build_batch_json 使用）。
 std::string runtime_report_to_json(const RuntimeSymbolReport &report);
 
+/// 仅序列化 runtime_maps 值，供 continuous native/runtime 组合诊断复用。
+std::string runtime_maps_to_json(const RuntimeSymbolReport &report);
+
 /// 主流程：枚举 runtime 进程（与 perf.data 采样 PID 交集）、定位/校验/复制
 /// map、必要时刷新 Java map，产出报告。dataPath 为 perf.data 路径；perfBin
 /// 为 perf 可执行文件（用于 -F comm,pid 提取采样 PID）。

@@ -68,6 +68,7 @@ set(COMMON_SRCS
     common/CapabilityDetector.cpp
     common/ContinuousSampler.cpp
     common/RuntimeSymbolMap.cpp
+    common/GoSymbolizer.cpp
     common/Process.cpp
     common/COSClient.cpp
     common/Utils.cpp
@@ -175,6 +176,7 @@ if(GTest_FOUND)
         tests/test_agent_utils.cpp
         tests/test_pid_registry.cpp
         tests/test_runtime_symbol_map.cpp
+        tests/test_go_symbolizer.cpp
         tests/test_continuous_sampler.cpp
         server/TaskQueue.cpp
         common/ProcessExecutor.cpp
@@ -183,6 +185,7 @@ if(GTest_FOUND)
         common/BuildId.cpp
         common/PidRegistry.cpp
         common/RuntimeSymbolMap.cpp
+        common/GoSymbolizer.cpp
         agent/RunnerUtils.cpp
         agent/TaskQueue.cpp
         agent/UploadQueue.cpp

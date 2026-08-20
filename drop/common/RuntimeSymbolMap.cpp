@@ -385,11 +385,17 @@ std::string runtime_report_to_json(const RuntimeSymbolReport &report)
 {
     std::string body = "{";
     body += "\"symbol_status\":\"" + report.status + "\",";
-    body += "\"runtime_maps\":{";
+    body += "\"runtime_maps\":" + runtime_maps_to_json(report);
+    body += "}";
+    return body;
+}
+
+std::string runtime_maps_to_json(const RuntimeSymbolReport &report)
+{
+    std::string body = "{";
     body += "\"java\":" + info_to_json(report.java) + ",";
     body += "\"node\":" + info_to_json(report.node) + ",";
     body += "\"python\":" + info_to_json(report.python);
-    body += "}";
     body += "}";
     return body;
 }

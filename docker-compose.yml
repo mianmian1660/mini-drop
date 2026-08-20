@@ -132,6 +132,15 @@ services:
       DROP_BTF_PATH: "${DROP_BTF_PATH:-}"
       DROP_NATIVE_CP_API_BASE_URL: "${DROP_NATIVE_CP_API_BASE_URL:-http://127.0.0.1:8191}"
       DROP_NATIVE_CP_SESSION_ID: "${DROP_NATIVE_CP_SESSION_ID:-}"
+      DROP_GO_SYMBOL_CACHE_DIR: "/var/lib/mini-drop/symbol-cache"
+      DROP_GO_SYMBOL_TIMEOUT_SEC: "${DROP_GO_SYMBOL_TIMEOUT_SEC:-120}"
+      # GoReSym 解析大型 stripped Go ELF 时可能占用数 GiB；用 Go runtime
+      # 软上限配合容器硬上限，避免小内存宿主机进入 swap 风暴。
+      DROP_GO_SYMBOL_MEMORY_LIMIT: "${DROP_GO_SYMBOL_MEMORY_LIMIT:-1024MiB}"
+      DROP_GO_SYMBOL_GOGC: "${DROP_GO_SYMBOL_GOGC:-20}"
+    cpus: "${DROP_AGENT_CPU_LIMIT:-1.0}"
+    mem_limit: "${DROP_AGENT_MEMORY_LIMIT:-2g}"
+    memswap_limit: "${DROP_AGENT_MEMORY_LIMIT:-2g}"
     network_mode: host # 使用宿主机网络（需要 perf 权限）
     privileged: true # 特权模式（perf 需要）
     pid: host # 使用宿主机 PID 命名空间
@@ -157,6 +166,7 @@ services:
       # async-profiler 的 collapsed 输出由宿主 JVM 直接写文件（JVM 命名空间），
       # 共享 /tmp 让容器内 agent 能读到 asprof 产物（否则 resultCode=-6 产物缺失）。
       - /tmp:/tmp
+      - gosymbolcache:/var/lib/mini-drop/symbol-cache
     depends_on:
       - drop_server
 
@@ -250,3 +260,4 @@ services:
 volumes:
   pgdata:
   miniodata:
+  gosymbolcache:

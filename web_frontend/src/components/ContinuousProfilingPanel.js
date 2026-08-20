@@ -536,7 +536,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     {flamegraph?.truncated && <span>火焰图节点数超过 {maxNodes} 上限，已截断展示。请缩小时间范围或提高最大节点数以查看完整栈。</span>}
                     {flamegraph?.truncated && flamegraph?.symbol_status && ' · '}
                     {flamegraph?.symbol_status && flamegraph?.symbol_status !== 'not_applicable' && (
-                        <span>符号状态：{symbolStatusLabel(flamegraph.symbol_status)}</span>
+                        <span>符号状态：{symbolStatusLabel(flamegraph.symbol_status, flamegraph.symbol_diagnostics)}</span>
                     )}
                 </div>
             )}
@@ -975,15 +975,24 @@ function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, sta
         `total_raw_value: ${formatRawMetric(flamegraph?.total || topn?.total || 0, flamegraph?.unit || topn?.unit || '')}`,
         `profile_url: ${flamegraph?.profile_url || topn?.profile_url || target?.profile_url || '-'}`,
         `symbol_status: ${flamegraph?.symbol_status || topn?.symbol_status || 'not_applicable'}`,
+        `symbol_diagnostics: ${JSON.stringify(flamegraph?.symbol_diagnostics || topn?.symbol_diagnostics || {})}`,
         `truncated: ${flamegraph?.truncated || topn?.truncated || false}`,
     ].join('\n');
 }
 
-function symbolStatusLabel(status) {
+function symbolStatusLabel(status, diagnostics = {}) {
+    const percent = Number(diagnostics?.unresolved_percent || 0);
+    const unresolved = Number(diagnostics?.unresolved_frame_weight || 0);
+    const goState = diagnostics?.go_symbol_state;
+    const suffix = goState === 'pending'
+        ? ' · Go 符号正在后台预热'
+        : goState === 'failed'
+            ? ` · Go 符号提取失败${diagnostics?.reasons?.length ? `：${diagnostics.reasons[0]}` : ''}`
+            : '';
     switch (status) {
-        case 'complete': return '完整（build-id / kallsyms 可用）';
-        case 'partial': return '部分缺失（部分符号引用未解析）';
-        case 'missing': return '缺失（无 build-id / kallsyms 引用）';
+        case 'complete': return `完整（当前范围未检测到裸地址帧）${suffix}`;
+        case 'partial': return `部分解析（裸地址帧 ${percent.toFixed(1)}%，权重 ${formatNum(unresolved)}）${suffix}`;
+        case 'missing': return `缺失（当前范围主要为裸地址帧，权重 ${formatNum(unresolved)}）${suffix}`;
         case 'not_applicable': return '不适用';
         default: return status || '未知';
     }

@@ -98,20 +98,29 @@ type ProfileNode struct {
 	Children []ProfileNode `json:"children,omitempty"`
 }
 
+type ProfileSymbolDiagnostics struct {
+	TotalFrameWeight      float64  `json:"total_frame_weight"`
+	UnresolvedFrameWeight float64  `json:"unresolved_frame_weight"`
+	UnresolvedPercent     float64  `json:"unresolved_percent"`
+	GoSymbolState         string   `json:"go_symbol_state"`
+	Reasons               []string `json:"reasons"`
+}
+
 type ProfileFlamegraph struct {
-	Nodes         []ProfileNode `json:"nodes"`
-	Total         float64       `json:"total"`
-	Unit          string        `json:"unit"`
-	Backend       string        `json:"backend,omitempty"`
-	Empty         bool          `json:"empty"`
-	Message       string        `json:"message"`
-	Source        string        `json:"source"`
-	ProfileSource string        `json:"profile_source"`
-	ProfileURL    string        `json:"profile_url,omitempty"`
-	Query         string        `json:"query,omitempty"`
-	SymbolStatus  string        `json:"symbol_status,omitempty"`
-	Truncated     bool          `json:"truncated"`
-	GeneratedAt   time.Time     `json:"generated_at"`
+	Nodes             []ProfileNode            `json:"nodes"`
+	Total             float64                  `json:"total"`
+	Unit              string                   `json:"unit"`
+	Backend           string                   `json:"backend,omitempty"`
+	Empty             bool                     `json:"empty"`
+	Message           string                   `json:"message"`
+	Source            string                   `json:"source"`
+	ProfileSource     string                   `json:"profile_source"`
+	ProfileURL        string                   `json:"profile_url,omitempty"`
+	Query             string                   `json:"query,omitempty"`
+	SymbolStatus      string                   `json:"symbol_status,omitempty"`
+	SymbolDiagnostics ProfileSymbolDiagnostics `json:"symbol_diagnostics"`
+	Truncated         bool                     `json:"truncated"`
+	GeneratedAt       time.Time                `json:"generated_at"`
 }
 
 type ProfileTopItem struct {
@@ -122,19 +131,20 @@ type ProfileTopItem struct {
 }
 
 type ProfileTopN struct {
-	Items         []ProfileTopItem `json:"items"`
-	Total         float64          `json:"total"`
-	Unit          string           `json:"unit"`
-	Backend       string           `json:"backend,omitempty"`
-	Empty         bool             `json:"empty"`
-	Message       string           `json:"message"`
-	Source        string           `json:"source"`
-	ProfileSource string           `json:"profile_source"`
-	ProfileURL    string           `json:"profile_url,omitempty"`
-	Query         string           `json:"query,omitempty"`
-	SymbolStatus  string           `json:"symbol_status,omitempty"`
-	Truncated     bool             `json:"truncated"`
-	GeneratedAt   time.Time        `json:"generated_at"`
+	Items             []ProfileTopItem         `json:"items"`
+	Total             float64                  `json:"total"`
+	Unit              string                   `json:"unit"`
+	Backend           string                   `json:"backend,omitempty"`
+	Empty             bool                     `json:"empty"`
+	Message           string                   `json:"message"`
+	Source            string                   `json:"source"`
+	ProfileSource     string                   `json:"profile_source"`
+	ProfileURL        string                   `json:"profile_url,omitempty"`
+	Query             string                   `json:"query,omitempty"`
+	SymbolStatus      string                   `json:"symbol_status,omitempty"`
+	SymbolDiagnostics ProfileSymbolDiagnostics `json:"symbol_diagnostics"`
+	Truncated         bool                     `json:"truncated"`
+	GeneratedAt       time.Time                `json:"generated_at"`
 }
 
 type ProfileLabelValues struct {

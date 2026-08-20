@@ -4,6 +4,7 @@
 
 #include "common/ContinuousSampler.h"
 #include "common/BuildId.h"
+#include "common/GoSymbolizer.h"
 #include "common/RuntimeSymbolMap.h"
 #include "common/Utils.h"
 
@@ -206,7 +207,7 @@ static std::string read_exe(int pid)
     return std::string(buf);
 }
 
-static std::string parse_frame_name(const std::string &raw)
+static std::string parse_frame_name(const std::string &raw, int pid)
 {
     std::string line = drop::trim(raw);
     if (line.empty())
@@ -237,6 +238,10 @@ static std::string parse_frame_name(const std::string &raw)
     // 函数名，遵循 symbolization-design.md 的"宁可标记未解析"原则。
     if (name == "[unknown]" && !dso.empty())
     {
+        uint64_t address = std::strtoull(first.c_str(), nullptr, 16);
+        std::string goName;
+        if (address > 0 && drop::resolve_go_symbol(pid, dso, address, &goName))
+            return goName;
         size_t slash = dso.rfind('/');
         std::string base = slash == std::string::npos ? dso : dso.substr(slash + 1);
         // perf 退化输出时 DSO 位置可能本身就是方括号占位符，比如
@@ -333,7 +338,7 @@ static std::vector<AggregatedSample> parse_perf_script(const std::string &script
         }
         if (!currentComm.empty() && (line[0] == ' ' || line[0] == '\t'))
         {
-            std::string frame = parse_frame_name(line);
+            std::string frame = parse_frame_name(line, currentPid);
             if (!frame.empty())
                 currentStack.push_back(frame);
         }
@@ -415,16 +420,16 @@ static bool looks_like_elf(const std::string &path)
 
 // 任务1核心：perf script 之前，把能拿到的用户态二进制预热进本地 build-id
 // 缓存，让 perf script 自带的缓存回退机制命中，当场生效不依赖网络往返。
-static void warm_build_id_cache(const std::string &perf, const std::string &dataPath)
+static std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &perf, const std::string &dataPath)
 {
     std::string listOutput;
     int rc = drop::exec_capture({perf, "buildid-list", "-i", dataPath}, &listOutput, 65536);
     if (rc != 0)
-        return;
+        return {};
 
     std::vector<drop::BuildIdEntry> entries = drop::parse_buildid_list(listOutput);
     if (entries.empty())
-        return;
+        return entries;
 
     int64_t nowMs = now_ms();
     std::vector<drop::BuildIdEntry> pending;
@@ -437,7 +442,7 @@ static void warm_build_id_cache(const std::string &perf, const std::string &data
         pending.push_back(e);
     }
     if (pending.empty())
-        return;
+        return entries;
 
     // 只在确实有需要解析的 build-id 时才建索引——O(进程数) 的一次性开销
     // 不针对每个 build-id 重复付出（详见设计文档任务1"技术方案依据"）。
@@ -467,6 +472,50 @@ static void warm_build_id_cache(const std::string &perf, const std::string &data
         else
             record_build_id_transient_fail(e.buildId, nowMs);
     }
+    return entries;
+}
+
+static bool unresolved_frame(const std::string &raw)
+{
+    std::string frame = drop::trim(raw);
+    if (frame.empty() || frame == "unknown" || frame == "[unknown]")
+        return true;
+    if (frame.size() > 2 && frame.front() == '[' && frame.back() == ']')
+        return true;
+    if (frame.rfind("0x", 0) != 0)
+        return false;
+    size_t i = 2;
+    while (i < frame.size() && std::isxdigit(static_cast<unsigned char>(frame[i])))
+        ++i;
+    return i > 2 && (i == frame.size() || std::isspace(static_cast<unsigned char>(frame[i])));
+}
+
+static std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &runtimeReport,
+                                             const drop::GoSymbolReport &goReport,
+                                             const std::vector<AggregatedSample> &samples)
+{
+    uint64_t totalFrames = 0;
+    uint64_t unresolvedFrames = 0;
+    for (const auto &sample : samples)
+    {
+        for (const auto &frame : sample.stack)
+        {
+            totalFrames = add_count(totalFrames, sample.count);
+            if (unresolved_frame(frame))
+                unresolvedFrames = add_count(unresolvedFrames, sample.count);
+        }
+    }
+    std::string status = "not_applicable";
+    if (totalFrames > 0)
+        status = unresolvedFrames == 0 ? "complete" : (unresolvedFrames >= totalFrames ? "missing" : "partial");
+    std::string body = "{";
+    body += "\"symbol_status\":\"" + status + "\",";
+    body += "\"frame_stats\":{\"total_frame_weight\":" + std::to_string(totalFrames) +
+            ",\"unresolved_frame_weight\":" + std::to_string(unresolvedFrames) + "},";
+    body += "\"runtime_maps\":" + drop::runtime_maps_to_json(runtimeReport) + ",";
+    body += "\"native_go\":" + drop::go_symbol_report_json(goReport);
+    body += "}";
+    return body;
 }
 
 static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
@@ -494,13 +543,15 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
         return window;
     }
     int64_t tWarmStart = now_ms();
-    warm_build_id_cache(perf, dataPath);
+    std::vector<drop::BuildIdEntry> buildIds = warm_build_id_cache(perf, dataPath);
     int64_t warmMs = now_ms() - tWarmStart;
+    int64_t tGoStart = now_ms();
+    drop::GoSymbolReport goReport = drop::prepare_go_symbols(buildIds);
+    int64_t goMs = now_ms() - tGoStart;
     // Java/Node/Python JIT perf map 定位/校验/搬运 + Java map 刷新，
     // 必须在 perf script 前完成，让同一份 perf.data 能解析出用户函数名。
     int64_t tRtStart = now_ms();
     drop::RuntimeSymbolReport runtimeReport = drop::collect_runtime_maps(perf, dataPath);
-    window.symbolRefsJson = drop::runtime_report_to_json(runtimeReport);
     int64_t rtMs = now_ms() - tRtStart;
     int64_t tScriptStart = now_ms();
     std::string scriptOutput;
@@ -519,6 +570,11 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     window.samples = parse_perf_script(scriptOutput);
     for (auto &sample : window.samples)
         sample.backend = "perf";
+    window.symbolRefsJson = combined_symbol_refs_json(runtimeReport, goReport, window.samples);
+    std::cout << "[native-cp] Go symbols ready=" << goReport.ready.size()
+              << " pending=" << goReport.pending.size()
+              << " failed=" << goReport.failed.size()
+              << " prepare_ms=" << goMs << std::endl;
     return window;
 }
 
