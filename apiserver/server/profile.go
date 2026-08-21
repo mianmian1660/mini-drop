@@ -145,6 +145,10 @@ type ProfileFlamegraph struct {
 	RuntimeDiagnostics map[string]ProfileRuntimeDiagnostic `json:"runtime_diagnostics"`
 	Truncated          bool                                `json:"truncated"`
 	GeneratedAt        time.Time                           `json:"generated_at"`
+	// Degraded 为 true 表示这段时间原始数据已经过期清理，展示的是冷层降
+	// 采样摘要（火焰图场景下摘要没有调用树，实际不会有 Nodes，只用来
+	// 承载 Message 提示前端引导去看 TopN）。
+	Degraded bool `json:"degraded,omitempty"`
 }
 
 type ProfileTopItem struct {
@@ -170,6 +174,10 @@ type ProfileTopN struct {
 	RuntimeDiagnostics map[string]ProfileRuntimeDiagnostic `json:"runtime_diagnostics"`
 	Truncated          bool                                `json:"truncated"`
 	GeneratedAt        time.Time                           `json:"generated_at"`
+	// Degraded 为 true 表示原始数据已过期清理，Items 来自冷层降采样摘要
+	// （ContinuousWindowSummary）——只有函数级 self time 汇总，精度和口径
+	// 上不等价于原始数据的 TopN（跨多个小时桶合并、可能截断过 Top 50）。
+	Degraded bool `json:"degraded,omitempty"`
 }
 
 type ProfileLabelValues struct {

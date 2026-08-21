@@ -170,4 +170,20 @@ func (s *APIServer) cleanupAllContinuousRetention(ctx context.Context, limit int
 	for _, session := range sessions {
 		s.cleanupContinuousRetention(ctx, session)
 	}
+	s.cleanupContinuousSummaries(ctx)
+}
+
+// cleanupContinuousSummaries 清理过期的冷层摘要（ContinuousWindowSummary）。
+// 保留期是全局配置（Retention.ContinuousSummaryRetentionHours），不像原始
+// 数据那样按 session 各自的 RetentionHours 走——摘要已经和具体 session 的
+// 生命周期弱相关（session 停止/删除后摘要还应该按自己的节奏过期）。
+func (s *APIServer) cleanupContinuousSummaries(ctx context.Context) {
+	hours := s.Config.Retention.ContinuousSummaryRetentionHours
+	if hours <= 0 {
+		hours = 168
+	}
+	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
+	if err := s.DB.WithContext(ctx).Where("bucket_start < ?", cutoff).Delete(&model.ContinuousWindowSummary{}).Error; err != nil {
+		s.Logger.Warn("Native Continuous Profiling 冷层摘要清理失败", zap.Error(err))
+	}
 }

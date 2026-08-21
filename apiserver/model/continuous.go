@@ -68,6 +68,25 @@ type ProfileBatch struct {
 	CreatedAt          time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
+// ContinuousWindowSummary 是原始 ProfileWindow 过期硬删前的冷层降采样摘要：
+// 按 session + signal_type + 小时分桶，只保留 TopN 函数的 self time 累加值，
+// 不含调用栈/调用树结构——查询范围一旦落进纯冷层区间，火焰图/树形 diff 用
+// 不了，只能回答"这段时间 TopN 热点函数是谁"。体积比原始窗口小几个数量级，
+// 保留期由 config.Retention.ContinuousSummaryRetentionHours 单独控制（默认
+// 7 天，比原始数据默认 24h 长一个数量级）。
+type ContinuousWindowSummary struct {
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	SessionSID  string    `gorm:"column:session_sid;size:64;uniqueIndex:idx_continuous_window_summary,priority:1" json:"session_sid"`
+	SignalType  string    `gorm:"column:signal_type;size:64;uniqueIndex:idx_continuous_window_summary,priority:2" json:"signal_type"`
+	BucketStart time.Time `gorm:"column:bucket_start;uniqueIndex:idx_continuous_window_summary,priority:3" json:"bucket_start"`
+	BucketEnd   time.Time `gorm:"column:bucket_end" json:"bucket_end"`
+	Unit        string    `gorm:"column:unit;size:32;default:samples" json:"unit"`
+	SampleCount uint64    `gorm:"column:sample_count" json:"sample_count"`
+	TopSelfJSON []byte    `gorm:"column:top_self_json;type:jsonb" json:"top_self_json"`
+	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
 type ProfileWindow struct {
 	ID                uint      `gorm:"primaryKey" json:"id"`
 	SessionSID        string    `gorm:"column:session_sid;size:64;index:idx_profile_windows_session_time,priority:1" json:"session_sid"`

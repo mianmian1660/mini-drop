@@ -68,6 +68,12 @@ type RetentionConfig struct {
 	ResultRetentionHours int  `mapstructure:"result_retention_hours"`
 	CleanupIntervalSec   int  `mapstructure:"cleanup_interval_sec"`
 	BatchLimit           int  `mapstructure:"batch_limit"`
+	// ContinuousSummaryRetentionHours 控制 Native Continuous Profiling 冷层
+	// 摘要（ContinuousWindowSummary）的保留时长。原始窗口/样本过期后（由
+	// 每个 session 自己的 RetentionHours 决定）不是直接硬删，而是先降采样
+	// 成这张摘要表，摘要本身再按这个全局配置单独过期——默认比原始数据
+	// 保留期长一个数量级（7 天），因为摘要体积小很多。
+	ContinuousSummaryRetentionHours int `mapstructure:"continuous_summary_retention_hours"`
 }
 
 // LogConfig 日志配置
@@ -206,6 +212,9 @@ func Load(configPath string) (*Config, error) {
 	if envResultRetention := os.Getenv("ARTIFACT_RESULT_RETENTION_HOURS"); envResultRetention != "" {
 		v.Set("retention.result_retention_hours", envResultRetention)
 	}
+	if envContinuousSummaryRetention := os.Getenv("CONTINUOUS_SUMMARY_RETENTION_HOURS"); envContinuousSummaryRetention != "" {
+		v.Set("retention.continuous_summary_retention_hours", envContinuousSummaryRetention)
+	}
 	if envCleanupInterval := os.Getenv("RETENTION_CLEANUP_INTERVAL_SEC"); envCleanupInterval != "" {
 		v.Set("retention.cleanup_interval_sec", envCleanupInterval)
 	}
@@ -274,6 +283,9 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Retention.CleanupIntervalSec <= 0 {
 		cfg.Retention.CleanupIntervalSec = 3600
+	}
+	if cfg.Retention.ContinuousSummaryRetentionHours <= 0 {
+		cfg.Retention.ContinuousSummaryRetentionHours = 168
 	}
 	if cfg.Retention.BatchLimit <= 0 {
 		cfg.Retention.BatchLimit = 200

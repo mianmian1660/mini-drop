@@ -26,6 +26,14 @@ import (
 const continuousMaxDBCount = uint64(1<<63 - 1)
 const continuousMaxReasonableProfileSampleCount = uint64(1_000_000_000)
 
+// continuousSummaryBucketDuration 冷层摘要按 1 小时对齐分桶，和原始数据
+// 10s 窗口/60s batch 的粒度差好几个数量级——冷层本来就是拿精度换存储。
+const continuousSummaryBucketDuration = time.Hour
+
+// continuousSummaryTopLimit 每个 (session, signal_type, 小时桶) 摘要最多
+// 保留的函数条数，防止某个桶函数基数很大时摘要本身也膨胀。
+const continuousSummaryTopLimit = 50
+
 // 查询跨度由当前 Session retention_hours 决定；匹配窗口超过上限时返回错误，
 // 绝不静默截断。max_nodes 默认 5000，上限 20000。
 const continuousMaxWindowCount = 20000
@@ -775,7 +783,33 @@ func (s *APIServer) cleanupContinuousRetention(ctx context.Context, session mode
 		s.Logger.Warn("Native Continuous Profiling retention 查询过期 batch 失败", zap.String("sid", session.SID), zap.Error(err))
 		return
 	}
-	if err := s.DB.Where("session_sid = ? AND window_end < ?", session.SID, cutoff).Delete(&model.ProfileWindow{}).Error; err != nil {
+
+	// 冷热分层：硬删原始 window 之前先把它们(cpu_profile 信号)降采样进
+	// ContinuousWindowSummary。降采样失败的 window（对应的 batch 对象读取
+	// 出错）不能删，留到下一轮重试，避免"摘要没写成功、原始数据却已经
+	// 被删了"这种数据丢失。
+	var expiredWindows []model.ProfileWindow
+	if err := s.DB.Where("session_sid = ? AND window_end < ?", session.SID, cutoff).Find(&expiredWindows).Error; err != nil {
+		s.Logger.Warn("Native Continuous Profiling retention 查询过期 window 失败", zap.String("sid", session.SID), zap.Error(err))
+		return
+	}
+	failedObjects, err := s.downsampleContinuousWindows(ctx, session, expiredWindows)
+	if err != nil {
+		s.Logger.Warn("Native Continuous Profiling 冷层摘要生成失败，本轮跳过硬删",
+			zap.String("sid", session.SID), zap.Error(err))
+		return
+	}
+	deletableIDs := make([]uint, 0, len(expiredWindows))
+	for _, w := range expiredWindows {
+		if w.SignalType == "cpu_profile" && failedObjects[w.ObjectKey] {
+			continue
+		}
+		deletableIDs = append(deletableIDs, w.ID)
+	}
+	if len(deletableIDs) == 0 {
+		return
+	}
+	if err := s.DB.Where("id IN ?", deletableIDs).Delete(&model.ProfileWindow{}).Error; err != nil {
 		s.Logger.Warn("Native Continuous Profiling retention 删除过期 window 失败", zap.String("sid", session.SID), zap.Error(err))
 		return
 	}
@@ -803,8 +837,30 @@ func (s *APIServer) cleanupContinuousRetention(ctx context.Context, session mode
 
 func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q ProfileQuery) (ProfileFlamegraph, bool, error) {
 	agg, found, err := s.queryNativeContinuousAggregate(ctx, q)
-	if err != nil || !found {
+	if err != nil {
 		return ProfileFlamegraph{}, found, err
+	}
+	if !found {
+		// 原始窗口没有了：可能这段时间本来就没采集，也可能已经过期被
+		// 降采样进冷层摘要了。冷层摘要没有调用栈，火焰图做不出来，但
+		// 至少要把"数据其实还在，只是降级成 TopN 了"这件事告诉调用方，
+		// 而不是让它以为压根没采过——两种情况前端展示语义完全不同。
+		hasSummary, summaryErr := s.continuousHasSummaryForRange(ctx, q)
+		if summaryErr != nil {
+			return ProfileFlamegraph{}, false, summaryErr
+		}
+		if !hasSummary {
+			return ProfileFlamegraph{}, false, nil
+		}
+		return ProfileFlamegraph{
+			Empty:         true,
+			Degraded:      true,
+			Message:       "该时间范围原始数据已过期清理，仅保留降采样 TopN 摘要，无法生成调用树火焰图，请改用 TopN 视图查看",
+			Source:        "mini-drop-native-cold",
+			ProfileSource: "native",
+			Query:         profileLabelSelector(q),
+			GeneratedAt:   time.Now(),
+		}, true, nil
 	}
 	maxNodes := q.MaxNodes
 	if maxNodes == 0 {
@@ -835,8 +891,14 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 
 func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuery) (ProfileTopN, bool, error) {
 	agg, found, err := s.queryNativeContinuousAggregate(ctx, q)
-	if err != nil || !found {
+	if err != nil {
 		return ProfileTopN{}, found, err
+	}
+	if !found {
+		// 原始窗口不在了——落到冷层摘要兜底；连摘要都没有才是真的"没有
+		// 这段数据"，交回调用方走原来的 !found 分支（可能落回旧的
+		// profileClient().TopN 兜底路径）。
+		return s.queryNativeContinuousSummary(ctx, q)
 	}
 	items := make([]ProfileTopItem, 0, len(agg.Top))
 	for _, item := range agg.Top {
@@ -879,6 +941,278 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 		out.Message = "Native Continuous Profiling 暂无匹配样本"
 	}
 	return out, true, nil
+}
+
+// continuousSummarySessionSIDs 返回 q.Host 对应、当前调用方有权限看到的
+// session SID 子查询——和 queryNativeContinuousAggregate 里的会话过滤逻辑
+// 保持一致，避免冷层摘要绕过权限检查。
+func (s *APIServer) continuousSummarySessionSIDs(q ProfileQuery) *gorm.DB {
+	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
+	if !q.CanReadAll {
+		if len(q.OwnerUIDs) > 0 {
+			sessionQuery = sessionQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", q.OwnerUIDs)
+		} else {
+			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
+		}
+	}
+	return sessionQuery
+}
+
+// continuousHasSummaryForRange 只判断"这段时间冷层有没有摘要"，不取数据，
+// 供火焰图路径决定要不要把"没有数据"改成"数据已降级"的提示。
+func (s *APIServer) continuousHasSummaryForRange(ctx context.Context, q ProfileQuery) (bool, error) {
+	var count int64
+	err := s.DB.WithContext(ctx).Model(&model.ContinuousWindowSummary{}).
+		Where("session_sid IN (?)", s.continuousSummarySessionSIDs(q)).
+		Where("signal_type = ?", "cpu_profile").
+		Where("bucket_end >= ? AND bucket_start <= ?", q.From, q.To).
+		Count(&count).Error
+	return count > 0, err
+}
+
+// queryNativeContinuousSummary 是 queryNativeContinuousTopN 在原始窗口已经
+// 过期清理后的冷层兜底：把命中时间范围的若干小时桶摘要按函数名合并、
+// 重新排序，返回一份 Degraded=true 的 ProfileTopN。找不到任何摘要时
+// found=false，交回调用方走原有的"没有这段数据"分支。
+func (s *APIServer) queryNativeContinuousSummary(ctx context.Context, q ProfileQuery) (ProfileTopN, bool, error) {
+	var rows []model.ContinuousWindowSummary
+	err := s.DB.WithContext(ctx).
+		Where("session_sid IN (?)", s.continuousSummarySessionSIDs(q)).
+		Where("signal_type = ?", "cpu_profile").
+		Where("bucket_end >= ? AND bucket_start <= ?", q.From, q.To).
+		Find(&rows).Error
+	if err != nil {
+		return ProfileTopN{}, false, err
+	}
+	if len(rows) == 0 {
+		return ProfileTopN{}, false, nil
+	}
+
+	merged := map[string]*ProfileTopItem{}
+	var totalSamples uint64
+	for _, row := range rows {
+		if len(row.TopSelfJSON) == 0 {
+			continue
+		}
+		var items []ProfileTopItem
+		if unmarshalErr := json.Unmarshal(row.TopSelfJSON, &items); unmarshalErr != nil {
+			s.Logger.Warn("解析 Native Continuous Profiling 冷层摘要失败，跳过该桶",
+				zap.Uint("summary_id", row.ID), zap.Error(unmarshalErr))
+			continue
+		}
+		for _, item := range items {
+			existing, ok := merged[item.Name]
+			if !ok {
+				existing = &ProfileTopItem{Name: item.Name, Unit: firstNonEmpty(item.Unit, "samples")}
+				merged[item.Name] = existing
+			}
+			// 冷层不再区分 inclusive/exclusive——Value 退化成等于 Self，
+			// 前端排序/占比逻辑复用同一套字段不用特殊分支。
+			existing.Self += item.Self
+			existing.Value += item.Self
+		}
+		totalSamples += row.SampleCount
+	}
+
+	items := make([]ProfileTopItem, 0, len(merged))
+	for _, item := range merged {
+		items = append(items, *item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Self == items[j].Self {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].Self > items[j].Self
+	})
+	maxNodes := q.MaxNodes
+	if maxNodes == 0 {
+		maxNodes = continuousDefaultMaxNodes
+	}
+	truncated := false
+	if len(items) > maxNodes {
+		items = items[:maxNodes]
+		truncated = true
+	}
+
+	out := ProfileTopN{
+		Items:         items,
+		Total:         float64(totalSamples),
+		Unit:          "samples",
+		Empty:         len(items) == 0,
+		Source:        "mini-drop-native-cold",
+		ProfileSource: "native",
+		Query:         profileLabelSelector(q),
+		Truncated:     truncated,
+		Degraded:      true,
+		GeneratedAt:   time.Now(),
+	}
+	if out.Empty {
+		out.Message = "该时间范围原始数据已过期清理，且冷层摘要里没有匹配样本"
+	} else {
+		out.Message = "该时间范围原始数据已过期清理，以下为降采样摘要（仅函数级 self time 汇总，精度低于原始数据，不支持调用树/火焰图）"
+	}
+	return out, true, nil
+}
+
+// downsampleContinuousWindows 把即将被硬删的 cpu_profile 窗口聚合进冷层
+// 摘要表，在硬删原始 window/batch 之前调用。非 cpu_profile 信号
+// （io_latency/sched_latency）v1 不做冷层摘要，直接跟着走原有的硬删——
+// histogram 摘要没有函数名维度，值不值得单独建模留到后续按需再做。
+//
+// 返回处理失败（MinIO 对象读取/解析出错）涉及到的 batch object key 集合，
+// 调用方要把这些 object key 对应的 window 从本轮硬删名单里剔除、留到下一
+// 轮重试——绝不能"摘要没写成功、原始数据却已经被删了"。
+func (s *APIServer) downsampleContinuousWindows(ctx context.Context, session model.ContinuousSession, windows []model.ProfileWindow) (map[string]bool, error) {
+	failedObjects := map[string]bool{}
+
+	byObject := map[string][]model.ProfileWindow{}
+	for _, w := range windows {
+		if w.SignalType != "cpu_profile" || w.ObjectKey == "" {
+			continue
+		}
+		byObject[w.ObjectKey] = append(byObject[w.ObjectKey], w)
+	}
+	if len(byObject) == 0 {
+		return failedObjects, nil
+	}
+
+	type bucketKey struct {
+		bucketStart time.Time
+	}
+	buckets := map[bucketKey]*continuousAggregate{}
+	bucketEnds := map[bucketKey]time.Time{}
+
+	for objectKey, rows := range byObject {
+		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+		if err != nil {
+			s.Logger.Warn("Native Continuous Profiling 冷层摘要读取 batch 对象失败，本轮跳过这些窗口",
+				zap.String("session_sid", session.SID), zap.String("object_key", objectKey), zap.Error(err))
+			failedObjects[objectKey] = true
+			continue
+		}
+		// 用 Unix 秒比较，不直接比较 time.Time：row.WindowStart 是从数据库
+		// 读回来的（Postgres 时间戳精度可能比 Go 的 time.Time 低），
+		// window.WindowStart 是从 MinIO 里的原始 JSON 解析出来的（保留了
+		// Agent 上报时的完整精度），两边直接 Equal() 有极小概率因为精度
+		// 截断错判成"不匹配"，导致这个 window 被删除却从没进过摘要。
+		rowSet := map[int64]bool{}
+		for _, row := range rows {
+			rowSet[row.WindowStart.Unix()] = true
+		}
+		for _, window := range batch.Windows {
+			if firstNonEmpty(window.SignalType, "cpu_profile") != "cpu_profile" {
+				continue
+			}
+			if !rowSet[window.WindowStart.Unix()] {
+				continue // 这个 batch 对象里还有别的、这轮还没到期的 window，不动它
+			}
+			bucketStart := window.WindowStart.Truncate(continuousSummaryBucketDuration)
+			key := bucketKey{bucketStart: bucketStart}
+			agg, ok := buckets[key]
+			if !ok {
+				agg = &continuousAggregate{
+					Top:                map[string]*ProfileTopItem{},
+					Root:               &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
+					LabelValue:         map[string]map[string]bool{"comm": {}, "pid": {}, "exe": {}, "runtime": {}},
+					Backends:           map[string]bool{},
+					SymbolReasons:      map[string]bool{},
+					RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
+					SeenProfileIDs:     map[string]bool{},
+					Unit:               "samples",
+				}
+				buckets[key] = agg
+			}
+			bucketEnd := bucketStart.Add(continuousSummaryBucketDuration)
+			if existing, ok := bucketEnds[key]; !ok || existing.Before(bucketEnd) {
+				bucketEnds[key] = bucketEnd
+			}
+			// 复用生产 TopN 路径同一套 continuousAddSample 聚合逻辑，不再
+			// 手写一份"取栈顶算 self"——这正是之前 TopN 排序 bug 的教训：
+			// 两处独立实现迟早会走偏。
+			for _, sample := range continuousProfileSamplesForQuery(window, ProfileQuery{}, agg.SeenProfileIDs) {
+				if !continuousSampleMatches(sample, window.Labels, nil) {
+					continue
+				}
+				continuousAddSample(agg, sample, window.Labels)
+			}
+		}
+	}
+
+	for key, agg := range buckets {
+		if len(agg.Top) == 0 {
+			continue
+		}
+		if err := s.mergeContinuousWindowSummary(ctx, session.SID, "cpu_profile", key.bucketStart, bucketEnds[key], agg); err != nil {
+			return failedObjects, err
+		}
+	}
+	return failedObjects, nil
+}
+
+// mergeContinuousWindowSummary 把一个小时桶新算出来的 Top self 值合并进
+// 已有的 ContinuousWindowSummary 行（如果存在）——因为 retention 清理是
+// 周期性跑的，同一个小时桶里的 window 很可能分几轮才全部过期，需要
+// 读出旧摘要、按函数名累加、重新排序截断，而不是覆盖。
+func (s *APIServer) mergeContinuousWindowSummary(ctx context.Context, sessionSID, signalType string, bucketStart, bucketEnd time.Time, agg *continuousAggregate) error {
+	var existing model.ContinuousWindowSummary
+	lookupErr := s.DB.WithContext(ctx).
+		Where("session_sid = ? AND signal_type = ? AND bucket_start = ?", sessionSID, signalType, bucketStart).
+		First(&existing).Error
+
+	merged := map[string]float64{}
+	var sampleCount uint64
+	if lookupErr == nil {
+		var oldItems []ProfileTopItem
+		if len(existing.TopSelfJSON) > 0 {
+			if unmarshalErr := json.Unmarshal(existing.TopSelfJSON, &oldItems); unmarshalErr != nil {
+				s.Logger.Warn("解析已有冷层摘要失败，本次将用新数据覆盖",
+					zap.String("session_sid", sessionSID), zap.Time("bucket_start", bucketStart), zap.Error(unmarshalErr))
+				oldItems = nil
+			}
+		}
+		for _, item := range oldItems {
+			merged[item.Name] += item.Self
+		}
+		sampleCount = existing.SampleCount
+	} else if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		return lookupErr
+	}
+
+	for name, item := range agg.Top {
+		merged[name] += item.Self
+	}
+	sampleCount += uint64(agg.Total)
+
+	items := make([]ProfileTopItem, 0, len(merged))
+	for name, self := range merged {
+		items = append(items, ProfileTopItem{Name: name, Self: self, Value: self, Unit: "samples"})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Self == items[j].Self {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].Self > items[j].Self
+	})
+	if len(items) > continuousSummaryTopLimit {
+		items = items[:continuousSummaryTopLimit]
+	}
+
+	payload, marshalErr := json.Marshal(items)
+	if marshalErr != nil {
+		return marshalErr
+	}
+
+	row := model.ContinuousWindowSummary{}
+	result := s.DB.WithContext(ctx).
+		Where(model.ContinuousWindowSummary{SessionSID: sessionSID, SignalType: signalType, BucketStart: bucketStart}).
+		Assign(map[string]interface{}{
+			"bucket_end":    bucketEnd,
+			"sample_count":  sampleCount,
+			"top_self_json": payload,
+			"unit":          "samples",
+		}).
+		FirstOrCreate(&row)
+	return result.Error
 }
 
 func (s *APIServer) queryNativeContinuousLabelValues(ctx context.Context, q ProfileQuery, label string) (ProfileLabelValues, bool, error) {
