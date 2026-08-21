@@ -35,6 +35,7 @@ export default function TaskListPage() {
     const [keyword, setKeyword] = useState('');       // 搜索输入框的值
     const [searchText, setSearchText] = useState(''); // 实际发起搜索的值（按回车触发）
     const [statusFilter, setStatusFilter] = useState('');
+    const [ownerFilter, setOwnerFilter] = useState('all');
     const [page, setPage] = useState(1);
     const [pageSize] = useState(10);                  // 每页 10 条，方便看到分页效果
     const [total, setTotal] = useState(0);
@@ -51,6 +52,7 @@ export default function TaskListPage() {
                 pageSize,
                 keyword: searchText,
                 status: statusFilter || undefined,
+                owner_filter: ownerFilter,
             });
             if (res.code === 0) {
                 setTaskList(res.data?.tasks || []);
@@ -61,7 +63,7 @@ export default function TaskListPage() {
         } finally {
             setLoading(false);
         }
-    }, [page, pageSize, searchText, statusFilter]);
+    }, [page, pageSize, searchText, statusFilter, ownerFilter]);
 
     // page / searchText / statusFilter 变化时重新加载
     useEffect(() => {
@@ -87,6 +89,11 @@ export default function TaskListPage() {
     // 状态筛选变化
     const handleStatusChange = (e) => {
         setStatusFilter(e.target.value);
+        setPage(1);
+    };
+
+    const handleOwnerChange = (e) => {
+        setOwnerFilter(e.target.value);
         setPage(1);
     };
 
@@ -134,6 +141,10 @@ export default function TaskListPage() {
                         <option value="2">已完成</option>
                         <option value="3">失败</option>
                     </select>
+                    <select style={styles.select} value={ownerFilter} onChange={handleOwnerChange} aria-label="任务归属筛选">
+                        <option value="all">全部创建者</option>
+                        <option value="mine">我创建的</option>
+                    </select>
                 </div>
 
                 {/* 工具栏：总数 + 页码信息 */}
@@ -165,6 +176,7 @@ export default function TaskListPage() {
                                 <th style={styles.th}>采集器</th>
                                 <th style={styles.th}>状态</th>
                                 <th style={styles.th}>创建时间</th>
+                                <th style={styles.th}>创建者</th>
                                 <th style={styles.th}>操作</th>
                             </tr>
                         </thead>
@@ -181,9 +193,10 @@ export default function TaskListPage() {
                                         </span>
                                     </td>
                                     <td style={styles.td}>{t.create_time}</td>
+                                    <td style={styles.td}>{t.user_name || '系统'}</td>
                                     <td style={styles.td}>
                                         <Link to={`/task/result?tid=${t.tid}`} style={{ color: '#4a6cf7', marginRight: 12 }}>查看</Link>
-                                        <button style={styles.deleteBtn} onClick={() => handleDelete(t.tid)}>删除</button>
+                                        {t.can_manage && <button style={styles.deleteBtn} onClick={() => handleDelete(t.tid)}>删除</button>}
                                     </td>
                                 </tr>
                             ))}

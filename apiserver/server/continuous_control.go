@@ -191,11 +191,13 @@ func (s *APIServer) continuousSessionSelection(q ProfileQuery) *gorm.DB {
 }
 
 func (s *APIServer) GetContinuousSession(c *gin.Context) {
-	session, ok := s.loadReadableContinuousSession(c, strings.TrimSpace(c.Param("sid")), s.AuthContext(c))
+	auth := s.AuthContext(c)
+	session, ok := s.loadReadableContinuousSession(c, strings.TrimSpace(c.Param("sid")), auth)
 	if !ok {
 		return
 	}
 	markContinuousSessionOffline(&session, time.Now())
+	session.CanManage = s.canManageOwner(session.UID, auth)
 	s.RespondOK(c, gin.H{"session": session})
 }
 

@@ -8,6 +8,7 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -312,6 +313,7 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 	s.addCronJob(*sch)
 
 	s.Logger.Info("定时任务已创建", zap.String("sid", sid), zap.String("cron", req.CronExpr))
+	sch.CanManage = true
 	s.RespondOK(c, sch)
 }
 
@@ -323,12 +325,13 @@ func (s *APIServer) ListSchedules(c *gin.Context) {
 	auth := s.AuthContext(c)
 	var schedules []model.ScheduleTask
 	query := s.DB.Order("created_at DESC")
-	if !auth.IsPlatformAdmin() {
-		visibleUIDs := s.visibleOwnerUIDs(auth)
-		if len(visibleUIDs) == 0 {
-			visibleUIDs = []string{auth.UID}
-		}
-		query = query.Where("uid IN ?", visibleUIDs)
+	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("owner_filter", "all"))) {
+	case "", "all":
+	case "mine":
+		query = query.Where("uid = ?", auth.UID)
+	default:
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "owner_filter 仅支持 all/mine")
+		return
 	}
 	if err := query.Find(&schedules).Error; err != nil {
 		s.Logger.Error("查询定时任务失败", zap.Error(err))
@@ -338,6 +341,9 @@ func (s *APIServer) ListSchedules(c *gin.Context) {
 
 	if schedules == nil {
 		schedules = []model.ScheduleTask{}
+	}
+	for index := range schedules {
+		schedules[index].CanManage = s.canManageOwner(schedules[index].UID, auth)
 	}
 
 	s.RespondOK(c, gin.H{"schedules": schedules, "total": len(schedules)})

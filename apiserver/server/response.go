@@ -35,6 +35,10 @@ func (s *APIServer) RespondOK(c *gin.Context, data interface{}) {
 }
 
 func (s *APIServer) RespondHTTPError(c *gin.Context, status int, code string, message string) {
+	respondHTTPErrorWithData(c, status, code, message, nil)
+}
+
+func respondHTTPErrorWithData(c *gin.Context, status int, code string, message string, data interface{}) {
 	if code == "" {
 		code = ErrCodeTaskInvalidArgument
 	}
@@ -47,7 +51,7 @@ func (s *APIServer) RespondHTTPError(c *gin.Context, status int, code string, me
 	}
 	c.JSON(status, gin.H{
 		"request_id": requestIDFromGin(c),
-		"data":       nil,
+		"data":       data,
 		"error":      APIError{Code: ec.Code, Message: message, Retryable: ec.Retryable, Stage: ec.Stage},
 		"code":       status,
 		"message":    message,

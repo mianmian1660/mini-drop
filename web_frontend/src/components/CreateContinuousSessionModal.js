@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { continuous } from '../api';
 import { CONTINUOUS_SIGNALS, formatBytes, signalLabel } from '../utils/continuous';
 
@@ -45,6 +46,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
     const [aggregationWindow, setAggregationWindow] = useState(10);
     const [uploadBatch, setUploadBatch] = useState(60);
     const [retentionHours, setRetentionHours] = useState(24);
+    const [conflictSession, setConflictSession] = useState(null);
 
     const loadProcesses = useCallback(async () => {
         setLoading(true);
@@ -91,6 +93,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
         if (!valid || submitting) return;
         setSubmitting(true);
         setError('');
+        setConflictSession(null);
         try {
             const response = await continuous.createSession({
                 name: name.trim(), target_ip: target.ip, hostname: target.hostname || '', service_name: target.service_name || 'hotmethod',
@@ -102,7 +105,10 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
             if (response.code !== 0) throw new Error(response.message || '创建持续采集失败');
             onSuccess?.(response.data?.session);
         } catch (err) {
-            setError(err?.response?.data?.message || err?.message || '创建持续采集失败');
+            const payload = err?.response?.data;
+            const existing = payload?.data?.existing_session;
+            if (existing?.sid) setConflictSession(existing);
+            setError(payload?.message || err?.message || '创建持续采集失败');
         } finally {
             setSubmitting(false);
         }
@@ -160,6 +166,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                 <label style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'flex-start', fontWeight: 700 }}><input type="checkbox" checked={allowDegraded} onChange={event => setAllowDegraded(event.target.checked)} />我已了解并允许降级运行</label>
             </div>}
             {error && <div style={S.error}>{error}</div>}
+            {conflictSession?.sid && <div style={S.warn}>已有活动会话由 {conflictSession.user_name || '系统'} 创建。<Link to={`/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(conflictSession.sid)}`} onClick={onClose}>查看已有会话</Link></div>}
             <div style={S.actions}><button style={S.cancel} onClick={onClose} disabled={submitting}>取消</button><button style={S.submit(!valid || submitting)} onClick={submit} disabled={!valid || submitting}>{submitting ? '创建中...' : '创建并开始采集'}</button></div>
         </div>
     </div>;

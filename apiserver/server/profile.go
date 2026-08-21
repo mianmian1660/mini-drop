@@ -554,14 +554,8 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) (Profi
 	}
 	q.Labels = mergeProfileLabels(target, q.Labels)
 	q.Filters = sanitizeProfileFilters(q.Filters)
-	auth := s.AuthContext(c)
-	q.CanReadAll = auth.IsPlatformAdmin()
-	if !q.CanReadAll {
-		q.OwnerUIDs = s.visibleOwnerUIDs(auth)
-		if len(q.OwnerUIDs) == 0 && auth.UID != "" {
-			q.OwnerUIDs = []string{auth.UID}
-		}
-	}
+	q.CanReadAll = true
+	q.OwnerUIDs = nil
 	return target, true
 }
 
@@ -698,13 +692,6 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 	byKey := map[string]*ProfileTarget{}
 	var agents []model.AgentInfo
 	query := s.DB.Order("last_seen DESC")
-	if !auth.IsPlatformAdmin() && auth.UID != "" {
-		if len(auth.Groups) > 0 {
-			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL OR gid IN ? OR gid = '' OR gid IS NULL)", auth.UID, auth.Groups)
-		} else {
-			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL) AND (gid = '' OR gid IS NULL)", auth.UID)
-		}
-	}
 	if err := query.Find(&agents).Error; err != nil {
 		return nil, err
 	}
@@ -735,14 +722,6 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 	taskQuery := s.DB.Model(&model.HotmethodTask{}).
 		Select("target_ip, create_time").
 		Where("target_ip != ''")
-	if !auth.IsPlatformAdmin() {
-		owners := s.visibleOwnerUIDs(auth)
-		if len(owners) > 0 {
-			taskQuery = taskQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", owners)
-		} else {
-			taskQuery = taskQuery.Where("(uid = '' OR uid IS NULL)")
-		}
-	}
 	if err := taskQuery.Order("create_time DESC").Limit(500).Find(&recentTasks).Error; err != nil {
 		return nil, err
 	}
@@ -797,14 +776,6 @@ func (s *APIServer) profileTargets(auth AuthContext) ([]ProfileTarget, error) {
 func (s *APIServer) attachContinuousSessionStatus(targets map[string]*ProfileTarget, auth AuthContext) {
 	var sessions []model.ContinuousSession
 	query := s.DB.Where("deleted_at IS NULL")
-	if !auth.IsPlatformAdmin() {
-		owners := s.visibleOwnerUIDs(auth)
-		if len(owners) > 0 {
-			query = query.Where("(uid IN ? OR uid = '' OR uid IS NULL)", owners)
-		} else {
-			query = query.Where("(uid = '' OR uid IS NULL)")
-		}
-	}
 	if err := query.Order("updated_at DESC").Find(&sessions).Error; err != nil {
 		return
 	}

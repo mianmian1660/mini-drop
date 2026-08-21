@@ -136,6 +136,15 @@ body {
         width: 100% !important;
     }
 
+    .continuous-list-filters {
+        flex: 0 0 auto !important;
+    }
+
+    .continuous-list-filters > * {
+        flex: 0 0 auto !important;
+        height: 36px !important;
+    }
+
     .continuous-process-row {
         grid-template-columns: 20px minmax(0, 1fr) !important;
     }

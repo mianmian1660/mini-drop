@@ -109,13 +109,7 @@ func (s *APIServer) ownerSharesGroup(ownerUID string, auth AuthContext) bool {
 }
 
 func (s *APIServer) canReadOwner(ownerUID string, auth AuthContext) bool {
-	if ownerUID == "" {
-		return true
-	}
-	if auth.IsPlatformAdmin() || ownerUID == auth.UID {
-		return true
-	}
-	return s.ownerSharesGroup(ownerUID, auth)
+	return true
 }
 
 func (s *APIServer) canManageOwner(ownerUID string, auth AuthContext) bool {
@@ -178,13 +172,5 @@ func (s *APIServer) canManageGroup(group model.Group, auth AuthContext) bool {
 }
 
 func (s *APIServer) canReadAgent(agent model.AgentInfo, auth AuthContext) bool {
-	if auth.IsPlatformAdmin() || agent.UID == "" && agent.GID == "" || agent.UID == auth.UID {
-		return true
-	}
-	for _, gid := range auth.Groups {
-		if gid == agent.GID {
-			return true
-		}
-	}
-	return false
+	return true
 }

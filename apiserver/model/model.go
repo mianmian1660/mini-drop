@@ -103,6 +103,7 @@ type HotmethodTask struct {
 	CancelRequested bool           `gorm:"column:cancel_requested;default:false;index" json:"cancel_requested"`
 	CanceledAt      *time.Time     `gorm:"column:canceled_at" json:"canceled_at"`
 	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	CanManage       bool           `gorm:"-" json:"can_manage"`
 }
 
 // ----------------------------------------------------------
@@ -196,6 +197,7 @@ type ScheduleTask struct {
 	CreatedAt     time.Time      `gorm:"column:created_at" json:"created_at"`
 	UpdatedAt     time.Time      `gorm:"column:updated_at" json:"updated_at"`
 	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	CanManage     bool           `gorm:"-" json:"can_manage"`
 }
 
 // ScheduleTrigger — 定时任务触发表。

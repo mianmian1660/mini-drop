@@ -94,7 +94,7 @@ func TestListProfileTargetsAggregatesAgentsAndTasks(t *testing.T) {
 	}
 }
 
-func TestListProfileTargetsHonorsVisibility(t *testing.T) {
+func TestListProfileTargetsSharesAllTargets(t *testing.T) {
 	s := newTestAPIServer(t)
 	now := time.Now()
 	_ = s.DB.Create(&model.AgentInfo{Hostname: "owned", IPAddr: "10.0.0.1", UID: "owner", Online: true, LastSeen: now}).Error
@@ -109,11 +109,10 @@ func TestListProfileTargetsHonorsVisibility(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if strings.Contains(w.Body.String(), "10.0.0.2") || strings.Contains(w.Body.String(), "10.0.0.4") {
-		t.Fatalf("response leaked inaccessible targets: %s", w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "10.0.0.1") || !strings.Contains(w.Body.String(), "10.0.0.3") {
-		t.Fatalf("response missing accessible targets: %s", w.Body.String())
+	for _, target := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
+		if !strings.Contains(w.Body.String(), target) {
+			t.Fatalf("response missing shared target %s: %s", target, w.Body.String())
+		}
 	}
 }
 
@@ -711,7 +710,7 @@ func TestContinuousHistogramIngestAndQuery(t *testing.T) {
 	}
 }
 
-func TestUserContinuousSessionRemainsPrivate(t *testing.T) {
+func TestUserContinuousSessionIsSharedReadOnly(t *testing.T) {
 	s := newTestAPIServer(t)
 	s.Storage = newContinuousMemoryStorage()
 	now := time.Now().UTC()
@@ -752,10 +751,14 @@ func TestUserContinuousSessionRemainsPrivate(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &targetsResp); err != nil {
 		t.Fatalf("targets json: %v", err)
 	}
+	found := false
 	for _, target := range targetsResp.Data.Targets {
 		if target.ID == "10.0.0.20:hotmethod" && target.ProfileStatus == model.ContinuousSessionStatusRunning {
-			t.Fatalf("ordinary user should not see private continuous session running: %+v", target)
+			found = true
 		}
+	}
+	if !found {
+		t.Fatalf("ordinary user should see shared continuous session: %+v", targetsResp.Data.Targets)
 	}
 }
 

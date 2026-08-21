@@ -30,16 +30,7 @@ import (
 // 优先查 DB，DB 为空时尝试通过 gRPC 从 drop_server 发现 Agent
 func (s *APIServer) ListAgents(c *gin.Context) {
 	var agents []model.AgentInfo
-	auth := s.AuthContext(c)
-
 	query := s.DB.Order("last_seen DESC")
-	if !auth.IsPlatformAdmin() && auth.UID != "" {
-		if len(auth.Groups) > 0 {
-			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL OR gid IN ? OR gid = '' OR gid IS NULL)", auth.UID, auth.Groups)
-		} else {
-			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL) AND (gid = '' OR gid IS NULL)", auth.UID)
-		}
-	}
 	if err := query.Find(&agents).Error; err != nil {
 		s.Logger.Error("查询 Agent 列表失败", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
