@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -155,22 +156,53 @@ class LegacyFunctionAnalyzer(BaseAnalyzer):
         self.analyzer_version = analyzer_version
 
     def analyze(self, prepared: dict) -> AnalyzerResult:
+        # 之前这里是"调用返回之后才比较耗时"，如果 _analyze_func 内部真的
+        # 卡死（比如某个子进程调用忘了传 timeout=），这个检查永远等不到
+        # 执行的机会——timeout_seconds 全是摆设，daemon 的单线程处理循环会
+        # 被永久卡死。现在把调用放进一个后台线程，用 join(timeout) 真正
+        # 限定 daemon 愿意等多久：超时就直接判失败、把控制权交还给调用方，
+        # 不再无限等待。
+        #
+        # 代价：Python 没有安全的手段从外部强行杀死一个线程，所以卡住的
+        # 后台线程本身还会继续跑到它自己内部的阻塞点解除为止（比如子进程
+        # 自己的 timeout= 到期），期间占用的内存/fd 不会立刻释放——这是
+        # "daemon 不再永久卡死"和"资源立刻回收"之间的权衡，优先保证前者。
+        # 真正杜绝资源泄漏需要把 _analyze_func 整个放进子进程
+        # (multiprocessing)，可以用 terminate()/kill()，但那是更大的改动，
+        # 这次先解决"永久卡死"这个更紧急的问题。
+        result_box = {}
+        error_box = {}
+
+        def _run():
+            try:
+                result_box["legacy"] = self._analyze_func(
+                    prepared["conn"],
+                    prepared["storage_cfg"],
+                    prepared["task"],
+                    prepared["bucket"],
+                    prepared["tid"],
+                    prepared.get("local_dir", ""),
+                )
+            except BaseException as exc:  # noqa: BLE001 - 需要把任何异常带回主线程
+                error_box["exc"] = exc
+
+        worker = threading.Thread(target=_run, daemon=True)
         started = time.time()
-        try:
-            legacy = self._analyze_func(
-                prepared["conn"],
-                prepared["storage_cfg"],
-                prepared["task"],
-                prepared["bucket"],
-                prepared["tid"],
-                prepared.get("local_dir", ""),
+        worker.start()
+        worker.join(self.timeout_seconds)
+        if worker.is_alive():
+            raise AnalyzerTemporaryError(
+                f"分析超时: 已等待 {self.timeout_seconds}s 仍未返回，放弃等待（后台线程可能仍在运行）"
             )
-        except AnalyzerError:
-            raise
-        except Exception as exc:
+        if "exc" in error_box:
+            exc = error_box["exc"]
+            if isinstance(exc, AnalyzerError):
+                raise exc
             raise AnalyzerTemporaryError(str(exc)) from exc
-        if time.time() - started > self.timeout_seconds:
+        elapsed = time.time() - started
+        if elapsed > self.timeout_seconds:
             raise AnalyzerTemporaryError(f"分析超时: {self.timeout_seconds}s")
+        legacy = result_box.get("legacy")
         result = AnalyzerResult.from_legacy(legacy)
         if not result.outputs:
             raise AnalyzerInputError(f"{self.name} 未生成任何结果产物")

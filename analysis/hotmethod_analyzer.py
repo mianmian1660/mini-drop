@@ -834,12 +834,18 @@ def _analyze_pprof_cpu(conn, storage_cfg: dict, task: dict, bucket: str, tid: st
         raise RuntimeError("分析镜像缺少 go tool pprof")
 
     svg_path = f"/tmp/{tid}_pprof.svg"
-    svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-output", svg_path, local_profile],
-                             text=True, capture_output=True)
+    try:
+        svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-output", svg_path, local_profile],
+                                 text=True, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("pprof SVG 生成超时（120s）")
     if svg_run.returncode != 0 or not os.path.exists(svg_path):
         raise RuntimeError("pprof SVG 生成失败: " + (svg_run.stderr.strip() or svg_run.stdout.strip()))
-    top_run = subprocess.run(["go", "tool", "pprof", "-top", local_profile],
-                             text=True, capture_output=True)
+    try:
+        top_run = subprocess.run(["go", "tool", "pprof", "-top", local_profile],
+                                 text=True, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("pprof TopN 生成超时（60s）")
     if top_run.returncode != 0:
         raise RuntimeError("pprof TopN 生成失败: " + top_run.stderr.strip())
     with open(svg_path, "rb") as f:
@@ -878,19 +884,28 @@ def _analyze_pprof_heap(conn, storage_cfg: dict, task: dict, bucket: str, tid: s
 
     # Validate this is a heap profile by checking sample type
     sample_index = "inuse_space"
-    type_run = subprocess.run(["go", "tool", "pprof", "-top", "-sample_index", sample_index, local_profile],
-                              text=True, capture_output=True)
+    try:
+        type_run = subprocess.run(["go", "tool", "pprof", "-top", "-sample_index", sample_index, local_profile],
+                                  text=True, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("pprof heap TopN 生成超时（60s，sample_index=inuse_space）")
     if type_run.returncode != 0:
         # Try alloc_space as fallback
         sample_index = "alloc_space"
-        type_run = subprocess.run(["go", "tool", "pprof", "-top", "-sample_index", sample_index, local_profile],
-                                  text=True, capture_output=True)
+        try:
+            type_run = subprocess.run(["go", "tool", "pprof", "-top", "-sample_index", sample_index, local_profile],
+                                      text=True, capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("pprof heap TopN 生成超时（60s，sample_index=alloc_space）")
         if type_run.returncode != 0:
             raise RuntimeError("pprof heap TopN 生成失败（不是有效的 heap profile）: " + type_run.stderr.strip())
 
     svg_path = f"/tmp/{tid}_pprof_heap.svg"
-    svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-sample_index", sample_index, "-output", svg_path, local_profile],
-                             text=True, capture_output=True)
+    try:
+        svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-sample_index", sample_index, "-output", svg_path, local_profile],
+                                 text=True, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("pprof heap SVG 生成超时（120s）")
     if svg_run.returncode != 0 or not os.path.exists(svg_path):
         raise RuntimeError("pprof heap SVG 生成失败: " + (svg_run.stderr.strip() or svg_run.stdout.strip()))
 
