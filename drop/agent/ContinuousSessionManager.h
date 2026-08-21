@@ -27,6 +27,9 @@ struct ContinuousAssignment
     int aggregationWindowSec = 10;
     int uploadBatchSec = 60;
     int retentionHours = 24;
+    // 来自 session.labels.db_targets（服务端零迁移透传的 jsonb），驱动
+    // DBSnapshotSampler。为空时该 Session 不做数据库巡检。
+    std::vector<drop::DBTargetConfig> dbTargets;
 };
 
 std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesByExe(
@@ -56,6 +59,11 @@ private:
         std::string effectiveContinuityMode = "degraded";
         std::string degradationReason;
         std::string lastError;
+        // 数据库巡检不走 SharedDualTrackContinuousSampler 的"整机唯一物理采集
+        // 器+按 PID 分流"模型——那套模型是为了绕开 perf_event/eBPF 只能有一个
+        // 物理挂载点的限制。数据库短连接查询没有这个硬件级约束，每个 Session
+        // 独立持有自己的 DBSnapshotSampler 更简单，生命周期直接跟着 Runtime 走。
+        std::unique_ptr<drop::DBSnapshotSampler> dbSampler;
     };
 
     struct StoppingRuntime
@@ -82,6 +90,7 @@ private:
     void UpdateRuntimeEngineStatus(const std::vector<drop::ContinuousSamplerConfig> &configs);
     void AdvanceStoppingSessions();
     drop::ContinuousSamplerConfig BuildSamplerConfig(const Runtime &runtime) const;
+    void ReconcileDBSampler(Runtime &runtime);
     void StopRuntime(Runtime &runtime);
     std::string BuildReconcileBody(const std::vector<drop::ContinuousTargetProcess> &processes) const;
     bool ParseAssignments(const std::string &response, std::vector<ContinuousAssignment> *assignments, uint64_t *revision) const;

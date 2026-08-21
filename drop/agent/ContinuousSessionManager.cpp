@@ -35,6 +35,40 @@ uint64_t env_uint64(const char *name, uint64_t fallback)
     return end && *end == '\0' ? static_cast<uint64_t>(value) : fallback;
 }
 
+// apiserver's model.ContinuousSession.Labels is `[]byte` (raw jsonb bytes from
+// Postgres). Go's encoding/json always base64-encodes a []byte field when it
+// has no custom MarshalJSON, so the reconcile response's "labels" is a base64
+// string wrapping a JSON object, not a nested JSON object directly — must
+// decode before parsing. No base64 decoder existed in the C++ agent yet.
+std::string base64_decode(const std::string &encoded)
+{
+    static const std::string kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::vector<int> table(256, -1);
+    for (size_t i = 0; i < kAlphabet.size(); ++i)
+        table[static_cast<unsigned char>(kAlphabet[i])] = static_cast<int>(i);
+
+    std::string out;
+    int bits = 0;
+    int bitCount = 0;
+    for (unsigned char c : encoded)
+    {
+        if (c == '=' || c == '\n' || c == '\r')
+            continue;
+        int value = table[c];
+        if (value < 0)
+            continue;
+        bits = (bits << 6) | value;
+        bitCount += 6;
+        if (bitCount >= 8)
+        {
+            bitCount -= 8;
+            out.push_back(static_cast<char>((bits >> bitCount) & 0xFF));
+        }
+    }
+    return out;
+}
+
 bool numeric_name(const char *name)
 {
     if (!name || !*name)
@@ -391,6 +425,36 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
             assignment.aggregationWindowSec = item.value("aggregation_window_sec", 10);
             assignment.uploadBatchSec = item.value("upload_batch_sec", 60);
             assignment.retentionHours = item.value("retention_hours", 24);
+            // labels 是 base64 包一层 JSON（见 base64_decode 上方注释），解码失败
+            // 或不含 db_targets 时静默跳过——数据库巡检是可选能力，不能因为
+            // labels 格式问题拖垮整条 CPU/IO/sched 采集链路。
+            const std::string labelsB64 = item.value("labels", std::string());
+            if (!labelsB64.empty() && labelsB64 != "null")
+            {
+                try
+                {
+                    json labels = json::parse(base64_decode(labelsB64));
+                    for (const auto &dbItem : labels.value("db_targets", json::array()))
+                    {
+                        drop::DBTargetConfig target;
+                        target.engine = dbItem.value("engine", "");
+                        target.instanceLabel = dbItem.value("instance_label", "");
+                        target.host = dbItem.value("host", "");
+                        target.port = dbItem.value("port", 0);
+                        target.user = dbItem.value("user", "");
+                        target.passwordRef = dbItem.value("password_ref", "");
+                        target.pollIntervalSec = dbItem.value("poll_interval_sec", assignment.aggregationWindowSec);
+                        target.queryTimeoutMs = dbItem.value("query_timeout_ms", 500);
+                        if (!target.engine.empty() && !target.host.empty())
+                            assignment.dbTargets.push_back(std::move(target));
+                    }
+                }
+                catch (const std::exception &error)
+                {
+                    std::cerr << "[native-cp] reconcile labels parse failed sid=" << assignment.sid
+                              << ": " << error.what() << std::endl;
+                }
+            }
             if (!assignment.sid.empty())
                 assignments->push_back(std::move(assignment));
         }
@@ -440,6 +504,7 @@ void ContinuousSessionManager::ApplyAssignments(const std::vector<ContinuousAssi
         runtime.assignment = assignment;
         if (runtime.observedState == "pending")
             runtime.effectiveContinuityMode = assignment.continuityMode;
+        ReconcileDBSampler(runtime);
     }
     for (auto it = runtimes_.begin(); it != runtimes_.end();)
     {
@@ -506,7 +571,36 @@ drop::ContinuousSamplerConfig ContinuousSessionManager::BuildSamplerConfig(const
     samplerConfig.signals = "cpu,io,io_syscall,sched";
     samplerConfig.allowDegraded = runtime.assignment.allowDegraded || runtime.assignment.continuityMode == "degraded";
     samplerConfig.targetProcesses = runtime.targets;
+    samplerConfig.dbTargets = runtime.assignment.dbTargets;
     return samplerConfig;
+}
+
+// 数据库巡检不接入 SharedDualTrackContinuousSampler 的整机唯一采集器模型
+// （那是为了绕开 perf_event/eBPF 单一物理挂载点限制），每个 Session 独立持有
+// 自己的 DBSnapshotSampler。当前实现是启动一次不再热更新配置——db_targets
+// 变化需要重新创建 Session 才会生效，这个限制记在设计文档，不是本次要解决的点。
+void ContinuousSessionManager::ReconcileDBSampler(Runtime &runtime)
+{
+    if (runtime.assignment.dbTargets.empty())
+    {
+        if (runtime.dbSampler)
+        {
+            runtime.dbSampler->Stop();
+            runtime.dbSampler.reset();
+        }
+        return;
+    }
+    if (runtime.dbSampler && runtime.dbSampler->Running())
+        return;
+    runtime.dbSampler = std::make_unique<drop::DBSnapshotSampler>();
+    drop::ContinuousSamplerConfig samplerConfig = BuildSamplerConfig(runtime);
+    std::string error;
+    if (!runtime.dbSampler->Start(samplerConfig, &error))
+    {
+        std::cerr << "[native-cp] db snapshot sampler failed to start sid=" << runtime.assignment.sid
+                  << ": " << error << std::endl;
+        runtime.dbSampler.reset();
+    }
 }
 
 void ContinuousSessionManager::UpdateRuntimeEngineStatus(
@@ -665,6 +759,11 @@ void ContinuousSessionManager::AdvanceStoppingSessions()
 
 void ContinuousSessionManager::StopRuntime(Runtime &runtime)
 {
+    if (runtime.dbSampler)
+    {
+        runtime.dbSampler->Stop();
+        runtime.dbSampler.reset();
+    }
     runtime.observedState = "stopped";
 }
 
