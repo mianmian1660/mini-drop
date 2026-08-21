@@ -663,12 +663,13 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 	}
 
 	auth := s.AuthContext(c)
-	if !auth.IsPlatformAdmin() {
-		visibleUIDs := s.visibleOwnerUIDs(auth)
-		if len(visibleUIDs) == 0 {
-			visibleUIDs = []string{auth.UID}
-		}
-		query = query.Where("uid IN ?", visibleUIDs)
+	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("owner_filter", "all"))) {
+	case "", "all":
+	case "mine":
+		query = query.Where("uid = ?", auth.UID)
+	default:
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "owner_filter 仅支持 all/mine")
+		return
 	}
 
 	query.Count(&total)
@@ -688,6 +689,9 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 	// 确保返回空数组而不是 null
 	if tasks == nil {
 		tasks = []model.HotmethodTask{}
+	}
+	for index := range tasks {
+		tasks[index].CanManage = s.canManageOwner(tasks[index].UID, auth)
 	}
 
 	s.RespondOK(c, gin.H{
@@ -712,10 +716,12 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "任务不存在: "+tid)
 		return
 	}
-	if !s.canReadOwner(task.UID, s.AuthContext(c)) {
+	auth := s.AuthContext(c)
+	if !s.canReadOwner(task.UID, auth) {
 		s.forbid(c)
 		return
 	}
+	task.CanManage = s.canManageOwner(task.UID, auth)
 
 	result := s.taskDetailPayload(task)
 
@@ -811,15 +817,18 @@ func taskDetailResponse(task model.HotmethodTask) gin.H {
 		"begin_time":      task.BeginTime,
 		"end_time":        task.EndTime,
 		"master_task_tid": task.MasterTaskTID,
+		"can_manage":      task.CanManage,
 	}
 }
 
 func (s *APIServer) StreamTaskEvents(c *gin.Context) {
-	task, serr := s.taskService().requireReadableTask(c.Param("tid"), s.AuthContext(c))
+	auth := s.AuthContext(c)
+	task, serr := s.taskService().requireReadableTask(c.Param("tid"), auth)
 	if serr != nil {
 		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
+	task.CanManage = s.canManageOwner(task.UID, auth)
 	s.prepareSSE(c)
 	incSSEActive()
 	defer decSSEActive()
@@ -854,6 +863,7 @@ func (s *APIServer) StreamTaskEvents(c *gin.Context) {
 			if err := s.DB.Where("tid = ?", task.TID).First(&fresh).Error; err != nil {
 				return
 			}
+			fresh.CanManage = task.CanManage
 			events := s.fetchTaskStatusEventsAfter(task.TID, lastSequence)
 			if len(events) == 0 {
 				if isTerminalTaskStatus(fresh.Status) && fresh.AnalysisStatus >= 2 {

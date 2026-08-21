@@ -333,7 +333,9 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		StartedAt:            now,
 		CreatedAt:            now,
 		UpdatedAt:            now,
+		CanManage:            ownerUID != "",
 	}
+	var conflictSession *model.ContinuousSession
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		// AgentInfo is guaranteed to exist and provides one stable row to lock even
 		// when the host currently has zero active Sessions.
@@ -354,6 +356,7 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 			return err
 		}
 		if err := validateContinuousActiveSet(active, req.Scope, req.SelectorExe); err != nil {
+			conflictSession = findContinuousConflict(active, req.Scope, req.SelectorExe)
 			return err
 		}
 		nextRevision := lockedState.Revision + 1
@@ -373,7 +376,15 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		if errors.Is(err, errContinuousModeConflict) || errors.Is(err, errContinuousHostLimitReached) ||
 			errors.Is(err, errContinuousLimitReached) ||
 			errors.Is(err, errContinuousDuplicateSelector) {
-			s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, err.Error())
+			data := gin.H{"conflict_type": continuousConflictType(err), "target_ip": req.TargetIP}
+			if conflictSession != nil {
+				data["existing_session"] = gin.H{
+					"sid": conflictSession.SID, "name": conflictSession.Name, "scope": conflictSession.Scope,
+					"selector_exe": conflictSession.SelectorExe, "uid": conflictSession.UID,
+					"user_name": conflictSession.UserName,
+				}
+			}
+			respondHTTPErrorWithData(c, http.StatusConflict, ErrCodeTaskInvalidArgument, err.Error(), data)
 			return
 		}
 		s.Logger.Error("创建 ContinuousSession 失败", zap.Error(err))
@@ -383,17 +394,42 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 	s.RespondOK(c, gin.H{"session": session})
 }
 
+func findContinuousConflict(active []model.ContinuousSession, scope, selectorExe string) *model.ContinuousSession {
+	for index := range active {
+		session := &active[index]
+		if scope == "host" || session.Scope == "host" || session.Scope == "" || session.SelectorExe == selectorExe {
+			return session
+		}
+	}
+	return nil
+}
+
+func continuousConflictType(err error) string {
+	switch {
+	case errors.Is(err, errContinuousHostLimitReached):
+		return "host_limit"
+	case errors.Is(err, errContinuousModeConflict):
+		return "scope_conflict"
+	case errors.Is(err, errContinuousDuplicateSelector):
+		return "duplicate_selector"
+	case errors.Is(err, errContinuousLimitReached):
+		return "process_limit"
+	default:
+		return "continuous_conflict"
+	}
+}
+
 func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 	auth := s.AuthContext(c)
 	var sessions []model.ContinuousSession
 	query := s.DB.Model(&model.ContinuousSession{})
-	if !auth.IsPlatformAdmin() {
-		owners := s.visibleOwnerUIDs(auth)
-		if len(owners) > 0 {
-			query = query.Where("(uid IN ? OR uid = '' OR uid IS NULL)", owners)
-		} else {
-			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL)", auth.UID)
-		}
+	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("owner_filter", "all"))) {
+	case "", "all":
+	case "mine":
+		query = query.Where("uid = ?", auth.UID)
+	default:
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "owner_filter 仅支持 all/mine")
+		return
 	}
 	if value := strings.TrimSpace(c.Query("target_ip")); value != "" {
 		query = query.Where("target_ip = ?", value)
@@ -427,6 +463,7 @@ func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 	}
 	for index := range sessions {
 		markContinuousSessionOffline(&sessions[index], time.Now())
+		sessions[index].CanManage = s.canManageOwner(sessions[index].UID, auth)
 	}
 	s.RespondOK(c, gin.H{"sessions": sessions, "total": total, "page": page, "page_size": pageSize})
 }

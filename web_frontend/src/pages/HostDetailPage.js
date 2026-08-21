@@ -124,7 +124,7 @@ export default function HostDetailPage() {
 
     const loadHostTasks = useCallback(async (ip) => {
         if (!ip) return;
-        const res = await tasks.list({ page: 1, pageSize: 5, keyword: ip });
+        const res = await tasks.list({ page: 1, pageSize: 5, target_ip: ip, owner_filter: 'all' });
         if (res.code === 0) setHostTasks(res.data?.tasks || []);
     }, []);
 
@@ -399,7 +399,7 @@ function HostTasksPanel({ target }) {
     const loadTasks = useCallback(async () => {
         setLoading(true);
         try {
-            const res = await tasks.list({ page, pageSize, keyword: target.ip, status: statusFilter || undefined });
+            const res = await tasks.list({ page, pageSize, target_ip: target.ip, owner_filter: 'all', status: statusFilter || undefined });
             if (res.code === 0) {
                 const list = res.data?.tasks || [];
                 const q = keyword.trim().toLowerCase();
@@ -684,6 +684,7 @@ function TaskTable({ tasks: taskItems, compact = false }) {
                     {!compact && <th style={S.th}>采集器</th>}
                     <th style={S.th}>状态</th>
                     <th style={S.th}>创建时间</th>
+                    <th style={S.th}>创建者</th>
                     <th style={S.th}>操作</th>
                 </tr>
             </thead>
@@ -695,6 +696,7 @@ function TaskTable({ tasks: taskItems, compact = false }) {
                         {!compact && <td style={S.td}>{collectorLabelFromTask(task)}</td>}
                         <td style={S.td}><span style={{ ...S.badge, background: statusColors[task.status] || '#999', color: '#fff' }}>{statusNames[task.status] || '未知'}</span></td>
                         <td style={S.td}>{formatTime(task.create_time)}</td>
+                        <td style={S.td}>{task.user_name || '系统'}</td>
                         <td style={S.td}><Link to={`/task/result?tid=${task.tid}`} style={{ color: '#315efb', fontWeight: 700 }}>查看</Link></td>
                     </tr>
                 ))}

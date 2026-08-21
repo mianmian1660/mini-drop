@@ -29,6 +29,7 @@ test('detail route binds the SID to its host and exposes the stopping flow', asy
                 sid: 'cps-api', name: 'API', target_ip: '10.0.0.8', scope: 'process', selector_exe: '/opt/api',
                 desired_state: 'running', observed_state: 'degraded', continuity_mode: 'degraded',
                 active_processes: [{ pid: 42, process_start_ms: 1724160000000 }],
+                can_manage: true,
             },
         },
     });

@@ -87,7 +87,7 @@ export default function ContinuousSessionDetailPage() {
     return <div className="performance-page" style={S.container}>
         <div className="performance-page-header" style={S.head}>
             <div><p style={S.eyebrow}>Performance Center · 持续采集</p><h2 style={S.title}>{session.name}</h2></div>
-            <div className="performance-page-actions" style={S.actions}><Link style={S.back} to={`/hosts/${encodeURIComponent(target.id)}?tab=profiling`}>返回持续采集列表</Link>{running && <button style={S.stop} onClick={stop} disabled={stopping}>{stopping ? '停止中...' : '停止持续采集'}</button>}</div>
+            <div className="performance-page-actions" style={S.actions}><Link style={S.back} to={`/hosts/${encodeURIComponent(target.id)}?tab=profiling`}>返回持续采集列表</Link>{running && session.can_manage && <button style={S.stop} onClick={stop} disabled={stopping}>{stopping ? '停止中...' : '停止持续采集'}</button>}</div>
         </div>
         {error && <div style={S.error}>{error}</div>}
         {session.continuity_mode === 'degraded' && <div style={S.warn}><strong>降级连续性：</strong>{session.degradation_reason || '当前使用 PID 范围受限的滚动采集回退；窗口切换可能产生短暂空档。'} 采集范围不会退化为整机。</div>}
@@ -97,6 +97,7 @@ export default function ContinuousSessionDetailPage() {
                 <Metric label="期望状态" value={session.desired_state === 'running' ? '持续运行' : '已请求停止'} />
                 <Metric label="实际状态" value={continuousStateLabel(state)} />
                 <Metric label="采集范围" value={session.scope === 'process' ? '进程 · 全部实例' : '整机'} />
+                <Metric label="创建者" value={session.user_name || '系统'} />
                 <Metric label="最近上传" value={formatRelativeTime(session.last_upload_at)} />
                 <Metric label="连续性" value={session.continuity_mode === 'strict' ? '严格连续' : '降级'} />
                 <Metric label="活动 PID" value={session.scope === 'process' ? `${activeProcesses.length} 个` : '整机'} />

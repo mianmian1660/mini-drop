@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { continuous } from '../api';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
@@ -27,43 +27,63 @@ const S = {
     warn: { marginBottom: 14, color: '#b54708', background: '#fffaeb', border: '1px solid #fedf89', borderRadius: 6, padding: 10, fontSize: 13 },
     error: { marginBottom: 14, color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: 10, fontSize: 13 },
     empty: { textAlign: 'center', color: '#667085', padding: 38, border: '1px dashed #d0d5dd', borderRadius: 8 },
+    pagination: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 },
+    pageButton: { height: 32, padding: '0 10px', color: '#315efb', background: '#fff', border: '1px solid #c7d2fe', borderRadius: 6, fontWeight: 700, cursor: 'pointer' },
+    pageButtonDisabled: { color: '#98a2b3', background: '#f8fafc', border: '1px solid #e5e7eb', cursor: 'not-allowed' },
 };
+
+const PAGE_SIZE = 20;
 
 export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [sessions, setSessions] = useState([]);
+    const [total, setTotal] = useState(0);
+    const [page, setPage] = useState(1);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [keyword, setKeyword] = useState('');
     const [status, setStatus] = useState('');
     const [scope, setScope] = useState('');
+    const [ownerFilter, setOwnerFilter] = useState('all');
     const [stopping, setStopping] = useState('');
+    const requestSequence = useRef(0);
 
     const load = useCallback(async (silent = false) => {
+        const requestID = ++requestSequence.current;
         if (!silent) setLoading(true);
         setError('');
         try {
-            const response = await continuous.sessions({ target_ip: target.ip, page: 1, page_size: 100 });
+            const response = await continuous.sessions({
+                target_ip: target.ip,
+                page,
+                page_size: PAGE_SIZE,
+                owner_filter: ownerFilter,
+                keyword: keyword.trim() || undefined,
+                observed_state: status || undefined,
+                scope: scope || undefined,
+            });
+            if (requestID !== requestSequence.current) return;
             if (response.code !== 0) throw new Error(response.message || '加载持续采集任务失败');
-            setSessions(response.data?.sessions || []);
+            const nextSessions = response.data?.sessions || [];
+            const nextTotal = Number(response.data?.total ?? nextSessions.length);
+            const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
+            if (page > lastPage) {
+                setPage(lastPage);
+                return;
+            }
+            setSessions(nextSessions);
+            setTotal(nextTotal);
         } catch (err) {
-            setError(err?.message || '加载持续采集任务失败');
+            if (requestID === requestSequence.current) setError(err?.message || '加载持续采集任务失败');
         } finally {
-            if (!silent) setLoading(false);
+            if (!silent && requestID === requestSequence.current) setLoading(false);
         }
-    }, [target.ip]);
+    }, [target.ip, ownerFilter, keyword, status, scope, page]);
 
     useEffect(() => { load(); }, [load, refreshToken]);
     useEffect(() => {
         const timer = window.setInterval(() => load(true), 5000);
         return () => window.clearInterval(timer);
     }, [load]);
-
-    const filtered = useMemo(() => {
-        const query = keyword.trim().toLowerCase();
-        return sessions.filter(session => (!status || session.observed_state === status)
-            && (!scope || normalizedScope(session) === scope)
-            && (!query || `${session.name} ${session.selector_exe}`.toLowerCase().includes(query)));
-    }, [sessions, keyword, status, scope]);
 
     const stop = async session => {
         if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
@@ -81,21 +101,23 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     };
 
     const degradedCount = sessions.filter(session => session.continuity_mode === 'degraded' && session.desired_state === 'running').length;
+    const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
     return <section style={S.card}>
-        <div style={S.head}><div><h3 style={S.title}>持续采集</h3><span style={S.subtle}>任务按用户期望持续运行；等待进程和 Agent 离线不会自动终止任务</span></div><span style={S.subtle}>共 {sessions.length} 条</span></div>
-        {degradedCount > 0 && <div style={S.warn}>{degradedCount} 个活动任务正在降级运行。任务仍严格限制采集范围，但滚动采集窗口可能存在短暂空档。</div>}
+        <div style={S.head}><div><h3 style={S.title}>持续采集</h3><span style={S.subtle}>任务按用户期望持续运行；等待进程和 Agent 离线不会自动终止任务</span></div><span style={S.subtle}>共 {total} 条</span></div>
+        {degradedCount > 0 && <div style={S.warn}>本页有 {degradedCount} 个活动任务正在降级运行。任务仍严格限制采集范围，但滚动采集窗口可能存在短暂空档。</div>}
         {error && <div style={S.error}>{error}</div>}
         <div className="continuous-list-toolbar" style={S.toolbar}>
             <div className="continuous-list-filters" style={S.filters}>
-                <input style={S.input} value={keyword} onChange={event => setKeyword(event.target.value)} placeholder="搜索名称 / exe" />
-                <select style={S.select} value={status} onChange={event => setStatus(event.target.value)}><option value="">全部状态</option><option value="running">运行中</option><option value="waiting">等待进程</option><option value="degraded">降级运行</option><option value="pending">待启动</option><option value="stopping">停止中</option><option value="stopped">已停止</option><option value="offline">Agent 离线</option><option value="error">异常</option></select>
-                <select style={S.select} value={scope} onChange={event => setScope(event.target.value)}><option value="">全部范围</option><option value="host">整机</option><option value="process">进程</option></select>
+                <input style={S.input} value={keyword} onChange={event => { setKeyword(event.target.value); setPage(1); }} placeholder="搜索名称 / exe" />
+                <select style={S.select} value={status} onChange={event => { setStatus(event.target.value); setPage(1); }}><option value="">全部状态</option><option value="running">运行中</option><option value="waiting">等待进程</option><option value="degraded">降级运行</option><option value="pending">待启动</option><option value="stopping">停止中</option><option value="stopped">已停止</option><option value="offline">Agent 离线</option><option value="error">异常</option></select>
+                <select style={S.select} value={scope} onChange={event => { setScope(event.target.value); setPage(1); }}><option value="">全部范围</option><option value="host">整机</option><option value="process">进程</option></select>
+                <select aria-label="持续采集归属筛选" style={S.select} value={ownerFilter} onChange={event => { setOwnerFilter(event.target.value); setPage(1); }}><option value="all">全部创建者</option><option value="mine">我创建的</option></select>
             </div>
             <button style={S.button} onClick={() => load()} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
         </div>
-        {loading ? <div style={S.empty}>正在加载持续采集任务...</div> : filtered.length === 0 ? <div style={S.empty}>{sessions.length ? '没有匹配的持续采集任务' : '暂无持续采集任务。点击右上角“新建持续采集”开始。'}</div> : <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
+        {loading ? <div style={S.empty}>正在加载持续采集任务...</div> : sessions.length === 0 ? <div style={S.empty}>{total ? '当前页暂无持续采集任务' : '暂无匹配的持续采集任务。'}</div> : <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
             <thead><tr><th style={S.th}>名称</th><th style={S.th}>范围与目标</th><th style={S.th}>状态</th><th style={S.th}>信号</th><th style={S.th}>最近数据</th><th style={S.th}>持续时间 / 创建人</th><th style={S.th}>操作</th></tr></thead>
-            <tbody>{filtered.map(session => {
+            <tbody>{sessions.map(session => {
                 const state = session.observed_state || 'pending';
                 const [background, color] = continuousStateColor(state);
                 const signals = decodeJSONField(session.signals, ['cpu_profile', 'io_latency', 'io_syscall_latency', 'sched_latency']);
@@ -108,10 +130,15 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                     <td style={S.td}><div style={S.chips}>{signals.map(signal => <span key={signal} style={S.chip}>{signalLabel(signal)}</span>)}</div></td>
                     <td style={S.td}>{formatRelativeTime(session.last_upload_at)}</td>
                     <td style={S.td}>{duration(session.started_at, session.stopped_at)}<div style={S.subtle}>{session.user_name || 'system'}</div></td>
-                    <td style={S.td}><Link style={S.link} to={`/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(session.sid)}`}>查看</Link>{running && <button style={S.stop} disabled={stopping === session.sid} onClick={() => stop(session)}>{stopping === session.sid ? '停止中' : '停止'}</button>}</td>
+                    <td style={S.td}><Link style={S.link} to={`/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(session.sid)}`}>查看</Link>{running && session.can_manage && <button style={S.stop} disabled={stopping === session.sid} onClick={() => stop(session)}>{stopping === session.sid ? '停止中' : '停止'}</button>}</td>
                 </tr>;
             })}</tbody>
         </table></div>}
+        {!loading && total > 0 && <div style={S.pagination}>
+            <button aria-label="持续采集上一页" style={{ ...S.pageButton, ...(page <= 1 ? S.pageButtonDisabled : {}) }} disabled={page <= 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button>
+            <span style={S.subtle}>第 {page} / {pageCount} 页</span>
+            <button aria-label="持续采集下一页" style={{ ...S.pageButton, ...(page >= pageCount ? S.pageButtonDisabled : {}) }} disabled={page >= pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button>
+        </div>}
     </section>;
 }
 

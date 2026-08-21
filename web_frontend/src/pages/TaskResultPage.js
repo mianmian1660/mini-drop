@@ -427,7 +427,7 @@ export default function TaskResultPage() {
 
             <StageTimeline stages={stages} />
 
-            {failure && <FailurePanel failure={failure} retrying={retrying} onRetry={retryTask} notice={retryNotice} />}
+            {failure && <FailurePanel failure={failure} retrying={retrying} onRetry={retryTask} notice={retryNotice} canManage={Boolean(task.can_manage)} />}
 
             <div style={styles.card}>
                 <h3 style={styles.sectionTitle}>任务概览</h3>
@@ -437,6 +437,7 @@ export default function TaskResultPage() {
                     <Metric label="采集器" value={collectorLabel} />
                     <Metric label="TaskKind" value={collectorLabelByKind(task.task_kind) || task.task_kind || '旧任务兼容'} />
                     <Metric label="目标 Agent" value={task.target_ip || '-'} />
+                    <Metric label="创建者" value={task.user_name || '系统'} />
                     {isPprofTask && <Metric label="pprof 来源" value={redactProfileUrl(taskParams.pprof_url) || '-'} />}
                     <Metric label="创建时间" value={formatTime(task.create_time)} />
                     <Metric label="开始时间" value={formatTime(task.begin_time) || '-'} />
@@ -961,7 +962,7 @@ function StageTimeline({ stages }) {
     );
 }
 
-function FailurePanel({ failure, retrying, onRetry, notice }) {
+function FailurePanel({ failure, retrying, onRetry, notice, canManage }) {
     return (
         <div style={styles.failure} role="alert">
             <div>
@@ -977,7 +978,7 @@ function FailurePanel({ failure, retrying, onRetry, notice }) {
                 </div>
                 {notice && <div style={{ marginTop: 6, fontSize: 12, color: '#b42318' }}>{safeText(notice)}</div>}
             </div>
-            {failure.retryable && (
+            {failure.retryable && canManage && (
                 <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onRetry} disabled={retrying}>
                     {retrying ? '正在创建重试任务...' : '重试任务'}
                 </button>

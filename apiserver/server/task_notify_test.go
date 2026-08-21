@@ -520,8 +520,8 @@ func TestTaskReadHandlersUseUIDAndReturnEvidence(t *testing.T) {
 	req.Header.Set("Drop-User-Uid", "other")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("cross-user detail status=%d, want 403", w.Code)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"can_manage":false`) {
+		t.Fatalf("cross-user detail status=%d body=%s, want shared read with can_manage=false", w.Code, w.Body.String())
 	}
 }
 
@@ -666,8 +666,8 @@ func TestStage2ResponseCancelArtifactAndRBAC(t *testing.T) {
 	req.Header.Set("Drop-User-Uid", "other")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("cross user artifact download status=%d, want 403", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cross user artifact download status=%d body=%s, want shared read", w.Code, w.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/tid-stage2/artifacts/"+strconv.Itoa(artifactID)+"/download", nil)
@@ -819,8 +819,8 @@ func TestStage5TaskEventSSESnapshotLastEventIDAndPermission(t *testing.T) {
 	req.Header.Set("X-Request-ID", "rid-sse-forbid")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `"request_id":"rid-sse-forbid"`) {
-		t.Fatalf("forbidden sse status=%d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"can_manage":false`) {
+		t.Fatalf("shared sse status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

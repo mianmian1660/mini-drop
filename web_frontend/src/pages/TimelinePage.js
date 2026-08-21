@@ -220,6 +220,7 @@ export default function TimelinePage() {
                                 <div style={{ flex: 1 }}>
                                     <strong>{sch.name}</strong>
                                     <span style={{ marginLeft: 10, fontSize: 12, color: '#888' }}>{sch.cron_expr}</span>
+                                    <span style={{ marginLeft: 10, fontSize: 12, color: '#667085' }}>{sch.user_name || '系统'}</span>
                                     <span style={{
                                         marginLeft: 10, padding: '2px 6px', borderRadius: 8, fontSize: 11,
                                         background: sch.enabled ? '#e8f5e9' : '#f5f5f5', color: sch.enabled ? '#4caf50' : '#999'
@@ -231,14 +232,14 @@ export default function TimelinePage() {
                                     <span style={{ fontSize: 11, color: '#888', marginRight: 8 }}>
                                         SID: {sch.sid}
                                     </span>
-                                    <button style={{ ...S.btnSm, background: sch.enabled ? '#ff9800' : '#4caf50', color: '#fff' }}
+                                    {sch.can_manage && <button style={{ ...S.btnSm, background: sch.enabled ? '#ff9800' : '#4caf50', color: '#fff' }}
                                         onClick={(e) => toggleSchedule(sch.sid, e)}>
                                         {sch.enabled ? '⏸ 停止' : '▶ 启用'}
-                                    </button>
-                                    <button style={{ ...S.btnSm, background: '#f44336', color: '#fff' }}
+                                    </button>}
+                                    {sch.can_manage && <button style={{ ...S.btnSm, background: '#f44336', color: '#fff' }}
                                         onClick={(e) => deleteSchedule(sch.sid, e)}>
                                         🗑 删除
-                                    </button>
+                                    </button>}
                                 </div>
                             </div>
                         ))
