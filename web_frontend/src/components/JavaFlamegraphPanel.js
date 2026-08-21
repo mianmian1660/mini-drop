@@ -1,13 +1,13 @@
 import React, { useMemo } from 'react';
 
 const S = {
-    card: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
     title: { margin: '0 0 12px 0', fontSize: 17 },
     grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginBottom: 16 },
     metric: { border: '1px solid #edf0f3', background: '#fbfcfe', borderRadius: 6, padding: 12, minHeight: 58 },
     metricLabel: { fontSize: 12, color: '#667085', marginBottom: 6 },
     metricValue: { fontSize: 14, color: '#202124', wordBreak: 'break-word', fontWeight: 700 },
-    split: { display: 'grid', gridTemplateColumns: 'minmax(0, 1.25fr) minmax(280px, 0.75fr)', gap: 16, alignItems: 'start' },
+    split: { display: 'grid', gridTemplateColumns: 'minmax(0, 1.25fr) minmax(280px, 0.75fr)', gap: 16, alignItems: 'start', minWidth: 0, maxWidth: '100%' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
     td: { padding: '10px 12px', borderBottom: '1px solid #edf0f3', fontSize: 13, verticalAlign: 'top' },
@@ -34,11 +34,11 @@ export default function JavaFlamegraphPanel({ task, topFunctions = [], files = [
                 <Metric label="最热方法" value={hottest?.function || '-'} />
             </div>
 
-            <div style={S.split}>
+            <div className="layout-boundary" style={S.split}>
                 <div>
                     <h4 style={S.pathTitle}>Java 方法 TopN</h4>
                     {topFunctions.length > 0 ? (
-                        <div style={{ overflowX: 'auto' }}>
+                        <div className="table-scroll">
                             <table style={S.table}>
                                 <thead>
                                     <tr>

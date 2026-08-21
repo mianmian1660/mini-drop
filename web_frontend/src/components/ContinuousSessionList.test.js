@@ -37,6 +37,8 @@ test('list renders waiting process tasks and stop writes desired state through t
 
     expect(container.textContent).toContain('等待进程');
     expect(container.textContent).toContain('/opt/worker');
+    expect(container.querySelector('.table-scroll')).not.toBeNull();
+    expect(container.querySelector('.table-scroll').style.maxWidth).toBe('100%');
     const stop = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '停止');
     await act(async () => Simulate.click(stop));
     expect(window.confirm).toHaveBeenCalled();

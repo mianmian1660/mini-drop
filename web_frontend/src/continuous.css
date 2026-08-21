@@ -2,9 +2,60 @@
     box-sizing: border-box;
 }
 
+html,
 body {
     margin: 0;
-    min-width: 320px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: hidden;
+}
+
+#root,
+#root > * {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+}
+
+.performance-page,
+.continuous-profiling-panel,
+.continuous-profiling-panel > *,
+.layout-boundary,
+.layout-boundary > *,
+.table-scroll {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.continuous-profiling-panel {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.table-scroll {
+    width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-inline: contain;
+    -webkit-overflow-scrolling: touch;
+}
+
+.table-scroll > table {
+    max-width: none;
+}
+
+.diagnostic-details,
+.diagnostic-output,
+.flamegraph-scroll-boundary,
+.timeline-chart {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.diagnostic-output {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 @media (max-width: 720px) {

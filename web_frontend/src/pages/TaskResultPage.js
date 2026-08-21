@@ -12,32 +12,32 @@ import AICard from '../components/AICard';
 import { collectorLabelFromTask, collectorLabelByKind, parseRequestParams } from '../utils/collectors';
 
 const styles = {
-    container: { maxWidth: 1280, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif', color: '#202124' },
+    container: { width: '100%', maxWidth: 1280, minWidth: 0, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif', color: '#202124' },
     header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 16 },
     titleBlock: { minWidth: 0 },
     pageTitle: { margin: '0 0 6px 0', fontSize: 24, lineHeight: 1.25 },
     subtitle: { margin: 0, color: '#667085', fontSize: 13, wordBreak: 'break-all' },
     button: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #d0d7de', background: '#fff', color: '#24292f', textDecoration: 'none', borderRadius: 6, padding: '8px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer' },
     primaryButton: { border: '1px solid #315efb', background: '#315efb', color: '#fff' },
-    card: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
     sectionTitle: { margin: '0 0 12px 0', fontSize: 17 },
     grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 12 },
     metric: { border: '1px solid #edf0f3', background: '#fbfcfe', borderRadius: 6, padding: 12, minHeight: 58 },
     metricLabel: { fontSize: 12, color: '#667085', marginBottom: 6 },
     metricValue: { fontSize: 14, color: '#202124', wordBreak: 'break-word' },
     badge: { display: 'inline-flex', alignItems: 'center', borderRadius: 999, padding: '4px 10px', fontSize: 12, fontWeight: 700, color: '#fff' },
-    stageTimeline: { display: 'grid', gridTemplateColumns: 'repeat(10, minmax(112px, 1fr))', gap: 8, overflowX: 'auto', paddingBottom: 4, marginBottom: 16 },
+    stageTimeline: { width: '100%', minWidth: 0, maxWidth: '100%', display: 'grid', gridTemplateColumns: 'repeat(10, minmax(112px, 1fr))', gap: 8, overflowX: 'auto', overflowY: 'hidden', overscrollBehaviorInline: 'contain', paddingBottom: 4, marginBottom: 16 },
     stage: (state) => ({ minHeight: 74, borderRadius: 6, border: `1px solid ${state === 'failed' ? '#fda29b' : state === 'done' ? '#86efac' : state === 'active' ? '#93c5fd' : '#e2e8f0'}`, background: state === 'failed' ? '#fee4e2' : state === 'done' ? '#f0fdf4' : state === 'active' ? '#eff6ff' : '#f8fafc', padding: '10px 11px' }),
     stageTitle: (state) => ({ margin: 0, fontSize: 13, fontWeight: 700, color: state === 'failed' ? '#b42318' : state === 'done' ? '#166534' : state === 'active' ? '#1d4ed8' : '#64748b', whiteSpace: 'nowrap' }),
     stageMeta: { margin: '6px 0 0 0', fontSize: 11, lineHeight: 1.35, color: '#667085', wordBreak: 'break-word', whiteSpace: 'pre-wrap' },
     failure: { border: '1px solid #fda29b', background: '#fff6f5', borderRadius: 6, padding: 14, marginBottom: 16, display: 'flex', gap: 14, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' },
     notice: { display: 'flex', gap: 8, alignItems: 'center', background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 13 },
     flameFrame: { width: '100%', height: 720, border: '1px solid #d0d7de', borderRadius: 6, background: '#fff' },
-    interactiveFlameBox: { height: 720, overflowX: 'auto', overflowY: 'auto', border: '1px solid #d0d7de', borderRadius: 6, background: '#fff', padding: 6 },
+    interactiveFlameBox: { width: '100%', minWidth: 0, maxWidth: '100%', height: 720, overflowX: 'auto', overflowY: 'auto', border: '1px solid #d0d7de', borderRadius: 6, background: '#fff', padding: 6 },
     histogramStage: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 420, border: '1px solid #d0d7de', borderRadius: 6, background: '#fbfcfe', padding: 16, overflow: 'hidden' },
     histogramImage: { width: '100%', height: 'clamp(340px, 42vw, 520px)', objectFit: 'contain', display: 'block' },
     visualEmpty: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 260, color: '#667085', textAlign: 'center', background: '#f8fafc', border: '1px dashed #cbd5e1', borderRadius: 6, padding: 24 },
-    split: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(300px, 1fr)', gap: 16, alignItems: 'start' },
+    split: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(300px, 1fr)', gap: 16, alignItems: 'start', minWidth: 0, maxWidth: '100%' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
     td: { padding: '10px 12px', borderBottom: '1px solid #edf0f3', fontSize: 13, verticalAlign: 'top' },
@@ -462,7 +462,7 @@ export default function TaskResultPage() {
                 />
             </div>
 
-            <div style={styles.split}>
+            <div className="layout-boundary" style={styles.split}>
                 <div style={styles.card}>
                     <h3 style={styles.sectionTitle}>采集参数</h3>
                     <ParameterPanel task={task} />
@@ -727,7 +727,7 @@ function StatusEventsPanel({ events }) {
         <div style={styles.card}>
             <h3 style={styles.sectionTitle}>状态迁移 Reason</h3>
             {events.length > 0 ? (
-                <div style={{ overflowX: 'auto' }}>
+                <div className="table-scroll">
                     <table style={styles.table}>
                         <thead>
                             <tr>
@@ -774,7 +774,7 @@ function BPFHistogramPanel({ histogram }) {
                         <Metric label="P50 / P95 / P99" value={`${formatNumber(summary.p50)} / ${formatNumber(summary.p95)} / ${formatNumber(summary.p99)}`} />
                     </div>
                     {buckets.length > 0 ? (
-                        <div style={{ overflowX: 'auto', marginTop: 14 }}>
+                        <div className="table-scroll" style={{ marginTop: 14 }}>
                             <table style={styles.table}>
                                 <thead>
                                     <tr>
@@ -814,7 +814,7 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN', isPpro
         <div style={styles.card}>
             <h3 style={styles.sectionTitle}>{title}</h3>
             {topFunctions.length > 0 ? (
-                <div style={{ overflowX: 'auto' }}>
+                <div className="table-scroll">
                     <table style={styles.table}>
                         <thead>
                                 <tr>

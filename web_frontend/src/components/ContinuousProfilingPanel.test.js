@@ -1,3 +1,7 @@
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { act } from 'react-dom/test-utils';
+
 jest.mock('./InteractiveFlamegraph', () => ({
     __esModule: true,
     default: () => null,
@@ -5,6 +9,9 @@ jest.mock('./InteractiveFlamegraph', () => ({
 }));
 
 import {
+    DiagnosticDetails,
+    diagnosticText,
+    formatDiagnosticJSON,
     makeSequentialDiffWindows,
     makeTimeWindow,
     coverageSegments,
@@ -14,6 +21,57 @@ import {
     runtimeLabel,
     validateCustomTimeWindow,
 } from './ContinuousProfilingPanel';
+
+global.IS_REACT_ACT_ENVIRONMENT = true;
+
+test('diagnostic JSON uses two-space indentation for nested values', () => {
+    expect(formatDiagnosticJSON({ outer: { enabled: true } })).toBe([
+        '{',
+        '  "outer": {',
+        '    "enabled": true',
+        '  }',
+        '}',
+    ].join('\n'));
+});
+
+test('diagnostic text preserves long values and tolerates missing or unusual values', () => {
+    const longValue = 'x'.repeat(4096);
+    const circular = { longValue, count: 12n };
+    circular.self = circular;
+
+    expect(() => formatDiagnosticJSON(undefined)).not.toThrow();
+    expect(formatDiagnosticJSON({})).toBe('{}');
+    expect(formatDiagnosticJSON(circular)).toContain(longValue);
+    expect(formatDiagnosticJSON(circular)).toContain('"count": "12"');
+    expect(formatDiagnosticJSON(circular)).toContain('"self": "[Circular]"');
+    expect(() => diagnosticText()).not.toThrow();
+});
+
+test('diagnostic block exposes bounded wrapping styles and formatted fields', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<DiagnosticDetails
+            target={{ id: 'target-1', continuous_session: { sampler: { name: 'perf' } } }}
+            flamegraph={{ symbol_diagnostics: { unresolved: { count: 2 } } }}
+            timeWindow={{ from: 'start', to: 'end' }}
+            profileType="cpu"
+        />);
+    });
+
+    const details = container.querySelector('.diagnostic-details');
+    const output = container.querySelector('.diagnostic-output');
+    expect(details).not.toBeNull();
+    expect(output.style.maxWidth).toBe('100%');
+    expect(output.style.whiteSpace).toBe('pre-wrap');
+    expect(output.style.overflowWrap).toBe('anywhere');
+    expect(output.textContent).toContain('continuous_session:\n{\n  "sampler": {');
+    expect(output.textContent).toContain('symbol_diagnostics:\n{\n  "unresolved": {');
+
+    act(() => root.unmount());
+    container.remove();
+});
 
 test('process instance filters keep PID reuse identities separate', () => {
     expect(instanceFilters('42|1724160000123')).toEqual({ pid: '42', process_start_ms: '1724160000123' });

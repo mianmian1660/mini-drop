@@ -4,11 +4,11 @@ import { profiles } from '../api';
 import ContinuousProfilingPanel from '../components/ContinuousProfilingPanel';
 
 const S = {
-    container: { maxWidth: 1280, margin: '0 auto', padding: 24, fontFamily: 'Arial, sans-serif', color: '#202124' },
+    container: { width: '100%', maxWidth: 1280, minWidth: 0, margin: '0 auto', padding: 24, fontFamily: 'Arial, sans-serif', color: '#202124' },
     pageHead: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-end', marginBottom: 18 },
     eyebrow: { margin: '0 0 6px 0', color: '#667085', fontSize: 13 },
     title: { margin: 0, fontSize: 28, lineHeight: 1.2 },
-    band: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 1px 3px rgba(16,24,40,0.08)' },
+    band: { minWidth: 0, maxWidth: '100%', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 18, marginBottom: 16, boxShadow: '0 1px 3px rgba(16,24,40,0.08)' },
     subtle: { color: '#667085', fontSize: 12 },
     error: { background: '#fff3f3', border: '1px solid #ffcdd2', color: '#b42318', borderRadius: 8, padding: 12, marginBottom: 16 },
     empty: { textAlign: 'center', padding: 46, color: '#667085', background: '#fbfcfe', border: '1px dashed #d0d7de', borderRadius: 8 },

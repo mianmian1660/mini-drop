@@ -14,8 +14,8 @@ import { useSearchParams, Link } from 'react-router-dom';
 import { tasks } from '../api';
 
 const S = {
-    container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
-    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
+    container: { width: '100%', maxWidth: 1200, minWidth: 0, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
     loading: { textAlign: 'center', padding: 60, color: '#999' },
     hint: { fontSize: 12, color: '#888', marginTop: 4 },
     input: { padding: '7px 10px', border: '1px solid #ddd', borderRadius: 6, fontSize: 13, boxSizing: 'border-box' },
@@ -152,7 +152,7 @@ export default function TaskDiffPage() {
                             两次采集的热点分布没有超过阈值的差异
                         </div>
                     ) : (
-                        <div style={{ overflowX: 'auto' }}>
+                        <div className="table-scroll">
                             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                                 <thead>
                                     <tr>

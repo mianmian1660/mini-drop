@@ -9,7 +9,7 @@ const SAFE_MAX_NODES = 3500;
 const MAX_CHART_HEIGHT = 2400;
 
 const BASE = {
-    flameBox: { height: 560, overflowX: 'auto', overflowY: 'auto', border: '1px solid #eaecf0', borderRadius: 8, background: '#fff', padding: 6 },
+    flameBox: { width: '100%', minWidth: 0, maxWidth: '100%', height: 560, overflowX: 'auto', overflowY: 'auto', border: '1px solid #eaecf0', borderRadius: 8, background: '#fff', padding: 6 },
     empty: { textAlign: 'center', padding: 44, color: '#667085', background: '#fff', border: '1px dashed #d0d7de', borderRadius: 8 },
     warn: { color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '9px 12px', fontSize: 13 },
     note: { color: '#475467', background: '#f9fafb', border: '1px solid #eaecf0', borderRadius: 6, padding: '9px 12px', fontSize: 13, marginTop: 12 },
@@ -121,7 +121,7 @@ export default function InteractiveFlamegraph({
 
     return (
         <>
-            <div ref={graphRef} style={{ ...BASE.flameBox, ...boxStyle }} />
+            <div className="flamegraph-scroll-boundary" ref={graphRef} style={{ ...BASE.flameBox, ...boxStyle }} />
             {renderMode === 'safe' && !renderError && (
                 <div style={BASE.note}>
                     完整渲染失败，安全视图已渲染 {renderedNodes}/{profileStats.nodes} 个节点，原始深度 {profileStats.depth}。

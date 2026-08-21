@@ -11,14 +11,14 @@ import Pagination from '../components/Pagination';
 import { collectorLabelFromTask } from '../utils/collectors';
 
 const styles = {
-    container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
-    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
+    container: { width: '100%', maxWidth: 1200, minWidth: 0, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid #e0e0e0', color: '#666', fontSize: 13 },
     td: { padding: '12px 16px', borderBottom: '1px solid #f0f0f0', fontSize: 14 },
     badge: { padding: '2px 8px', borderRadius: 10, fontSize: 12, fontWeight: 'bold' },
-    searchRow: { display: 'flex', gap: 12, marginBottom: 16 },
-    input: { flex: 1, padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14 },
+    searchRow: { display: 'flex', gap: 12, flexWrap: 'wrap', minWidth: 0, marginBottom: 16 },
+    input: { flex: '1 1 220px', minWidth: 0, padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14 },
     select: { padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14, background: '#fff' },
     empty: { textAlign: 'center', padding: 40, color: '#999' },
     loading: { textAlign: 'center', padding: 40, color: '#999' },
@@ -155,6 +155,7 @@ export default function TaskListPage() {
                 {taskList.length === 0 ? (
                     <p style={styles.empty}>{searchText ? '没有匹配的任务' : '暂无任务'}</p>
                 ) : (
+                    <div className="table-scroll">
                     <table style={styles.table}>
                         <thead>
                             <tr>
@@ -188,6 +189,7 @@ export default function TaskListPage() {
                             ))}
                         </tbody>
                     </table>
+                    </div>
                 )}
 
                 {/* 分页组件 */}

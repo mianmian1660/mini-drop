@@ -7,17 +7,17 @@ import { Link } from 'react-router-dom';
 import { profiles } from '../api';
 
 const styles = {
-    container: { maxWidth: 1280, margin: '0 auto', padding: 24, fontFamily: 'Arial, sans-serif', color: '#202124' },
+    container: { width: '100%', maxWidth: 1280, minWidth: 0, margin: '0 auto', padding: 24, fontFamily: 'Arial, sans-serif', color: '#202124' },
     pageHead: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-end', marginBottom: 18 },
     eyebrow: { margin: '0 0 6px 0', color: '#667085', fontSize: 13 },
     title: { margin: 0, fontSize: 28, lineHeight: 1.2 },
-    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 3px rgba(16,24,40,0.08)' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 3px rgba(16,24,40,0.08)' },
     metricGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 16 },
     metric: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 16 },
     metricLabel: { color: '#667085', fontSize: 12, marginBottom: 8 },
     metricValue: { fontSize: 24, fontWeight: 700 },
-    toolbar: { display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 14 },
-    input: { flex: 1, minWidth: 220, padding: '9px 12px', border: '1px solid #d0d7de', borderRadius: 6, fontSize: 14 },
+    toolbar: { display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap', minWidth: 0, marginBottom: 14 },
+    input: { flex: '1 1 220px', minWidth: 0, padding: '9px 12px', border: '1px solid #d0d7de', borderRadius: 6, fontSize: 14 },
     btnSecondary: { background: '#fff', color: '#315efb', border: '1px solid #c7d2fe', padding: '8px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 700, textDecoration: 'none' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid #d0d7de', color: '#475467', fontSize: 12, background: '#f8fafc' },
@@ -105,12 +105,13 @@ export default function HomePage() {
                         value={keyword}
                         onChange={e => setKeyword(e.target.value)}
                     />
-                    <span style={styles.subtle}>先进入主机，再查看该主机任务、周期性深度采样时间轴和 Native profiling</span>
+                    <span style={{ ...styles.subtle, flex: '1 1 220px', minWidth: 0, overflowWrap: 'anywhere' }}>先进入主机，再查看该主机任务、周期性深度采样时间轴和 Native profiling</span>
                 </div>
 
                 {filteredTargets.length === 0 ? (
                     <p style={styles.empty}>{targets.length === 0 ? '暂无可观测对象。启动 drop_agent 或创建按需任务后会出现在这里。' : '没有匹配的主机或服务'}</p>
                 ) : (
+                    <div className="table-scroll">
                     <table style={styles.table}>
                         <thead>
                             <tr>
@@ -145,6 +146,7 @@ export default function HomePage() {
                             ))}
                         </tbody>
                     </table>
+                    </div>
                 )}
             </section>
 

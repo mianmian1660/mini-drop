@@ -12,8 +12,8 @@ import {
 } from '../utils/profileMetrics';
 
 const S = {
-    panel: { display: 'grid', gap: 14 },
-    card: { background: '#fff', borderRadius: 8, padding: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
+    panel: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 14, minWidth: 0, maxWidth: '100%' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
     head: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' },
     titleLine: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
     title: { margin: 0, fontSize: 18, letterSpacing: 0 },
@@ -33,7 +33,7 @@ const S = {
     searchInput: { width: 210, maxWidth: '100%', padding: '7px 10px', border: '1px solid #d0d7de', borderRadius: 6, background: '#fff', fontSize: 13, height: 34, boxSizing: 'border-box' },
     flameActions: { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 10, flexWrap: 'wrap' },
     stateBadge: { display: 'inline-flex', alignItems: 'center', border: '1px solid #abefc6', background: '#ecfdf3', color: '#067647', borderRadius: 999, padding: '3px 8px', fontSize: 12, fontWeight: 700 },
-    summaryGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 0, borderTop: '1px solid #eef2f6', borderBottom: '1px solid #eef2f6' },
+    summaryGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(170px, 100%), 1fr))', gap: 0, minWidth: 0, maxWidth: '100%', borderTop: '1px solid #eef2f6', borderBottom: '1px solid #eef2f6' },
     metric: { padding: '10px 14px 10px 0', minWidth: 0 },
     metricLabel: { color: '#667085', fontSize: 12, marginBottom: 4 },
     metricValue: { color: '#111827', fontSize: 16, fontWeight: 700, wordBreak: 'break-word', lineHeight: 1.35 },
@@ -47,7 +47,7 @@ const S = {
     sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12, flexWrap: 'wrap' },
     subtle: { color: '#667085', fontSize: 12 },
     inlineNote: { color: '#667085', fontSize: 12, lineHeight: 1.5 },
-    flameBox: { height: 560, overflowX: 'auto', overflowY: 'auto', border: '1px solid #eaecf0', borderRadius: 8, background: '#fff', padding: 6 },
+    flameBox: { width: '100%', maxWidth: '100%', minWidth: 0, height: 560, overflowX: 'auto', overflowY: 'auto', border: '1px solid #eaecf0', borderRadius: 8, background: '#fff', padding: 6 },
     empty: { textAlign: 'center', padding: 44, color: '#667085', background: '#fff', border: '1px dashed #d0d7de', borderRadius: 8 },
     error: { background: '#fff3f3', border: '1px solid #ffcdd2', color: '#b42318', borderRadius: 8, padding: 12 },
     warn: { color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '9px 12px', fontSize: 13 },
@@ -57,13 +57,13 @@ const S = {
     coverageOK: { height: '100%', background: '#12b76a' },
     coverageGap: { height: '100%', background: '#d92d20', minWidth: 2 },
     gapList: { display: 'grid', gap: 5, marginTop: 8, color: '#b42318', fontSize: 12 },
-    tableWrap: { overflowX: 'auto' },
+    tableWrap: { width: '100%', minWidth: 0, maxWidth: '100%', overflowX: 'auto', overflowY: 'hidden' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '9px 10px', borderBottom: '1px solid #eaecf0', color: '#475467', fontSize: 12, background: '#fff' },
     td: { padding: '8px 10px', borderBottom: '1px solid #f2f4f7', fontSize: 13, verticalAlign: 'top', lineHeight: 1.45 },
-    details: { borderTop: '1px solid #eaecf0', padding: '10px 0 0', background: '#fff' },
+    details: { width: '100%', minWidth: 0, maxWidth: '100%', borderTop: '1px solid #eaecf0', padding: '10px 0 0', background: '#fff' },
     detailsSummary: { cursor: 'pointer', color: '#475467', fontSize: 13, fontWeight: 700 },
-    mono: { margin: '10px 0 0', padding: 10, background: '#111827', color: '#e5e7eb', borderRadius: 6, overflowX: 'auto', fontSize: 12, lineHeight: 1.5 },
+    mono: { width: '100%', minWidth: 0, maxWidth: '100%', margin: '10px 0 0', padding: 10, background: '#111827', color: '#e5e7eb', borderRadius: 6, overflowX: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.5 },
 };
 
 const RANGE_OPTIONS = [
@@ -538,7 +538,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     }
 
     return (
-        <div style={S.panel}>
+        <div className="continuous-profiling-panel" style={S.panel}>
             <section style={S.card}>
                 <div style={S.head}>
                     <div>
@@ -786,7 +786,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             </div>
                             {diffViewMode === 'table' && diffError && <div style={{ ...S.error, marginTop: 8 }}>{diffError}</div>}
                             {diffViewMode === 'table' && diffResult && !diffResult.empty && Array.isArray(diffResult.items) && diffResult.items.length > 0 && (
-                                <div style={{ marginTop: 12, overflowX: 'auto' }}>
+                                <div className="table-scroll" style={{ ...S.tableWrap, marginTop: 12 }}>
                                     <table style={{ ...S.table, width: '100%' }}>
                                         <thead>
                                             <tr>
@@ -889,11 +889,17 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 </section>
             )}
 
-            <details style={S.details}>
-                <summary style={S.detailsSummary}>诊断信息</summary>
-                <pre style={S.mono}>{diagnosticText({ target, flamegraph, topn, timeWindow, profileType, stackScope, filters: activeFilters })}</pre>
-            </details>
+            <DiagnosticDetails target={target} flamegraph={flamegraph} topn={topn} timeWindow={timeWindow} profileType={profileType} stackScope={stackScope} filters={activeFilters} />
         </div>
+    );
+}
+
+export function DiagnosticDetails(props) {
+    return (
+        <details className="diagnostic-details" style={S.details}>
+            <summary style={S.detailsSummary}>诊断信息</summary>
+            <pre className="diagnostic-output" style={S.mono}>{diagnosticText(props)}</pre>
+        </details>
     );
 }
 
@@ -947,7 +953,7 @@ function RuntimeDiagnostics({ diagnostics }) {
     return (
         <section style={S.card}>
             <div style={S.sectionHead}><h3 style={S.title}>语言采集状态</h3><span style={S.subtle}>{entries.length} runtimes</span></div>
-            <div style={S.tableWrap}><table style={S.table}>
+            <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
                 <thead><tr><th style={S.th}>语言</th><th style={S.th}>状态</th><th style={S.th}>模式</th><th style={S.th}>进程</th><th style={S.th}>诊断</th></tr></thead>
                 <tbody>{entries.map(([runtime, item]) => (
                     <tr key={runtime}>
@@ -1107,7 +1113,7 @@ function TopNTable({ data, loading, profileURL, filterText = '' }) {
         return <ProfileEmpty message={data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} url={data?.profile_url || profileURL} />;
     }
     return (
-        <div style={S.tableWrap}>
+        <div className="table-scroll" style={S.tableWrap}>
             <table style={S.table}>
                 <thead>
                     <tr>
@@ -1164,7 +1170,7 @@ function HistogramPanel({ data, loading, title }) {
                         <Metric label="P99" value={formatLatency(summary.p99, data?.unit)} />
                         <Metric label="事件数" value={formatMetricValue(data?.event_count || 0, 'samples')} />
                     </div>
-                    <div style={{ ...S.tableWrap, marginTop: 14 }}>
+                    <div className="table-scroll" style={{ ...S.tableWrap, marginTop: 14 }}>
                         <table style={S.table}>
                             <thead>
                                 <tr>
@@ -1193,7 +1199,7 @@ function HistogramPanel({ data, loading, title }) {
                             <h3 style={S.title}>P95/P99 趋势</h3>
                             <span style={S.subtle}>{trend.length} 个窗口</span>
                         </div>
-                        <div style={S.tableWrap}>
+                        <div className="table-scroll" style={S.tableWrap}>
                             <table style={S.table}>
                                 <thead>
                                     <tr>
@@ -1305,23 +1311,48 @@ function labelSelectorForTarget(target, filters = {}) {
     return `{${Object.entries(labels).map(([k, v]) => `${k}="${v}"`).join(', ')}}`;
 }
 
-function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, stackScope = 'all', filters = {} }) {
+export function formatDiagnosticJSON(value) {
+    const seen = new WeakSet();
+    try {
+        const formatted = JSON.stringify(value === undefined ? null : value, (key, nestedValue) => {
+            if (typeof nestedValue === 'bigint') return String(nestedValue);
+            if (nestedValue && typeof nestedValue === 'object') {
+                if (seen.has(nestedValue)) return '[Circular]';
+                seen.add(nestedValue);
+            }
+            return nestedValue;
+        }, 2);
+        return formatted === undefined ? String(value) : formatted;
+    } catch (error) {
+        try {
+            return String(value);
+        } catch (stringError) {
+            return '[Unserializable value]';
+        }
+    }
+}
+
+function diagnosticJSONField(label, value) {
+    return `${label}:\n${formatDiagnosticJSON(value)}`;
+}
+
+export function diagnosticText({ target, flamegraph, topn, timeWindow, profileType, stackScope = 'all', filters = {} } = {}) {
     return [
         `target: ${target?.id || '-'}`,
-        `profile_type: ${profileType}`,
+        `profile_type: ${profileType || '-'}`,
         `stack_scope: ${stackScope}`,
-        `continuous_session: ${JSON.stringify(target?.continuous_session || {})}`,
-        `time_range: ${timeWindow.from} -> ${timeWindow.to}`,
+        diagnosticJSONField('continuous_session', target?.continuous_session || {}),
+        `time_range: ${timeWindow?.from || '-'} -> ${timeWindow?.to || '-'}`,
         `selector: ${labelSelectorForTarget(target, filters)}`,
-        `filters: ${JSON.stringify(filters || {})}`,
+        diagnosticJSONField('filters', filters || {}),
         `backend: ${flamegraph?.backend || topn?.backend || '-'}`,
         `query: ${flamegraph?.query || topn?.query || '-'}`,
         `unit: ${flamegraph?.unit || topn?.unit || '-'}`,
         `total_raw_value: ${formatRawMetric(flamegraph?.total || topn?.total || 0, flamegraph?.unit || topn?.unit || '')}`,
         `profile_url: ${flamegraph?.profile_url || topn?.profile_url || target?.profile_url || '-'}`,
         `symbol_status: ${flamegraph?.symbol_status || topn?.symbol_status || 'not_applicable'}`,
-        `symbol_diagnostics: ${JSON.stringify(flamegraph?.symbol_diagnostics || topn?.symbol_diagnostics || {})}`,
-        `runtime_diagnostics: ${JSON.stringify(flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics || {})}`,
+        diagnosticJSONField('symbol_diagnostics', flamegraph?.symbol_diagnostics || topn?.symbol_diagnostics || {}),
+        diagnosticJSONField('runtime_diagnostics', flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics || {}),
         `truncated: ${flamegraph?.truncated || topn?.truncated || false}`,
     ].join('\n');
 }

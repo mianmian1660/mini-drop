@@ -31,6 +31,16 @@ export const statusColor = (status) => {
 
 const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
 
+export function clampTooltipX(x, containerWidth, tooltipWidth, edgePadding = 8) {
+    const width = Math.max(0, Number(containerWidth) || 0);
+    const boundedTooltipWidth = Math.min(Math.max(0, Number(tooltipWidth) || 0), Math.max(0, width - edgePadding * 2));
+    const half = boundedTooltipWidth / 2;
+    const min = edgePadding + half;
+    const max = width - edgePadding - half;
+    if (max < min) return width / 2;
+    return Math.min(max, Math.max(min, Number(x) || 0));
+}
+
 // 窗口起点：后端 window_start 恒等于 create_time，留 create_time 兜底
 const startOf = (p) => new Date(p.window_start || p.create_time);
 
@@ -150,8 +160,11 @@ export default function TimelineChart({ points }) {
 
     if (!points || points.length === 0) return null;
 
+    const tooltipMaxWidth = Math.max(0, Math.min(320, width - 16));
+    const tooltipX = tip ? clampTooltipX(tip.x, width, tooltipMaxWidth) : 0;
+
     return (
-        <div ref={wrapRef} style={{ position: 'relative', width: '100%' }}>
+        <div className="timeline-chart" ref={wrapRef} style={{ position: 'relative', width: '100%', minWidth: 0, maxWidth: '100%' }}>
             <svg ref={svgRef} width="100%" height={HEIGHT} style={{ display: 'block' }} />
 
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 4, fontSize: 12, color: '#666' }}>
@@ -175,11 +188,13 @@ export default function TimelineChart({ points }) {
 
             {tip && (
                 <div style={{
-                    position: 'absolute', left: tip.x, top: tip.y - 10,
+                    position: 'absolute', left: tooltipX, top: tip.y - 10,
                     transform: 'translate(-50%, -100%)',
                     background: 'rgba(40,40,40,0.94)', color: '#fff',
                     padding: '6px 10px', borderRadius: 4, fontSize: 12,
-                    lineHeight: 1.5, whiteSpace: 'nowrap', pointerEvents: 'none', zIndex: 5,
+                    width: 'max-content', maxWidth: tooltipMaxWidth,
+                    lineHeight: 1.5, whiteSpace: 'normal', overflowWrap: 'anywhere', wordBreak: 'break-word',
+                    pointerEvents: 'none', zIndex: 5,
                 }}>
                     {tip.lines.map((l, i) => <div key={i}>{l}</div>)}
                 </div>

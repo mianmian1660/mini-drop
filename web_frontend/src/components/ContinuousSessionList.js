@@ -4,7 +4,7 @@ import { continuous } from '../api';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
 
 const S = {
-    card: { background: '#fff', borderRadius: 8, padding: 20, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,.04)' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 20, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,.04)' },
     head: { display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 14 },
     title: { margin: 0, fontSize: 18, color: '#101828' },
     subtle: { color: '#667085', fontSize: 12 },
@@ -13,7 +13,7 @@ const S = {
     input: { minWidth: 220, flex: '1 1 240px', height: 36, padding: '7px 10px', boxSizing: 'border-box', border: '1px solid #d0d5dd', borderRadius: 6, fontSize: 13 },
     select: { height: 36, padding: '7px 10px', border: '1px solid #d0d5dd', borderRadius: 6, background: '#fff', fontSize: 13 },
     button: { height: 36, padding: '0 12px', color: '#315efb', background: '#fff', border: '1px solid #c7d2fe', borderRadius: 6, fontWeight: 700, cursor: 'pointer' },
-    tableWrap: { overflowX: 'auto' },
+    tableWrap: { width: '100%', minWidth: 0, maxWidth: '100%', overflowX: 'auto', overflowY: 'hidden' },
     table: { width: '100%', borderCollapse: 'collapse', minWidth: 920 },
     th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d5dd', color: '#475467', background: '#f8fafc', fontSize: 12, whiteSpace: 'nowrap' },
     td: { padding: '11px 12px', borderBottom: '1px solid #edf0f3', color: '#344054', fontSize: 13, verticalAlign: 'top' },
@@ -93,7 +93,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
             </div>
             <button style={S.button} onClick={() => load()} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
         </div>
-        {loading ? <div style={S.empty}>正在加载持续采集任务...</div> : filtered.length === 0 ? <div style={S.empty}>{sessions.length ? '没有匹配的持续采集任务' : '暂无持续采集任务。点击右上角“新建持续采集”开始。'}</div> : <div style={S.tableWrap}><table style={S.table}>
+        {loading ? <div style={S.empty}>正在加载持续采集任务...</div> : filtered.length === 0 ? <div style={S.empty}>{sessions.length ? '没有匹配的持续采集任务' : '暂无持续采集任务。点击右上角“新建持续采集”开始。'}</div> : <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
             <thead><tr><th style={S.th}>名称</th><th style={S.th}>范围与目标</th><th style={S.th}>状态</th><th style={S.th}>信号</th><th style={S.th}>最近数据</th><th style={S.th}>持续时间 / 创建人</th><th style={S.th}>操作</th></tr></thead>
             <tbody>{filtered.map(session => {
                 const state = session.observed_state || 'pending';

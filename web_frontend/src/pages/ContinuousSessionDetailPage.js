@@ -5,15 +5,15 @@ import ContinuousProfilingPanel from '../components/ContinuousProfilingPanel';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime } from '../utils/continuous';
 
 const S = {
-    container: { maxWidth: 1320, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
+    container: { width: '100%', maxWidth: 1320, minWidth: 0, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
     head: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 16, flexWrap: 'wrap', marginBottom: 14 },
     eyebrow: { margin: '0 0 6px', color: '#667085', fontSize: 13 },
     title: { margin: 0, fontSize: 28, letterSpacing: 0 },
     actions: { display: 'flex', gap: 10, flexWrap: 'wrap' },
     back: { background: '#fff', color: '#315efb', border: '1px solid #c7d2fe', borderRadius: 6, padding: '8px 12px', textDecoration: 'none', fontSize: 13, fontWeight: 700 },
     stop: { background: '#fff', color: '#b42318', border: '1px solid #fda29b', borderRadius: 6, padding: '8px 12px', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
-    card: { background: '#fff', borderRadius: 8, padding: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,.04)', marginBottom: 14 },
-    meta: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))', borderTop: '1px solid #eef2f6', marginTop: 14 },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,.04)', marginBottom: 14 },
+    meta: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(min(170px,100%),1fr))', minWidth: 0, maxWidth: '100%', borderTop: '1px solid #eef2f6', marginTop: 14 },
     metric: { padding: '12px 14px 0 0', minWidth: 0 },
     label: { color: '#667085', fontSize: 12, marginBottom: 4 },
     value: { color: '#101828', fontSize: 14, fontWeight: 700, wordBreak: 'break-word', lineHeight: 1.45 },

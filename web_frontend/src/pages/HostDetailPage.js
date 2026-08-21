@@ -11,12 +11,12 @@ import { formatMetricValue, metricColumnLabel } from '../utils/profileMetrics';
 import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
 
 const S = {
-    container: { maxWidth: 1320, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
+    container: { width: '100%', maxWidth: 1320, minWidth: 0, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
     pageHead: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-end', marginBottom: 12 },
     eyebrow: { margin: '0 0 6px 0', color: '#667085', fontSize: 13 },
     title: { margin: 0, fontSize: 28, lineHeight: 1.2, letterSpacing: 0 },
     actions: { display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' },
-    card: { background: '#fff', borderRadius: 8, padding: 20, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 20, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
     contextDetails: { background: '#fff', border: '1px solid #eaecf0', borderRadius: 8, marginBottom: 14 },
     contextSummary: { cursor: 'pointer', padding: '12px 14px', display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'center', color: '#667085', fontSize: 13, listStyle: 'none' },
     contextSummaryMain: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 },
@@ -29,7 +29,7 @@ const S = {
     contextValue: { color: '#111827', fontSize: 14, fontWeight: 650, wordBreak: 'break-word', lineHeight: 1.45 },
     tabBar: { display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 16, borderBottom: '1px solid #e5e7eb' },
     tab: (active) => ({ padding: '10px 0 11px', borderRadius: 0, border: 'none', borderBottom: active ? '2px solid #315efb' : '2px solid transparent', background: 'transparent', color: active ? '#315efb' : '#667085', cursor: 'pointer', fontSize: 14, fontWeight: 700 }),
-    grid: { display: 'grid', gridTemplateColumns: 'minmax(280px, 0.8fr) minmax(420px, 1.2fr)', gap: 16 },
+    grid: { display: 'grid', gridTemplateColumns: 'minmax(280px, 0.8fr) minmax(420px, 1.2fr)', gap: 16, minWidth: 0, maxWidth: '100%' },
     sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 },
     sectionTitle: { margin: 0, fontSize: 18 },
     btn: { background: '#315efb', color: '#fff', border: 'none', padding: '9px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 700 },
@@ -63,7 +63,7 @@ const S = {
     statusChipLabel: { color: '#667085', fontSize: 12, fontWeight: 700 },
     statusChipValue: { fontSize: 14, fontWeight: 700 },
     linkStrong: { color: '#315efb', fontWeight: 700, textDecoration: 'none' },
-    flameGraphBox: { minHeight: 280, overflowX: 'auto', border: '1px solid #edf0f3', borderRadius: 6, background: '#fbfcfe', padding: 8 },
+    flameGraphBox: { width: '100%', minWidth: 0, maxWidth: '100%', minHeight: 280, overflowX: 'auto', border: '1px solid #edf0f3', borderRadius: 6, background: '#fbfcfe', padding: 8 },
     fallbackTitle: { margin: '12px 0 8px', color: '#475467', fontSize: 12, fontWeight: 700 },
     flameWrap: { display: 'grid', gap: 8 },
     flameRow: { display: 'grid', gridTemplateColumns: 'minmax(140px, 220px) minmax(0, 1fr) 86px', gap: 10, alignItems: 'center', fontSize: 13 },
@@ -675,6 +675,7 @@ function MiniTaskList({ tasks: taskItems }) {
 function TaskTable({ tasks: taskItems, compact = false }) {
     if (taskItems.length === 0) return <div style={S.empty}>没有匹配的任务</div>;
     return (
+        <div className="table-scroll">
         <table style={S.table}>
             <thead>
                 <tr>
@@ -699,6 +700,7 @@ function TaskTable({ tasks: taskItems, compact = false }) {
                 ))}
             </tbody>
         </table>
+        </div>
     );
 }
 
@@ -709,6 +711,7 @@ function TopNTable({ data, loading, compact = false, profileURL }) {
         return <ProfileEmptyState profileURL={profileURL} compact={compact} />;
     }
     return (
+        <div className="table-scroll">
         <table style={S.table}>
             <thead>
                 <tr>
@@ -727,6 +730,7 @@ function TopNTable({ data, loading, compact = false, profileURL }) {
                 ))}
             </tbody>
         </table>
+        </div>
     );
 }
 

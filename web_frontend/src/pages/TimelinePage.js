@@ -11,8 +11,8 @@ import TimelineChart, { statusColor } from '../components/TimelineChart';
 import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
 
 const S = {
-    container: { maxWidth: 1200, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
-    card: { background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
+    container: { width: '100%', maxWidth: 1200, minWidth: 0, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
     btn: { background: '#4a6cf7', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontSize: 13 },
     btnSm: { background: '#e0e0e0', color: '#333', border: 'none', padding: '4px 10px', borderRadius: 4, cursor: 'pointer', fontSize: 12, marginRight: 6 },
     input: { padding: '7px 10px', border: '1px solid #ddd', borderRadius: 6, fontSize: 13, marginBottom: 12, boxSizing: 'border-box' },
