@@ -27,6 +27,27 @@ var (
 
 var continuousDefaultSignals = []string{"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"}
 
+func normalizeContinuousRequestedSignals(signals []string) []string {
+	allowed := map[string]bool{}
+	for _, signal := range continuousDefaultSignals {
+		allowed[signal] = true
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(signals))
+	for _, signal := range signals {
+		signal = strings.ToLower(strings.TrimSpace(signal))
+		if !allowed[signal] || seen[signal] {
+			continue
+		}
+		seen[signal] = true
+		out = append(out, signal)
+	}
+	if len(out) == 0 {
+		return append([]string(nil), continuousDefaultSignals...)
+	}
+	return out
+}
+
 type continuousProcessReport struct {
 	PID            int    `json:"pid"`
 	ProcessStartMs int64  `json:"process_start_ms"`

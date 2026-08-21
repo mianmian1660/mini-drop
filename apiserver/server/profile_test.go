@@ -596,8 +596,11 @@ func TestLegacyInternalContinuousCreateIsDisabledAndHistoricalSystemSessionIsRea
 	if topResp.Data.Empty || topResp.Data.Total != 7 || len(topResp.Data.Items) == 0 {
 		t.Fatalf("ordinary user should read system topn: %+v", topResp.Data)
 	}
-	if !strings.HasPrefix(topResp.Data.ProfileURL, "/api/v1/continuous/raw?key=") || strings.Contains(topResp.Data.ProfileURL, "localhost") {
-		t.Fatalf("profile_url should be same-origin, got %q", topResp.Data.ProfileURL)
+	if !strings.HasPrefix(topResp.Data.ProfileURL, "/profiles?") || !strings.Contains(topResp.Data.ProfileURL, "target_id=10.0.0.10%3Ahotmethod") || !strings.Contains(topResp.Data.ProfileURL, "from=") || !strings.Contains(topResp.Data.ProfileURL, "to=") {
+		t.Fatalf("profile_url should preserve the visual query context, got %q", topResp.Data.ProfileURL)
+	}
+	if !strings.HasPrefix(topResp.Data.RawProfileURL, "/api/v1/continuous/raw?key=") || strings.Contains(topResp.Data.RawProfileURL, "localhost") {
+		t.Fatalf("raw_profile_url should be same-origin raw endpoint, got %q", topResp.Data.RawProfileURL)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/flamegraph?target_id=10.0.0.10:hotmethod"+queryRange, nil)
@@ -617,7 +620,7 @@ func TestLegacyInternalContinuousCreateIsDisabledAndHistoricalSystemSessionIsRea
 		t.Fatalf("ordinary user should read system flamegraph: %+v", flameResp.Data)
 	}
 
-	req = httptest.NewRequest(http.MethodGet, topResp.Data.ProfileURL, nil)
+	req = httptest.NewRequest(http.MethodGet, topResp.Data.RawProfileURL, nil)
 	req.Header.Set("Drop-User-Uid", "user-demo")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)

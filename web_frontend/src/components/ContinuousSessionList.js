@@ -13,6 +13,7 @@ const S = {
     input: { minWidth: 220, flex: '1 1 240px', height: 36, padding: '7px 10px', boxSizing: 'border-box', border: '1px solid #d0d5dd', borderRadius: 6, fontSize: 13 },
     select: { height: 36, padding: '7px 10px', border: '1px solid #d0d5dd', borderRadius: 6, background: '#fff', fontSize: 13 },
     button: { height: 36, padding: '0 12px', color: '#315efb', background: '#fff', border: '1px solid #c7d2fe', borderRadius: 6, fontWeight: 700, cursor: 'pointer' },
+    dangerButton: { height: 36, padding: '0 12px', color: '#b42318', background: '#fff', border: '1px solid #fda29b', borderRadius: 6, fontWeight: 700, cursor: 'pointer' },
     tableWrap: { width: '100%', minWidth: 0, maxWidth: '100%', overflowX: 'auto', overflowY: 'hidden' },
     table: { width: '100%', borderCollapse: 'collapse', minWidth: 920 },
     th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d5dd', color: '#475467', background: '#f8fafc', fontSize: 12, whiteSpace: 'nowrap' },
@@ -45,6 +46,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [scope, setScope] = useState('');
     const [ownerFilter, setOwnerFilter] = useState('all');
     const [stopping, setStopping] = useState('');
+    const [cleaning, setCleaning] = useState(false);
     const requestSequence = useRef(0);
 
     const load = useCallback(async (silent = false) => {
@@ -100,6 +102,42 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         }
     };
 
+    const cleanableSessions = sessions.filter(isCleanableTestSession);
+    const cleanupTestSessions = async () => {
+        if (cleanableSessions.length === 0 || cleaning) return;
+        const names = cleanableSessions.map(session => session.name).join('、');
+        if (!window.confirm(`将清理本页 ${cleanableSessions.length} 个已停止、无样本测试任务：${names}。继续吗？`)) return;
+        setCleaning(true);
+        setError('');
+        try {
+            for (const session of cleanableSessions) {
+                const response = await continuous.deleteSession(session.sid);
+                if (response.code !== 0) throw new Error(response.message || `清理 ${session.name} 失败`);
+            }
+            await load();
+        } catch (err) {
+            setError(err?.response?.data?.message || err?.message || '清理测试任务失败');
+        } finally {
+            setCleaning(false);
+        }
+    };
+
+    const cleanupOne = async session => {
+        if (cleaning || !isCleanableTestSession(session)) return;
+        if (!window.confirm(`确认清理测试任务“${session.name}”？仅删除已停止且无样本任务。`)) return;
+        setCleaning(true);
+        setError('');
+        try {
+            const response = await continuous.deleteSession(session.sid);
+            if (response.code !== 0) throw new Error(response.message || '清理测试任务失败');
+            await load();
+        } catch (err) {
+            setError(err?.response?.data?.message || err?.message || '清理测试任务失败');
+        } finally {
+            setCleaning(false);
+        }
+    };
+
     const degradedCount = sessions.filter(session => session.continuity_mode === 'degraded' && session.desired_state === 'running').length;
     const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
     return <section style={S.card}>
@@ -113,24 +151,27 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 <select style={S.select} value={scope} onChange={event => { setScope(event.target.value); setPage(1); }}><option value="">全部范围</option><option value="host">整机</option><option value="process">进程</option></select>
                 <select aria-label="持续采集归属筛选" style={S.select} value={ownerFilter} onChange={event => { setOwnerFilter(event.target.value); setPage(1); }}><option value="all">全部创建者</option><option value="mine">我创建的</option></select>
             </div>
-            <button style={S.button} onClick={() => load()} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {cleanableSessions.length > 0 && <button style={S.dangerButton} onClick={cleanupTestSessions} disabled={cleaning}>{cleaning ? '清理中...' : `清理测试残留（${cleanableSessions.length}）`}</button>}
+                <button style={S.button} onClick={() => load()} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
+            </div>
         </div>
         {loading ? <div style={S.empty}>正在加载持续采集任务...</div> : sessions.length === 0 ? <div style={S.empty}>{total ? '当前页暂无持续采集任务' : '暂无匹配的持续采集任务。'}</div> : <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
-            <thead><tr><th style={S.th}>名称</th><th style={S.th}>范围与目标</th><th style={S.th}>状态</th><th style={S.th}>信号</th><th style={S.th}>最近数据</th><th style={S.th}>持续时间 / 创建人</th><th style={S.th}>操作</th></tr></thead>
+            <thead><tr><th style={S.th}>名称</th><th style={S.th}>范围与目标</th><th style={S.th}>状态</th><th style={S.th}>信号</th><th style={S.th}>最近上传</th><th style={S.th}>持续时间 / 创建人</th><th style={S.th}>操作</th></tr></thead>
             <tbody>{sessions.map(session => {
                 const state = session.observed_state || 'pending';
                 const [background, color] = continuousStateColor(state);
-                const signals = decodeJSONField(session.signals, ['cpu_profile', 'io_latency', 'io_syscall_latency', 'sched_latency']);
+                const signals = decodeJSONField(session.signals, ['cpu_profile']);
                 const active = decodeJSONField(session.active_processes, []);
                 const running = session.desired_state === 'running';
                 return <tr key={session.sid}>
                     <td style={S.td}><div style={S.name}>{session.name}</div><span style={S.subtle}>{shortSID(session.sid)}</span></td>
-                    <td style={S.td}>{normalizedScope(session) === 'process' ? <><strong>进程 · {active.length} 个活动实例</strong><div style={S.mono} title={session.selector_exe}>{session.selector_exe}</div></> : <strong>整机</strong>}</td>
+                    <td style={S.td}>{normalizedScope(session) === 'process' ? <><strong>进程 · {active.length} 个活动实例</strong><div style={S.mono} title={session.selector_exe}>{session.selector_exe}</div></> : <strong>整机</strong>}<div style={S.subtle}>样本 {formatCount(session.sample_count)}</div></td>
                     <td style={S.td}><span style={{ ...S.badge, background, color }}>{continuousStateLabel(state)}</span>{session.continuity_mode === 'degraded' && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }}>降级连续性</div>}</td>
                     <td style={S.td}><div style={S.chips}>{signals.map(signal => <span key={signal} style={S.chip}>{signalLabel(signal)}</span>)}</div></td>
                     <td style={S.td}>{formatRelativeTime(session.last_upload_at)}</td>
                     <td style={S.td}>{duration(session.started_at, session.stopped_at)}<div style={S.subtle}>{session.user_name || 'system'}</div></td>
-                    <td style={S.td}><Link style={S.link} to={`/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(session.sid)}`}>查看</Link>{running && session.can_manage && <button style={S.stop} disabled={stopping === session.sid} onClick={() => stop(session)}>{stopping === session.sid ? '停止中' : '停止'}</button>}</td>
+                    <td style={S.td}><Link style={S.link} to={`/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(session.sid)}`}>查看</Link>{running && session.can_manage && <button style={S.stop} disabled={stopping === session.sid} onClick={() => stop(session)}>{stopping === session.sid ? '停止中' : '停止'}</button>}{isCleanableTestSession(session) && <button style={S.stop} disabled={cleaning} onClick={() => cleanupOne(session)}>清理</button>}</td>
                 </tr>;
             })}</tbody>
         </table></div>}
@@ -144,6 +185,19 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
 
 function normalizedScope(session) { return session.scope === 'process' ? 'process' : 'host'; }
 function shortSID(value) { return String(value || '').length > 18 ? `${value.slice(0, 10)}...${value.slice(-4)}` : value; }
+function formatCount(value) {
+    const count = Number(value) || 0;
+    if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
+    if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
+    return String(Math.round(count));
+}
+function isCleanableTestSession(session) {
+    const state = session?.observed_state || '';
+    const desired = session?.desired_state || '';
+    const name = String(session?.name || '').toLowerCase();
+    const marker = ['boundary-', 'multilang-', 'test', 'smoke', '测试'].some(value => name.includes(value));
+    return marker && desired === 'stopped' && ['stopped', 'error'].includes(state) && Number(session?.sample_count || 0) === 0 && session?.can_manage;
+}
 function duration(start, end) {
     const from = new Date(start).getTime();
     const to = end ? new Date(end).getTime() : Date.now();

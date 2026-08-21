@@ -141,6 +141,7 @@ export default function App() {
                 <Route path="/" element={<HomePage />} />
                 <Route path="/hosts/:targetId" element={<HostDetailPage />} />
 				<Route path="/hosts/:targetId/continuous/:sid" element={<ContinuousSessionDetailPage />} />
+				<Route path="/continuous/sessions/:sid" element={<ContinuousSessionDetailPage />} />
                 <Route path="/tasks" element={<TaskListPage />} />
                 <Route path="/profiles" element={<ProfilesPage />} />
                 <Route path="/task/result" element={<TaskResultPage />} />

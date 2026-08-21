@@ -38,16 +38,20 @@ test('process creation follows all exe instances and requires degraded confirmat
     expect(container.textContent).toContain('跟随该 exe 的全部实例');
     expect(container.textContent).toContain('2 个实例');
     expect(container.textContent).toContain('我已了解并允许降级运行');
+    expect(container.textContent).toContain('采集信号');
 
     const name = container.querySelector('input[placeholder="例如：API 服务持续剖析"]');
     const exe = container.querySelector('input[type="radio"]');
-    const confirmation = container.querySelector('input[type="checkbox"]');
+    const checkboxes = Array.from(container.querySelectorAll('input[type="checkbox"]'));
+    const signalCheckboxes = checkboxes.slice(0, 4);
+    const confirmation = checkboxes[4];
     const submit = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '创建并开始采集');
     act(() => {
         Simulate.change(name, { target: { value: 'API 服务' } });
         Simulate.change(exe, { target: { checked: true } });
     });
     expect(submit.disabled).toBe(true);
+    act(() => Simulate.change(signalCheckboxes[1], { target: { checked: true } }));
     act(() => Simulate.change(confirmation, { target: { checked: true } }));
     expect(submit.disabled).toBe(false);
 
@@ -57,6 +61,7 @@ test('process creation follows all exe instances and requires degraded confirmat
         scope: 'process',
         selector_exe: '/opt/api',
         selector_mode: 'all_instances',
+        signals: expect.arrayContaining(['cpu_profile', 'io_latency']),
         allow_degraded: true,
     }));
     expect(onSuccess).toHaveBeenCalledWith({ sid: 'cps-new' });

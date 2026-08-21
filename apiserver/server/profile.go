@@ -141,6 +141,7 @@ type ProfileFlamegraph struct {
 	Source             string                              `json:"source"`
 	ProfileSource      string                              `json:"profile_source"`
 	ProfileURL         string                              `json:"profile_url,omitempty"`
+	RawProfileURL      string                              `json:"raw_profile_url,omitempty"`
 	Query              string                              `json:"query,omitempty"`
 	SymbolStatus       string                              `json:"symbol_status,omitempty"`
 	SymbolDiagnostics  ProfileSymbolDiagnostics            `json:"symbol_diagnostics"`
@@ -154,10 +155,14 @@ type ProfileFlamegraph struct {
 }
 
 type ProfileTopItem struct {
-	Name  string  `json:"name"`
-	Value float64 `json:"value"`
-	Self  float64 `json:"self"`
-	Unit  string  `json:"unit"`
+	Name        string  `json:"name"`
+	DisplayName string  `json:"display_name,omitempty"`
+	Value       float64 `json:"value"`
+	Self        float64 `json:"self"`
+	Percent     float64 `json:"percent,omitempty"`
+	SelfPercent float64 `json:"self_percent,omitempty"`
+	Unresolved  bool    `json:"unresolved,omitempty"`
+	Unit        string  `json:"unit"`
 }
 
 type ProfileTopN struct {
@@ -170,6 +175,7 @@ type ProfileTopN struct {
 	Source             string                              `json:"source"`
 	ProfileSource      string                              `json:"profile_source"`
 	ProfileURL         string                              `json:"profile_url,omitempty"`
+	RawProfileURL      string                              `json:"raw_profile_url,omitempty"`
 	Query              string                              `json:"query,omitempty"`
 	SymbolStatus       string                              `json:"symbol_status,omitempty"`
 	SymbolDiagnostics  ProfileSymbolDiagnostics            `json:"symbol_diagnostics"`

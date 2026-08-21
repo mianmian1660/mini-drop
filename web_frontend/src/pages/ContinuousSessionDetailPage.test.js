@@ -20,6 +20,10 @@ jest.mock('../components/ContinuousProfilingPanel', () => ({
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
+beforeEach(() => {
+    jest.clearAllMocks();
+});
+
 test('detail route binds the SID to its host and exposes the stopping flow', async () => {
     profiles.targets.mockResolvedValue({ code: 0, data: { targets: [{ id: 'target-1', ip: '10.0.0.8', hostname: 'node' }] } });
     continuous.detail.mockResolvedValue({
@@ -46,11 +50,43 @@ test('detail route binds the SID to its host and exposes the stopping flow', asy
     await act(async () => { await Promise.resolve(); });
 
     expect(container.textContent).toContain('API');
-    expect(container.textContent).toContain('PID 42');
+    expect(container.textContent).toContain('活动实例');
+    const instanceDetails = Array.from(container.querySelectorAll('details')).find(details => details.textContent.includes('进程实例明细'));
+    expect(instanceDetails).not.toBeNull();
+    expect(instanceDetails.open).toBe(false);
+    expect(instanceDetails.textContent).toContain('PID 42');
     expect(container.querySelector('[data-testid="profiling-panel"]').textContent).toBe('cps-api');
     const stop = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '停止持续采集');
     await act(async () => Simulate.click(stop));
     expect(continuous.stopSession).toHaveBeenCalledWith('cps-api');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('legacy continuous session route resolves the host from session target ip', async () => {
+    profiles.targets.mockResolvedValue({ code: 0, data: { targets: [{ id: 'target-1', ip: '10.0.0.8', hostname: 'node' }] } });
+    continuous.detail.mockResolvedValue({
+        code: 0,
+        data: {
+            session: {
+                sid: 'cps-api', name: 'API', target_ip: '10.0.0.8', scope: 'host',
+                desired_state: 'running', observed_state: 'running', continuity_mode: 'strict',
+            },
+        },
+    });
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<MemoryRouter initialEntries={['/continuous/sessions/cps-api']}>
+            <Routes><Route path="/continuous/sessions/:sid" element={<ContinuousSessionDetailPage />} /></Routes>
+        </MemoryRouter>);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(container.textContent).toContain('API');
+    expect(container.querySelector('[data-testid="profiling-panel"]').textContent).toBe('cps-api');
 
     act(() => root.unmount());
     container.remove();

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { continuous } from '../api';
-import { CONTINUOUS_SIGNALS, formatBytes, signalLabel } from '../utils/continuous';
+import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, formatBytes, signalLabel } from '../utils/continuous';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(16,24,40,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
@@ -41,6 +41,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
     const [loading, setLoading] = useState(true);
     const [submitting, setSubmitting] = useState(false);
     const [allowDegraded, setAllowDegraded] = useState(false);
+    const [selectedSignals, setSelectedSignals] = useState(DEFAULT_CONTINUOUS_SIGNALS);
     const [error, setError] = useState('');
     const [sampleRate, setSampleRate] = useState(19);
     const [aggregationWindow, setAggregationWindow] = useState(10);
@@ -86,8 +87,18 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
         && Number(aggregationWindow) >= 5 && Number(aggregationWindow) <= 300
         && Number(uploadBatch) >= Number(aggregationWindow) && Number(uploadBatch) <= 3600
         && Number(retentionHours) >= 1 && Number(retentionHours) <= 720;
-    const valid = agentFresh && numericSettingsValid && name.trim() && (scope === 'host' || selectedExe)
+    const valid = agentFresh && numericSettingsValid && name.trim() && selectedSignals.length > 0 && (scope === 'host' || selectedExe)
         && (!needsDegradedConfirmation || allowDegraded);
+
+    const toggleSignal = useCallback((signal) => {
+        setSelectedSignals(current => {
+            if (current.includes(signal)) {
+                const next = current.filter(item => item !== signal);
+                return next.length > 0 ? next : current;
+            }
+            return [...current, signal];
+        });
+    }, []);
 
     const submit = async () => {
         if (!valid || submitting) return;
@@ -98,7 +109,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
             const response = await continuous.createSession({
                 name: name.trim(), target_ip: target.ip, hostname: target.hostname || '', service_name: target.service_name || 'hotmethod',
                 scope, selector_exe: scope === 'process' ? selectedExe : '', selector_mode: 'all_instances',
-                signals: CONTINUOUS_SIGNALS, continuity_mode: 'strict', allow_degraded: allowDegraded,
+                signals: selectedSignals, continuity_mode: 'strict', allow_degraded: allowDegraded,
                 sample_rate_hz: Number(sampleRate), aggregation_window_sec: Number(aggregationWindow),
                 upload_batch_sec: Number(uploadBatch), retention_hours: Number(retentionHours),
             });
@@ -148,7 +159,22 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                 </div>
             </div>}
 
-            <div style={S.section}><label style={S.label}>采集信号</label><div style={S.chips}>{CONTINUOUS_SIGNALS.map(signal => <span key={signal} style={S.chip}>{signalLabel(signal)}</span>)}</div></div>
+            <div style={S.section}>
+                <label style={S.label}>采集信号 *</label>
+                <div style={{ display: 'grid', gap: 8 }}>
+                    {CONTINUOUS_SIGNALS.map(signal => (
+                        <label key={signal} style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, color: '#344054', fontWeight: 700 }}>
+                            <input
+                                type="checkbox"
+                                checked={selectedSignals.includes(signal)}
+                                onChange={() => toggleSignal(signal)}
+                            />
+                            <span>{signalLabel(signal)}</span>
+                        </label>
+                    ))}
+                </div>
+                <div style={{ ...S.subtle, marginTop: 8 }}>只会创建你勾选的信号；CPU 是最常用的默认项。</div>
+            </div>
 
             <details style={S.section}>
                 <summary style={{ cursor: 'pointer', color: '#344054', fontSize: 13, fontWeight: 700 }}>高级设置</summary>

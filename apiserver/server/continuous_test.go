@@ -37,6 +37,19 @@ func TestContinuousTimelineCoverageUsesFiveSecondTolerance(t *testing.T) {
 	}
 }
 
+func TestContinuousTopFrameKeyGroupsUnresolvedModuleAddresses(t *testing.T) {
+	key, display, unresolved := continuousTopFrameKey("0x57f4c5123456 [postgres]")
+	if !unresolved || key != "[未解析] postgres" || display != "[未解析] postgres" {
+		t.Fatalf("unexpected unresolved frame grouping: key=%q display=%q unresolved=%v", key, display, unresolved)
+	}
+
+	item := &ProfileTopItem{Name: key, DisplayName: display, Value: 2, Self: 1, Unit: "samples", Unresolved: unresolved}
+	continuousFinalizeTopItem(item, 4)
+	if item.Percent != 50 || item.SelfPercent != 25 {
+		t.Fatalf("unexpected top percentages: %+v", item)
+	}
+}
+
 func TestContinuousAgentClockClassification(t *testing.T) {
 	received := time.UnixMilli(100_000)
 	for _, tc := range []struct {

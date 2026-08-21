@@ -1,6 +1,21 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { act } from 'react-dom/test-utils';
+import { act, Simulate } from 'react-dom/test-utils';
+
+jest.mock('../api', () => ({
+    continuous: {
+        timeline: jest.fn(),
+        histogram: jest.fn(),
+    },
+    profiles: {
+        flamegraph: jest.fn(),
+        topn: jest.fn(),
+        diff: jest.fn(),
+        labelValues: jest.fn(),
+        timeseries: jest.fn(),
+        heapTasks: jest.fn(),
+    },
+}));
 
 jest.mock('./InteractiveFlamegraph', () => ({
     __esModule: true,
@@ -9,20 +24,36 @@ jest.mock('./InteractiveFlamegraph', () => ({
 }));
 
 import {
+    default as ContinuousProfilingPanel,
+    CoverageBand,
+    coverageAlertForReliability,
     DiagnosticDetails,
+    TopNTable,
+    HistogramPanel,
+    customInputsToSlider,
     diagnosticText,
     formatDiagnosticJSON,
     makeSequentialDiffWindows,
     makeTimeWindow,
     coverageSegments,
     instanceFilters,
-	processInstanceOptions,
+    processInstanceOptions,
     rangeOptionsForRetention,
+    sampledProcessInstanceOptions,
+    diffWindowsFromMinutes,
+    normalizeEvenSpan,
+    sequentialDiffWindowsFromStart,
+    sliderMinutesToInputs,
     runtimeLabel,
     validateCustomTimeWindow,
 } from './ContinuousProfilingPanel';
+import { continuous, profiles } from '../api';
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
+
+beforeEach(() => {
+    jest.clearAllMocks();
+});
 
 test('diagnostic JSON uses two-space indentation for nested values', () => {
     expect(formatDiagnosticJSON({ outer: { enabled: true } })).toBe([
@@ -73,6 +104,78 @@ test('diagnostic block exposes bounded wrapping styles and formatted fields', ()
     container.remove();
 });
 
+test('TopN table labels cumulative and self columns with percentages', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<TopNTable data={{
+            unit: 'samples',
+            total: 4,
+            items: [{ name: '0x57f4 [postgres]', display_name: '[未解析] postgres', value: 2, self: 1, percent: 50, self_percent: 25, unresolved: true, unit: 'samples' }],
+        }} />);
+    });
+
+    expect(container.textContent).toContain('累计占比');
+    expect(container.textContent).toContain('自身占比');
+    expect(container.textContent).toContain('[未解析] postgres');
+    expect(container.textContent).toContain('50.0%');
+    expect(container.textContent).toContain('25.0%');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('TopN loading state does not render an empty no-sample message first', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<TopNTable loading />);
+    });
+
+    expect(container.textContent).toContain('正在查询 TopN');
+    expect(container.textContent).not.toContain('暂无热点函数');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('Histogram table renders visible distribution bars and Chinese event counts', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<HistogramPanel title="块 IO 延迟" data={{
+            source: 'mini-drop-native',
+            backend: 'ebpf',
+            unit: 'us',
+            event_count: 897,
+            summary: { p50: 512, p95: 2048, p99: 4096 },
+            buckets: [
+                { range: '[256, 512)', count: 162 },
+                { range: '[512, 1024)', count: 465 },
+            ],
+            trend: [{ window_start: '2026-08-21T12:00:00Z', p50: 512, p95: 2048, p99: 4096, event_count: 162 }],
+        }} />);
+    });
+
+    expect(container.textContent).toContain('延迟桶');
+    expect(container.textContent).toContain('分布');
+    expect(container.textContent).toContain('事件数');
+    expect(container.textContent).toContain('总事件 897 个');
+    expect(container.textContent).toContain('897 个');
+    expect(container.textContent).toContain('162 个');
+    expect(container.textContent).not.toContain('samples events');
+    const bars = container.querySelectorAll('[data-testid="histogram-bar"]');
+    expect(bars.length).toBe(2);
+    expect(parseFloat(bars[0].style.width)).toBeGreaterThan(0);
+    expect(bars[1].style.width).toBe('100%');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
 test('process instance filters keep PID reuse identities separate', () => {
     expect(instanceFilters('42|1724160000123')).toEqual({ pid: '42', process_start_ms: '1724160000123' });
     expect(instanceFilters('42')).toEqual({});
@@ -88,6 +191,17 @@ test('process instance options retain historical PID identities after restart', 
 		{ value: '77|1724160000333', pid: 77, processStartMs: 1724160000333, active: false },
 		{ value: '42|1724160000111', pid: 42, processStartMs: 1724160000111, active: false },
 	]);
+});
+
+test('sampled process instance options only expose instances with samples', () => {
+    const options = sampledProcessInstanceOptions(
+        [{ pid: 42, process_start_ms: 1724160000222 }, { pid: 99, process_start_ms: 1724160000999 }],
+        ['42|1724160000222', '77|1724160000333'],
+    );
+    expect(options).toEqual([
+        { value: '42|1724160000222', pid: 42, processStartMs: 1724160000222, active: true },
+        { value: '77|1724160000333', pid: 77, processStartMs: 1724160000333, active: false },
+    ]);
 });
 
 function toLocalInput(value) {
@@ -158,6 +272,21 @@ test('custom ranges enforce future and retention boundaries', () => {
     expect(expired.error).toContain('数据保留边界');
 });
 
+test('slider minute helpers preserve selected windows inside retention', () => {
+    const now = new Date('2026-08-19T12:00:00Z');
+    const inputs = sliderMinutesToInputs(60, 120, 24, now);
+    const slider = customInputsToSlider(inputs.fromInput, inputs.toInput, 24, now);
+    expect(slider.fromMinute).toBe(60);
+    expect(slider.toMinute).toBe(120);
+});
+
+test('slider helpers use the supplied anchor without drifting', () => {
+    const now = new Date('2026-08-19T12:00:00Z');
+    const first = sliderMinutesToInputs(60, 120, 24, now);
+    const second = sliderMinutesToInputs(60, 120, 24, now);
+    expect(first).toEqual(second);
+});
+
 test('diff quick windows are adjacent, equal, and filtered by total retention', () => {
     const windows = makeSequentialDiffWindows('15m', new Date('2026-08-19T12:00:00Z'));
     expect(windows.baseWindow.to).toBe(windows.compareWindow.from);
@@ -167,4 +296,118 @@ test('diff quick windows are adjacent, equal, and filtered by total retention', 
     expect(rangeOptionsForRetention(24).map(([value]) => value)).toContain('24h');
     expect(rangeOptionsForRetention(24, true).map(([value]) => value)).toContain('12h');
     expect(rangeOptionsForRetention(24, true).map(([value]) => value)).not.toContain('24h');
+});
+
+test('diff slider windows remain adjacent and equal length', () => {
+    const bounds = { from: new Date('2026-08-19T10:00:00Z'), to: new Date('2026-08-19T12:00:00Z') };
+    const windows = sequentialDiffWindowsFromStart(30, 15, bounds);
+    expect(windows.baseWindow.to).toBe(windows.compareWindow.from);
+    expect(new Date(windows.baseWindow.to) - new Date(windows.baseWindow.from)).toBe(15 * 60 * 1000);
+    expect(new Date(windows.compareWindow.to) - new Date(windows.compareWindow.from)).toBe(15 * 60 * 1000);
+});
+
+test('diff window range normalizes to adjacent equal halves', () => {
+    const bounds = { from: new Date('2026-08-19T10:00:00Z'), to: new Date('2026-08-19T12:00:00Z') };
+    const normalized = normalizeEvenSpan(11, 46, 120);
+    expect((normalized.toMinute - normalized.fromMinute) % 2).toBe(0);
+    const windows = diffWindowsFromMinutes(11, 46, bounds);
+    expect(windows.baseWindow.to).toBe(windows.compareWindow.from);
+    expect(new Date(windows.baseWindow.to) - new Date(windows.baseWindow.from))
+        .toBe(new Date(windows.compareWindow.to) - new Date(windows.compareWindow.from));
+});
+
+test('coverage bar hover reveals segment details', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<CoverageBand reliability={{
+            coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.8 },
+            gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z' }],
+        }} />);
+    });
+    const gap = container.querySelector('[data-testid="coverage-gap"]');
+    expect(gap).not.toBeNull();
+    act(() => Simulate.mouseEnter(gap));
+    act(() => Simulate.mouseMove(gap));
+    expect(container.textContent).toContain('采集缺口');
+    expect(container.textContent).toContain('该时段无样本或存在上传空档');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('coverage alert summarizes large gaps clearly', () => {
+    const alert = coverageAlertForReliability({
+        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.8 },
+        gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z', duration_seconds: 120 }],
+    });
+    expect(alert.summary).toContain('覆盖 80.0%');
+    expect(alert.summary).toContain('最长 2.0 分钟');
+    expect(alert.detail).toContain('累计缺口');
+});
+
+test('stable target fields prevent parent polling from re-querying profiles', async () => {
+    profiles.flamegraph.mockResolvedValue({ code: 0, data: { nodes: [], empty: true } });
+    profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
+    continuous.timeline.mockResolvedValue({ code: 0, data: null });
+
+    const session = {
+        sid: 'cps-api',
+        name: 'API',
+        scope: 'host',
+        observed_state: 'running',
+        desired_state: 'running',
+        retention_hours: 24,
+    };
+    const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+    expect(profiles.flamegraph).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+        root.render(<ContinuousProfilingPanel target={{ ...target }} fixedSession={{ ...session, last_upload_at: '2026-08-19T12:00:00Z' }} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+    expect(profiles.flamegraph).toHaveBeenCalledTimes(1);
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('session signal tabs only show signals configured on the session', async () => {
+    profiles.flamegraph.mockResolvedValue({ code: 0, data: { nodes: [], empty: true } });
+    profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
+    continuous.timeline.mockResolvedValue({ code: 0, data: null });
+
+    const session = {
+        sid: 'cps-cpu',
+        name: 'CPU only',
+        scope: 'host',
+        observed_state: 'running',
+        desired_state: 'running',
+        signals: ['cpu_profile'],
+    };
+    const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(container.textContent).toContain('CPU');
+    expect(container.textContent).not.toContain('块 IO');
+    expect(container.textContent).not.toContain('系统调用 IO');
+    expect(container.textContent).not.toContain('调度延迟');
+
+    act(() => root.unmount());
+    container.remove();
 });

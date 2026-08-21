@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -101,6 +102,18 @@ func TestCreateContinuousSessionRequiresDegradedConfirmation(t *testing.T) {
 	}
 	if !first.AllowDegraded {
 		t.Fatalf("confirmed fallback policy was not persisted: %+v", first)
+	}
+}
+
+func TestNormalizeContinuousRequestedSignalsPreservesSelection(t *testing.T) {
+	got := normalizeContinuousRequestedSignals([]string{"cpu_profile", "io_latency", "cpu_profile", "unsupported"})
+	want := []string{"cpu_profile", "io_latency"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized signals=%v, want %v", got, want)
+	}
+	got = normalizeContinuousRequestedSignals(nil)
+	if !reflect.DeepEqual(got, continuousDefaultSignals) {
+		t.Fatalf("empty signals=%v, want defaults %v", got, continuousDefaultSignals)
 	}
 }
 
