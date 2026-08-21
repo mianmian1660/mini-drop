@@ -3048,6 +3048,217 @@ void DualTrackContinuousSampler::Loop()
     run_continuous_spool_loop(running_, config_, collect_dual_track_window);
 }
 
+// ---------- DBSnapshotSampler：阶段一（标量健康指标） ----------
+// 借鉴 mysqld_exporter/postgres_exporter 的采集口径（查哪些系统视图能反映
+// 数据库健康度），但不复用它们的代码/二进制：自己拼查询、自己解析输出、
+// 自己决定窗口聚合方式。阶段二会在这个函数里追加 digest/锁查询，复用同一
+// 个连接建立/超时熔断骨架，不是另起一套。
+
+// 密码只在真正发起查询前，从 target.passwordRef 指向的本机文件读取，
+// 从不经服务端 Labels 明文中转、不落 Postgres——与 AgentDiscoveryConfig
+// 现有的"不存密码"约定一致。
+static bool read_db_target_password(const DBTargetConfig &target, std::string *password)
+{
+    if (target.passwordRef.empty())
+    {
+        password->clear();
+        return true;
+    }
+    std::string body;
+    if (!read_file(target.passwordRef, &body))
+        return false;
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r'))
+        body.pop_back();
+    *password = body;
+    return true;
+}
+
+// mysql 客户端不接受把密码明文放进 argv（会出现在 `ps`），标准做法是写一个
+// 0600 的 --defaults-extra-file 临时文件，用完立即删除。
+static bool write_mysql_defaults_file(const std::string &path, const std::string &user, const std::string &password)
+{
+    std::ostringstream body;
+    body << "[client]\nuser=" << user << "\npassword=" << password << "\n";
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+        return false;
+    const std::string content = body.str();
+    size_t written = 0;
+    bool ok = true;
+    while (written < content.size())
+    {
+        ssize_t count = ::write(fd, content.data() + written, content.size() - written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+        {
+            ok = false;
+            break;
+        }
+        written += static_cast<size_t>(count);
+    }
+    ::close(fd);
+    return ok;
+}
+
+// 单个 MySQL 目标的一次标量指标轮询：SHOW GLOBAL STATUS 一次性拿全量
+// 计数器，本地过滤出关心的几项，换算成 MetricPayload。查询超时/失败只
+// 标记 unavailable，不能拖垮整个采集循环（沿用 HistogramPayload 已有的
+// unavailable/reason 模式）。
+static void collect_mysql_target_metrics(const ContinuousSamplerConfig &cfg, const DBTargetConfig &target,
+                                          WindowPayload *window)
+{
+    std::string password;
+    if (!read_db_target_password(target, &password))
+    {
+        std::cout << "[native-cp] db target=" << target.instanceLabel
+                  << " failed to read password_ref=" << target.passwordRef << std::endl;
+        return;
+    }
+    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
+    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+    {
+        std::cout << "[native-cp] db target=" << target.instanceLabel << " failed to stage mysql defaults file"
+                  << std::endl;
+        return;
+    }
+    std::vector<std::string> argv = {
+        "mysql", "--defaults-extra-file=" + defaultsPath,
+        "-h", target.host, "-P", std::to_string(target.port),
+        "--connect-timeout=2", "--batch", "--skip-column-names",
+        "-e", "SHOW GLOBAL STATUS"};
+    std::string output;
+    int rc = drop::exec_capture(argv, &output, 64 * 1024);
+    ::unlink(defaultsPath.c_str());
+    if (rc != 0)
+    {
+        std::cout << "[native-cp] db target=" << target.instanceLabel << " SHOW GLOBAL STATUS failed rc=" << rc
+                  << std::endl;
+        return;
+    }
+
+    std::unordered_map<std::string, uint64_t> status;
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos)
+            continue;
+        const std::string key = line.substr(0, tab);
+        const std::string value = line.substr(tab + 1);
+        char *end = nullptr;
+        uint64_t parsed = std::strtoull(value.c_str(), &end, 10);
+        if (end != value.c_str())
+            status[key] = parsed;
+    }
+
+    const int64_t nowMillis = now_ms();
+    auto pushMetric = [&](const std::string &name, uint64_t value, const std::string &unit) {
+        MetricPayload metric;
+        metric.metric = name;
+        metric.unit = unit;
+        metric.runtime = "mysql:" + target.instanceLabel;
+        metric.timestampMs = nowMillis;
+        metric.value = value;
+        window->metrics.push_back(std::move(metric));
+    };
+    if (status.count("Threads_connected"))
+        pushMetric("db_active_connections", status["Threads_connected"], "count");
+    if (status.count("Questions"))
+        pushMetric("db_questions_total", status["Questions"], "count");
+    if (status.count("Innodb_buffer_pool_read_requests") && status.count("Innodb_buffer_pool_reads"))
+    {
+        const uint64_t requests = status["Innodb_buffer_pool_read_requests"];
+        const uint64_t reads = status["Innodb_buffer_pool_reads"];
+        // 命中率放大 10000 倍存成整数（0~10000 代表 0%~100%），MetricPayload.value 是
+        // uint64_t，不支持小数；前端展示时按 /100.0 还原成百分比。
+        uint64_t hitRatioBps = requests == 0 ? 10000
+                                              : static_cast<uint64_t>(
+                                                    (1.0 - static_cast<double>(reads) / static_cast<double>(requests)) *
+                                                    10000.0);
+        pushMetric("db_innodb_buffer_pool_hit_ratio_bps", hitRatioBps, "ratio_bps");
+    }
+}
+
+static WindowPayload collect_db_window(const ContinuousSamplerConfig &cfg)
+{
+    WindowPayload window;
+    window.startMs = now_ms();
+    window.selectedBackend = "db_snapshot";
+    window.backendStatus = "ok";
+    for (const auto &target : cfg.dbTargets)
+    {
+        if (target.engine == "mysql")
+            collect_mysql_target_metrics(cfg, target, &window);
+        // PostgreSQL 标量指标 + 阶段二的 digest/锁查询在后续子任务补上，
+        // 这里先只覆盖 MySQL，架构上两者共用同一个 collect_db_window 入口。
+    }
+    window.endMs = now_ms();
+    return window;
+}
+
+DBSnapshotSampler::~DBSnapshotSampler()
+{
+    Stop();
+}
+
+std::string DBSnapshotSampler::Name() const
+{
+    return "db_snapshot";
+}
+
+bool DBSnapshotSampler::Start(const ContinuousSamplerConfig &config, std::string *error)
+{
+    if (config.aggregationWindowSec <= 0 || config.uploadBatchSec <= 0)
+    {
+        if (error)
+            *error = "invalid db snapshot sampler config";
+        return false;
+    }
+    if (config.sessionSID.empty() || config.apiBaseURL.empty() || config.authUID.empty())
+    {
+        if (error)
+            *error = "missing db snapshot session/api/auth config";
+        return false;
+    }
+    if (config.dbTargets.empty())
+    {
+        if (error)
+            *error = "db snapshot sampler started with no db targets";
+        return false;
+    }
+    if (!ensure_directory(session_spool_directory(config)))
+    {
+        if (error)
+            *error = "continuous spool directory is not writable";
+        return false;
+    }
+    if (running_.load())
+        return true;
+    config_ = config;
+    running_ = true;
+    worker_ = std::thread(&DBSnapshotSampler::Loop, this);
+    return true;
+}
+
+void DBSnapshotSampler::Stop()
+{
+    running_ = false;
+    if (worker_.joinable())
+        worker_.join();
+}
+
+bool DBSnapshotSampler::Running() const
+{
+    return running_.load();
+}
+
+void DBSnapshotSampler::Loop()
+{
+    run_continuous_spool_loop(running_, config_, collect_db_window);
+}
+
 namespace
 {
 

@@ -29,6 +29,23 @@ struct ContinuousTargetProcess
     std::string exe;
 };
 
+// 阶段一（标量健康指标，借鉴 mysqld_exporter/postgres_exporter 的采集口径）
+// 与阶段二（SQL digest/锁快照，借鉴 pg_stat_monitor/PMM 的聚合思路）共用同一个
+// target 描述：一个 DBSnapshotSampler 实例按 engine 区分查询集合，短连接、
+// 用完即断。密码不落这个结构体本身的持久化路径——passwordRef 只是本机文件
+// 路径，由采集器在真正发起查询前读取，不经服务端中转、不落 Postgres。
+struct DBTargetConfig
+{
+    std::string engine;        // "mysql" | "postgres"
+    std::string instanceLabel; // 用户在 session labels 里起的名字，用于多实例区分
+    std::string host;
+    int port = 0;
+    std::string user;
+    std::string passwordRef;      // agent 本机文件路径，指向密码
+    int pollIntervalSec = 10;     // 默认对齐 aggregationWindowSec
+    int queryTimeoutMs = 500;     // 单条查询超时熔断
+};
+
 struct ContinuousSamplerConfig
 {
     int sampleRateHz = 19;
@@ -49,6 +66,7 @@ struct ContinuousSamplerConfig
     std::string signals = "cpu,io,io_syscall,sched";
     bool allowDegraded = false;
     std::vector<ContinuousTargetProcess> targetProcesses;
+    std::vector<DBTargetConfig> dbTargets;
 };
 
 // Returns true only when this binary includes the libbpf loader and the
@@ -101,6 +119,29 @@ class DualTrackContinuousSampler : public Sampler
 {
 public:
     ~DualTrackContinuousSampler() override;
+    std::string Name() const override;
+    bool Start(const ContinuousSamplerConfig &config, std::string *error) override;
+    void Stop() override;
+    bool Running() const override;
+
+private:
+    void Loop();
+
+    std::atomic<bool> running_{false};
+    ContinuousSamplerConfig config_;
+    std::thread worker_;
+};
+
+// Polls database system views/expvars (config.dbTargets) instead of
+// perf_event/eBPF. Shares the same Sampler interface and the same
+// spool/retry/ACK pipeline as PerfEventSampler/DualTrackContinuousSampler
+// (both call run_continuous_spool_loop; this one does too), but is not a
+// perf/eBPF collector — kept as a sibling class rather than folded into
+// DualTrackContinuousSampler, whose `signals` set is perf/eBPF-specific.
+class DBSnapshotSampler : public Sampler
+{
+public:
+    ~DBSnapshotSampler() override;
     std::string Name() const override;
     bool Start(const ContinuousSamplerConfig &config, std::string *error) override;
     void Stop() override;
