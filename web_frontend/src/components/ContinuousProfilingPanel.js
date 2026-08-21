@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { continuous, profiles } from '../api';
 import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
 import { localDateTimeToISO } from '../utils/time';
+import { decodeJSONField } from '../utils/continuous';
 import {
     formatMetricValue,
     formatRawMetric,
@@ -74,7 +75,7 @@ const RANGE_OPTIONS = [
     ['24h', '最近 24 小时', 1440],
 ];
 
-export default function ContinuousProfilingPanel({ target, targets = [], targetId = '', onTargetChange, showTargetSelect = false }) {
+export default function ContinuousProfilingPanel({ target, targets = [], targetId = '', onTargetChange, showTargetSelect = false, fixedSession = null }) {
     const [range, setRange] = useState('30m');
     const [timeWindow, setTimeWindow] = useState(() => makeTimeWindow('30m'));
     const [customFrom, setCustomFrom] = useState('');
@@ -92,6 +93,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [resetKey, setResetKey] = useState(0);
     const [scope, setScope] = useState('host');
     const [selectedComm, setSelectedComm] = useState('');
+	const [selectedInstance, setSelectedInstance] = useState('');
+	const [historicalInstanceValues, setHistoricalInstanceValues] = useState([]);
     const [commValues, setCommValues] = useState([]);
     const [commAvailable, setCommAvailable] = useState(false);
     const [commMessage, setCommMessage] = useState('');
@@ -121,20 +124,30 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [heapTasksLoading, setHeapTasksLoading] = useState(false);
     const profileURL = flamegraph?.profile_url || topn?.profile_url || target?.profile_url;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
-    const sampleState = sampleStateForTarget(target, flamegraph, topn);
-    const sessionMeta = continuousSessionMeta(target);
+	const sampleState = sampleStateForTarget(target, flamegraph, topn, fixedSession);
+	const sessionMeta = continuousSessionMeta(target, fixedSession);
     const sessionSID = sessionMeta.sid;
+	const taskScope = fixedSession?.scope === 'process' ? 'process' : 'host';
+	const activeProcesses = useMemo(() => decodeJSONField(fixedSession?.active_processes, []), [fixedSession?.active_processes]);
+	const processInstances = useMemo(
+		() => processInstanceOptions(activeProcesses, historicalInstanceValues),
+		[activeProcesses, historicalInstanceValues],
+	);
     const rangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours), [sessionMeta.retentionHours]);
     const diffRangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours, true), [sessionMeta.retentionHours]);
     const uploadState = uploadFreshness(sessionMeta);
     const unit = flamegraph?.unit || topn?.unit || '';
-    const activeFilters = useMemo(() => ({
-        ...(scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}),
+	const activeFilters = useMemo(() => ({
+		...(taskScope === 'process' && fixedSession?.selector_exe ? { exe: fixedSession.selector_exe } : {}),
+		...(taskScope === 'process' && selectedInstance ? instanceFilters(selectedInstance) : {}),
+		...(taskScope === 'host' && scope === 'process' && selectedComm.trim() ? { comm: selectedComm.trim() } : {}),
         ...(selectedRuntime ? { runtime: selectedRuntime } : {}),
-    }), [scope, selectedComm, selectedRuntime]);
+	}), [taskScope, fixedSession?.selector_exe, selectedInstance, scope, selectedComm, selectedRuntime]);
     const activeFilterText = Object.entries(activeFilters).map(([key, value]) => `${key}=${value}`).join(', ');
     const stackScopeLabel = stackScope === 'user' ? '用户栈' : stackScope === 'kernel' ? '内核栈' : '混合栈';
-    const scopeLabel = activeFilters.comm ? `进程级 Native Continuous Profiling / ${activeFilterText} / ${stackScopeLabel}` : `整机 Native Continuous Profiling / ${stackScopeLabel}`;
+	const scopeLabel = taskScope === 'process'
+		? `进程持续采集 / ${fixedSession?.selector_exe || '-'} / ${selectedInstance ? '单实例' : '全部实例'} / ${stackScopeLabel}`
+		: activeFilters.comm ? `整机任务查询过滤 / ${activeFilterText} / ${stackScopeLabel}` : `整机持续采集 / ${stackScopeLabel}`;
 
     useEffect(() => {
         const timer = setTimeout(() => setFlameSearchText(flameSearchInput.trim()), 250);
@@ -156,7 +169,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         if (!target) return;
         setQuerying(true);
         setError('');
-        const params = {
+		const params = {
+			session_sid: sessionSID,
             target_id: target.id,
             host: target.ip,
             service: target.service_name || 'hotmethod',
@@ -165,9 +179,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             profile_type: profileType,
             max_nodes: maxNodes,
         };
-        if (Object.keys(activeFilters).length > 0) {
-            params.filters = JSON.stringify(activeFilters);
-        }
+			if (signalTab === 'cpu' && Object.keys(activeFilters).length > 0) {
+                params.filters = JSON.stringify(activeFilters);
+            }
         try {
             const timelinePromise = sessionSID
                 ? continuous.timeline(sessionSID, { from: queryWindow.from, to: queryWindow.to }).catch(() => null)
@@ -193,7 +207,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             } else {
                 setFlamegraph(null);
                 setTopn(null);
-                const signalType = signalTab === 'io' ? 'io_latency' : 'sched_latency';
+				const signalType = signalTab === 'io' ? 'io_latency' : signalTab === 'io_syscall' ? 'io_syscall_latency' : 'sched_latency';
                 const [histRes, timelineRes] = await Promise.all([
                     continuous.histogram({ ...params, signal_type: signalType }),
                     timelinePromise,
@@ -301,7 +315,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             } else {
                 ({ baseWindow, compareWindow } = makeSequentialDiffWindows(diffRange));
             }
-            const params = {
+			const params = {
+				session_sid: sessionSID,
                 target_id: target.id,
                 host: target.ip,
                 service: target.service_name || 'hotmethod',
@@ -325,7 +340,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setDiffLoading(false);
         }
-    }, [target, diffMode, diffRange, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFilters]);
+	}, [target, sessionSID, diffMode, diffRange, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFilters]);
 
     const changeDiffMode = useCallback((nextMode) => {
         setDiffMode(nextMode);
@@ -341,9 +356,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 
     useEffect(() => {
         setSelectedComm('');
-        setSelectedRuntime('');
-        setScope('host');
-    }, [target?.id]);
+		setSelectedRuntime('');
+		setSelectedInstance('');
+		setScope(taskScope === 'process' ? 'process' : 'host');
+	}, [target?.id, sessionSID, taskScope]);
 
     useEffect(() => {
         if (!target) {
@@ -355,7 +371,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         let cancelled = false;
         setCommLoading(true);
         setCommMessage('');
-        profiles.labelValues({
+		profiles.labelValues({
+			session_sid: sessionSID,
             target_id: target.id,
             host: target.ip,
             service: target.service_name || 'hotmethod',
@@ -390,16 +407,45 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         return () => {
             cancelled = true;
         };
-    }, [target, timeWindow, profileType, selectedComm]);
+	}, [target, sessionSID, timeWindow, profileType, selectedComm]);
 
-    useEffect(() => {
-        if (!target) return undefined;
+	useEffect(() => {
+		if (!target) return undefined;
         let cancelled = false;
-        profiles.labelValues({ target_id: target.id, host: target.ip, service: target.service_name || 'hotmethod', from: timeWindow.from, to: timeWindow.to, profile_type: profileType, label: 'runtime' })
+		profiles.labelValues({ session_sid: sessionSID, target_id: target.id, host: target.ip, service: target.service_name || 'hotmethod', from: timeWindow.from, to: timeWindow.to, profile_type: profileType, label: 'runtime' })
             .then(res => { if (!cancelled && res.code === 0) setRuntimeValues(res.data?.values || []); })
             .catch(() => { if (!cancelled) setRuntimeValues([]); });
         return () => { cancelled = true; };
-    }, [target, timeWindow, profileType]);
+	}, [target, sessionSID, timeWindow, profileType]);
+
+	useEffect(() => {
+		if (!target || taskScope !== 'process' || !sessionSID || profileType !== 'cpu') {
+			setHistoricalInstanceValues([]);
+			return undefined;
+		}
+		let cancelled = false;
+		profiles.labelValues({
+			session_sid: sessionSID,
+			target_id: target.id,
+			host: target.ip,
+			service: target.service_name || 'hotmethod',
+			from: timeWindow.from,
+			to: timeWindow.to,
+			profile_type: 'cpu',
+			label: 'process_instance',
+		}).then(res => {
+			if (!cancelled && res.code === 0) setHistoricalInstanceValues(res.data?.values || []);
+		}).catch(() => {
+			if (!cancelled) setHistoricalInstanceValues([]);
+		});
+		return () => { cancelled = true; };
+	}, [target, taskScope, sessionSID, profileType, timeWindow]);
+
+	useEffect(() => {
+		if (selectedInstance && !processInstances.some(instance => instance.value === selectedInstance)) {
+			setSelectedInstance('');
+		}
+	}, [processInstances, selectedInstance]);
 
     useEffect(() => {
         if (profileType !== 'memory' || rssSeries.length === 0) return;
@@ -419,7 +465,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 <div style={S.head}>
                     <div>
                         <div style={S.titleLine}>
-                            <h3 style={S.title}>Native Continuous Profiling</h3>
+							<h3 style={S.title}>{sessionMeta.name}</h3>
                             <span style={S.stateBadge}>{sampleState}</span>
                         </div>
                         <p style={S.subtitle}>{target.hostname || target.ip} · {target.service_name || 'hotmethod'}</p>
@@ -469,7 +515,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <Field label="信号">
                         <span style={S.segmented}>
                             <button type="button" style={S.segment(signalTab === 'cpu')} onClick={() => setSignalTab('cpu')}>CPU</button>
-                            <button type="button" style={S.segment(signalTab === 'io')} onClick={() => setSignalTab('io')}>IO 延迟</button>
+							<button type="button" style={S.segment(signalTab === 'io')} onClick={() => setSignalTab('io')}>块 IO</button>
+							<button type="button" style={S.segment(signalTab === 'io_syscall')} onClick={() => setSignalTab('io_syscall')}>系统调用 IO</button>
                             <button type="button" style={{ ...S.segment(signalTab === 'sched'), borderRight: 'none' }} onClick={() => setSignalTab('sched')}>调度延迟</button>
                         </span>
                     </Field>
@@ -482,13 +529,13 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             </span>
                         </Field>
                     )}
-                    <Field label="范围">
-                        <span style={S.segmented}>
-                            <button type="button" style={S.segment(scope === 'host')} onClick={() => setScope('host')}>整机</button>
-                            <button type="button" style={{ ...S.segment(scope === 'process'), borderRight: 'none' }} onClick={() => setScope('process')} disabled={!commAvailable}>进程</button>
-                        </span>
-                    </Field>
-                    {scope === 'process' && (
+					{taskScope === 'host' && <Field label="查询范围">
+						<span style={S.segmented}>
+							<button type="button" style={S.segment(scope === 'host')} onClick={() => setScope('host')}>全部进程</button>
+							<button type="button" style={{ ...S.segment(scope === 'process'), borderRight: 'none' }} onClick={() => setScope('process')} disabled={!commAvailable}>按 comm 筛选</button>
+						</span>
+					</Field>}
+					{taskScope === 'host' && scope === 'process' && (
                         <Field label="进程 comm" wide>
                             <input
                                 style={S.textInput}
@@ -503,6 +550,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             </datalist>
                         </Field>
                     )}
+					{taskScope === 'process' && signalTab === 'cpu' && <Field label="进程实例" wide>
+						<select style={S.select} value={selectedInstance} onChange={event => setSelectedInstance(event.target.value)}>
+							<option value="">全部实例</option>
+							{processInstances.map(instance => <option key={instance.value} value={instance.value}>PID {instance.pid} · {formatTime(instance.processStartMs)}{instance.active ? ' · 活动' : ' · 历史'}</option>)}
+						</select>
+					</Field>}
                 </div>
                 {range === 'custom' && (
                     <div style={S.customRange}>
@@ -530,7 +583,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
                 </div>
                 <div style={{ ...S.info, marginTop: 14 }}>
-                    {signalTab === 'cpu' ? scopeLabel : `${signalTab === 'io' ? '整机 IO 延迟' : '整机调度延迟'} / eBPF histogram`}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。
+					{signalTab === 'cpu' ? scopeLabel : `${taskScope === 'process' ? '进程范围' : '整机范围'} ${signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} / eBPF histogram`}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。
                     {signalTab === 'cpu' ? ' comm 是 Linux task comm，可能被截断到约 15 字符。' : ` 当前 backend：${histogram?.backend || signalBackend(sessionMeta, signalTab) || '-'}`}
                     {scope === 'process' && commMessage ? ` ${commMessage}` : ''}
                 </div>
@@ -581,7 +634,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     onRenderStats={setRenderStats}
                     onSearchStats={setSearchStats}
                 />
-            </section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? 'IO 延迟' : '调度延迟'} />}
+			</section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
 
             {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
                 <div style={{ ...S.warn, marginTop: 10 }}>
@@ -851,14 +904,14 @@ function Metric({ label, value }) {
     return <div style={S.metric}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value || '-'}</div></div>;
 }
 
-function continuousSessionMeta(target) {
-    const raw = target?.continuous_session || {};
-    const caps = raw.capabilities || {};
+function continuousSessionMeta(target, fixedSession = null) {
+	const raw = fixedSession || target?.continuous_session || {};
+	const caps = decodeJSONField(raw.capabilities, {});
     return {
         sid: raw.sid || '',
         name: raw.name || 'Native Continuous Profiling',
-        status: raw.status || target?.profile_status || 'unknown',
-        sampler: raw.sampler || caps.sampler || 'perf_event',
+		status: raw.observed_state || raw.status || target?.profile_status || 'unknown',
+		sampler: raw.sampler || caps.sampler || (raw.continuity_mode === 'degraded' ? 'perf/bpftrace fallback' : 'perf_event'),
         sampleRateHz: numberOrDefault(raw.sample_rate_hz, 19),
         aggregationWindowSec: numberOrDefault(raw.aggregation_window_sec, 10),
         uploadBatchSec: numberOrDefault(raw.upload_batch_sec, 60),
@@ -1068,8 +1121,12 @@ function HistogramPanel({ data, loading, title }) {
     );
 }
 
-function sampleStateForTarget(target, flamegraph, topn) {
-    const status = String(target?.profile_status || 'unknown');
+function sampleStateForTarget(target, flamegraph, topn, fixedSession = null) {
+	const status = String(fixedSession?.observed_state || target?.profile_status || 'unknown');
+	if (status === 'degraded') return '降级运行';
+	if (status === 'waiting') return '等待进程';
+	if (status === 'pending') return '待启动';
+	if (status === 'stopping') return '停止中';
     if (status === 'online_with_samples') return '有样本';
     if (status === 'online_no_samples') return '在线但暂无样本';
     if (status === 'online') return '在线';
@@ -1086,8 +1143,35 @@ function signalBackend(meta, signal) {
     const caps = meta?.capabilities || {};
     if (signal === 'cpu') return caps.cpu_backend || caps.sampler || '';
     if (signal === 'io') return caps.io_backend || '';
+	if (signal === 'io_syscall') return caps.io_syscall_backend || caps.io_backend || '';
     if (signal === 'sched') return caps.sched_backend || '';
     return '';
+}
+
+export function instanceFilters(value) {
+	const [pid, processStartMs] = String(value || '').split('|');
+	return pid && processStartMs ? { pid, process_start_ms: processStartMs } : {};
+}
+
+export function processInstanceOptions(activeProcesses, historicalValues) {
+	const instances = new Map();
+	(activeProcesses || []).forEach(process => {
+		const pid = Number(process?.pid);
+		const processStartMs = Number(process?.process_start_ms);
+		if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(processStartMs) || processStartMs <= 0) return;
+		const value = `${pid}|${processStartMs}`;
+		instances.set(value, { value, pid, processStartMs, active: true });
+	});
+	(historicalValues || []).forEach(raw => {
+		const value = String(raw || '');
+		const [pidText, startText] = value.split('|');
+		const pid = Number(pidText);
+		const processStartMs = Number(startText);
+		if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(processStartMs) || processStartMs <= 0 || instances.has(value)) return;
+		instances.set(value, { value, pid, processStartMs, active: false });
+	});
+	return Array.from(instances.values()).sort((left, right) => Number(right.active) - Number(left.active)
+		|| right.processStartMs - left.processStartMs || left.pid - right.pid);
 }
 
 function formatLatency(value, unit = 'us') {

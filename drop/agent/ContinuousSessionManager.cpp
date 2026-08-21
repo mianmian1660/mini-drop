@@ -1,0 +1,686 @@
+#include "agent/ContinuousSessionManager.h"
+
+#include "agent/AgentUtils.h"
+#include "common/Utils.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <dirent.h>
+#include <fcntl.h>
+#include <fstream>
+#include <iostream>
+#include <set>
+#include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace drop_agent
+{
+namespace
+{
+using json = nlohmann::json;
+
+uint64_t env_uint64(const char *name, uint64_t fallback)
+{
+    std::string raw = EnvString(name);
+    if (raw.empty())
+        return fallback;
+    char *end = nullptr;
+    unsigned long long value = std::strtoull(raw.c_str(), &end, 10);
+    return end && *end == '\0' ? static_cast<uint64_t>(value) : fallback;
+}
+
+bool numeric_name(const char *name)
+{
+    if (!name || !*name)
+        return false;
+    for (const char *p = name; *p; ++p)
+        if (*p < '0' || *p > '9')
+            return false;
+    return true;
+}
+
+std::string read_line(const std::string &path)
+{
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    return line;
+}
+
+std::string read_link(const std::string &path)
+{
+    char buffer[4096];
+    ssize_t size = ::readlink(path.c_str(), buffer, sizeof(buffer) - 1);
+    if (size <= 0)
+        return "";
+    buffer[size] = '\0';
+    std::string value(buffer);
+    const std::string deletedSuffix = " (deleted)";
+    if (value.size() > deletedSuffix.size() &&
+        value.compare(value.size() - deletedSuffix.size(), deletedSuffix.size(), deletedSuffix) == 0)
+        value.resize(value.size() - deletedSuffix.size());
+    return value;
+}
+
+int64_t boot_time_ms()
+{
+    static int64_t cached = 0;
+    if (cached > 0)
+        return cached;
+    std::ifstream in("/proc/stat");
+    std::string key;
+    int64_t seconds = 0;
+    while (in >> key)
+    {
+        if (key == "btime")
+        {
+            in >> seconds;
+            break;
+        }
+        std::string rest;
+        std::getline(in, rest);
+    }
+    cached = seconds * 1000;
+    return cached;
+}
+
+int64_t process_start_ms(int pid)
+{
+    std::string stat = read_line("/proc/" + std::to_string(pid) + "/stat");
+    size_t close = stat.rfind(')');
+    if (close == std::string::npos || close + 2 >= stat.size())
+        return 0;
+    std::istringstream fields(stat.substr(close + 2));
+    std::string value;
+    uint64_t ticks = 0;
+    // starttime is field 22; the substring begins at field 3.
+    for (int field = 3; field <= 22; ++field)
+    {
+        if (!(fields >> value))
+            return 0;
+        if (field == 22)
+            ticks = std::strtoull(value.c_str(), nullptr, 10);
+    }
+    long hz = ::sysconf(_SC_CLK_TCK);
+    if (hz <= 0 || boot_time_ms() <= 0)
+        return 0;
+    return boot_time_ms() + static_cast<int64_t>(ticks * 1000 / static_cast<uint64_t>(hz));
+}
+
+int process_tgid(int pid)
+{
+    std::ifstream in("/proc/" + std::to_string(pid) + "/status");
+    std::string key;
+    while (in >> key)
+    {
+        if (key == "Tgid:")
+        {
+            int tgid = 0;
+            in >> tgid;
+            return tgid > 0 ? tgid : pid;
+        }
+        std::string rest;
+        std::getline(in, rest);
+    }
+    return pid;
+}
+
+uint64_t process_rss_bytes(int pid)
+{
+    std::ifstream in("/proc/" + std::to_string(pid) + "/status");
+    std::string key;
+    while (in >> key)
+    {
+        if (key == "VmRSS:")
+        {
+            uint64_t kb = 0;
+            in >> kb;
+            return kb * 1024;
+        }
+        std::string rest;
+        std::getline(in, rest);
+    }
+    return 0;
+}
+
+bool same_targets(const std::vector<drop::ContinuousTargetProcess> &left,
+                  const std::vector<drop::ContinuousTargetProcess> &right)
+{
+    if (left.size() != right.size())
+        return false;
+    for (size_t index = 0; index < left.size(); ++index)
+        if (left[index].pid != right[index].pid || left[index].processStartMs != right[index].processStartMs)
+            return false;
+    return true;
+}
+
+bool atomic_write(const std::string &path, const std::string &body)
+{
+    std::string temporary = path + ".tmp." + std::to_string(::getpid());
+    int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+        return false;
+    size_t offset = 0;
+    while (offset < body.size())
+    {
+        ssize_t count = ::write(fd, body.data() + offset, body.size() - offset);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+        {
+            ::close(fd);
+            ::unlink(temporary.c_str());
+            return false;
+        }
+        offset += static_cast<size_t>(count);
+    }
+    bool ok = ::fsync(fd) == 0 && ::close(fd) == 0 && ::rename(temporary.c_str(), path.c_str()) == 0;
+    if (!ok)
+        ::unlink(temporary.c_str());
+    return ok;
+}
+
+} // namespace
+
+std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesByExe(
+    const std::vector<drop::ContinuousTargetProcess> &processes,
+    const std::string &selectorExe)
+{
+    std::vector<drop::ContinuousTargetProcess> matches;
+    for (const auto &process : processes)
+        if (!selectorExe.empty() && process.exe == selectorExe)
+            matches.push_back(process);
+    return matches;
+}
+
+ContinuousSessionManager::ContinuousSessionManager(const AgentConfig &config,
+                                                   std::string apiBaseURL,
+                                                   std::string authUID,
+                                                   std::atomic<bool> &agentRunning)
+    : config_(config), apiBaseURL_(std::move(apiBaseURL)), authUID_(std::move(authUID)), agentRunning_(agentRunning)
+{
+    spoolDirectory_ = EnvString("DROP_NATIVE_CP_SPOOL_DIR", "/var/lib/mini-drop/continuous-spool");
+    cachePath_ = spoolDirectory_ + "/assignments.json";
+    spoolMaxBytes_ = env_uint64("DROP_NATIVE_CP_SPOOL_MAX_BYTES", spoolMaxBytes_);
+    spoolMinFreeBytes_ = env_uint64("DROP_NATIVE_CP_SPOOL_MIN_FREE_BYTES", spoolMinFreeBytes_);
+    retryMaxSec_ = static_cast<int>(env_uint64("DROP_NATIVE_CP_RETRY_MAX_SEC", 300));
+}
+
+ContinuousSessionManager::~ContinuousSessionManager()
+{
+    Stop();
+}
+
+void ContinuousSessionManager::Start()
+{
+    if (!EnvEnabled("DROP_NATIVE_CP_ENABLED") || running_.exchange(true))
+        return;
+    EnsureDirRecursive(spoolDirectory_);
+    std::vector<ContinuousAssignment> cached;
+    uint64_t cachedRevision = 0;
+    if (LoadAssignmentCache(&cached, &cachedRevision))
+    {
+        revision_ = cachedRevision;
+        ApplyAssignments(cached, ScanProcesses());
+    }
+    thread_ = std::thread(&ContinuousSessionManager::Loop, this);
+}
+
+void ContinuousSessionManager::Stop()
+{
+    running_ = false;
+    if (thread_.joinable())
+        thread_.join();
+    if (sharedSampler_)
+    {
+        sharedSampler_->Stop();
+        sharedSampler_.reset();
+    }
+    for (auto &entry : runtimes_)
+        StopRuntime(entry.second);
+    runtimes_.clear();
+}
+
+void ContinuousSessionManager::Loop()
+{
+    auto nextReconcile = std::chrono::steady_clock::time_point{};
+    while (running_ && agentRunning_)
+    {
+        auto processes = ScanProcesses();
+        RefreshTargets(processes);
+        AdvanceStoppingSessions();
+        auto now = std::chrono::steady_clock::now();
+        if (now >= nextReconcile)
+        {
+            Reconcile(processes);
+            nextReconcile = now + std::chrono::seconds(5);
+        }
+        for (int step = 0; step < 10 && running_ && agentRunning_; ++step)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+std::vector<drop::ContinuousTargetProcess> ContinuousSessionManager::ScanProcesses() const
+{
+    std::vector<drop::ContinuousTargetProcess> out;
+    std::set<int> seenTgids;
+    DIR *directory = ::opendir("/proc");
+    if (!directory)
+        return out;
+    while (dirent *entry = ::readdir(directory))
+    {
+        if (!numeric_name(entry->d_name))
+            continue;
+        int pid = std::atoi(entry->d_name);
+        int tgid = process_tgid(pid);
+        // /proc contains one entry for every thread. A process selector follows
+        // the executable instance, so register only the thread-group leader.
+        // Passing transient TIDs to perf -p makes startup fail when a worker
+        // thread exits between the scan and recorder attach.
+        if (pid <= 0 || tgid != pid || !seenTgids.insert(tgid).second)
+            continue;
+        std::string base = "/proc/" + std::to_string(pid);
+        std::string exe = read_link(base + "/exe");
+        int64_t started = process_start_ms(pid);
+        if (pid <= 0 || exe.empty() || started <= 0)
+            continue;
+        out.push_back({pid, started, read_line(base + "/comm"), exe});
+    }
+    ::closedir(directory);
+    std::sort(out.begin(), out.end(), [](const auto &left, const auto &right) { return left.pid < right.pid; });
+    return out;
+}
+
+std::string ContinuousSessionManager::BuildReconcileBody(const std::vector<drop::ContinuousTargetProcess> &processes) const
+{
+    json body = {
+        {"target_ip", config_.ipAddr}, {"hostname", config_.hostname}, {"agent_id", config_.uid},
+        {"strict_capable", drop::CoreContinuousSamplerAvailable()}, {"capabilities", config_.capabilities}, {"revision", revision_},
+    };
+    body["processes"] = json::array();
+    for (const auto &process : processes)
+        body["processes"].push_back({{"pid", process.pid}, {"process_start_ms", process.processStartMs},
+                                      {"comm", process.comm}, {"exe", process.exe},
+                                      {"rss_bytes", process_rss_bytes(process.pid)}});
+    body["sessions"] = json::array();
+    for (const auto &entry : runtimes_)
+    {
+        const Runtime &runtime = entry.second;
+        json active = json::array();
+        for (const auto &target : runtime.targets)
+            active.push_back({{"pid", target.pid}, {"process_start_ms", target.processStartMs},
+                              {"comm", target.comm}, {"exe", target.exe}, {"rss_bytes", process_rss_bytes(target.pid)}});
+        body["sessions"].push_back({{"sid", entry.first}, {"observed_state", runtime.observedState},
+                                     {"active_processes", active}, {"continuity_mode", runtime.effectiveContinuityMode},
+                                     {"degradation_reason", runtime.degradationReason},
+                                     {"last_error", runtime.lastError}});
+    }
+    for (const auto &entry : stoppedReports_)
+        body["sessions"].push_back({{"sid", entry.first}, {"observed_state", "stopped"},
+                                     {"active_processes", json::array()}, {"continuity_mode", entry.second.continuityMode},
+                                     {"degradation_reason", entry.second.degradationReason}, {"last_error", ""}});
+    for (const auto &entry : stoppingRuntimes_)
+        body["sessions"].push_back({{"sid", entry.first}, {"observed_state", "stopping"},
+                                     {"active_processes", json::array()}, {"continuity_mode", entry.second.continuityMode},
+                                     {"degradation_reason", entry.second.degradationReason},
+                                     {"last_error", entry.second.lastError}});
+    return body.dump();
+}
+
+bool ContinuousSessionManager::Reconcile(const std::vector<drop::ContinuousTargetProcess> &processes)
+{
+    std::string requestPath = spoolDirectory_ + "/reconcile-request.json";
+    if (!atomic_write(requestPath, BuildReconcileBody(processes)))
+        return false;
+    std::string response;
+    int rc = drop::exec_capture({"curl", "-sS", "-m", "10", "-X", "POST",
+                                 "-H", "Content-Type: application/json",
+                                 "-H", "Drop-User-Uid: " + authUID_,
+                                 "-d", "@" + requestPath,
+                                 apiBaseURL_ + "/api/v1/internal/continuous/reconcile"},
+                                &response, 4 * 1024 * 1024);
+    ::unlink(requestPath.c_str());
+    if (rc != 0)
+    {
+        std::cerr << "[native-cp] reconcile failed rc=" << rc << std::endl;
+        return false;
+    }
+    std::vector<ContinuousAssignment> assignments;
+    uint64_t revision = revision_;
+    if (!ParseAssignments(response, &assignments, &revision))
+    {
+        std::cerr << "[native-cp] invalid reconcile response" << std::endl;
+        return false;
+    }
+    revision_ = revision;
+    SaveAssignmentCache(response);
+    ApplyAssignments(assignments, processes);
+    stoppedReports_.clear();
+    return true;
+}
+
+bool ContinuousSessionManager::ParseAssignments(const std::string &response,
+                                                std::vector<ContinuousAssignment> *assignments,
+                                                uint64_t *revision) const
+{
+    try
+    {
+        json root = json::parse(response);
+        if (root.value("code", -1) != 0 || !root.contains("data"))
+            return false;
+        const json &data = root.at("data");
+        *revision = data.value("revision", static_cast<uint64_t>(0));
+        assignments->clear();
+        for (const auto &item : data.value("assignments", json::array()))
+        {
+            ContinuousAssignment assignment;
+            assignment.sid = item.value("sid", "");
+            assignment.scope = item.value("scope", "host");
+            assignment.selectorExe = item.value("selector_exe", "");
+            assignment.desiredState = item.value("desired_state", "running");
+            assignment.continuityMode = item.value("continuity_mode", "degraded");
+            assignment.allowDegraded = item.value("allow_degraded", assignment.continuityMode == "degraded");
+            assignment.revision = item.value("revision", static_cast<uint64_t>(0));
+            assignment.sampleRateHz = item.value("sample_rate_hz", 19);
+            assignment.aggregationWindowSec = item.value("aggregation_window_sec", 10);
+            assignment.uploadBatchSec = item.value("upload_batch_sec", 60);
+            assignment.retentionHours = item.value("retention_hours", 24);
+            if (!assignment.sid.empty())
+                assignments->push_back(std::move(assignment));
+        }
+        return true;
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << "[native-cp] reconcile JSON parse failed: " << error.what() << std::endl;
+        return false;
+    }
+}
+
+void ContinuousSessionManager::ApplyAssignments(const std::vector<ContinuousAssignment> &assignments,
+                                                const std::vector<drop::ContinuousTargetProcess> &processes)
+{
+    std::map<std::string, bool> authoritative;
+    for (const auto &assignment : assignments)
+    {
+        authoritative[assignment.sid] = true;
+        if (assignment.desiredState == "stopped")
+        {
+            if (stoppedReports_.count(assignment.sid) > 0 || stoppingRuntimes_.count(assignment.sid) > 0)
+                continue;
+            auto existing = runtimes_.find(assignment.sid);
+            if (existing != runtimes_.end())
+            {
+                StoppingRuntime stopping;
+                stopping.samplerConfig = BuildSamplerConfig(existing->second);
+                stopping.continuityMode = existing->second.effectiveContinuityMode;
+                stopping.degradationReason = existing->second.degradationReason;
+                stoppingRuntimes_[assignment.sid] = std::move(stopping);
+                StopRuntime(existing->second);
+                runtimes_.erase(existing);
+            }
+            else
+            {
+                Runtime stopped;
+                stopped.assignment = assignment;
+                StoppingRuntime stopping;
+                stopping.samplerConfig = BuildSamplerConfig(stopped);
+                stopping.continuityMode = assignment.continuityMode;
+                stoppingRuntimes_[assignment.sid] = std::move(stopping);
+            }
+            continue;
+        }
+        Runtime &runtime = runtimes_[assignment.sid];
+        runtime.assignment = assignment;
+        if (runtime.observedState == "pending")
+            runtime.effectiveContinuityMode = assignment.continuityMode;
+    }
+    for (auto it = runtimes_.begin(); it != runtimes_.end();)
+    {
+        if (!authoritative[it->first])
+        {
+            StopRuntime(it->second);
+            it = runtimes_.erase(it);
+        }
+        else
+            ++it;
+    }
+    for (auto it = stoppingRuntimes_.begin(); it != stoppingRuntimes_.end();)
+    {
+        if (!authoritative[it->first])
+            it = stoppingRuntimes_.erase(it);
+        else
+            ++it;
+    }
+    RefreshTargets(processes);
+}
+
+void ContinuousSessionManager::RefreshTargets(const std::vector<drop::ContinuousTargetProcess> &processes)
+{
+    for (auto &entry : runtimes_)
+    {
+        Runtime &runtime = entry.second;
+        std::vector<drop::ContinuousTargetProcess> targets;
+        if (runtime.assignment.scope == "process")
+            targets = MatchContinuousProcessesByExe(processes, runtime.assignment.selectorExe);
+        bool changed = !same_targets(runtime.targets, targets);
+        if (runtime.assignment.scope == "process" && targets.empty())
+        {
+            runtime.targets.clear();
+            runtime.observedState = "waiting";
+            runtime.effectiveContinuityMode = runtime.assignment.continuityMode;
+            runtime.degradationReason = "target exe is not currently present; collection will resume when any instance returns";
+            runtime.lastError.clear();
+            continue;
+        }
+        if (changed)
+            runtime.targets = std::move(targets);
+    }
+    RebuildSharedEngine();
+}
+
+drop::ContinuousSamplerConfig ContinuousSessionManager::BuildSamplerConfig(const Runtime &runtime) const
+{
+    drop::ContinuousSamplerConfig samplerConfig;
+    samplerConfig.sampleRateHz = runtime.assignment.sampleRateHz;
+    samplerConfig.aggregationWindowSec = runtime.assignment.aggregationWindowSec;
+    samplerConfig.uploadBatchSec = runtime.assignment.uploadBatchSec;
+    samplerConfig.retentionHours = runtime.assignment.retentionHours;
+    samplerConfig.spoolDirectory = spoolDirectory_;
+    samplerConfig.spoolMaxBytes = spoolMaxBytes_;
+    samplerConfig.spoolMinFreeBytes = spoolMinFreeBytes_;
+    samplerConfig.retryMaxSec = retryMaxSec_;
+    samplerConfig.sessionSID = runtime.assignment.sid;
+    samplerConfig.targetIP = config_.ipAddr;
+    samplerConfig.hostname = config_.hostname;
+    samplerConfig.apiBaseURL = apiBaseURL_;
+    samplerConfig.authUID = authUID_;
+    samplerConfig.scope = runtime.assignment.scope;
+    samplerConfig.selectorExe = runtime.assignment.selectorExe;
+    samplerConfig.signals = "cpu,io,io_syscall,sched";
+    samplerConfig.allowDegraded = runtime.assignment.allowDegraded || runtime.assignment.continuityMode == "degraded";
+    samplerConfig.targetProcesses = runtime.targets;
+    return samplerConfig;
+}
+
+void ContinuousSessionManager::UpdateRuntimeEngineStatus(
+    const std::vector<drop::ContinuousSamplerConfig> &configs)
+{
+    if (!sharedSampler_)
+        return;
+    if (sharedSampler_->Failed())
+    {
+        const std::string engineError = sharedSampler_->DegradationReason();
+        for (auto &entry : runtimes_)
+        {
+            Runtime &runtime = entry.second;
+            if (runtime.assignment.scope == "process" && runtime.targets.empty())
+                continue;
+            runtime.observedState = "error";
+            runtime.effectiveContinuityMode = runtime.assignment.continuityMode;
+            runtime.degradationReason.clear();
+            runtime.lastError = engineError;
+        }
+        return;
+    }
+    const bool sharedProcessFallback = configs.size() > 1 && configs.front().scope == "process";
+    std::string engineDegradation = sharedSampler_->DegradationReason();
+    if (!sharedSampler_->Strict() && sharedProcessFallback &&
+        engineDegradation.find("spool backpressure") == std::string::npos)
+        engineDegradation = "CPU is collected once for the union TGID set and isolated by PID/start time; "
+                            "rolling bpftrace histograms are unavailable because this fallback cannot safely attribute them across selectors";
+    for (auto &entry : runtimes_)
+    {
+        Runtime &runtime = entry.second;
+        if (runtime.assignment.scope == "process" && runtime.targets.empty())
+            continue;
+        runtime.observedState = engineDegradation.empty() && sharedSampler_->Strict() ? "running" : "degraded";
+        runtime.effectiveContinuityMode = sharedSampler_->Strict() ? "strict" : "degraded";
+        runtime.lastError.clear();
+        runtime.degradationReason = engineDegradation;
+    }
+}
+
+void ContinuousSessionManager::RebuildSharedEngine()
+{
+    std::vector<drop::ContinuousSamplerConfig> configs;
+    std::ostringstream fingerprint;
+    for (const auto &entry : runtimes_)
+    {
+        const Runtime &runtime = entry.second;
+        if (runtime.assignment.scope == "process" && runtime.targets.empty())
+            continue;
+        configs.push_back(BuildSamplerConfig(runtime));
+        fingerprint << entry.first << '|' << runtime.assignment.revision << '|'
+                    << runtime.assignment.scope << '|' << runtime.assignment.continuityMode << '|'
+                    << runtime.assignment.allowDegraded << '|' << runtime.assignment.sampleRateHz << '|'
+                    << runtime.assignment.aggregationWindowSec << '|' << runtime.assignment.uploadBatchSec << ';';
+        for (const auto &target : runtime.targets)
+            fingerprint << target.pid << ':' << target.processStartMs << ',';
+    }
+    const std::string nextFingerprint = fingerprint.str();
+    if (configs.empty())
+    {
+        if (sharedSampler_)
+        {
+            sharedSampler_->Stop();
+            sharedSampler_.reset();
+        }
+        sharedFingerprint_.clear();
+        return;
+    }
+    if (sharedSampler_ && sharedSampler_->Running() && sharedFingerprint_ == nextFingerprint)
+    {
+        UpdateRuntimeEngineStatus(configs);
+        return;
+    }
+
+    // Blue/green handoff: attach the replacement collector while the current
+    // one is still sampling. Only after the new backend reports ready do we
+    // stop the old recorder, preventing a target/PID change from creating an
+    // avoidable startup gap. Both generations use the same session spool and
+    // the old generation is stopped before the new one can emit its next
+    // complete aggregation window, so ownership remains time ordered.
+    auto replacement = std::make_unique<drop::SharedDualTrackContinuousSampler>();
+    std::string error;
+    if (!replacement->Start(configs, &error))
+    {
+        for (auto &entry : runtimes_)
+        {
+            Runtime &runtime = entry.second;
+            if (runtime.assignment.scope == "process" && runtime.targets.empty())
+                continue;
+            runtime.observedState = "error";
+            runtime.lastError = error;
+        }
+        return;
+    }
+    bool ready = replacement->Ready();
+    const uint64_t readyTimeoutMs = env_uint64("DROP_NATIVE_CP_HANDOFF_READY_TIMEOUT_MS", 8000);
+    const auto readyDeadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(readyTimeoutMs);
+    while (!ready && std::chrono::steady_clock::now() < readyDeadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ready = replacement->Ready();
+    }
+    if (!ready)
+    {
+        replacement->Stop();
+        for (auto &entry : runtimes_)
+        {
+            Runtime &runtime = entry.second;
+            if (runtime.assignment.scope == "process" && runtime.targets.empty())
+                continue;
+            runtime.observedState = "error";
+            runtime.lastError = "replacement continuous collector did not become ready";
+        }
+        return;
+    }
+    auto previous = std::move(sharedSampler_);
+    sharedSampler_ = std::move(replacement);
+    if (previous)
+        previous->Stop();
+    sharedFingerprint_ = nextFingerprint;
+    UpdateRuntimeEngineStatus(configs);
+}
+
+void ContinuousSessionManager::AdvanceStoppingSessions()
+{
+    bool attemptedUpload = false;
+    for (auto it = stoppingRuntimes_.begin(); it != stoppingRuntimes_.end();)
+    {
+        StoppingRuntime &stopping = it->second;
+        if (drop::ContinuousSessionHasPendingSpool(stopping.samplerConfig))
+        {
+            // The active shared engine only drains the Sessions in its current
+            // assignment set. A stopped Session therefore owns its retry here.
+            if (!attemptedUpload)
+            {
+                attemptedUpload = true;
+                if (!drop::DrainOneContinuousSessionBatch(stopping.samplerConfig))
+                {
+                    stopping.lastError = "final batch upload pending; retrying from Session spool";
+                    ++it;
+                    continue;
+                }
+            }
+            if (drop::ContinuousSessionHasPendingSpool(stopping.samplerConfig))
+            {
+                stopping.lastError = "final batch upload pending; retrying from Session spool";
+                ++it;
+                continue;
+            }
+        }
+        stoppedReports_[it->first] = {stopping.continuityMode, stopping.degradationReason};
+        it = stoppingRuntimes_.erase(it);
+    }
+}
+
+void ContinuousSessionManager::StopRuntime(Runtime &runtime)
+{
+    runtime.observedState = "stopped";
+}
+
+void ContinuousSessionManager::SaveAssignmentCache(const std::string &response) const
+{
+    atomic_write(cachePath_, response);
+}
+
+bool ContinuousSessionManager::LoadAssignmentCache(std::vector<ContinuousAssignment> *assignments, uint64_t *revision) const
+{
+    std::ifstream in(cachePath_);
+    if (!in.is_open())
+        return false;
+    std::ostringstream body;
+    body << in.rdbuf();
+    return ParseAssignments(body.str(), assignments, revision);
+}
+
+} // namespace drop_agent

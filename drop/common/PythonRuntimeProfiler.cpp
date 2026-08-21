@@ -18,7 +18,7 @@ namespace
 {
 
 std::mutex g_candidatesMutex;
-std::vector<PythonCandidate> g_candidates;
+std::map<std::string, std::vector<PythonCandidate>> g_candidatesBySession;
 std::map<std::pair<int, int64_t>, int64_t> g_failureCooldown;
 constexpr int64_t kFailureCooldownMs = 60 * 1000;
 
@@ -27,6 +27,28 @@ int64_t wall_now_ms()
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+int64_t boot_epoch_ms()
+{
+    static int64_t cached = 0;
+    if (cached > 0)
+        return cached;
+    std::ifstream statFile("/proc/stat");
+    std::string key;
+    int64_t seconds = 0;
+    while (statFile >> key)
+    {
+        if (key == "btime")
+        {
+            statFile >> seconds;
+            break;
+        }
+        std::string rest;
+        std::getline(statFile, rest);
+    }
+    cached = seconds * 1000;
+    return cached;
 }
 
 std::string read_link(const std::string &path)
@@ -141,10 +163,10 @@ bool python_process_start_ms(int pid, int64_t *out)
     long hz = ::sysconf(_SC_CLK_TCK);
     if (hz <= 0)
         return false;
-    // Keep the identity relative to boot. Reconstructing wall-clock time with
-    // wall_now_ms() - /proc/uptime introduces millisecond rounding drift, so
-    // two reads of the same live process can compare unequal.
-    *out = static_cast<int64_t>(ticks * 1000ULL / static_cast<unsigned long long>(hz));
+    int64_t bootMs = boot_epoch_ms();
+    if (bootMs <= 0)
+        return false;
+    *out = bootMs + static_cast<int64_t>(ticks * 1000ULL / static_cast<unsigned long long>(hz));
     return true;
 }
 
@@ -194,7 +216,8 @@ std::vector<PythonStackSample> parse_pyspy_raw(const std::string &raw)
     return out;
 }
 
-void schedule_python_fallback(const std::vector<PythonCandidate> &candidates)
+void schedule_python_fallback(const std::string &sessionSID,
+                              const std::vector<PythonCandidate> &candidates)
 {
     std::vector<PythonCandidate> next = candidates;
     std::sort(next.begin(), next.end(), [](const auto &a, const auto &b) {
@@ -203,10 +226,13 @@ void schedule_python_fallback(const std::vector<PythonCandidate> &candidates)
         return a.samples > b.samples;
     });
     std::lock_guard<std::mutex> lock(g_candidatesMutex);
-    g_candidates = std::move(next);
+    g_candidatesBySession[sessionSID] = std::move(next);
 }
 
-PythonFallbackCapture start_python_fallback_capture(int durationSec, int rateHz, int maxProcesses)
+PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSID,
+                                                    int durationSec,
+                                                    int rateHz,
+                                                    int maxProcesses)
 {
     PythonFallbackCapture capture;
     if (durationSec <= 0 || rateHz <= 0 || maxProcesses <= 0)
@@ -214,7 +240,9 @@ PythonFallbackCapture start_python_fallback_capture(int durationSec, int rateHz,
     std::vector<PythonCandidate> candidates;
     {
         std::lock_guard<std::mutex> lock(g_candidatesMutex);
-        candidates = g_candidates;
+        auto found = g_candidatesBySession.find(sessionSID);
+        if (found != g_candidatesBySession.end())
+            candidates = found->second;
         int64_t now = wall_now_ms();
         candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const auto &candidate) {
                              auto it = g_failureCooldown.find({candidate.pid, candidate.startMs});

@@ -1,0 +1,96 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-width: 320px;
+}
+
+@media (max-width: 720px) {
+    .app-header {
+        align-items: flex-start !important;
+        gap: 12px;
+        padding: 12px 14px !important;
+    }
+
+    .app-nav {
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 10px !important;
+    }
+
+    .performance-page {
+        padding: 16px 12px 28px !important;
+    }
+
+    .performance-page-header {
+        align-items: flex-start !important;
+        flex-direction: column;
+    }
+
+    .performance-page-actions {
+        display: grid !important;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        width: 100%;
+    }
+
+    .performance-page-actions > * {
+        min-width: 0;
+        text-align: center;
+    }
+
+    .performance-tabs {
+        flex-wrap: nowrap !important;
+        gap: 18px !important;
+        overflow-x: auto;
+        scrollbar-width: thin;
+    }
+
+    .performance-tabs > * {
+        flex: 0 0 auto;
+    }
+
+    .performance-overview-grid {
+        grid-template-columns: minmax(0, 1fr) !important;
+    }
+
+    .performance-overview-grid > * {
+        min-width: 0;
+    }
+
+    .continuous-modal-overlay {
+        align-items: flex-end !important;
+        padding: 0 !important;
+    }
+
+    .continuous-modal {
+        width: 100% !important;
+        max-height: 96dvh !important;
+        border-radius: 8px 8px 0 0 !important;
+        padding: 16px !important;
+    }
+
+    .continuous-modal-toolbar,
+    .continuous-list-toolbar,
+    .continuous-list-filters {
+        align-items: stretch !important;
+        flex-direction: column;
+        width: 100%;
+    }
+
+    .continuous-list-filters > *,
+    .continuous-modal-toolbar > * {
+        min-width: 0 !important;
+        width: 100% !important;
+    }
+
+    .continuous-process-row {
+        grid-template-columns: 20px minmax(0, 1fr) !important;
+    }
+
+    .continuous-process-meta {
+        grid-column: 2;
+        text-align: left !important;
+    }
+}

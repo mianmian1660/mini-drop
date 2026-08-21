@@ -102,138 +102,6 @@ namespace drop_agent
         return nullptr;
     }
 
-    namespace
-    {
-
-        uint64_t EnvUint64(const char *name, uint64_t fallback)
-        {
-            string value = EnvString(name);
-            if (value.empty())
-                return fallback;
-            char *end = nullptr;
-            unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
-            return end && *end == '\0' ? static_cast<uint64_t>(parsed) : fallback;
-        }
-
-        string ExtractJsonString(const string &json, const string &key)
-        {
-            string needle = "\"" + key + "\"";
-            size_t pos = json.find(needle);
-            if (pos == string::npos)
-                return "";
-            pos = json.find(':', pos + needle.size());
-            if (pos == string::npos)
-                return "";
-            pos = json.find('"', pos);
-            if (pos == string::npos)
-                return "";
-            size_t end = pos + 1;
-            while (end < json.size())
-            {
-                if (json[end] == '"' && json[end - 1] != '\\')
-                    return json.substr(pos + 1, end - pos - 1);
-                ++end;
-            }
-            return "";
-        }
-
-        string CreateNativeContinuousSession(const AgentConfig &cfg,
-                                              const string &apiBaseURL,
-                                              const string &authUID)
-        {
-            string path = "/tmp/mini_drop_native_cp_create_session.json";
-            {
-                ofstream out(path, ios::binary);
-                if (!out.is_open())
-                    return "";
-                out << "{"
-                    << "\"name\":\"Native Dual-Track Continuous Profiling\","
-                    << "\"target_ip\":\"" << JsonEscape(cfg.ipAddr) << "\","
-                    << "\"hostname\":\"" << JsonEscape(cfg.hostname) << "\","
-                    << "\"service_name\":\"hotmethod\","
-                    << "\"sample_rate_hz\":19,"
-                    << "\"aggregation_window_sec\":10,"
-                    << "\"upload_batch_sec\":60,"
-                    << "\"retention_hours\":24,"
-                    << "\"labels\":{\"job\":\"hotmethod\",\"instance\":\"" << JsonEscape(cfg.ipAddr)
-                    << "\",\"node\":\"" << JsonEscape(cfg.hostname) << "\"},"
-                    << "\"capabilities\":{"
-                    << "\"sampler\":\"dual_track\","
-                    << "\"cpu_backend\":\"core,bpftrace,perf\","
-                    << "\"io_backend\":\"bpftrace\","
-                    << "\"sched_backend\":\"bpftrace\","
-                    << "\"signals\":\"" << JsonEscape(EnvString("DROP_NATIVE_CP_SIGNALS", "cpu,io,sched")) << "\","
-                    << "\"unavailable_reason\":\"\""
-                    << "}"
-                    << "}";
-            }
-            string response;
-            int rc = drop::exec_capture({"curl", "-sS", "-m", "10", "-X", "POST",
-                                         "-H", "Content-Type: application/json",
-                                         "-H", "Drop-User-Uid: " + authUID,
-                                         "-d", "@" + path,
-                                         apiBaseURL + "/api/v1/internal/continuous/sessions"},
-                                        &response, 8192);
-            ::remove(path.c_str());
-            if (rc != 0)
-            {
-                cout << "[native-cp] 创建 ContinuousSession 失败 rc=" << rc << " response=" << response << endl;
-                return "";
-            }
-            string sid = ExtractJsonString(response, "sid");
-            if (sid.empty())
-                cout << "[native-cp] 创建 ContinuousSession 响应中未找到 sid: " << response << endl;
-            return sid;
-        }
-
-        void EnsureNativeContinuousSampler(drop::DualTrackContinuousSampler &sampler,
-                                            const AgentConfig &cfg,
-                                            const string &apiBaseURL,
-                                            const string &authUID,
-                                            string &sessionSID,
-                                            steady_clock::time_point &nextRetryAt)
-        {
-            if (!EnvEnabled("DROP_NATIVE_CP_ENABLED") || sampler.Running())
-                return;
-            auto now = steady_clock::now();
-            if (now < nextRetryAt)
-                return;
-            if (sessionSID.empty())
-                sessionSID = CreateNativeContinuousSession(cfg, apiBaseURL, authUID);
-            if (sessionSID.empty())
-            {
-                nextRetryAt = now + seconds(30);
-                cout << "[native-cp] session not ready, retry in 30s" << endl;
-                return;
-            }
-
-            drop::ContinuousSamplerConfig nativeCfg;
-            nativeCfg.sampleRateHz = 19;
-            nativeCfg.aggregationWindowSec = 10;
-            nativeCfg.uploadBatchSec = 60;
-            nativeCfg.retentionHours = 24;
-            nativeCfg.spoolDirectory = EnvString("DROP_NATIVE_CP_SPOOL_DIR", "/var/lib/mini-drop/continuous-spool");
-            nativeCfg.spoolMaxBytes = EnvUint64("DROP_NATIVE_CP_SPOOL_MAX_BYTES", 5ULL * 1024 * 1024 * 1024);
-            nativeCfg.spoolMinFreeBytes = EnvUint64("DROP_NATIVE_CP_SPOOL_MIN_FREE_BYTES", 2ULL * 1024 * 1024 * 1024);
-            nativeCfg.retryMaxSec = static_cast<int>(EnvUint64("DROP_NATIVE_CP_RETRY_MAX_SEC", 300));
-            nativeCfg.sessionSID = sessionSID;
-            nativeCfg.targetIP = cfg.ipAddr;
-            nativeCfg.hostname = cfg.hostname;
-            nativeCfg.apiBaseURL = apiBaseURL;
-            nativeCfg.authUID = authUID;
-            string samplerError;
-            if (sampler.Start(nativeCfg, &samplerError))
-            {
-                cout << "[native-cp] DualTrackContinuousSampler started session=" << sessionSID
-                     << " api=" << apiBaseURL << endl;
-                return;
-            }
-            cout << "[native-cp] DualTrackContinuousSampler not started: " << samplerError << endl;
-            nextRetryAt = now + seconds(30);
-        }
-
-    } // namespace
-
     HeartbeatThread::HeartbeatThread(const AgentConfig &cfg,
                                      std::shared_ptr<grpc::Channel> initialChannel,
                                      const common::CosConfig &initialCosConfig,
@@ -252,13 +120,17 @@ namespace drop_agent
         healthStub_ = healthcheck::HealthCheck::NewStub(channel_);
         hotmethodStub_ = hotmethod::Hotmethod::NewStub(channel_);
 
-        nativeCPAPIBaseURL_ = EnvString("DROP_NATIVE_CP_API_BASE_URL", EnvString("APISERVER_SYMBOL_BASE_URL", "http://127.0.0.1:8191"));
-        nativeCPAuthUID_ = EnvString("DROP_NATIVE_CP_UID", cfg_.uid);
-        nativeCPSessionSID_ = EnvString("DROP_NATIVE_CP_SESSION_ID");
+		continuousManager_ = std::make_unique<ContinuousSessionManager>(
+			cfg_,
+			EnvString("DROP_NATIVE_CP_API_BASE_URL", EnvString("APISERVER_SYMBOL_BASE_URL", "http://127.0.0.1:8191")),
+			EnvString("DROP_NATIVE_CP_UID", cfg_.uid),
+			running_);
     }
 
     void HeartbeatThread::Start()
     {
+		if (continuousManager_)
+			continuousManager_->Start();
         thread_ = std::thread(&HeartbeatThread::Loop, this);
     }
 
@@ -270,7 +142,8 @@ namespace drop_agent
 
     void HeartbeatThread::StopSampler()
     {
-        nativeSampler_.Stop();
+		if (continuousManager_)
+			continuousManager_->Stop();
     }
 
     void HeartbeatThread::Loop()
@@ -279,9 +152,6 @@ namespace drop_agent
 
         while (running_)
         {
-            EnsureNativeContinuousSampler(nativeSampler_, cfg_, nativeCPAPIBaseURL_, nativeCPAuthUID_,
-                                          nativeCPSessionSID_, nativeCPNextRetryAt_);
-
             // 自监控
             common::PidStats selfPs = drop::collect_self_pidstats();
             vector<common::PidStats> childrenPs = drop::collect_children_pidstats();

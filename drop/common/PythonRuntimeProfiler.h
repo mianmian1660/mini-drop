@@ -59,16 +59,23 @@ public:
     size_t LimitedCount() const { return limitedCount_; }
 
 private:
-    friend PythonFallbackCapture start_python_fallback_capture(int durationSec, int rateHz, int maxProcesses);
+    friend PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSID,
+                                                                int durationSec,
+                                                                int rateHz,
+                                                                int maxProcesses);
     std::vector<std::future<PythonFallbackResult>> futures_;
     size_t limitedCount_ = 0;
 };
 
 /// Replaces the candidate set for the next window. PID identity includes startMs.
-void schedule_python_fallback(const std::vector<PythonCandidate> &candidates);
+void schedule_python_fallback(const std::string &sessionSID,
+                              const std::vector<PythonCandidate> &candidates);
 
 /// Starts py-spy for candidates learned from the preceding perf window.
-PythonFallbackCapture start_python_fallback_capture(int durationSec, int rateHz, int maxProcesses);
+PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSID,
+                                                    int durationSec,
+                                                    int rateHz,
+                                                    int maxProcesses);
 
 /// Parses py-spy folded/raw output. Frames remain root-to-leaf.
 std::vector<PythonStackSample> parse_pyspy_raw(const std::string &raw);
@@ -76,7 +83,7 @@ std::vector<PythonStackSample> parse_pyspy_raw(const std::string &raw);
 /// Reads current Python RSS points, sorted descending and capped.
 std::vector<PythonRSSMetric> collect_python_rss(size_t maxProcesses, size_t *truncated);
 
-/// Reads /proc/<pid>/stat start time as stable milliseconds since boot.
+/// Reads /proc/<pid>/stat start time as stable Unix epoch milliseconds.
 bool python_process_start_ms(int pid, int64_t *out);
 bool python_process_is_same(int pid, int64_t expectedStartMs);
 

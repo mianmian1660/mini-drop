@@ -20,6 +20,9 @@ find_package(Protobuf REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(gRPC REQUIRED IMPORTED_TARGET grpc++ grpc)
+find_path(LIBBPF_INCLUDE_DIR bpf/libbpf.h)
+find_library(LIBBPF_LIBRARY bpf)
+find_program(CLANG_EXECUTABLE clang)
 # 跨平台查找 grpc 的 protoc 插件：Ubuntu 在 /usr/bin，Homebrew(macOS) 在 /opt/homebrew/bin
 find_program(gRPC_CPP_PLUGIN NAMES grpc_cpp_plugin REQUIRED)
 
@@ -67,6 +70,7 @@ set(PROTO_GRPC_SRCS
 set(COMMON_SRCS
     common/CapabilityDetector.cpp
     common/ContinuousSampler.cpp
+    common/CoreEbpfCollector.cpp
     common/RuntimeSymbolMap.cpp
     common/PythonRuntimeProfiler.cpp
     common/MemrayProfileIngest.cpp
@@ -82,6 +86,25 @@ set(COMMON_SRCS
     common/LoggerIface.cpp
     common/PidRegistry.cpp
 )
+
+set(NATIVE_CP_CORE_ENABLED OFF)
+if(LIBBPF_INCLUDE_DIR AND LIBBPF_LIBRARY AND CLANG_EXECUTABLE)
+    set(NATIVE_CP_CORE_ENABLED ON)
+    set(NATIVE_CP_CORE_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/native_cp.bpf.o)
+    add_custom_command(
+        OUTPUT ${NATIVE_CP_CORE_OBJECT}
+        COMMAND ${CLANG_EXECUTABLE} -target bpf -O2 -g -c
+                ${CMAKE_SOURCE_DIR}/common/native_cp.bpf.c
+                -I/usr/include/x86_64-linux-gnu
+                -o ${NATIVE_CP_CORE_OBJECT}
+        DEPENDS common/native_cp.bpf.c
+        VERBATIM
+    )
+    add_custom_target(native_cp_core_object DEPENDS ${NATIVE_CP_CORE_OBJECT})
+    message(STATUS "Native CP strict CO-RE build enabled")
+else()
+    message(STATUS "Native CP strict CO-RE build disabled (libbpf headers/library or clang missing)")
+endif()
 
 # ---------- server 模块源文件 ----------
 set(SERVER_SRCS
@@ -112,6 +135,7 @@ add_executable(drop_agent
     agent/AttemptTracker.cpp
     agent/ServerChannelHolder.cpp
     agent/HeartbeatThread.cpp
+	agent/ContinuousSessionManager.cpp
     agent/WorkerThread.cpp
     agent/UploadWorker.cpp
     agent/ResultDelivery.cpp
@@ -125,6 +149,11 @@ add_executable(drop_agent
     ${COMMON_SRCS}
     ${PROTO_SRCS} ${PROTO_GRPC_SRCS}
 )
+if(NATIVE_CP_CORE_ENABLED)
+    add_dependencies(drop_agent native_cp_core_object)
+    target_compile_definitions(drop_agent PRIVATE DROP_NATIVE_CP_HAVE_LIBBPF=1 DROP_NATIVE_CP_CORE_OBJECT=\"${NATIVE_CP_CORE_OBJECT}\")
+    target_include_directories(drop_agent PRIVATE ${LIBBPF_INCLUDE_DIR})
+endif()
 target_include_directories(drop_agent PRIVATE
     ${PROTO_GEN_DIR}
     ${CMAKE_SOURCE_DIR}
@@ -136,6 +165,9 @@ target_link_libraries(drop_agent
     ${Protobuf_LIBRARIES}
     Threads::Threads
 )
+if(NATIVE_CP_CORE_ENABLED)
+    target_link_libraries(drop_agent ${LIBBPF_LIBRARY})
+endif()
 
 # ============================================================
 # 编译 drop_server
@@ -180,6 +212,8 @@ if(GTest_FOUND)
         tests/test_runtime_symbol_map.cpp
         tests/test_go_symbolizer.cpp
         tests/test_continuous_sampler.cpp
+		tests/test_continuous_session_manager.cpp
+        tests/test_core_ebpf_collector.cpp
         server/TaskQueue.cpp
         common/ProcessExecutor.cpp
         common/Process.cpp
@@ -190,12 +224,14 @@ if(GTest_FOUND)
         common/PythonRuntimeProfiler.cpp
         common/MemrayProfileIngest.cpp
         common/GoSymbolizer.cpp
+        common/CoreEbpfCollector.cpp
         agent/RunnerUtils.cpp
         agent/TaskQueue.cpp
         agent/UploadQueue.cpp
         agent/AttemptTracker.cpp
         agent/ResultDelivery.cpp
         agent/AgentUtils.cpp
+		agent/ContinuousSessionManager.cpp
         agent/runners/PerfRunner.cpp
         agent/runners/AsyncProfilerRunner.cpp
         agent/runners/PprofRunner.cpp
@@ -213,6 +249,12 @@ if(GTest_FOUND)
         ${Protobuf_LIBRARIES}
         Threads::Threads
     )
+    if(NATIVE_CP_CORE_ENABLED)
+        add_dependencies(drop_tests native_cp_core_object)
+        target_compile_definitions(drop_tests PRIVATE DROP_NATIVE_CP_HAVE_LIBBPF=1 DROP_NATIVE_CP_TESTING=1 DROP_NATIVE_CP_CORE_OBJECT=\"${NATIVE_CP_CORE_OBJECT}\")
+        target_include_directories(drop_tests PRIVATE ${LIBBPF_INCLUDE_DIR})
+        target_link_libraries(drop_tests ${LIBBPF_LIBRARY})
+    endif()
     enable_testing()
     add_test(NAME drop_tests COMMAND drop_tests)
 else()

@@ -9,6 +9,23 @@ import (
 const (
 	ContinuousSessionStatusRunning = "running"
 	ContinuousSessionStatusStopped = "stopped"
+	ContinuousSessionStatusLegacy  = "legacy"
+)
+
+const (
+	ContinuousDesiredStateRunning = "running"
+	ContinuousDesiredStateStopped = "stopped"
+)
+
+const (
+	ContinuousObservedStatePending  = "pending"
+	ContinuousObservedStateRunning  = "running"
+	ContinuousObservedStateWaiting  = "waiting"
+	ContinuousObservedStateDegraded = "degraded"
+	ContinuousObservedStateStopping = "stopping"
+	ContinuousObservedStateStopped  = "stopped"
+	ContinuousObservedStateError    = "error"
+	ContinuousObservedStateOffline  = "offline"
 )
 
 const (
@@ -30,6 +47,21 @@ type ContinuousSession struct {
 	Labels               []byte         `gorm:"column:labels;type:jsonb" json:"labels"`
 	Capabilities         []byte         `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
 	Status               string         `gorm:"column:status;size:32;default:running;index" json:"status"`
+	Scope                string         `gorm:"column:scope;size:16;default:host;index" json:"scope"`
+	SelectorExe          string         `gorm:"column:selector_exe;size:4096;index" json:"selector_exe"`
+	SelectorMode         string         `gorm:"column:selector_mode;size:32;default:all_instances" json:"selector_mode"`
+	Signals              []byte         `gorm:"column:signals;type:jsonb" json:"signals"`
+	DesiredState         string         `gorm:"column:desired_state;size:16;default:running;index" json:"desired_state"`
+	ObservedState        string         `gorm:"column:observed_state;size:16;default:pending;index" json:"observed_state"`
+	ObservedAt           *time.Time     `gorm:"column:observed_at;index" json:"observed_at"`
+	ActiveProcesses      []byte         `gorm:"column:active_processes;type:jsonb" json:"active_processes"`
+	ContinuityMode       string         `gorm:"column:continuity_mode;size:16;default:degraded" json:"continuity_mode"`
+	AllowDegraded        bool           `gorm:"column:allow_degraded;default:false" json:"allow_degraded"`
+	DegradationReason    string         `gorm:"column:degradation_reason;type:text" json:"degradation_reason"`
+	LastError            string         `gorm:"column:last_error;type:text" json:"last_error"`
+	StopRequestedAt      *time.Time     `gorm:"column:stop_requested_at" json:"stop_requested_at"`
+	Revision             uint64         `gorm:"column:revision;default:1" json:"revision"`
+	AgentID              string         `gorm:"column:agent_id;size:128;index" json:"agent_id"`
 	LastUploadAt         *time.Time     `gorm:"column:last_upload_at" json:"last_upload_at"`
 	AgentClockOffsetMs   int64          `gorm:"column:agent_clock_offset_ms;default:0" json:"agent_clock_offset_ms"`
 	AgentClockStatus     string         `gorm:"column:agent_clock_status;size:16;default:unknown" json:"agent_clock_status"`
@@ -41,6 +73,31 @@ type ContinuousSession struct {
 	CreatedAt            time.Time      `gorm:"column:created_at" json:"created_at"`
 	UpdatedAt            time.Time      `gorm:"column:updated_at" json:"updated_at"`
 	DeletedAt            gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+}
+
+// ContinuousProcessSnapshot stores only the latest process inventory reported by
+// an Agent. Command-line arguments are deliberately excluded.
+type ContinuousProcessSnapshot struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	TargetIP       string    `gorm:"column:target_ip;size:45;uniqueIndex:idx_continuous_process_identity,priority:1" json:"target_ip"`
+	AgentID        string    `gorm:"column:agent_id;size:128;index" json:"agent_id"`
+	PID            int       `gorm:"column:pid;uniqueIndex:idx_continuous_process_identity,priority:2" json:"pid"`
+	ProcessStartMs int64     `gorm:"column:process_start_ms;uniqueIndex:idx_continuous_process_identity,priority:3" json:"process_start_ms"`
+	Comm           string    `gorm:"column:comm;size:256" json:"comm"`
+	Exe            string    `gorm:"column:exe;size:4096;index" json:"exe"`
+	RSSBytes       uint64    `gorm:"column:rss_bytes" json:"rss_bytes"`
+	ObservedAt     time.Time `gorm:"column:observed_at;index" json:"observed_at"`
+}
+
+type ContinuousAgentState struct {
+	ID            uint      `gorm:"primaryKey" json:"id"`
+	TargetIP      string    `gorm:"column:target_ip;size:45;uniqueIndex" json:"target_ip"`
+	AgentID       string    `gorm:"column:agent_id;size:128;index" json:"agent_id"`
+	StrictCapable bool      `gorm:"column:strict_capable;default:false" json:"strict_capable"`
+	Capabilities  []byte    `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
+	Revision      uint64    `gorm:"column:revision;default:0" json:"revision"`
+	ObservedAt    time.Time `gorm:"column:observed_at;index" json:"observed_at"`
+	UpdatedAt     time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 type ProfileBatch struct {

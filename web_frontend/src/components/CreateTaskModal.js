@@ -313,7 +313,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
             <div style={S.card} onClick={e => e.stopPropagation()}>
                 <div style={S.header}>
                     <div>
-                        <h3 style={S.title}>新建采样任务</h3>
+						<h3 style={S.title}>新建单次采样</h3>
                         <div style={S.hint}>任务类型与参数由后端 TaskKind 契约加载。</div>
                     </div>
                     <button style={S.close} onClick={onClose} disabled={sub} aria-label="关闭">×</button>

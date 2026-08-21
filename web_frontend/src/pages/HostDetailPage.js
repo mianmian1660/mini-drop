@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { agents, profiles, schedules, tasks } from '../api';
 import CreateTaskModal from '../components/CreateTaskModal';
-import ContinuousProfilingPanel from '../components/ContinuousProfilingPanel';
+import CreateContinuousSessionModal from '../components/CreateContinuousSessionModal';
+import ContinuousSessionList from '../components/ContinuousSessionList';
 import Pagination from '../components/Pagination';
 import TimelineChart, { statusColor } from '../components/TimelineChart';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
@@ -72,9 +73,9 @@ const S = {
 
 const tabs = [
     { id: 'overview', label: '概览' },
-    { id: 'tasks', label: '任务列表' },
-    { id: 'timeline', label: '深度采样时间轴' },
-    { id: 'profiling', label: 'Native Profiling' },
+	{ id: 'tasks', label: '任务列表' },
+	{ id: 'timeline', label: '周期性深度采样' },
+	{ id: 'profiling', label: '持续采集' },
     { id: 'logs', label: 'Agent 日志' },
 ];
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed' };
@@ -94,6 +95,8 @@ export default function HostDetailPage() {
     const [detailLoading, setDetailLoading] = useState(false);
     const [error, setError] = useState('');
     const [showCreate, setShowCreate] = useState(false);
+	const [showContinuousCreate, setShowContinuousCreate] = useState(false);
+	const [continuousRefreshToken, setContinuousRefreshToken] = useState(0);
 
     const activeTab = tabs.some(t => t.id === searchParams.get('tab')) ? searchParams.get('tab') : 'overview';
     const target = useMemo(() => targets.find(t => t.id === targetId) || null, [targets, targetId]);
@@ -201,24 +204,27 @@ export default function HostDetailPage() {
     const capabilities = parseStringList(agent.capabilities);
 
     return (
-        <div style={S.container}>
-            <div style={S.pageHead}>
+        <div className="performance-page" style={S.container}>
+            <div className="performance-page-header" style={S.pageHead}>
                 <div>
                     <p style={S.eyebrow}>Performance Center</p>
                     <h2 style={S.title}>{target.hostname || target.ip}</h2>
                 </div>
-                <div style={S.actions}>
+                <div className="performance-page-actions" style={S.actions}>
                     <Link to="/" style={S.btnSecondary}>返回主机列表</Link>
                     <button style={dropOnline ? S.btn : S.btnDisabled} onClick={() => dropOnline && setShowCreate(true)} disabled={!dropOnline}>
-                        新建采样
+						新建单次采样
                     </button>
+					<button style={dropOnline ? S.btn : S.btnDisabled} onClick={() => dropOnline && setShowContinuousCreate(true)} disabled={!dropOnline}>
+						新建持续采集
+					</button>
                 </div>
             </div>
 
             <HostContext target={target} activeTab={activeTab} />
             {!dropOnline && <DropAgentNotice target={target} activeTab={activeTab} />}
 
-            <div style={S.tabBar}>
+            <div className="performance-tabs" style={S.tabBar}>
                 {tabs.map(tab => <button key={tab.id} style={S.tab(activeTab === tab.id)} onClick={() => setTab(tab.id)}>{tab.label}</button>)}
             </div>
 
@@ -231,6 +237,18 @@ export default function HostDetailPage() {
                     onSuccess={handleTaskCreated}
                 />
             )}
+
+			{showContinuousCreate && (
+				<CreateContinuousSessionModal
+					target={target}
+					onClose={() => setShowContinuousCreate(false)}
+					onSuccess={() => {
+						setShowContinuousCreate(false);
+						setContinuousRefreshToken(value => value + 1);
+						setTab('profiling');
+					}}
+				/>
+			)}
 
             {activeTab === 'overview' && (
                 <OverviewPanel
@@ -253,7 +271,7 @@ export default function HostDetailPage() {
             )}
             {activeTab === 'tasks' && <HostTasksPanel target={target} />}
             {activeTab === 'timeline' && <HostTimelinePanel target={target} />}
-            {activeTab === 'profiling' && <HostProfilingPanel target={target} />}
+			{activeTab === 'profiling' && <HostProfilingPanel target={target} refreshToken={continuousRefreshToken} />}
             {activeTab === 'logs' && <AgentLogsPanel audits={audits} detailLoading={detailLoading} onRefresh={() => loadAgentDetail(target.ip)} />}
         </div>
     );
@@ -330,7 +348,7 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                 </div>
             </section>
 
-            <div style={S.grid}>
+            <div className="performance-overview-grid" style={S.grid}>
                 <section style={S.card}>
                     <div style={S.sectionHead}>
                         <h3 style={S.sectionTitle}>最近任务</h3>
@@ -530,7 +548,7 @@ function HostTimelinePanel({ target }) {
                     <h3 style={S.sectionTitle}>该主机周期性深度采样时间轴</h3>
                     <span style={S.subtle}>只显示 target_ip = {target.ip} 的周期性深度采样窗口 · 时间按浏览器本地时区显示：{browserTimeZoneLabel()}</span>
                 </div>
-                {scheduleList.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划。点击“新建采样”并勾选周期性深度采样后会出现在这里。</div> : (
+				{scheduleList.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划。点击“新建单次采样”并勾选周期性深度采样后会出现在这里。</div> : (
                     <>
                         <div style={S.toolbar}>
                             <select style={S.select} value={masterTid} onChange={e => setMasterTid(e.target.value)}>
@@ -623,8 +641,8 @@ function TimelineResult({ points, baselineTid, setBaselineTid }) {
     );
 }
 
-function HostProfilingPanel({ target }) {
-    return <ContinuousProfilingPanel target={target} />;
+function HostProfilingPanel({ target, refreshToken }) {
+	return <ContinuousSessionList target={target} refreshToken={refreshToken} />;
 }
 
 function AgentLogsPanel({ audits, detailLoading, onRefresh }) {

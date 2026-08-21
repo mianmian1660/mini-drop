@@ -45,6 +45,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgrpc++-dev \
     libgrpc-dev \
     libgtest-dev \
+    libbpf-dev \
+    clang \
     nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -89,6 +91,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     linux-headers-generic \
     linux-libc-dev \
     bpftrace \
+    libbpf0 \
     perl \
     curl \
     unzip \
@@ -146,6 +149,7 @@ WORKDIR /app
 # 从阶段1复制编译好的两个程序
 COPY --from=builder /app/build/drop_server .
 COPY --from=builder /app/build/drop_agent .
+COPY --from=builder /app/build/native_cp.bpf.o /app/native_cp.bpf.o
 COPY scripts/memray_converter.py /app/memray_converter.py
 
 # perf 采集需要特权模式（在 docker-compose 里用 privileged: true）

@@ -158,7 +158,6 @@ func TestProfileTargetsUseRemoteAgentLabelsForSelector(t *testing.T) {
 		Labels:   []byte(`["job=hotmethod","env=development","instance=111.230.29.115","node=cloud-node"]`),
 		LastSeen: now,
 	}).Error
-
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/profile/targets", nil)
 	req.Header.Set("Drop-User-Uid", "owner")
 	w := httptest.NewRecorder()
@@ -418,8 +417,8 @@ func TestNativeContinuousBatchIngestQueryAndFilters(t *testing.T) {
 			"window_end":%q,
 			"sample_count":22,
 			"samples":[
-				{"stack":["runtime.main","main.busy"],"count":19,"comm":"python3","pid":123,"exe":"/usr/bin/python3"},
-				{"stack":["runtime.main","main.idle"],"count":3,"comm":"bash","pid":234,"exe":"/usr/bin/bash"}
+				{"stack":["runtime.main","main.busy"],"count":19,"comm":"python3","pid":123,"process_start_ms":1724160000123,"exe":"/usr/bin/python3"},
+				{"stack":["runtime.main","main.idle"],"count":3,"comm":"bash","pid":234,"process_start_ms":1724160000234,"exe":"/usr/bin/bash"}
 			]
 		}]
 	}`, now.Add(-20*time.Second).Format(time.RFC3339), now.Add(-10*time.Second).Format(time.RFC3339), now.Add(-20*time.Second).Format(time.RFC3339), now.Add(-10*time.Second).Format(time.RFC3339))
@@ -464,9 +463,17 @@ func TestNativeContinuousBatchIngestQueryAndFilters(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"bash"`) || !strings.Contains(w.Body.String(), `"python3"`) {
 		t.Fatalf("expected comm label values, got %s", w.Body.String())
 	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/label-values?session_sid=cps-test&target_id=10.0.0.1:hotmethod&from="+url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339))+"&to="+url.QueryEscape(now.Format(time.RFC3339))+"&label=process_instance", nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"123|1724160000123"`) || !strings.Contains(w.Body.String(), `"234|1724160000234"`) {
+		t.Fatalf("expected SID-isolated process instances, status=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
-func TestInternalContinuousSessionIsSystemReadable(t *testing.T) {
+func TestLegacyInternalContinuousCreateIsDisabledAndHistoricalSystemSessionIsReadable(t *testing.T) {
 	s := newTestAPIServer(t)
 	s.Storage = newContinuousMemoryStorage()
 	now := time.Now().UTC()
@@ -474,8 +481,13 @@ func TestInternalContinuousSessionIsSystemReadable(t *testing.T) {
 	_ = s.DB.Create(&model.AgentInfo{
 		Hostname: "node-system",
 		IPAddr:   "10.0.0.10",
+		AgentID:  "agent-001",
 		Online:   true,
 		LastSeen: now,
+	}).Error
+	_ = s.DB.Create(&model.ContinuousAgentState{
+		TargetIP: "10.0.0.10", AgentID: "agent-001", StrictCapable: true,
+		ObservedAt: now, UpdatedAt: now,
 	}).Error
 
 	createBody := `{
@@ -490,20 +502,18 @@ func TestInternalContinuousSessionIsSystemReadable(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("create system session status=%d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusGone {
+		t.Fatalf("legacy Agent create status=%d body=%s", w.Code, w.Body.String())
 	}
-	var createResp struct {
-		Data struct {
-			Session model.ContinuousSession `json:"session"`
-		} `json:"data"`
+	session := model.ContinuousSession{
+		SID: "cps-system-history", Name: "Native Continuous Profiling", TargetIP: "10.0.0.10",
+		Hostname: "node-system", ServiceName: "hotmethod", SampleRateHz: 19, AggregationWindowSec: 10,
+		UploadBatchSec: 60, RetentionHours: 24, Capabilities: []byte(`{"sampler":"perf_event"}`),
+		Status: model.ContinuousSessionStatusRunning, Scope: "host", DesiredState: "running", ObservedState: "running",
+		AgentID: "agent-001", StartedAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &createResp); err != nil {
-		t.Fatalf("create json: %v", err)
-	}
-	session := createResp.Data.Session
-	if session.SID == "" || session.UID != "" || session.UserName != "system-agent" {
-		t.Fatalf("unexpected system session: %+v", session)
+	if err := s.DB.Create(&session).Error; err != nil {
+		t.Fatal(err)
 	}
 
 	start := now.Add(-20 * time.Second)

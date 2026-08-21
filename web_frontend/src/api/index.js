@@ -103,8 +103,10 @@ export const profiles = {
 export const continuous = {
     createSession: (data) => client.post('/api/v1/continuous/sessions', data),
     sessions: (params = {}) => client.get('/api/v1/continuous/sessions', { params }),
-    stopSession: (sid) => client.post(`/api/v1/continuous/sessions/${sid}/stop`),
-    timeline: (sid, params = {}) => client.get(`/api/v1/continuous/sessions/${sid}/timeline`, { params }),
+	detail: (sid) => client.get(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}`),
+	processes: (params = {}) => client.get('/api/v1/continuous/processes', { params }),
+    stopSession: (sid) => client.post(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}/stop`),
+    timeline: (sid, params = {}) => client.get(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}/timeline`, { params }),
     query: (params = {}) => client.get('/api/v1/continuous/query', { params }),
     histogram: (params = {}) => client.get('/api/v1/continuous/histogram', { params }),
 };

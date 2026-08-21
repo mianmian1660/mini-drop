@@ -73,6 +73,9 @@ CapabilityReport detect_capabilities()
     report.perfCommand = command_exists("perf") || command_exists("perf-real");
     report.bpftraceCommand = command_exists("bpftrace");
     report.btf = path_exists("/sys/kernel/btf/vmlinux");
+    std::string coreObject = std::getenv("DROP_NATIVE_CP_CORE_OBJECT") && *std::getenv("DROP_NATIVE_CP_CORE_OBJECT")
+                                 ? std::getenv("DROP_NATIVE_CP_CORE_OBJECT") : "/app/native_cp.bpf.o";
+    bool coreObjectReady = path_exists(coreObject);
     report.ebpfFS = path_exists("/sys/fs/bpf");
     report.traceFS = path_exists("/sys/kernel/tracing") || path_exists("/sys/kernel/debug/tracing");
     report.blockTracepoint =
@@ -107,7 +110,7 @@ CapabilityReport detect_capabilities()
         report.capabilities.push_back("native_cp_sampler_perf_event");
     if (report.bpftraceCommand && report.traceFS && report.ebpfFS)
         report.capabilities.push_back("native_cp_sampler_bpftrace_ready");
-    if (report.btf && report.ebpfFS && report.memlockUnlimited)
+    if (report.btf && report.ebpfFS && report.memlockUnlimited && coreObjectReady)
         report.capabilities.push_back("native_cp_sampler_core_ready");
     return report;
 }

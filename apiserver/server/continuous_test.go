@@ -133,6 +133,38 @@ func TestContinuousBatchStorageFailureDoesNotAckOrPersist(t *testing.T) {
 	}
 }
 
+func TestContinuousBatchRejectsWrongAgentOrTarget(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if err := s.DB.Create(&model.ContinuousSession{
+		SID: "cps-owned-agent", TargetIP: "10.0.0.10", AgentID: "agent-10", RetentionHours: 24,
+		Status: model.ContinuousSessionStatusRunning, StartedAt: now.Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"session_sid":"cps-owned-agent","batch_id":"cpb-owned-agent","target_ip":"10.0.0.99","start_time":%q,"end_time":%q,"windows":[]}`,
+		now.Add(-20*time.Second).Format(time.RFC3339Nano), now.Add(-10*time.Second).Format(time.RFC3339Nano))
+	router := profileRouter(s)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "other-agent")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("wrong Agent status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Drop-User-Uid", "agent-10")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("wrong target status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestContinuousSymbolMetadataCollectsGoState(t *testing.T) {
 	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{}}
 	refs := map[string]interface{}{

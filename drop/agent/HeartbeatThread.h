@@ -18,7 +18,7 @@
 #include "agent/TaskQueue.h"
 #include "agent/AttemptTracker.h"
 #include "agent/ServerChannelHolder.h"
-#include "common/ContinuousSampler.h" // drop::DualTrackContinuousSampler
+#include "agent/ContinuousSessionManager.h"
 #include "common/proto/common.pb.h"   // common::CosConfig
 #include "common/proto/healthcheck.grpc.pb.h"
 #include "common/proto/hotmethod.grpc.pb.h"
@@ -74,11 +74,7 @@ namespace drop_agent
         std::atomic<bool> &running_;
         std::thread thread_;
 
-        drop::DualTrackContinuousSampler nativeSampler_;
-        std::string nativeCPAPIBaseURL_;
-        std::string nativeCPAuthUID_;
-        std::string nativeCPSessionSID_;
-        std::chrono::steady_clock::time_point nativeCPNextRetryAt_{};
+		std::unique_ptr<ContinuousSessionManager> continuousManager_;
     };
 
 } // namespace drop_agent

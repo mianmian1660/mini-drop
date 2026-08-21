@@ -132,14 +132,14 @@ make demo-pprof
 
 如果 `make demo-cpu` 在 VMware 中无法生成真实 perf 火焰图，请先确认虚拟机是否支持虚拟化 CPU 性能计数器。若该选项无法勾选，建议不要把它作为机器故障处理，而是在演示说明中标注“当前 VMware 环境无法暴露 PMU，perf 真采需要换可用 Linux 环境”。但 eBPF 是评分硬项，必须在可运行 `bpftrace` 的 Linux 环境中完成 IO/调度现场采集。
 
-## Native Dual-Track Continuous Profiling（可选）
+## 用户驱动的 Native Continuous Profiling（可选）
 
-Native Continuous Profiling 是独立于旧 schedule 时间轴的整机低频持续采集链路。当前是双轨设计：
+Native Continuous Profiling 独立于旧 schedule 时间轴。Agent 启动不会自动创建任务；用户需要在主机性能中心创建整机或按 exe 跟随全部实例的持续任务，停止请求由 Agent 完成最后切窗和上传后确认。当前采集引擎是明确标记为 degraded 的双轨回退：
 
-- CPU profile 轨：优先尝试 eBPF backend，fallback 顺序为 `CO-RE -> bpftrace -> perf`。当前版本会探测 CO-RE/BTF 能力并记录不可用原因，真实 eBPF CPU 样本先由 bpftrace backend 产出；再失败则退到现有 `perf record -a -F 19 -g`。
-- 延迟 histogram 轨：使用 bpftrace 持续采集整机 IO 延迟和调度延迟 histogram，按 10 秒窗口、60 秒 batch 上传。
+- CPU profile 轨：整机任务使用 `perf record -a`；进程任务只使用 `perf record -p <pid-list>`，绝不降级为整机采集。
+- 延迟 histogram 轨：使用带目标 PID predicate 的 bpftrace 采集块 IO、系统调用 IO 和调度延迟，默认按 10 秒窗口、60 秒 batch 上传。
 
-前端主机页的 Native Profiling 标签页提供 CPU、IO 延迟、调度延迟三类视图。CPU 视图可切换用户栈/内核栈；IO/调度视图展示合并 histogram、P50/P95/P99 趋势和当前 backend。
+前端主机页的“持续采集”标签页先展示任务列表，进入单个任务后提供 CPU、块 IO、系统调用 IO 和调度延迟视图。进程任务可按 `PID + process_start_ms` 查看具体实例。
 
 它默认关闭，原因是 WSL、部分 VMware/VirtualBox 和权限受限云主机经常无法运行 host perf 采样；默认关闭可以避免平台启动后持续刷 perf 权限错误。确认当前机器具备 perf 权限后，可显式启用：
 
@@ -155,13 +155,12 @@ bash scripts/native_cp_smoke.sh
 
 可选环境变量：
 
-- `DROP_NATIVE_CP_ENABLED=true`：启用 Agent 内置 Native CP sampler。
+- `DROP_NATIVE_CP_ENABLED=true`：启用 Agent 持续采集控制面能力；不会自动开始采集。
 - `DROP_NATIVE_CP_EBPF_ENABLED=true`：启用持续 eBPF backend；关闭后 CPU 退回 perf，IO/sched histogram 显示不可用。
-- `DROP_NATIVE_CP_SIGNALS=cpu,io,sched`：选择持续采集信号。
+- `DROP_NATIVE_CP_SIGNALS=cpu,io,io_syscall,sched`：选择持续采集回退信号。
 - `DROP_NATIVE_CP_CPU_BACKENDS=core,bpftrace,perf`：CPU backend fallback 顺序。当前 CO-RE 是能力探测/预留位，实际 eBPF CPU 数据由 bpftrace backend 产生。
 - `DROP_BTF_PATH=/path/to/vmlinux.btf`：显式指定 CO-RE BTF 文件；未设置时默认探测 `/sys/kernel/btf/vmlinux`。
 - `DROP_NATIVE_CP_API_BASE_URL=http://127.0.0.1:8191`：Agent 访问 apiserver 的地址，host network compose 默认使用本机地址。
-- `DROP_NATIVE_CP_SESSION_ID=cps-...`：复用已有 session；不设置时 Agent 会自动创建。
 - `WAIT_SECONDS=75`：smoke 等待上传 batch 的时间。
 
 如果 smoke 返回空结果或日志出现 `perf record failed`、`bpftrace failed`、`tracepoints unavailable`、`CO-RE BTF unavailable`，先看：

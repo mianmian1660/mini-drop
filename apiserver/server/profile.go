@@ -62,6 +62,7 @@ type ContinuousSessionMeta struct {
 }
 
 type ProfileQuery struct {
+	SessionSID  string                 `json:"session_sid"`
 	TargetID    string                 `json:"target_id"`
 	Host        string                 `json:"host"`
 	Service     string                 `json:"service"`
@@ -77,6 +78,7 @@ type ProfileQuery struct {
 }
 
 type ProfileDiffQuery struct {
+	SessionSID  string                 `json:"session_sid"`
 	TargetID    string                 `json:"target_id"`
 	Host        string                 `json:"host"`
 	Service     string                 `json:"service"`
@@ -316,12 +318,14 @@ func (s *APIServer) GetProfileDiff(c *gin.Context) {
 	}
 	if baseTop, baseFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
 		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+		SessionSID: q.SessionSID,
 		StackScope: q.StackScope,
 	}); err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
 	} else if compareTop, compareFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{
 		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo, ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+		SessionSID: q.SessionSID,
 		StackScope: q.StackScope,
 	}); err != nil {
 		s.respondProfileDependencyError(c, err)
@@ -381,6 +385,7 @@ func (s *APIServer) profileQueryFromRequest(c *gin.Context) (ProfileQuery, bool)
 		return ProfileQuery{}, false
 	}
 	q := ProfileQuery{
+		SessionSID:  strings.TrimSpace(c.Query("session_sid")),
 		TargetID:    strings.TrimSpace(c.Query("target_id")),
 		Host:        strings.TrimSpace(c.Query("host")),
 		Service:     strings.TrimSpace(c.DefaultQuery("service", "hotmethod")),
@@ -417,6 +422,7 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 		return ProfileDiffQuery{}, false
 	}
 	q := ProfileDiffQuery{
+		SessionSID:  strings.TrimSpace(c.Query("session_sid")),
 		TargetID:    strings.TrimSpace(c.Query("target_id")),
 		Host:        strings.TrimSpace(c.Query("host")),
 		Service:     strings.TrimSpace(c.DefaultQuery("service", "hotmethod")),
@@ -430,7 +436,7 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 		Filters:     parseProfileFilters(c.Query("filters")),
 		MaxNodes:    parseMaxNodes(c, "max_nodes"),
 	}
-	pq := ProfileQuery{TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, StackScope: q.StackScope, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes}
+	pq := ProfileQuery{SessionSID: q.SessionSID, TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: baseFrom, To: baseTo, ProfileType: q.ProfileType, StackScope: q.StackScope, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes}
 	target, ok := s.validateProfileQuery(c, &pq)
 	if !ok {
 		return ProfileDiffQuery{}, false
@@ -444,6 +450,7 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 	}
 	q.Host, q.TargetID, q.Service, q.Labels, q.Filters = pq.Host, pq.TargetID, pq.Service, pq.Labels, pq.Filters
 	q.StackScope = pq.StackScope
+	q.SessionSID = pq.SessionSID
 	q.OwnerUIDs, q.CanReadAll = pq.OwnerUIDs, pq.CanReadAll
 	return q, true
 }
@@ -465,7 +472,21 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) (Profi
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "可观测对象不存在或无权限访问")
 		return ProfileTarget{}, false
 	}
-	if !s.validateProfileTimeRange(c, q.From, q.To, profileRetentionDuration(target)) {
+	retention := profileRetentionDuration(target)
+	if q.SessionSID != "" {
+		var session model.ContinuousSession
+		if err := s.DB.Where("sid = ?", q.SessionSID).First(&session).Error; err != nil || !s.canReadOwner(session.UID, s.AuthContext(c)) {
+			s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "持续采集任务不存在或无权限访问")
+			return ProfileTarget{}, false
+		}
+		if session.TargetIP != target.IP {
+			s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "session_sid 不属于当前主机")
+			return ProfileTarget{}, false
+		}
+		retention = time.Duration(firstNonZeroUint32(session.RetentionHours, 24)) * time.Hour
+		target.ContinuousSession = continuousSessionMeta(session)
+	}
+	if !s.validateProfileTimeRange(c, q.From, q.To, retention) {
 		return ProfileTarget{}, false
 	}
 	q.TargetID = target.ID
@@ -813,7 +834,7 @@ func profileTargetID(ip, service string) string {
 func profileLabelSelector(q ProfileQuery) string {
 	labels := mergeProfileLabels(ProfileTarget{IP: q.Host, ServiceName: q.Service, Labels: q.Labels}, q.Labels)
 	parts := make([]string, 0, len(labels)+len(q.Filters))
-	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
+	for _, key := range []string{"comm", "pid", "process_start_ms", "exe", "runtime"} {
 		if v := labelString(q.Filters, key); v != "" {
 			parts = append(parts, fmt.Sprintf("%s=%q", key, v))
 		}
@@ -876,7 +897,7 @@ func profileTargetLabels(target ProfileTarget, labels map[string]interface{}) ma
 
 func sanitizeProfileFilters(filters map[string]interface{}) map[string]interface{} {
 	out := map[string]interface{}{}
-	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
+	for _, key := range []string{"comm", "pid", "process_start_ms", "exe", "runtime"} {
 		if v := labelString(filters, key); v != "" {
 			out[key] = v
 		}
@@ -886,7 +907,7 @@ func sanitizeProfileFilters(filters map[string]interface{}) map[string]interface
 
 func isAllowedProfileFilterLabel(label string) bool {
 	switch label {
-	case "comm", "pid", "exe", "runtime":
+	case "comm", "pid", "process_start_ms", "exe", "runtime":
 		return true
 	default:
 		return false

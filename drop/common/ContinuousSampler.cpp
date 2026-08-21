@@ -8,11 +8,13 @@
 #include "common/PythonRuntimeProfiler.h"
 #include "common/MemrayProfileIngest.h"
 #include "common/RuntimeSymbolMap.h"
+#include "common/CoreEbpfCollector.h"
 #include "common/Utils.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -20,6 +22,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -29,6 +32,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -37,6 +42,64 @@ namespace drop
 
 namespace
 {
+
+struct WindowPayload;
+
+struct RollingPerfRecorder
+{
+    pid_t pid = -1;
+    std::string directory;
+    std::set<std::string> consumed;
+    int64_t wallStartMs = 0;
+    int64_t monotonicStartMs = 0;
+    bool Start(const ContinuousSamplerConfig &, std::string *error);
+    bool HasParseableOutput() const;
+    std::vector<WindowPayload> Drain(const ContinuousSamplerConfig &, bool final);
+    void Stop();
+};
+
+static bool create_rolling_perf_directory(std::string *directory)
+{
+    if (!directory)
+        return false;
+    std::string pattern = "/tmp/mini-drop-native-cp-rolling-" +
+                          std::to_string(::getpid()) + "-XXXXXX";
+    std::vector<char> writable(pattern.begin(), pattern.end());
+    writable.push_back('\0');
+    char *created = ::mkdtemp(writable.data());
+    if (!created)
+        return false;
+    *directory = created;
+    return true;
+}
+
+static std::vector<std::string> rolling_perf_files(const std::string &directory, bool final)
+{
+    std::vector<std::string> files;
+    DIR *dir = ::opendir(directory.c_str());
+    if (dir)
+    {
+        while (dirent *entry = ::readdir(dir))
+        {
+            std::string name = entry->d_name;
+            if (name == "perf.data" || name.rfind("perf.data.", 0) == 0)
+                files.push_back(directory + "/" + name);
+        }
+        ::closedir(dir);
+    }
+    std::sort(files.begin(), files.end());
+    // perf keeps the original `perf.data` path open and renames completed
+    // switch-output segments to `perf.data.<timestamp>`. During live drains
+    // every timestamped file is immutable; only the base path must wait for
+    // the recorder to stop.
+    if (!final)
+        files.erase(std::remove(files.begin(), files.end(), directory + "/perf.data"), files.end());
+    return files;
+}
+
+static double strict_histogram_low(uint32_t slot);
+static void append_core_histograms(WindowPayload *, const ContinuousSamplerConfig &,
+                                   const std::vector<CoreHistogramSample> &, uint64_t lost);
 static constexpr uint64_t kMaxDBCount = (1ULL << 63) - 1;
 
 struct SpoolRetryState
@@ -64,11 +127,35 @@ static uint64_t stable_string_hash(const std::string &value)
     return hash;
 }
 
+static uint64_t agent_generation_id()
+{
+    // PID alone is reusable after a container restart. The Agent's /proc
+    // start identity is stable for its lifetime and changes on every process
+    // generation, which keeps a recovered partial batch distinct from a new
+    // capture that happens to start at the same sample timestamp.
+    static const uint64_t identity = [] {
+        int64_t started = 0;
+        if (drop::python_process_start_ms(::getpid(), &started) && started > 0)
+            return static_cast<uint64_t>(started);
+        struct timespec ts = {};
+        ::clock_gettime(CLOCK_REALTIME, &ts);
+        return static_cast<uint64_t>(static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+                                     static_cast<uint64_t>(ts.tv_nsec));
+    }();
+    return identity;
+}
+
 static std::string make_batch_id(const ContinuousSamplerConfig &cfg, int64_t windowStartMs)
 {
+    std::ostringstream identity;
+    identity << cfg.scope << '|' << cfg.selectorExe << '|';
+    for (const auto &target : cfg.targetProcesses)
+        identity << target.pid << ':' << target.processStartMs << ':' << target.exe << ';';
     std::ostringstream id;
     id << "cpb-" << std::hex << stable_string_hash(cfg.sessionSID)
-       << std::dec << '-' << windowStartMs << '-' << ::getpid();
+       << '-' << stable_string_hash(identity.str())
+       << std::dec << '-' << windowStartMs
+       << '-' << std::hex << agent_generation_id();
     return id.str();
 }
 
@@ -165,7 +252,8 @@ static void append_spool_files(const std::string &directory,
             continue;
         if (S_ISDIR(st.st_mode))
             append_spool_files(path, suffix, files);
-        else if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+        else if (name.rfind("cpb-", 0) == 0 && name.size() > suffix.size() &&
+                 name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
             files->push_back(path);
     }
     ::closedir(dir);
@@ -178,6 +266,15 @@ static std::vector<std::string> list_spool_files(const ContinuousSamplerConfig &
     std::sort(files.begin(), files.end(), [](const std::string &a, const std::string &b) {
         return a.substr(a.find_last_of('/') + 1) < b.substr(b.find_last_of('/') + 1);
     });
+    return files;
+}
+
+static std::vector<std::string> list_session_spool_files(const ContinuousSamplerConfig &cfg,
+                                                         const std::string &suffix)
+{
+    std::vector<std::string> files;
+    append_spool_files(session_spool_directory(cfg), suffix, &files);
+    std::sort(files.begin(), files.end());
     return files;
 }
 
@@ -276,11 +373,23 @@ struct AggregatedSample
     std::vector<std::string> stack;
     std::string comm;
     int pid = 0;
+    int64_t processStartMs = 0;
     std::string exe;
     std::string stackScope;
     std::string backend;
     std::string runtime;
     uint64_t count = 0;
+};
+
+// `perf script -F ...time...` prints the sample clock in seconds. Keep the
+// bounds alongside the parsed stacks so rolling files can retain the actual
+// capture interval instead of the (much later) parser wall-clock interval.
+struct PerfScriptParseResult
+{
+    std::vector<AggregatedSample> samples;
+    double startTimestampSec = 0.0;
+    double endTimestampSec = 0.0;
+    bool hasTimestamp = false;
 };
 
 struct ProfilePayload
@@ -329,6 +438,7 @@ struct HistogramPayload
     double p99 = 0;
     bool unavailable = false;
     std::string reason;
+    int pid = 0;
 };
 
 struct WindowPayload
@@ -381,10 +491,18 @@ static int env_positive_int(const char *name, int fallback)
 static std::string rfc3339_from_ms(int64_t ms)
 {
     std::time_t sec = static_cast<std::time_t>(ms / 1000);
+    int milliseconds = static_cast<int>(ms % 1000);
+    if (milliseconds < 0)
+    {
+        milliseconds += 1000;
+        --sec;
+    }
     std::tm tm{};
     gmtime_r(&sec, &tm);
-    char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                  tm.tm_hour, tm.tm_min, tm.tm_sec, milliseconds);
     return std::string(buf);
 }
 
@@ -440,7 +558,125 @@ static std::string read_exe(int pid)
     if (n <= 0)
         return "";
     buf[n] = '\0';
-    return std::string(buf);
+    std::string exe(buf);
+    const std::string deletedSuffix = " (deleted)";
+    if (exe.size() > deletedSuffix.size() &&
+        exe.compare(exe.size() - deletedSuffix.size(), deletedSuffix.size(), deletedSuffix) == 0)
+        exe.resize(exe.size() - deletedSuffix.size());
+    return exe;
+}
+
+static int process_tgid(int pid)
+{
+    if (pid <= 0)
+        return pid;
+    std::ifstream in("/proc/" + std::to_string(pid) + "/status");
+    std::string key;
+    while (in >> key)
+    {
+        if (key == "Tgid:")
+        {
+            int tgid = 0;
+            in >> tgid;
+            return tgid > 0 ? tgid : pid;
+        }
+        std::string rest;
+        std::getline(in, rest);
+    }
+    return pid;
+}
+
+static bool process_targeted(const ContinuousSamplerConfig &cfg,
+                             int pid,
+                             int64_t processStartMs,
+                             const std::string &exe)
+{
+    if (cfg.scope != "process")
+        return true;
+    for (const auto &target : cfg.targetProcesses)
+        if (target.pid == pid &&
+            (processStartMs <= 0 || target.processStartMs <= 0 || processStartMs == target.processStartMs) &&
+            (cfg.selectorExe.empty() || exe.empty() || exe == cfg.selectorExe))
+            return true;
+    return false;
+}
+
+static bool process_targeted(const ContinuousSamplerConfig &cfg, int pid, const std::string &exe)
+{
+    return process_targeted(cfg, pid, 0, exe);
+}
+
+static int64_t configured_process_start_ms(const ContinuousSamplerConfig &cfg, int pid)
+{
+    for (const auto &target : cfg.targetProcesses)
+        if (target.pid == pid)
+            return target.processStartMs;
+    int64_t startMs = 0;
+    drop::python_process_start_ms(pid, &startMs);
+    return startMs;
+}
+
+static std::string configured_process_exe(const ContinuousSamplerConfig &cfg, int pid)
+{
+    for (const auto &target : cfg.targetProcesses)
+        if (target.pid == pid)
+            return target.exe;
+    return {};
+}
+
+static std::string target_pid_csv(const ContinuousSamplerConfig &cfg)
+{
+    std::ostringstream out;
+    bool first = true;
+    for (const auto &target : cfg.targetProcesses)
+    {
+        if (target.pid <= 0)
+            continue;
+        if (!first)
+            out << ',';
+        first = false;
+        out << target.pid;
+    }
+    return out.str();
+}
+
+static std::vector<std::string> perf_record_args(const ContinuousSamplerConfig &cfg,
+                                                 const std::string &perf,
+                                                 const std::string &perfEvent,
+                                                 const std::string &dataPath)
+{
+    std::vector<std::string> args{perf, "record", "--no-buildid-cache", "-q"};
+    if (cfg.scope == "process")
+    {
+        std::string pids = target_pid_csv(cfg);
+        if (pids.empty())
+            return {};
+        args.insert(args.end(), {"-p", pids});
+    }
+    else
+    {
+        args.push_back("-a");
+    }
+    args.insert(args.end(), {"-e", perfEvent, "-F", std::to_string(cfg.sampleRateHz),
+                             "-g", "-o", dataPath, "--", "sleep",
+                             std::to_string(cfg.aggregationWindowSec)});
+    return args;
+}
+
+static std::string bpftrace_target_predicate(const ContinuousSamplerConfig &cfg, const std::string &pidExpr = "pid")
+{
+    if (cfg.scope != "process")
+        return "";
+    std::string predicate;
+    for (const auto &target : cfg.targetProcesses)
+    {
+        if (target.pid <= 0)
+            continue;
+        if (!predicate.empty())
+            predicate += " || ";
+        predicate += pidExpr + " == " + std::to_string(target.pid);
+    }
+    return predicate.empty() ? "/0/" : "/" + predicate + "/";
 }
 
 static std::string parse_frame_name(const std::string &raw, int pid)
@@ -492,12 +728,18 @@ static std::string parse_frame_name(const std::string &raw, int pid)
     return name;
 }
 
-static bool parse_sample_header(const std::string &line, std::string *comm, int *pid)
+static bool parse_sample_header(const std::string &line,
+                                std::string *comm,
+                                int *pid,
+                                double *timestampSec = nullptr)
 {
     std::string trimmed = drop::trim(line);
     if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == '\t')
         return false;
-    if (trimmed.find(':') == std::string::npos || trimmed.find('[') == std::string::npos)
+    // System-wide perf output includes a [CPU] column, while process-attached
+    // output from `perf record -p` does not. Both formats still have a numeric
+    // PID token followed by a timestamp containing ':'.
+    if (trimmed.find(':') == std::string::npos)
         return false;
     std::istringstream iss(trimmed);
     std::string commToken, pidToken;
@@ -511,6 +753,34 @@ static bool parse_sample_header(const std::string &line, std::string *comm, int 
         return false;
     *comm = commToken;
     *pid = parsedPid;
+    if (timestampSec)
+    {
+        *timestampSec = 0.0;
+        std::string token;
+        while (iss >> token)
+        {
+            // The timestamp field is the only header token whose numeric
+            // value is immediately followed by ':'. This works for both
+            // `pid/tid [cpu] time:` and process-attached `pid tid time:`
+            // layouts emitted by perf versions in the supported images.
+            const size_t colon = token.find(':');
+            if (colon == std::string::npos || colon == 0)
+                continue;
+            const std::string number = token.substr(0, colon);
+            char *end = nullptr;
+            const double parsed = std::strtod(number.c_str(), &end);
+            if (!end || *end != '\0' || !std::isfinite(parsed) || parsed < 0.0)
+                continue;
+            // Event names can contain digits, but the timestamp contains a
+            // decimal point in perf's text format. Accept exponent notation
+            // too, while avoiding event tokens such as "v2:".
+            if (number.find('.') == std::string::npos && number.find('e') == std::string::npos &&
+                number.find('E') == std::string::npos)
+                continue;
+            *timestampSec = parsed;
+            break;
+        }
+    }
     return true;
 }
 
@@ -523,6 +793,10 @@ static void add_sample(std::map<std::string, AggregatedSample> *out,
 {
     if (rawStack.empty())
         return;
+    // `perf script` reports the sampled thread ID for multithreaded runtimes
+    // such as Go and the JVM. Continuous process selectors are TGID-based, so
+    // normalize every sample before executable and start-time attribution.
+    pid = process_tgid(pid);
     std::vector<std::string> stack = rawStack;
     std::reverse(stack.begin(), stack.end());
     std::string exe = read_exe(pid);
@@ -542,8 +816,9 @@ static void add_sample(std::map<std::string, AggregatedSample> *out,
     sample.count++;
 }
 
-static std::vector<AggregatedSample> parse_perf_script(const std::string &script)
+static PerfScriptParseResult parse_perf_script_result(const std::string &script)
 {
+    PerfScriptParseResult result;
     std::map<std::string, AggregatedSample> byKey;
     std::istringstream iss(script);
     std::string line;
@@ -565,11 +840,26 @@ static std::vector<AggregatedSample> parse_perf_script(const std::string &script
         }
         std::string comm;
         int pid = 0;
-        if (parse_sample_header(line, &comm, &pid))
+        double timestampSec = 0.0;
+        if (parse_sample_header(line, &comm, &pid, &timestampSec))
         {
             flush();
             currentComm = comm;
             currentPid = pid;
+            if (timestampSec > 0.0)
+            {
+                if (!result.hasTimestamp)
+                {
+                    result.startTimestampSec = timestampSec;
+                    result.endTimestampSec = timestampSec;
+                    result.hasTimestamp = true;
+                }
+                else
+                {
+                    result.startTimestampSec = std::min(result.startTimestampSec, timestampSec);
+                    result.endTimestampSec = std::max(result.endTimestampSec, timestampSec);
+                }
+            }
             continue;
         }
         if (!currentComm.empty() && (line[0] == ' ' || line[0] == '\t'))
@@ -580,11 +870,38 @@ static std::vector<AggregatedSample> parse_perf_script(const std::string &script
         }
     }
     flush();
-    std::vector<AggregatedSample> out;
-    out.reserve(byKey.size());
+    result.samples.reserve(byKey.size());
     for (auto &kv : byKey)
-        out.push_back(kv.second);
-    return out;
+        result.samples.push_back(kv.second);
+    return result;
+}
+
+static std::vector<AggregatedSample> parse_perf_script(const std::string &script)
+{
+    return parse_perf_script_result(script).samples;
+}
+
+static int64_t monotonic_ms()
+{
+    struct timespec ts = {};
+    if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t perf_timestamp_to_unix_ms(double timestampSec,
+                                         int64_t wallAnchorMs,
+                                         int64_t monotonicAnchorMs)
+{
+    if (!std::isfinite(timestampSec) || timestampSec <= 0.0)
+        return 0;
+    // Some perf exporters print CLOCK_REALTIME seconds, while the native
+    // perf tool normally prints CLOCK_MONOTONIC seconds. Support both forms.
+    if (timestampSec >= 1000000000.0)
+        return static_cast<int64_t>(std::llround(timestampSec * 1000.0));
+    if (wallAnchorMs <= 0 || monotonicAnchorMs <= 0)
+        return 0;
+    return wallAnchorMs + static_cast<int64_t>(std::llround(timestampSec * 1000.0)) - monotonicAnchorMs;
 }
 
 // ------------------------------------------------------------
@@ -887,7 +1204,8 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
     drop::PythonFallbackCapture pythonCapture;
     if (pythonFallbackEnabled)
-        pythonCapture = drop::start_python_fallback_capture(cfg.aggregationWindowSec, pythonRateHz, pythonMaxProcesses);
+        pythonCapture = drop::start_python_fallback_capture(
+            cfg.sessionSID, cfg.aggregationWindowSec, pythonRateHz, pythonMaxProcesses);
     // 云 VM 上硬件 cycles 计数器可能冻结（perf stat 读到 2^50 固定值），
     // perf 默认的 cycles 事件会采不到任何样本。默认改用软件事件 cpu-clock，
     // 可用 DROP_NATIVE_CP_PERF_EVENT 覆盖（Step 1 实测结论）。
@@ -897,7 +1215,14 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
             perfEvent = env;
     std::string recordOutput;
     int64_t tRecordStart = now_ms();
-    int rc = drop::exec_capture({perf, "record", "--no-buildid-cache", "-q", "-a", "-e", perfEvent, "-F", std::to_string(cfg.sampleRateHz), "-g", "-o", dataPath, "--", "sleep", std::to_string(cfg.aggregationWindowSec)}, &recordOutput, 4096);
+    std::vector<std::string> recordArgs = perf_record_args(cfg, perf, perfEvent, dataPath);
+    if (recordArgs.empty())
+    {
+        window.endMs = now_ms();
+        pythonCapture.Finish();
+        return window;
+    }
+    int rc = drop::exec_capture(recordArgs, &recordOutput, 4096);
     window.endMs = now_ms();
     int64_t recordMs = window.endMs - tRecordStart;
     if (rc != 0)
@@ -929,7 +1254,8 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     int64_t goMs = now_ms() - tGoStart;
     int64_t tScriptStart = now_ms();
     std::string scriptOutput;
-    rc = drop::exec_capture({perf, "script", "-i", dataPath}, &scriptOutput, 32 * 1024 * 1024);
+    rc = drop::exec_capture({perf, "script", "-F", "comm,pid,tid,time,event,ip,sym,dso", "-i", dataPath},
+                            &scriptOutput, 32 * 1024 * 1024);
     ::remove(dataPath.c_str());
     int64_t scriptMs = now_ms() - tScriptStart;
     std::cout << "[native-cp] perf window record_ms=" << recordMs
@@ -946,12 +1272,21 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     std::map<int, bool> goBuildInfoCache;
     for (auto &sample : window.samples)
     {
+		sample.processStartMs = configured_process_start_ms(cfg, sample.pid);
+		if (sample.exe.empty())
+			sample.exe = configured_process_exe(cfg, sample.pid);
         sample.backend = "perf";
         sample.runtime = sample_runtime(sample, goReport, &goBuildInfoCache);
         if (sample.runtime == "python")
             for (auto &frame : sample.stack)
                 frame = sanitize_python_perf_frame(frame);
     }
+	if (cfg.scope == "process")
+	{
+		window.samples.erase(std::remove_if(window.samples.begin(), window.samples.end(), [&](const auto &sample) {
+				return !process_targeted(cfg, sample.pid, sample.processStartMs, sample.exe);
+			}), window.samples.end());
+	}
 
     size_t pythonLimitedCount = pythonCapture.LimitedCount();
     std::vector<drop::PythonFallbackResult> pythonResults = pythonCapture.Finish();
@@ -984,6 +1319,7 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
                 sample.stack = raw.stack;
                 sample.comm = result.comm.empty() ? "python" : result.comm;
                 sample.pid = result.pid;
+				sample.processStartMs = result.startMs;
                 sample.exe = result.exe;
                 sample.backend = "py-spy";
                 sample.runtime = "python";
@@ -1014,9 +1350,11 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
             nextCandidates.push_back(std::move(candidate));
         }
     }
-    drop::schedule_python_fallback(nextCandidates);
+    drop::schedule_python_fallback(cfg.sessionSID, nextCandidates);
 
-    if (env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true))
+    // User-driven process Sessions expose only CPU/IO/sched. Do not scan or
+    // ingest unrelated Python memory data from the host into those Sessions.
+    if (cfg.scope != "process" && env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true))
     {
         size_t truncated = 0;
         auto rss = drop::collect_python_rss(
@@ -1038,7 +1376,7 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
         }
     }
     std::vector<drop::MemrayProfileResult> memrayResults;
-    if (env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true))
+    if (cfg.scope != "process" && env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true))
     {
         memrayResults = drop::collect_memray_profiles();
         for (const auto &result : memrayResults)
@@ -1065,6 +1403,19 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
             window.profiles.push_back(std::move(profile));
         }
     }
+	if (cfg.scope == "process")
+	{
+		window.metrics.erase(std::remove_if(window.metrics.begin(), window.metrics.end(), [&](const auto &metric) {
+				return !process_targeted(cfg, metric.pid, metric.processStartMs, metric.exe);
+			}), window.metrics.end());
+			for (auto &profile : window.profiles)
+				profile.samples.erase(std::remove_if(profile.samples.begin(), profile.samples.end(), [&](const auto &sample) {
+					return !process_targeted(cfg, sample.pid, sample.processStartMs, sample.exe);
+				}), profile.samples.end());
+		window.profiles.erase(std::remove_if(window.profiles.begin(), window.profiles.end(), [](const auto &profile) {
+			return profile.samples.empty();
+		}), window.profiles.end());
+	}
     window.symbolRefsJson = combined_symbol_refs_json(runtimeReport, goReport, pythonResults, pythonLimitedCount, memrayResults, window.samples);
     std::cout << "[native-cp] Go symbols ready=" << goReport.ready.size()
               << " pending=" << goReport.pending.size()
@@ -1232,7 +1583,8 @@ static ProfilePayload collect_bpftrace_cpu_profile(const ContinuousSamplerConfig
     std::string scriptPath = "/tmp/mini_drop_native_cp_cpu_" + scope + "_" + std::to_string(now_ms()) + ".bt";
     {
         std::ofstream out(scriptPath);
-        out << "profile:hz:" << cfg.sampleRateHz << "\n{\n  @samples[" << stackExpr << "] = count();\n}\n";
+        out << "profile:hz:" << cfg.sampleRateHz << " " << bpftrace_target_predicate(cfg)
+            << "\n{\n  @samples[" << stackExpr << "] = count();\n}\n";
     }
     std::string output;
     int rc = drop::exec_capture({"timeout", "-s", "INT", "-k", "2", std::to_string(std::max(1, cfg.aggregationWindowSec)), "bpftrace", scriptPath}, &output, 16 * 1024 * 1024);
@@ -1354,13 +1706,14 @@ static HistogramPayload collect_bpftrace_latency_histogram(const ContinuousSampl
     hist.signalType = signalType;
     hist.backend = "bpftrace";
     bool sched = signalType == "sched_latency";
+	bool syscallIO = signalType == "io_syscall_latency";
     if (!command_available("bpftrace"))
     {
         hist.unavailable = true;
         hist.reason = "bpftrace unavailable";
         return hist;
     }
-    if (!sched && (!tracepoint_exists("block:block_rq_issue") || !tracepoint_exists("block:block_rq_complete")))
+    if (!sched && !syscallIO && (!tracepoint_exists("block:block_rq_issue") || !tracepoint_exists("block:block_rq_complete")))
     {
         hist.unavailable = true;
         hist.reason = "block tracepoints unavailable";
@@ -1376,17 +1729,25 @@ static HistogramPayload collect_bpftrace_latency_histogram(const ContinuousSampl
     std::string scriptPath = "/tmp/mini_drop_native_cp_" + signalType + "_" + std::to_string(now_ms()) + ".bt";
     {
         std::ofstream out(scriptPath);
-        if (sched)
+        if (syscallIO)
+		{
+			std::string predicate = bpftrace_target_predicate(cfg, "pid");
+			out << "tracepoint:syscalls:sys_enter_read,tracepoint:syscalls:sys_enter_write,tracepoint:syscalls:sys_enter_pread64,tracepoint:syscalls:sys_enter_pwrite64 " << predicate << " { @sys_start[tid] = nsecs; }\n"
+				<< "tracepoint:syscalls:sys_exit_read,tracepoint:syscalls:sys_exit_write,tracepoint:syscalls:sys_exit_pread64,tracepoint:syscalls:sys_exit_pwrite64 /@sys_start[tid]/ { $lat = (nsecs - @sys_start[tid]) / 1000; @lat = hist($lat); @events = count(); delete(@sys_start[tid]); }\n";
+		}
+        else if (sched)
         {
+			std::string nextPredicate = bpftrace_target_predicate(cfg, "args->pid");
             out << "#define pid_t int\n"
-                << "tracepoint:sched:sched_wakeup { @wake[args->pid] = nsecs; }\n"
-                << "tracepoint:sched:sched_wakeup_new { @wake[args->pid] = nsecs; }\n"
+				<< "tracepoint:sched:sched_wakeup " << nextPredicate << " { @wake[args->pid] = nsecs; }\n"
+				<< "tracepoint:sched:sched_wakeup_new " << nextPredicate << " { @wake[args->pid] = nsecs; }\n"
                 << "tracepoint:sched:sched_switch /@wake[args->next_pid]/ { $lat = (nsecs - @wake[args->next_pid]) / 1000; @lat = hist($lat); @events = count(); delete(@wake[args->next_pid]); }\n";
         }
         else
         {
+			std::string issuePredicate = bpftrace_target_predicate(cfg, "pid");
             out << "#define dev_t unsigned int\n#define sector_t unsigned long\n"
-                << "tracepoint:block:block_rq_issue { @rq_start[args->dev, args->sector] = nsecs; }\n"
+				<< "tracepoint:block:block_rq_issue " << issuePredicate << " { @rq_start[args->dev, args->sector] = nsecs; }\n"
                 << "tracepoint:block:block_rq_complete /@rq_start[args->dev, args->sector]/ { $lat = (nsecs - @rq_start[args->dev, args->sector]) / 1000; @lat = hist($lat); @events = count(); delete(@rq_start[args->dev, args->sector]); }\n";
         }
     }
@@ -1592,6 +1953,7 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             body += "{";
             body += "\"comm\":\"" + json_escape(sample.comm) + "\",";
             body += "\"pid\":" + std::to_string(sample.pid) + ",";
+			body += "\"process_start_ms\":" + std::to_string(sample.processStartMs) + ",";
             body += "\"exe\":\"" + json_escape(sample.exe) + "\",";
             body += "\"runtime\":\"" + json_escape(sample.runtime) + "\",";
             body += "\"count\":" + std::to_string(sample.count) + ",";
@@ -1628,6 +1990,7 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
                 body += "{";
                 body += "\"comm\":\"" + json_escape(sample.comm) + "\",";
                 body += "\"pid\":" + std::to_string(sample.pid) + ",";
+				body += "\"process_start_ms\":" + std::to_string(sample.processStartMs) + ",";
                 body += "\"exe\":\"" + json_escape(sample.exe) + "\",";
                 body += "\"runtime\":\"" + json_escape(sample.runtime) + "\",";
                 body += "\"count\":" + std::to_string(sample.count) + ",";
@@ -1674,6 +2037,7 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             body += "{";
             body += "\"signal_type\":\"" + json_escape(hist.signalType) + "\",";
             body += "\"backend\":\"" + json_escape(hist.backend) + "\",";
+            body += "\"pid\":" + std::to_string(hist.pid) + ",";
             body += "\"unit\":\"" + json_escape(hist.unit) + "\",";
             body += "\"event_count\":" + std::to_string(hist.eventCount) + ",";
             body += "\"unavailable\":" + std::string(hist.unavailable ? "true" : "false") + ",";
@@ -1711,26 +2075,91 @@ static bool response_acknowledges_batch(const std::string &response, const std::
            response.find("\"batch_id\":\"" + batchID + "\"") != std::string::npos;
 }
 
-static bool post_spooled_batch(const ContinuousSamplerConfig &cfg,
-                               const std::string &path,
-                               const std::string &batchID)
+enum class SpoolPostResult
+{
+    Acknowledged,
+    BatchIDConflict,
+    Failed,
+};
+
+static SpoolPostResult post_spooled_batch(const ContinuousSamplerConfig &cfg,
+                                          const std::string &path,
+                                          const std::string &batchID)
 {
     std::string response;
-    int rc = drop::exec_capture({"curl", "-fsS", "-m", "20", "-X", "POST",
+    int rc = drop::exec_capture({"curl", "-sS", "-m", "20", "-X", "POST",
                                  "-H", "Content-Type: application/json",
                                  "-H", "Drop-User-Uid: " + cfg.authUID,
                                  "-H", "X-Mini-Drop-Agent-Time-Ms: " + std::to_string(now_ms()),
                                  "-d", "@" + path,
+                                 "-w", "\n%{http_code}",
                                  cfg.apiBaseURL + "/api/v1/internal/continuous/batches"},
                                 &response, 8192);
-    if (rc != 0 || !response_acknowledges_batch(response, batchID))
+    int httpStatus = 0;
+    size_t statusOffset = response.rfind('\n');
+    if (statusOffset != std::string::npos)
     {
-        std::cout << "[native-cp] batch upload failed batch=" << batchID
-                  << " rc=" << rc << " response=" << response << std::endl;
+        httpStatus = std::atoi(response.substr(statusOffset + 1).c_str());
+        response.resize(statusOffset);
+    }
+    if (rc == 0 && httpStatus == 200 && response_acknowledges_batch(response, batchID))
+    {
+        std::cout << "[native-cp] batch ACK received batch=" << batchID
+                  << " response=" << response << std::endl;
+        return SpoolPostResult::Acknowledged;
+    }
+    if (rc == 0 && httpStatus == 409)
+    {
+        std::cout << "[native-cp] batch ID conflict batch=" << batchID << std::endl;
+        return SpoolPostResult::BatchIDConflict;
+    }
+    std::cout << "[native-cp] batch upload failed batch=" << batchID
+              << " rc=" << rc << " http_status=" << httpStatus
+              << " response=" << response << std::endl;
+    return SpoolPostResult::Failed;
+}
+
+static bool rekey_conflicted_spooled_batch(const ContinuousSamplerConfig &cfg,
+                                           const std::string &path,
+                                           const std::string &batchID)
+{
+    std::string body;
+    if (!read_file(path, &body))
+        return false;
+    const std::string oldField = "\"batch_id\":\"" + json_escape(batchID) + "\"";
+    const size_t fieldOffset = body.find(oldField);
+    if (fieldOffset == std::string::npos)
+        return false;
+    std::ostringstream generated;
+    generated << "cpb-retry-" << std::hex << stable_string_hash(cfg.sessionSID)
+              << '-' << stable_string_hash(body);
+    const std::string replacementID = generated.str();
+    const std::string replacementField = "\"batch_id\":\"" + replacementID + "\"";
+    body.replace(fieldOffset, oldField.size(), replacementField);
+    const std::string replacementPath = spool_path(cfg, replacementID);
+    if (file_exists_local(replacementPath))
+    {
+        std::string existing;
+        if (!read_file(replacementPath, &existing) || existing != body)
+            return false;
+        return ::unlink(path.c_str()) == 0;
+    }
+    const std::string journal = journal_path(cfg, replacementID);
+    if (!atomic_write_file(journal, body) || ::rename(journal.c_str(), replacementPath.c_str()) != 0)
+    {
+        ::unlink(journal.c_str());
         return false;
     }
-    std::cout << "[native-cp] batch ACK received batch=" << batchID
-              << " response=" << response << std::endl;
+    int dirfd = ::open(session_spool_directory(cfg).c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0)
+    {
+        ::fsync(dirfd);
+        ::close(dirfd);
+    }
+    if (::unlink(path.c_str()) != 0)
+        return false;
+    std::cout << "[native-cp] re-keyed conflicting batch old=" << batchID
+              << " new=" << replacementID << std::endl;
     return true;
 }
 
@@ -1774,6 +2203,20 @@ static void recover_spool_journals(const ContinuousSamplerConfig &cfg)
     }
 }
 
+static void recover_session_spool_journals(const ContinuousSamplerConfig &cfg)
+{
+    for (const auto &path : list_session_spool_files(cfg, ".journal"))
+    {
+        size_t slash = path.find_last_of('/');
+        std::string directory = path.substr(0, slash);
+        std::string name = path.substr(slash + 1);
+        std::string batchID = name.substr(0, name.size() - 8);
+        std::string destination = directory + "/" + safe_spool_component(batchID) + ".json";
+        if (::rename(path.c_str(), destination.c_str()) != 0)
+            std::cout << "[native-cp] failed to recover stopped Session journal batch=" << batchID << std::endl;
+    }
+}
+
 static void schedule_spool_retry(const ContinuousSamplerConfig &cfg, SpoolRetryState *retry)
 {
     int jitterMs = retry->delaySec <= 1 ? 0 : std::rand() % (retry->delaySec * 250 + 1);
@@ -1785,7 +2228,10 @@ static bool drain_one_spooled_batch(const ContinuousSamplerConfig &cfg,
                                     SpoolRetryState *retry,
                                     bool force)
 {
-    std::vector<std::string> files = list_spool_files(cfg);
+    // A shared Agent spool contains one directory per Session. Draining the
+    // global recursive list with one Session's config could retry a different
+    // Session's batch forever after a conflict, starving every other Session.
+    std::vector<std::string> files = list_session_spool_files(cfg, ".json");
     if (files.empty())
     {
         retry->delaySec = 1;
@@ -1797,11 +2243,19 @@ static bool drain_one_spooled_batch(const ContinuousSamplerConfig &cfg,
 
     const std::string &path = files.front();
     std::string batchID = batch_id_from_spool_path(path);
-    if (post_spooled_batch(cfg, path, batchID))
+    const SpoolPostResult result = post_spooled_batch(cfg, path, batchID);
+    if (result == SpoolPostResult::Acknowledged)
     {
         if (::unlink(path.c_str()) != 0)
             std::cout << "[native-cp] ACK received but spool removal failed path=" << path
                       << " errno=" << errno << std::endl;
+        retry->delaySec = 1;
+        retry->nextAttemptMs = 0;
+        return true;
+    }
+    if (result == SpoolPostResult::BatchIDConflict &&
+        rekey_conflicted_spooled_batch(cfg, path, batchID))
+    {
         retry->delaySec = 1;
         retry->nextAttemptMs = 0;
         return true;
@@ -1923,7 +2377,7 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
     int64_t captureEndMs = window.startMs + static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1000;
     // 回收上一轮超预算被搁置的 io/sched future（它们已完成后台任务则清理）
     reap_abandoned_hist_futures();
-    std::string signals = env_string_local("DROP_NATIVE_CP_SIGNALS", "cpu,io,sched");
+    std::string signals = cfg.signals.empty() ? env_string_local("DROP_NATIVE_CP_SIGNALS", "cpu,io,io_syscall,sched") : cfg.signals;
     bool ebpfEnabled = env_enabled_local("DROP_NATIVE_CP_EBPF_ENABLED");
     std::vector<std::string> &attempted = window.attemptedBackends;
 
@@ -1976,14 +2430,21 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
 
     // IO/sched histograms（bpftrace）与 CPU 同窗并发。
     std::future<HistogramPayload> ioFuture;
+	std::future<HistogramPayload> ioSyscallFuture;
     std::future<HistogramPayload> schedFuture;
     bool ioStarted = false;
+	bool ioSyscallStarted = false;
     bool schedStarted = false;
     if (ebpfEnabled && signal_enabled(signals, "io"))
     {
         ioFuture = std::async(std::launch::async, collect_bpftrace_latency_histogram, cfg, "io_latency");
         ioStarted = true;
     }
+	if (ebpfEnabled && signal_enabled(signals, "io_syscall"))
+	{
+		ioSyscallFuture = std::async(std::launch::async, collect_bpftrace_latency_histogram, cfg, "io_syscall_latency");
+		ioSyscallStarted = true;
+	}
     if (ebpfEnabled && signal_enabled(signals, "sched"))
     {
         schedFuture = std::async(std::launch::async, collect_bpftrace_latency_histogram, cfg, "sched_latency");
@@ -2051,6 +2512,7 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
 
     // IO/sched 结果；各自带预算等待，超预算不阻塞 CPU 窗口（标记 unavailable）。
     uint64_t ioEvents = 0;
+	uint64_t ioSyscallEvents = 0;
     uint64_t schedEvents = 0;
     int64_t ioMs = 0;
     int64_t schedMs = 0;
@@ -2062,6 +2524,12 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
         ioEvents = hist.eventCount;
         window.histograms.push_back(hist);
     }
+	if (ioSyscallStarted)
+	{
+		HistogramPayload hist = wait_histogram_budgeted(ioSyscallFuture, "io_syscall_latency");
+		ioSyscallEvents = hist.eventCount;
+		window.histograms.push_back(hist);
+	}
     if (schedStarted)
     {
         int64_t t0 = now_ms();
@@ -2078,6 +2546,7 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
               << " capture_elapsed_ms=" << (window.endMs - window.startMs)
               << " cpu_samples=" << cpuSamples
               << " io_events=" << ioEvents
+			  << " io_syscall_events=" << ioSyscallEvents
               << " sched_events=" << schedEvents
               << " io_ms=" << ioMs
               << " sched_ms=" << schedMs
@@ -2086,7 +2555,282 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
     return window;
 }
 
+bool RollingPerfRecorder::Start(const ContinuousSamplerConfig &cfg, std::string *error)
+{
+    consumed.clear();
+    directory.clear();
+    if (!create_rolling_perf_directory(&directory))
+    {
+        if (error) *error = "failed to create strict rolling perf directory";
+        return false;
+    }
+    // perf's sample clock is normally CLOCK_MONOTONIC. Capture a wall/mono
+    // pair before launching perf so parsed timestamps can be mapped back to
+    // Unix milliseconds without using the later Drain() time.
+    wallStartMs = now_ms();
+    monotonicStartMs = monotonic_ms();
+    std::vector<std::string> args{perf_bin(), "record", "--no-buildid-cache", "-q"};
+    if (cfg.scope == "process")
+    {
+        std::string pids = target_pid_csv(cfg);
+        if (pids.empty())
+        {
+            if (error) *error = "strict rolling perf requires at least one target PID";
+            ::rmdir(directory.c_str());
+            directory.clear();
+            return false;
+        }
+        args.insert(args.end(), {"-p", pids});
+    }
+    else
+        args.push_back("-a");
+    args.insert(args.end(), {"-e", env_string_local("DROP_NATIVE_CP_PERF_EVENT", "cpu-clock"),
+                             "-F", std::to_string(cfg.sampleRateHz), "-g", "-T",
+                             "--timestamp-boundary", "--switch-output=2s", "--timestamp-filename",
+                             "-o", directory + "/perf.data", "--", "sleep", "86400"});
+    pid = ::fork();
+    if (pid < 0)
+    {
+        if (error) *error = "failed to fork strict rolling perf";
+        ::rmdir(directory.c_str());
+        directory.clear();
+        return false;
+    }
+    if (pid == 0)
+    {
+        ::setpgid(0, 0);
+        int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+        {
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+            ::close(devnull);
+        }
+        std::vector<char *> argv;
+        for (auto &arg : args) argv.push_back(const_cast<char *>(arg.c_str()));
+        argv.push_back(nullptr);
+        ::execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    ::setpgid(pid, pid);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    int status = 0;
+    if (::waitpid(pid, &status, WNOHANG) == pid)
+    {
+        if (error) *error = "strict rolling perf exited during startup";
+        pid = -1;
+        ::rmdir(directory.c_str());
+        directory.clear();
+        return false;
+    }
+    return true;
+}
+
+bool RollingPerfRecorder::HasParseableOutput() const
+{
+    const auto files = rolling_perf_files(directory, false);
+    if (files.empty())
+        return false;
+    std::string ignored;
+    return drop::exec_capture({perf_bin(), "script", "-F", "time", "-i", files.front()},
+                              &ignored, 1024 * 1024) == 0;
+}
+
+std::vector<WindowPayload> RollingPerfRecorder::Drain(const ContinuousSamplerConfig &cfg, bool final)
+{
+    const auto files = rolling_perf_files(directory, final);
+    std::vector<WindowPayload> windows;
+    for (const auto &path : files)
+    {
+        if (!consumed.insert(path).second) continue;
+        WindowPayload window;
+        window.startMs = now_ms();
+        window.attemptedBackends = {"perf_rolling"};
+        window.selectedBackend = "perf_rolling";
+        std::string output;
+        int rc = drop::exec_capture({perf_bin(), "script", "-F", "comm,pid,tid,time,event,ip,sym,dso", "-i", path},
+                                    &output, 32 * 1024 * 1024);
+        window.endMs = now_ms();
+        if (rc != 0)
+        {
+            window.backendStatus = "failed";
+            window.backendReason = "perf script failed for rolling file";
+        }
+        else
+        {
+            PerfScriptParseResult parsed = parse_perf_script_result(output);
+            if (parsed.hasTimestamp)
+            {
+                const int64_t parsedStart = perf_timestamp_to_unix_ms(parsed.startTimestampSec,
+                                                                        wallStartMs,
+                                                                        monotonicStartMs);
+                const int64_t parsedEnd = perf_timestamp_to_unix_ms(parsed.endTimestampSec,
+                                                                      wallStartMs,
+                                                                      monotonicStartMs);
+                if (parsedStart > 0 && parsedEnd >= parsedStart)
+                {
+                    window.startMs = parsedStart;
+                    window.endMs = std::max(parsedStart + 1, parsedEnd);
+                }
+            }
+            window.samples = std::move(parsed.samples);
+            std::map<int, bool> goCache;
+            for (auto &sample : window.samples)
+            {
+                sample.processStartMs = configured_process_start_ms(cfg, sample.pid);
+				if (sample.exe.empty())
+					sample.exe = configured_process_exe(cfg, sample.pid);
+                sample.backend = "perf_rolling";
+                sample.runtime = sample_runtime(sample, {}, &goCache);
+            }
+            if (cfg.scope == "process")
+                window.samples.erase(std::remove_if(window.samples.begin(), window.samples.end(), [&](const auto &sample) {
+                    return !process_targeted(cfg, sample.pid, sample.processStartMs, sample.exe);
+                }), window.samples.end());
+            window.backendStatus = "ok";
+        }
+        if (window.endMs <= window.startMs)
+            window.endMs = std::max(window.startMs + 1, now_ms());
+        windows.push_back(std::move(window));
+        ::unlink(path.c_str());
+    }
+    if (final && !directory.empty())
+    {
+        ::rmdir(directory.c_str());
+        directory.clear();
+    }
+    return windows;
+}
+
+void RollingPerfRecorder::Stop()
+{
+    if (pid <= 0) return;
+    ::kill(-pid, SIGINT);
+    for (int i = 0; i < 30; ++i)
+    {
+        int status = 0;
+        if (::waitpid(pid, &status, WNOHANG) == pid)
+        {
+            pid = -1;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ::kill(-pid, SIGKILL);
+    ::waitpid(pid, nullptr, 0);
+    pid = -1;
+}
+
+static double strict_histogram_low(uint32_t slot)
+{
+    static const double bounds[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384};
+    return bounds[std::min<uint32_t>(slot, 15)];
+}
+
+static void append_core_histograms(WindowPayload *window,
+                                   const ContinuousSamplerConfig &cfg,
+                                   const std::vector<CoreHistogramSample> &samples,
+                                   uint64_t lost)
+{
+    std::set<uint32_t> pids;
+    for (const auto &sample : samples) pids.insert(sample.tgid);
+    if (cfg.scope != "process" && pids.empty()) pids.insert(0);
+    for (uint32_t pid : pids)
+        for (uint32_t signal = 1; signal <= 3; ++signal)
+        {
+            HistogramPayload hist;
+            hist.pid = static_cast<int>(pid);
+            hist.signalType = signal == 1 ? "io_latency" : signal == 2 ? "io_syscall_latency" : "sched_latency";
+            hist.backend = "libbpf-co-re";
+            hist.unit = "us";
+            std::map<uint32_t, HistogramBucket> buckets;
+            for (const auto &sample : samples)
+            {
+                if (sample.signal != signal || sample.tgid != pid) continue;
+                auto &bucket = buckets[sample.slot];
+                if (bucket.range.empty())
+                {
+                    bucket.low = strict_histogram_low(sample.slot);
+                    bucket.high = sample.slot >= 15 ? bucket.low : strict_histogram_low(sample.slot + 1);
+                    bucket.range = "[" + std::to_string(static_cast<int>(bucket.low)) + ", " +
+                                   std::to_string(static_cast<int>(bucket.high)) + ")";
+                }
+                bucket.count = add_count(bucket.count, sample.count);
+            }
+            for (auto &entry : buckets)
+            {
+                hist.eventCount = add_count(hist.eventCount, entry.second.count);
+                hist.buckets.push_back(entry.second);
+            }
+            summarize_histogram(&hist);
+            if (hist.buckets.empty())
+            {
+                hist.unavailable = true;
+                hist.reason = "no events observed in strict CO-RE slice";
+            }
+            if (!hist.buckets.empty() || cfg.scope != "process")
+                window->histograms.push_back(std::move(hist));
+        }
+    if (lost > 0)
+        window->backendReason = "CO-RE lost events=" + std::to_string(lost);
+}
+
+static void queue_core_histograms(std::vector<WindowPayload> *windows,
+                                  const ContinuousSamplerConfig &cfg,
+                                  std::vector<CoreHistogramSample> *pendingSamples,
+                                  uint64_t *pendingLost,
+                                  std::vector<CoreHistogramSample> samples,
+                                  uint64_t lost)
+{
+    if (!windows || !pendingSamples || !pendingLost)
+        return;
+    pendingSamples->insert(pendingSamples->end(),
+                           std::make_move_iterator(samples.begin()),
+                           std::make_move_iterator(samples.end()));
+    *pendingLost = add_count(*pendingLost, lost);
+    if (windows->empty())
+        return;
+    if (!pendingSamples->empty() || *pendingLost > 0)
+        append_core_histograms(&windows->front(), cfg, *pendingSamples, *pendingLost);
+    pendingSamples->clear();
+    *pendingLost = 0;
+}
+
 } // namespace (anonymous)
+
+bool ContinuousSessionHasPendingSpool(const ContinuousSamplerConfig &config)
+{
+    return !list_session_spool_files(config, ".json").empty() ||
+           !list_session_spool_files(config, ".journal").empty();
+}
+
+bool DrainOneContinuousSessionBatch(const ContinuousSamplerConfig &config)
+{
+    recover_session_spool_journals(config);
+    std::vector<std::string> files = list_session_spool_files(config, ".json");
+    if (files.empty())
+        return true;
+    const std::string &path = files.front();
+    const std::string batchID = batch_id_from_spool_path(path);
+    const SpoolPostResult result = post_spooled_batch(config, path, batchID);
+    if (result == SpoolPostResult::BatchIDConflict)
+    {
+        if (!rekey_conflicted_spooled_batch(config, path, batchID))
+            return false;
+        return !list_session_spool_files(config, ".json").empty()
+                   ? DrainOneContinuousSessionBatch(config)
+                   : true;
+    }
+    if (result != SpoolPostResult::Acknowledged)
+        return false;
+    if (::unlink(path.c_str()) != 0)
+    {
+        std::cout << "[native-cp] stopped Session ACK received but spool removal failed path="
+                  << path << " errno=" << errno << std::endl;
+        return false;
+    }
+    return list_session_spool_files(config, ".json").empty();
+}
 
 PerfEventSampler::~PerfEventSampler()
 {
@@ -2148,7 +2892,7 @@ static void run_continuous_spool_loop(std::atomic<bool> &running,
     SpoolRetryState retry;
     while (running.load() && drain_one_spooled_batch(config, &retry, true))
     {
-        if (list_spool_files(config).empty())
+        if (list_session_spool_files(config, ".json").empty())
             break;
     }
 
@@ -2276,6 +3020,598 @@ bool DualTrackContinuousSampler::Running() const
 void DualTrackContinuousSampler::Loop()
 {
     run_continuous_spool_loop(running_, config_, collect_dual_track_window);
+}
+
+namespace
+{
+
+struct SharedSessionAccumulator
+{
+    ContinuousSamplerConfig config;
+    std::vector<WindowPayload> slices;
+    std::vector<WindowPayload> batch;
+    std::string batchID;
+};
+
+static ContinuousSamplerConfig shared_physical_config(const std::vector<ContinuousSamplerConfig> &sessions)
+{
+    ContinuousSamplerConfig physical = sessions.front();
+    physical.sessionSID = "__shared_continuous_engine__";
+    physical.sampleRateHz = 1;
+    physical.aggregationWindowSec = 5;
+    physical.uploadBatchSec = 5;
+    physical.selectorExe.clear();
+    physical.targetProcesses.clear();
+    bool hostScope = false;
+    std::map<std::pair<int, int64_t>, ContinuousTargetProcess> targets;
+    for (const auto &session : sessions)
+    {
+        physical.sampleRateHz = std::max(physical.sampleRateHz, session.sampleRateHz);
+        if (session.scope != "process")
+            hostScope = true;
+        for (const auto &target : session.targetProcesses)
+            if (target.pid > 0)
+                targets[{target.pid, target.processStartMs}] = target;
+    }
+    physical.scope = hostScope ? "host" : "process";
+    for (const auto &entry : targets)
+        physical.targetProcesses.push_back(entry.second);
+
+    // The rolling bpftrace fallback produces one aggregate histogram. It is
+    // safe to fan out only when exactly one process Session is active. With
+    // multiple selectors, collect CPU once and mark per-Session histograms as
+    // unavailable instead of leaking another selector's latency samples.
+    physical.signals = (!hostScope && sessions.size() > 1) ? "cpu" : "cpu,io,io_syscall,sched";
+    return physical;
+}
+
+static HistogramPayload unavailable_shared_histogram(const std::string &signalType)
+{
+    HistogramPayload histogram;
+    histogram.signalType = signalType;
+    histogram.backend = "shared-bpftrace-fallback";
+    histogram.unavailable = true;
+    histogram.reason = "shared rolling fallback cannot attribute this histogram across multiple process selectors";
+    return histogram;
+}
+
+static WindowPayload filter_shared_window(const WindowPayload &source,
+                                          const ContinuousSamplerConfig &session,
+                                          bool histogramAttributionSafe)
+{
+    if (session.scope != "process")
+        return source;
+
+    WindowPayload out = source;
+    out.samples.erase(std::remove_if(out.samples.begin(), out.samples.end(), [&](const auto &sample) {
+                          return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
+                      }),
+                      out.samples.end());
+    for (auto &profile : out.profiles)
+    {
+        profile.readyPath.clear();
+        profile.samples.erase(std::remove_if(profile.samples.begin(), profile.samples.end(), [&](const auto &sample) {
+                                  return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
+                              }),
+                              profile.samples.end());
+    }
+    out.profiles.erase(std::remove_if(out.profiles.begin(), out.profiles.end(), [](const auto &profile) {
+                           return profile.samples.empty();
+                       }),
+                       out.profiles.end());
+    out.metrics.erase(std::remove_if(out.metrics.begin(), out.metrics.end(), [&](const auto &metric) {
+                          return !process_targeted(session, metric.pid, metric.processStartMs, metric.exe);
+                      }),
+                      out.metrics.end());
+    out.histograms.erase(std::remove_if(out.histograms.begin(), out.histograms.end(), [&](const auto &histogram) {
+                              return histogram.pid > 0 && !process_targeted(session, histogram.pid, 0, "");
+                          }),
+                         out.histograms.end());
+
+    // Runtime symbol diagnostics can contain paths/PIDs for another selector in
+    // the physical union. Per-sample symbols are already resolved, so omit the
+    // cross-target diagnostic blob from process Session payloads.
+    out.symbolRefsJson.clear();
+    if (!histogramAttributionSafe)
+    {
+        out.histograms.clear();
+        out.histograms.push_back(unavailable_shared_histogram("io_latency"));
+        out.histograms.push_back(unavailable_shared_histogram("io_syscall_latency"));
+        out.histograms.push_back(unavailable_shared_histogram("sched_latency"));
+    }
+    return out;
+}
+
+static HistogramPayload merge_histograms(const std::vector<HistogramPayload> &parts,
+                                         const std::string &signalType)
+{
+    HistogramPayload merged;
+    merged.signalType = signalType;
+    std::map<std::string, HistogramBucket> buckets;
+    bool sawAvailable = false;
+    for (const auto &part : parts)
+    {
+        if (merged.backend.empty() && !part.backend.empty())
+            merged.backend = part.backend;
+        if (!part.unavailable)
+            sawAvailable = true;
+        else if (merged.reason.empty())
+            merged.reason = part.reason;
+        for (const auto &bucket : part.buckets)
+        {
+            std::string key = bucket.range + "|" + std::to_string(bucket.low) + "|" + std::to_string(bucket.high);
+            auto &target = buckets[key];
+            if (target.range.empty())
+                target = bucket;
+            else
+                target.count = add_count(target.count, bucket.count);
+        }
+    }
+    for (auto &entry : buckets)
+        merged.buckets.push_back(entry.second);
+    std::sort(merged.buckets.begin(), merged.buckets.end(), [](const auto &left, const auto &right) {
+        return left.low == right.low ? left.high < right.high : left.low < right.low;
+    });
+    merged.unavailable = !sawAvailable;
+    summarize_histogram(&merged);
+    return merged;
+}
+
+static WindowPayload merge_shared_slices(const std::vector<WindowPayload> &slices)
+{
+    WindowPayload merged;
+    if (slices.empty())
+        return merged;
+    merged.startMs = slices.front().startMs;
+    merged.endMs = slices.back().endMs;
+    std::map<std::string, std::vector<HistogramPayload>> histograms;
+    std::set<std::string> attempted;
+    bool anyFailed = false;
+    bool anyDegraded = false;
+    for (const auto &slice : slices)
+    {
+        merged.samples.insert(merged.samples.end(), slice.samples.begin(), slice.samples.end());
+        merged.profiles.insert(merged.profiles.end(), slice.profiles.begin(), slice.profiles.end());
+        merged.metrics.insert(merged.metrics.end(), slice.metrics.begin(), slice.metrics.end());
+        merged.rssTruncated += slice.rssTruncated;
+        for (const auto &histogram : slice.histograms)
+            histograms[histogram.signalType].push_back(histogram);
+        attempted.insert(slice.attemptedBackends.begin(), slice.attemptedBackends.end());
+        if (!slice.selectedBackend.empty())
+            merged.selectedBackend = slice.selectedBackend;
+        if (!slice.symbolRefsJson.empty())
+            merged.symbolRefsJson = slice.symbolRefsJson;
+        if (slice.backendStatus == "failed")
+            anyFailed = true;
+        else if (slice.backendStatus == "degraded")
+            anyDegraded = true;
+        if (merged.backendReason.empty() && !slice.backendReason.empty())
+            merged.backendReason = slice.backendReason;
+    }
+    for (const auto &entry : histograms)
+        merged.histograms.push_back(merge_histograms(entry.second, entry.first));
+    merged.attemptedBackends.assign(attempted.begin(), attempted.end());
+    merged.backendStatus = anyFailed ? (slices.size() == 1 ? "failed" : "degraded") : (anyDegraded ? "degraded" : "ok");
+    return merged;
+}
+
+static std::vector<WindowPayload> merge_shared_slices_preserving_gaps(
+    const std::vector<WindowPayload> &slices,
+    int64_t continuityToleranceMs = 100)
+{
+    std::vector<WindowPayload> merged;
+    std::vector<WindowPayload> contiguous;
+    for (const auto &slice : slices)
+    {
+        if (!contiguous.empty() && slice.startMs > contiguous.back().endMs + continuityToleranceMs)
+        {
+            merged.push_back(merge_shared_slices(contiguous));
+            contiguous.clear();
+        }
+        contiguous.push_back(slice);
+    }
+    if (!contiguous.empty())
+        merged.push_back(merge_shared_slices(contiguous));
+    return merged;
+}
+
+static bool persist_shared_aggregate(SharedSessionAccumulator *session)
+{
+    if (!session)
+        return false;
+    session->slices.erase(std::remove_if(session->slices.begin(), session->slices.end(), [](const auto &slice) {
+        const bool hasPayload = !slice.samples.empty() || !slice.profiles.empty() ||
+                                !slice.metrics.empty() || !slice.histograms.empty();
+        return slice.endMs <= slice.startMs || !hasPayload;
+    }), session->slices.end());
+    if (!session || session->slices.empty())
+        return true;
+    std::vector<WindowPayload> aggregates = merge_shared_slices_preserving_gaps(session->slices);
+    session->slices.clear();
+    session->batch.insert(session->batch.end(), aggregates.begin(), aggregates.end());
+    if (session->batchID.empty())
+        session->batchID = make_batch_id(session->config, aggregates.front().startMs);
+    std::string body = build_batch_json(session->config, session->batchID, session->batch);
+    if (!persist_batch(session->config, session->batchID, body))
+        return false;
+    acknowledge_batch_profiles(aggregates);
+
+    const int windowsPerBatch = std::max(1, (session->config.uploadBatchSec + session->config.aggregationWindowSec - 1) /
+                                               session->config.aggregationWindowSec);
+    if (static_cast<int>(session->batch.size()) >= windowsPerBatch)
+    {
+        if (!finalize_batch(session->config, session->batchID))
+            return false;
+        session->batch.clear();
+        session->batchID.clear();
+    }
+    return true;
+}
+
+static bool finalize_shared_session(SharedSessionAccumulator *session)
+{
+    if (!persist_shared_aggregate(session))
+        return false;
+    if (session->batch.empty() || session->batchID.empty())
+        return true;
+    if (!finalize_batch(session->config, session->batchID))
+        return false;
+    session->batch.clear();
+    session->batchID.clear();
+    return true;
+}
+
+} // namespace
+
+struct SharedDualTrackContinuousSampler::Impl
+{
+    std::atomic<bool> running{false};
+    std::atomic<bool> ready{false};
+    std::atomic<bool> strict{false};
+    std::atomic<bool> failed{false};
+    mutable std::mutex statusMutex;
+    std::string degradationReason;
+    std::thread worker;
+    std::vector<ContinuousSamplerConfig> sessions;
+    ContinuousSamplerConfig physical;
+    std::vector<SpoolRetryState> spoolRetries;
+
+    bool DrainAllSessionSpools(bool force)
+    {
+        if (spoolRetries.size() != sessions.size())
+            spoolRetries.assign(sessions.size(), {});
+        bool allSucceeded = true;
+        for (size_t index = 0; index < sessions.size(); ++index)
+            if (!drain_one_spooled_batch(sessions[index], &spoolRetries[index], force))
+                allSucceeded = false;
+        return allSucceeded;
+    }
+
+    bool AllSessionSpoolsEmpty() const
+    {
+        for (const auto &session : sessions)
+            if (!list_session_spool_files(session, ".json").empty() ||
+                !list_session_spool_files(session, ".journal").empty())
+                return false;
+        return true;
+    }
+
+    bool RunStrict(std::vector<SharedSessionAccumulator> &accumulators)
+    {
+        if (!CoreContinuousSamplerAvailable())
+        {
+            std::lock_guard<std::mutex> lock(statusMutex);
+            degradationReason = "strict persistent CO-RE object is unavailable";
+            return false;
+        }
+        CoreEbpfCollector core;
+        RollingPerfRecorder recorder;
+        std::string error;
+        if (!core.Start(physical.targetProcesses, &error) || !recorder.Start(physical, &error))
+        {
+            std::cout << "[native-cp] strict engine unavailable: " << error << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(statusMutex);
+                degradationReason = "strict persistent perf/CO-RE engine unavailable: " + error;
+            }
+            core.Stop();
+            recorder.Stop();
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(statusMutex);
+            degradationReason = core.DegradationReason();
+        }
+        std::cout << "[native-cp] strict engine started backend=perf_rolling,libbpf-co-re" << std::endl;
+        std::vector<CoreHistogramSample> pendingCoreSamples;
+        uint64_t pendingCoreLost = 0;
+        while (running.load())
+        {
+            DrainAllSessionSpools(false);
+            // Refresh the TID-to-TGID registry in place so sched latency keeps
+            // following threads created after the Session assignment.
+            if (!core.UpdateTargets(physical.targetProcesses, &error))
+            {
+                std::cout << "[native-cp] strict target refresh failed: " << error << std::endl;
+                running = false;
+                break;
+            }
+            // A successful attach is not enough for a gap-free handoff: keep
+            // the previous recorder alive until this generation has produced
+            // and successfully parsed at least one immutable switch-output
+            // segment. Probe does not consume the file, so backpressure cannot
+            // discard the first window merely to establish readiness.
+            if (!ready.load() && recorder.HasParseableOutput())
+            {
+                strict.store(true);
+                failed.store(false);
+                ready.store(true);
+                std::cout << "[native-cp] strict engine ready after first parseable rolling file" << std::endl;
+            }
+            else if (!strict.load() && recorder.HasParseableOutput())
+            {
+                // The sampler may already have been adopted in an explicit
+                // disk-backpressure state. Promote its observed status only
+                // after the resumed recorder proves it can parse a real file.
+                strict.store(true);
+                failed.store(false);
+            }
+            if (!spool_has_collection_capacity(sessions.front()))
+            {
+                interruptible_wait(running, 500);
+                continue;
+            }
+            auto windows = recorder.Drain(physical, false);
+            uint64_t lost = 0;
+            auto coreSamples = core.Drain(&lost);
+            queue_core_histograms(&windows, physical, &pendingCoreSamples, &pendingCoreLost,
+                                  std::move(coreSamples), lost);
+            for (auto &physicalWindow : windows)
+            {
+                physicalWindow.attemptedBackends.push_back("libbpf-co-re");
+                physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
+                physicalWindow.backendStatus = "ok";
+                for (auto &accumulator : accumulators)
+                {
+                    accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
+                    const int64_t coveredMs = accumulator.slices.back().endMs - accumulator.slices.front().startMs;
+                    if (coveredMs >= static_cast<int64_t>(accumulator.config.aggregationWindowSec) * 1000 &&
+                        !persist_shared_aggregate(&accumulator))
+                    {
+                        std::cout << "[native-cp] strict engine failed to persist sid=" << accumulator.config.sessionSID << std::endl;
+                        running = false;
+                        break;
+                    }
+                }
+            }
+            interruptible_wait(running, 250);
+        }
+        recorder.Stop();
+        auto finalWindows = recorder.Drain(physical, true);
+        uint64_t lost = 0;
+        auto finalCore = core.StopAndDrain(&lost);
+        queue_core_histograms(&finalWindows, physical, &pendingCoreSamples, &pendingCoreLost,
+                              std::move(finalCore), lost);
+        for (auto &physicalWindow : finalWindows)
+        {
+            physicalWindow.attemptedBackends.push_back("libbpf-co-re");
+            physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
+            physicalWindow.backendStatus = "ok";
+            for (auto &accumulator : accumulators)
+                accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
+        }
+        for (auto &accumulator : accumulators)
+            if (!finalize_shared_session(&accumulator))
+                std::cout << "[native-cp] strict engine final flush failed sid=" << accumulator.config.sessionSID << std::endl;
+        DrainAllSessionSpools(true);
+        return true;
+    }
+
+    void Loop()
+    {
+        std::vector<SharedSessionAccumulator> accumulators;
+        accumulators.reserve(sessions.size());
+        for (const auto &config : sessions)
+        {
+            recover_spool_journals(config);
+            accumulators.push_back({config, {}, {}, ""});
+        }
+        spoolRetries.assign(sessions.size(), {});
+        while (running.load() && DrainAllSessionSpools(true))
+        {
+            if (AllSessionSpoolsEmpty())
+                break;
+        }
+
+        if (running.load() && !spool_has_collection_capacity(sessions.front()))
+        {
+            strict.store(false);
+            {
+                std::lock_guard<std::mutex> lock(statusMutex);
+                degradationReason = "shared spool backpressure: free disk is below the configured reserve; collection is paused and will resume automatically";
+            }
+            // Readiness here means the replacement has entered an explicit,
+            // observable paused state. No perf recorder is launched, so low
+            // disk cannot accumulate unconsumed switch-output files.
+            ready.store(true);
+            while (running.load() && !spool_has_collection_capacity(sessions.front()))
+            {
+                DrainAllSessionSpools(false);
+                interruptible_wait(running, 1000);
+            }
+        }
+
+        if (!running.load())
+            return;
+
+        const bool degradedFallbackAllowed = std::all_of(
+            sessions.begin(), sessions.end(), [](const auto &session) { return session.allowDegraded; });
+        while (running.load() && !RunStrict(accumulators))
+        {
+            if (degradedFallbackAllowed)
+                break;
+            strict.store(false);
+            failed.store(true);
+            {
+                std::lock_guard<std::mutex> lock(statusMutex);
+                if (degradationReason.find("degraded fallback is not allowed") == std::string::npos)
+                    degradationReason += degradationReason.empty() ? "strict collector is unavailable and degraded fallback is not allowed"
+                                                                   : "; degraded fallback is not allowed";
+            }
+            ready.store(true);
+            interruptible_wait(running, 5000);
+        }
+
+        if (!running.load() || strict.load())
+            return;
+
+        const bool histogramAttributionSafe = physical.scope != "process" || sessions.size() == 1;
+        // The degraded path is still a valid attached collector. Mark it
+        // ready before entering its first collection window so a manager
+        // handoff never tears down the previous recorder during startup.
+        strict.store(false);
+        failed.store(false);
+        {
+            std::lock_guard<std::mutex> lock(statusMutex);
+            if (degradationReason.empty())
+                degradationReason = "strict persistent perf/CO-RE engine unavailable";
+            if (degradationReason.find("using shared rolling perf/bpftrace fallback") == std::string::npos)
+                degradationReason += "; using shared rolling perf/bpftrace fallback";
+        }
+        ready.store(true);
+        while (running.load())
+        {
+            DrainAllSessionSpools(false);
+            if (!spool_has_collection_capacity(sessions.front()))
+            {
+                std::cout << "[native-cp] shared spool backpressure usage_bytes=" << spool_usage_bytes(sessions.front())
+                          << " max_bytes=" << sessions.front().spoolMaxBytes << std::endl;
+                interruptible_wait(running, 1000);
+                continue;
+            }
+            WindowPayload physicalWindow = collect_dual_track_window(physical);
+            for (auto &accumulator : accumulators)
+            {
+                accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, histogramAttributionSafe));
+                const int64_t coveredMs = accumulator.slices.back().endMs - accumulator.slices.front().startMs;
+                if (coveredMs >= static_cast<int64_t>(accumulator.config.aggregationWindowSec) * 1000 &&
+                    !persist_shared_aggregate(&accumulator))
+                {
+                    std::cout << "[native-cp] shared engine failed to persist Session batch sid="
+                              << accumulator.config.sessionSID << " errno=" << errno << std::endl;
+                    running = false;
+                    break;
+                }
+            }
+        }
+
+        for (auto &accumulator : accumulators)
+            if (!finalize_shared_session(&accumulator))
+                std::cout << "[native-cp] shared engine failed final Session flush sid="
+                          << accumulator.config.sessionSID << " errno=" << errno << std::endl;
+        DrainAllSessionSpools(true);
+    }
+};
+
+SharedDualTrackContinuousSampler::SharedDualTrackContinuousSampler()
+    : impl_(new Impl)
+{
+}
+
+SharedDualTrackContinuousSampler::~SharedDualTrackContinuousSampler()
+{
+    Stop();
+}
+
+bool SharedDualTrackContinuousSampler::Start(const std::vector<ContinuousSamplerConfig> &sessions,
+                                             std::string *error)
+{
+    if (sessions.empty())
+    {
+        if (error)
+            *error = "shared continuous engine requires at least one Session";
+        return false;
+    }
+    if (impl_->running.load())
+        return true;
+    impl_->ready = false;
+    impl_->strict = false;
+    impl_->failed = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->statusMutex);
+        impl_->degradationReason.clear();
+    }
+    std::set<std::string> sids;
+    for (const auto &config : sessions)
+    {
+        if (config.sessionSID.empty() || config.apiBaseURL.empty() || config.authUID.empty() ||
+            config.sampleRateHz <= 0 || config.aggregationWindowSec <= 0 || config.uploadBatchSec <= 0)
+        {
+            if (error)
+                *error = "invalid shared continuous Session config";
+            return false;
+        }
+        if (!sids.insert(config.sessionSID).second)
+        {
+            if (error)
+                *error = "duplicate Session in shared continuous engine";
+            return false;
+        }
+        if (!ensure_directory(session_spool_directory(config)))
+        {
+            if (error)
+                *error = "continuous spool directory is not writable";
+            return false;
+        }
+    }
+    impl_->sessions = sessions;
+    impl_->physical = shared_physical_config(sessions);
+    impl_->running = true;
+    impl_->worker = std::thread(&SharedDualTrackContinuousSampler::Impl::Loop, impl_.get());
+    std::cout << "[native-cp] shared engine started sessions=" << sessions.size()
+              << " targets=" << impl_->physical.targetProcesses.size()
+              << " rate_hz=" << impl_->physical.sampleRateHz << std::endl;
+    return true;
+}
+
+void SharedDualTrackContinuousSampler::Stop()
+{
+    if (!impl_)
+        return;
+    impl_->running = false;
+    impl_->ready = false;
+    impl_->strict = false;
+    impl_->failed = false;
+    if (impl_->worker.joinable())
+        impl_->worker.join();
+}
+
+bool SharedDualTrackContinuousSampler::Running() const
+{
+    return impl_ && impl_->running.load();
+}
+
+bool SharedDualTrackContinuousSampler::Ready() const
+{
+    return impl_ && impl_->ready.load();
+}
+
+bool SharedDualTrackContinuousSampler::Strict() const
+{
+    return impl_ && impl_->strict.load();
+}
+
+bool SharedDualTrackContinuousSampler::Failed() const
+{
+    return impl_ && impl_->failed.load();
+}
+
+std::string SharedDualTrackContinuousSampler::DegradationReason() const
+{
+    if (!impl_)
+        return {};
+    std::lock_guard<std::mutex> lock(impl_->statusMutex);
+    return impl_->degradationReason;
 }
 
 } // namespace drop

@@ -25,6 +25,7 @@ import TaskDiffPage from './pages/TaskDiffPage';
 import LoginPage from './pages/LoginPage';
 import ProfilesPage from './pages/ProfilesPage';
 import HostDetailPage from './pages/HostDetailPage';
+import ContinuousSessionDetailPage from './pages/ContinuousSessionDetailPage';
 
 // ============================================================
 // CSS 样式
@@ -119,12 +120,12 @@ export default function App() {
     return (
         <div style={{ minHeight: '100vh', background: '#f0f2f5' }}>
             {/* 顶部导航栏 */}
-            <header style={styles.header}>
+            <header className="app-header" style={styles.header}>
                 <div>
                     <h1 style={{ margin: 0, fontSize: 20 }}>🔥 Mini-Drop</h1>
                     <span style={{ fontSize: 12, color: '#888' }}>性能分析平台</span>
                 </div>
-                <nav style={styles.nav}>
+                <nav className="app-nav" style={styles.nav}>
                     <Link to="/" style={styles.navLink}>主机</Link>
                     <Link to="/tasks" style={styles.navLink}>全部任务</Link>
                     <span style={{ color: '#555' }}>|</span>
@@ -139,6 +140,7 @@ export default function App() {
             <Routes>
                 <Route path="/" element={<HomePage />} />
                 <Route path="/hosts/:targetId" element={<HostDetailPage />} />
+				<Route path="/hosts/:targetId/continuous/:sid" element={<ContinuousSessionDetailPage />} />
                 <Route path="/tasks" element={<TaskListPage />} />
                 <Route path="/profiles" element={<ProfilesPage />} />
                 <Route path="/task/result" element={<TaskResultPage />} />

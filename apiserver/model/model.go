@@ -239,6 +239,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&Outbox{},
 		&SchemaMigration{},
 		&ContinuousSession{},
+		&ContinuousProcessSnapshot{},
+		&ContinuousAgentState{},
 		&ProfileBatch{},
 		&ProfileWindow{},
 		&SymbolFile{},

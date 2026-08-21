@@ -8,10 +8,29 @@ import {
     makeSequentialDiffWindows,
     makeTimeWindow,
     coverageSegments,
+    instanceFilters,
+	processInstanceOptions,
     rangeOptionsForRetention,
     runtimeLabel,
     validateCustomTimeWindow,
 } from './ContinuousProfilingPanel';
+
+test('process instance filters keep PID reuse identities separate', () => {
+    expect(instanceFilters('42|1724160000123')).toEqual({ pid: '42', process_start_ms: '1724160000123' });
+    expect(instanceFilters('42')).toEqual({});
+});
+
+test('process instance options retain historical PID identities after restart', () => {
+	const options = processInstanceOptions(
+		[{ pid: 42, process_start_ms: 1724160000222 }],
+		['42|1724160000111', '42|1724160000222', '77|1724160000333', 'invalid'],
+	);
+	expect(options).toEqual([
+		{ value: '42|1724160000222', pid: 42, processStartMs: 1724160000222, active: true },
+		{ value: '77|1724160000333', pid: 77, processStartMs: 1724160000333, active: false },
+		{ value: '42|1724160000111', pid: 42, processStartMs: 1724160000111, active: false },
+	]);
+});
 
 function toLocalInput(value) {
     const date = new Date(value);

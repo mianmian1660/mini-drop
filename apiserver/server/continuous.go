@@ -43,6 +43,12 @@ type CreateContinuousSessionReq struct {
 	RetentionHours       uint32                 `json:"retention_hours"`
 	Labels               map[string]interface{} `json:"labels"`
 	Capabilities         map[string]interface{} `json:"capabilities"`
+	Scope                string                 `json:"scope"`
+	SelectorExe          string                 `json:"selector_exe"`
+	SelectorMode         string                 `json:"selector_mode"`
+	Signals              []string               `json:"signals"`
+	ContinuityMode       string                 `json:"continuity_mode"`
+	AllowDegraded        bool                   `json:"allow_degraded"`
 }
 
 type ContinuousBatchIngestReq struct {
@@ -89,16 +95,17 @@ type ContinuousWindowIngest struct {
 }
 
 type ContinuousStackSample struct {
-	Stack       []string               `json:"stack"`
-	StackString string                 `json:"stack_string"`
-	Count       uint64                 `json:"count"`
-	Comm        string                 `json:"comm"`
-	PID         int                    `json:"pid"`
-	Exe         string                 `json:"exe"`
-	StackScope  string                 `json:"stack_scope"`
-	Backend     string                 `json:"backend"`
-	Runtime     string                 `json:"runtime"`
-	Labels      map[string]interface{} `json:"labels"`
+	Stack          []string               `json:"stack"`
+	StackString    string                 `json:"stack_string"`
+	Count          uint64                 `json:"count"`
+	Comm           string                 `json:"comm"`
+	PID            int                    `json:"pid"`
+	ProcessStartMs int64                  `json:"process_start_ms"`
+	Exe            string                 `json:"exe"`
+	StackScope     string                 `json:"stack_scope"`
+	Backend        string                 `json:"backend"`
+	Runtime        string                 `json:"runtime"`
+	Labels         map[string]interface{} `json:"labels"`
 }
 
 type ContinuousProfileIngest struct {
@@ -233,7 +240,10 @@ func (s *APIServer) CreateContinuousSession(c *gin.Context) {
 }
 
 func (s *APIServer) CreateInternalContinuousSession(c *gin.Context) {
-	s.createContinuousSession(c, "", "system-agent")
+	// Kept as an explicit compatibility response so an old Agent cannot silently
+	// recreate the host-wide Sessions archived by migration 006.
+	s.RespondHTTPError(c, http.StatusGone, ErrCodeTaskInvalidArgument,
+		"Agent 自动创建持续采集任务已停用，请由用户在主机性能中心创建")
 }
 
 func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, userName string) {
@@ -248,8 +258,42 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		return
 	}
 	applyContinuousDefaults(&req)
+	if message := validateContinuousCreateRequest(req); message != "" {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, message)
+		return
+	}
+	var agent model.AgentInfo
+	if err := s.DB.Where("ip_addr = ?", req.TargetIP).Order("last_seen DESC").First(&agent).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "目标 Agent 不存在")
+		return
+	}
+	if ownerUID != "" && !s.canReadAgent(agent, s.AuthContext(c)) {
+		s.forbid(c)
+		return
+	}
+	var agentState model.ContinuousAgentState
+	agentStateErr := s.DB.Where("target_ip = ?", req.TargetIP).First(&agentState).Error
+	agentReady := agentStateErr == nil && time.Since(agentState.ObservedAt) <= 30*time.Second
+	if !agentReady {
+		s.RespondHTTPError(c, http.StatusConflict, ErrCodeDependencyUnavailable, errContinuousAgentUnavailable.Error())
+		return
+	}
+	strictCapable := agentState.StrictCapable
+	if req.ContinuityMode == "strict" && !strictCapable && !req.AllowDegraded && ownerUID != "" {
+		s.RespondHTTPError(c, http.StatusConflict, ErrCodeDependencyUnavailable,
+			"目标 Agent 暂不具备严格连续采集能力；确认允许降级后才能创建")
+		return
+	}
+	continuityMode := req.ContinuityMode
+	degradationReason := ""
+	observedState := model.ContinuousObservedStatePending
+	if !strictCapable {
+		continuityMode = "degraded"
+		degradationReason = "strict persistent perf/CO-RE engine unavailable; using PID-scoped rolling fallback"
+	}
 	labels, _ := util.MarshalJSONB(req.Labels)
 	caps, _ := util.MarshalJSONB(req.Capabilities)
+	signals, _ := util.MarshalJSONB(req.Signals)
 	now := time.Now()
 	session := model.ContinuousSession{
 		SID:                  "cps-" + util.GenTID()[4:],
@@ -264,13 +308,66 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		Labels:               labels,
 		Capabilities:         caps,
 		Status:               model.ContinuousSessionStatusRunning,
+		Scope:                req.Scope,
+		SelectorExe:          req.SelectorExe,
+		SelectorMode:         req.SelectorMode,
+		Signals:              signals,
+		DesiredState:         model.ContinuousDesiredStateRunning,
+		ObservedState:        observedState,
+		ActiveProcesses:      []byte(`[]`),
+		ContinuityMode:       continuityMode,
+		AllowDegraded:        req.AllowDegraded || req.ContinuityMode == "degraded",
+		DegradationReason:    degradationReason,
+		Revision:             0,
+		AgentID:              firstNonEmpty(agentState.AgentID, agent.AgentID),
 		UID:                  ownerUID,
 		UserName:             userName,
 		StartedAt:            now,
 		CreatedAt:            now,
 		UpdatedAt:            now,
 	}
-	if err := s.DB.Create(&session).Error; err != nil {
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// AgentInfo is guaranteed to exist and provides one stable row to lock even
+		// when the host currently has zero active Sessions.
+		var lockedAgent model.AgentInfo
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", agent.ID).First(&lockedAgent).Error; err != nil {
+			return err
+		}
+		var lockedState model.ContinuousAgentState
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("target_ip = ?", req.TargetIP).First(&lockedState).Error; err != nil {
+			return errContinuousAgentUnavailable
+		}
+		if time.Since(lockedState.ObservedAt) > 30*time.Second {
+			return errContinuousAgentUnavailable
+		}
+		var active []model.ContinuousSession
+		if err := tx.Where("target_ip = ? AND desired_state = ?", req.TargetIP, model.ContinuousDesiredStateRunning).
+			Find(&active).Error; err != nil {
+			return err
+		}
+		if err := validateContinuousActiveSet(active, req.Scope, req.SelectorExe); err != nil {
+			return err
+		}
+		nextRevision := lockedState.Revision + 1
+		if err := tx.Model(&lockedState).Updates(map[string]interface{}{
+			"revision": nextRevision, "updated_at": now,
+		}).Error; err != nil {
+			return err
+		}
+		session.Revision = nextRevision
+		return tx.Create(&session).Error
+	})
+	if err != nil {
+		if errors.Is(err, errContinuousAgentUnavailable) {
+			s.RespondHTTPError(c, http.StatusConflict, ErrCodeDependencyUnavailable, err.Error())
+			return
+		}
+		if errors.Is(err, errContinuousModeConflict) || errors.Is(err, errContinuousHostLimitReached) ||
+			errors.Is(err, errContinuousLimitReached) ||
+			errors.Is(err, errContinuousDuplicateSelector) {
+			s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, err.Error())
+			return
+		}
 		s.Logger.Error("创建 ContinuousSession 失败", zap.Error(err))
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "创建 ContinuousSession 失败")
 		return
@@ -281,7 +378,7 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 	auth := s.AuthContext(c)
 	var sessions []model.ContinuousSession
-	query := s.DB.Order("created_at DESC")
+	query := s.DB.Model(&model.ContinuousSession{})
 	if !auth.IsPlatformAdmin() {
 		owners := s.visibleOwnerUIDs(auth)
 		if len(owners) > 0 {
@@ -290,6 +387,29 @@ func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 			query = query.Where("(uid = ? OR uid = '' OR uid IS NULL)", auth.UID)
 		}
 	}
+	if value := strings.TrimSpace(c.Query("target_ip")); value != "" {
+		query = query.Where("target_ip = ?", value)
+	}
+	if value := strings.TrimSpace(c.Query("scope")); value != "" {
+		query = query.Where("scope = ?", value)
+	}
+	if value := strings.TrimSpace(c.Query("desired_state")); value != "" {
+		query = query.Where("desired_state = ?", value)
+	}
+	if value := strings.TrimSpace(c.Query("observed_state")); value != "" {
+		query = query.Where("observed_state = ?", value)
+	}
+	if value := strings.TrimSpace(c.Query("keyword")); value != "" {
+		like := "%" + value + "%"
+		query = query.Where("name LIKE ? OR selector_exe LIKE ?", like, like)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 ContinuousSession 失败")
+		return
+	}
+	page, pageSize := continuousPagination(c)
+	query = query.Order(continuousSessionOrderSQL()).Offset((page - 1) * pageSize).Limit(pageSize)
 	if err := query.Find(&sessions).Error; err != nil {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 ContinuousSession 失败")
 		return
@@ -297,7 +417,10 @@ func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 	if sessions == nil {
 		sessions = []model.ContinuousSession{}
 	}
-	s.RespondOK(c, gin.H{"sessions": sessions, "total": len(sessions)})
+	for index := range sessions {
+		markContinuousSessionOffline(&sessions[index], time.Now())
+	}
+	s.RespondOK(c, gin.H{"sessions": sessions, "total": total, "page": page, "page_size": pageSize})
 }
 
 func (s *APIServer) StopContinuousSession(c *gin.Context) {
@@ -311,22 +434,44 @@ func (s *APIServer) StopContinuousSession(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if session.Status == model.ContinuousSessionStatusStopped {
-		s.RespondOK(c, gin.H{"session": session, "already_stopped": true})
-		return
-	}
 	now := time.Now()
-	if err := s.DB.Model(&session).Updates(map[string]interface{}{
-		"status":     model.ContinuousSessionStatusStopped,
-		"stopped_at": &now,
-		"updated_at": now,
-	}).Error; err != nil {
+	alreadyStopped := false
+	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var current model.ContinuousSession
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", session.ID).First(&current).Error; err != nil {
+			return err
+		}
+		session = current
+		if current.DesiredState == model.ContinuousDesiredStateStopped {
+			alreadyStopped = true
+			return nil
+		}
+		nextRevision := current.Revision + 1
+		var state model.ContinuousAgentState
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("target_ip = ?", current.TargetIP).First(&state).Error; err == nil {
+			nextRevision = state.Revision + 1
+			if err := tx.Model(&state).Updates(map[string]interface{}{"revision": nextRevision, "updated_at": now}).Error; err != nil {
+				return err
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := tx.Model(&current).Updates(map[string]interface{}{
+			"desired_state": model.ContinuousDesiredStateStopped, "observed_state": model.ContinuousObservedStateStopping,
+			"stop_requested_at": &now, "revision": nextRevision, "updated_at": now,
+		}).Error; err != nil {
+			return err
+		}
+		session.DesiredState = model.ContinuousDesiredStateStopped
+		session.ObservedState = model.ContinuousObservedStateStopping
+		session.StopRequestedAt = &now
+		session.Revision = nextRevision
+		return nil
+	}); err != nil {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "停止 ContinuousSession 失败")
 		return
 	}
-	session.Status = model.ContinuousSessionStatusStopped
-	session.StoppedAt = &now
-	s.RespondOK(c, gin.H{"session": session})
+	s.RespondOK(c, gin.H{"session": session, "already_stopped": alreadyStopped})
 }
 
 func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
@@ -344,11 +489,18 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "ContinuousSession 不存在")
 		return
 	}
+	if session.AgentID != "" && getRequestUID(c) != session.AgentID {
+		s.forbid(c)
+		return
+	}
 	if req.BatchID == "" {
 		req.BatchID = "cpb-" + util.GenTID()[4:]
 	}
 	if req.TargetIP == "" {
 		req.TargetIP = session.TargetIP
+	} else if req.TargetIP != session.TargetIP {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "target_ip 与 ContinuousSession 不一致")
+		return
 	}
 	if req.ObjectKey == "" {
 		req.ObjectKey = continuousBatchObjectKey(req.SessionSID, req.BatchID)
@@ -880,12 +1032,12 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 }
 
 func (s *APIServer) queryNativeContinuousLabelValues(ctx context.Context, q ProfileQuery, label string) (ProfileLabelValues, bool, error) {
-	if !isAllowedProfileFilterLabel(label) {
+	if label != "process_instance" && !isAllowedProfileFilterLabel(label) {
 		return ProfileLabelValues{
 			Label:       label,
 			Values:      []string{},
 			Available:   false,
-			Message:     "Native Continuous Profiling 仅支持 comm/pid/exe/runtime 过滤标签",
+			Message:     "Native Continuous Profiling 仅支持 comm/pid/process_start_ms/process_instance/exe/runtime 标签",
 			Source:      "mini-drop-native",
 			Query:       profileLabelSelector(q),
 			GeneratedAt: time.Now(),
@@ -946,14 +1098,7 @@ func (s *APIServer) GetProfileTimeseries(c *gin.Context) {
 
 func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q ProfileQuery, metricName string, maxSeries int) ([]ProfileTimeseriesSeries, bool, error) {
 	var windows []model.ProfileWindow
-	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
-	if !q.CanReadAll {
-		if len(q.OwnerUIDs) > 0 {
-			sessionQuery = sessionQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", q.OwnerUIDs)
-		} else {
-			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
-		}
-	}
+	sessionQuery := s.continuousSessionSelection(q)
 	err := s.DB.Where("session_sid IN (?)", sessionQuery).Where("signal_type = ?", "python_rss").
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).Order("window_start ASC").
 		Limit(continuousMaxWindowCount + 1).Find(&windows).Error
@@ -1050,14 +1195,7 @@ func downsampleRSSPoints(points []ProfileTimeseriesPoint, limit int) []ProfileTi
 
 func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q ProfileQuery) (continuousAggregate, bool, error) {
 	var windows []model.ProfileWindow
-	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
-	if !q.CanReadAll {
-		if len(q.OwnerUIDs) > 0 {
-			sessionQuery = sessionQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", q.OwnerUIDs)
-		} else {
-			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
-		}
-	}
+	sessionQuery := s.continuousSessionSelection(q)
 	signalType := "cpu_profile"
 	if q.ProfileType == "memory" {
 		signalType = "python_memory"
@@ -1087,10 +1225,12 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			Children: map[string]*continuousTreeNode{},
 		},
 		LabelValue: map[string]map[string]bool{
-			"comm":    {},
-			"pid":     {},
-			"exe":     {},
-			"runtime": {},
+			"comm":             {},
+			"pid":              {},
+			"process_start_ms": {},
+			"process_instance": {},
+			"exe":              {},
+			"runtime":          {},
 		},
 		Backends:           map[string]bool{},
 		SymbolStatus:       "not_applicable",
@@ -1369,12 +1509,17 @@ func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if len(q.Filters) > 0 {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
+			"当前延迟 histogram 不支持 PID/进程标签过滤，请在 CPU 视图使用实例筛选")
+		return
+	}
 	signalType := strings.ToLower(strings.TrimSpace(c.Query("signal_type")))
 	if signalType == "" {
 		signalType = strings.ToLower(strings.TrimSpace(c.Query("profile_type")))
 	}
-	if signalType != "io_latency" && signalType != "sched_latency" {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "signal_type 仅支持 io_latency/sched_latency")
+	if signalType != "io_latency" && signalType != "io_syscall_latency" && signalType != "sched_latency" {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "signal_type 仅支持 io_latency/io_syscall_latency/sched_latency")
 		return
 	}
 	data, found, err := s.queryNativeContinuousHistogram(c.Request.Context(), q, signalType)
@@ -1400,14 +1545,7 @@ func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
 
 func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q ProfileQuery, signalType string) (gin.H, bool, error) {
 	var windows []model.ProfileWindow
-	sessionQuery := s.DB.Model(&model.ContinuousSession{}).Select("sid").Where("target_ip = ?", q.Host)
-	if !q.CanReadAll {
-		if len(q.OwnerUIDs) > 0 {
-			sessionQuery = sessionQuery.Where("(uid IN ? OR uid = '' OR uid IS NULL)", q.OwnerUIDs)
-		} else {
-			sessionQuery = sessionQuery.Where("(uid = '' OR uid IS NULL)")
-		}
-	}
+	sessionQuery := s.continuousSessionSelection(q)
 	err := s.DB.Where("session_sid IN (?)", sessionQuery).
 		Where("signal_type = ?", signalType).
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
@@ -1547,7 +1685,7 @@ func (s *APIServer) loadContinuousStoredBatch(ctx context.Context, objectKey str
 }
 
 func continuousSampleMatches(sample ContinuousStackSample, windowLabels map[string]interface{}, filters map[string]interface{}) bool {
-	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
+	for _, key := range []string{"comm", "pid", "process_start_ms", "exe", "runtime"} {
 		want := labelString(filters, key)
 		if want == "" {
 			continue
@@ -1605,6 +1743,12 @@ func continuousProfileSamplesForQuery(window ContinuousWindowIngest, q ProfileQu
 }
 
 func continuousSampleLabel(sample ContinuousStackSample, windowLabels map[string]interface{}, key string) string {
+	if key == "process_instance" {
+		if sample.PID > 0 && sample.ProcessStartMs > 0 {
+			return strconv.Itoa(sample.PID) + "|" + strconv.FormatInt(sample.ProcessStartMs, 10)
+		}
+		return ""
+	}
 	if value := labelString(sample.Labels, key); value != "" {
 		return value
 	}
@@ -1616,6 +1760,10 @@ func continuousSampleLabel(sample ContinuousStackSample, windowLabels map[string
 	case "pid":
 		if sample.PID > 0 {
 			return strconv.Itoa(sample.PID)
+		}
+	case "process_start_ms":
+		if sample.ProcessStartMs > 0 {
+			return strconv.FormatInt(sample.ProcessStartMs, 10)
 		}
 	case "exe":
 		if sample.Exe != "" {
@@ -1651,7 +1799,7 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 	if sample.Backend != "" {
 		diag.Modes[sample.Backend] = true
 	}
-	for _, key := range []string{"comm", "pid", "exe", "runtime"} {
+	for _, key := range []string{"comm", "pid", "process_start_ms", "process_instance", "exe", "runtime"} {
 		if value := continuousSampleLabel(sample, windowLabels, key); value != "" {
 			agg.LabelValue[key][value] = true
 		}
@@ -1909,6 +2057,33 @@ func windowOverlaps(start, end, from, to time.Time) bool {
 }
 
 func applyContinuousDefaults(req *CreateContinuousSessionReq) {
+	req.Name = strings.TrimSpace(req.Name)
+	req.TargetIP = strings.TrimSpace(req.TargetIP)
+	req.Hostname = strings.TrimSpace(req.Hostname)
+	req.ServiceName = strings.TrimSpace(req.ServiceName)
+	req.Scope = strings.ToLower(strings.TrimSpace(req.Scope))
+	if req.Scope == "" {
+		req.Scope = "host"
+	}
+	req.SelectorExe = strings.TrimSpace(req.SelectorExe)
+	const deletedSuffix = " (deleted)"
+	if strings.HasSuffix(req.SelectorExe, deletedSuffix) {
+		req.SelectorExe = strings.TrimSuffix(req.SelectorExe, deletedSuffix)
+	}
+	req.SelectorMode = strings.ToLower(strings.TrimSpace(req.SelectorMode))
+	if req.SelectorMode == "" {
+		req.SelectorMode = "all_instances"
+	}
+	req.ContinuityMode = strings.ToLower(strings.TrimSpace(req.ContinuityMode))
+	if req.ContinuityMode == "" {
+		req.ContinuityMode = "strict"
+	}
+	if len(req.Signals) == 0 {
+		req.Signals = append([]string(nil), continuousDefaultSignals...)
+	} else {
+		// The first user-driven version exposes one complete, coherent signal set.
+		req.Signals = append([]string(nil), continuousDefaultSignals...)
+	}
 	if req.SampleRateHz == 0 {
 		req.SampleRateHz = 19
 	}
