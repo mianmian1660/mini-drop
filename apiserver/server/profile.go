@@ -206,6 +206,40 @@ type ProfileDiff struct {
 	GeneratedAt time.Time         `json:"generated_at"`
 }
 
+// ProfileDiffNode 是差分火焰图的一个调用栈节点：base/compare 两棵树按
+// (父节点路径, frame 名) 对齐后逐节点算出来的。只在某一侧出现的函数，
+// 另一侧的值就是 0（纯新增/纯消失）。Value 用 inclusive（和普通火焰图
+// 口径一致，树形展示天然是 inclusive，这点和 TopN 用 self 排序不同）。
+type ProfileDiffNode struct {
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	BaseValue    float64           `json:"base_value"`
+	CompareValue float64           `json:"compare_value"`
+	Delta        float64           `json:"delta"`
+	// DeltaPercent 相对 BaseValue 的变化百分比；BaseValue 为 0（纯新增函数）
+	// 时约定为 100，前端可以用它和"BaseValue==0"一起识别出"全新出现"的节点，
+	// 单独着色，而不是套用普通的深浅渐变。
+	DeltaPercent float64           `json:"delta_percent"`
+	Children     []ProfileDiffNode `json:"children,omitempty"`
+}
+
+type ProfileDiffFlamegraph struct {
+	Root         ProfileDiffNode `json:"root"`
+	BaseTotal    float64         `json:"base_total"`
+	CompareTotal float64         `json:"compare_total"`
+	Unit         string          `json:"unit"`
+	Empty        bool            `json:"empty"`
+	Message      string          `json:"message"`
+	Source       string          `json:"source"`
+	Truncated    bool            `json:"truncated"`
+	GeneratedAt  time.Time       `json:"generated_at"`
+	// Degraded 为 true 表示 base/compare 至少有一侧的原始数据已经过期清理、
+	// 只剩冷层 TopN 摘要（没有调用树），没法做树形 diff——这种情况 Root
+	// 是空节点，前端应该引导用户退回表格 diff（现有 diffTopN 路径本来就
+	// 兼容冷层摘要）。
+	Degraded bool `json:"degraded,omitempty"`
+}
+
 var errProfileUnavailable = errors.New("native continuous profiling unavailable")
 var errContinuousWindowLimit = errors.New("匹配的持续采集窗口超过 20000 个，请缩小时间范围")
 
@@ -320,6 +354,22 @@ func (s *APIServer) GetProfileDiff(c *gin.Context) {
 		return
 	}
 	if reserved := s.respondReservedProfileType(c, q.ProfileType); reserved {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("format")), "flamegraph") {
+		if data, found, err := s.queryNativeContinuousDiffFlamegraph(c.Request.Context(), q); err != nil {
+			s.respondProfileDependencyError(c, err)
+			return
+		} else if found {
+			s.RespondOK(c, data)
+			return
+		}
+		s.RespondOK(c, ProfileDiffFlamegraph{
+			Empty:       true,
+			Message:     "Native Continuous Profiling 未启用或暂无可对比数据",
+			Source:      "mini-drop-native",
+			GeneratedAt: time.Now(),
+		})
 		return
 	}
 	if baseTop, baseFound, err := s.queryNativeContinuousTopN(c.Request.Context(), ProfileQuery{

@@ -889,6 +889,103 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 	return out, true, nil
 }
 
+// queryNativeContinuousDiffFlamegraph 两次拉 base/compare 期间的调用树，
+// 按调用路径逐节点对齐算 delta，输出一棵可以直接喂给差分火焰图渲染的树。
+// 和 diffTopN(表格 diff) 是两条独立路径——那个走 queryNativeContinuousTopN
+// 拿扁平列表，这个走 queryNativeContinuousAggregate 拿 Root 树，互不影响。
+//
+// 任一侧原始数据已经过期只剩冷层摘要（没有调用树）时，直接报 Degraded，
+// 不强行拼一棵"半棵冷半棵热"的树——冷层摘要本来就没有调用栈结构信息，
+// 拼出来的树没有意义。
+func (s *APIServer) queryNativeContinuousDiffFlamegraph(ctx context.Context, q ProfileDiffQuery) (ProfileDiffFlamegraph, bool, error) {
+	baseAgg, baseFound, err := s.queryNativeContinuousAggregate(ctx, ProfileQuery{
+		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.BaseFrom, To: q.BaseTo,
+		ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes,
+		OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll, StackScope: q.StackScope,
+	})
+	if err != nil {
+		return ProfileDiffFlamegraph{}, false, err
+	}
+	compareAgg, compareFound, err := s.queryNativeContinuousAggregate(ctx, ProfileQuery{
+		TargetID: q.TargetID, Host: q.Host, Service: q.Service, From: q.CompareFrom, To: q.CompareTo,
+		ProfileType: q.ProfileType, Labels: q.Labels, Filters: q.Filters, MaxNodes: q.MaxNodes,
+		OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll, StackScope: q.StackScope,
+	})
+	if err != nil {
+		return ProfileDiffFlamegraph{}, false, err
+	}
+
+	baseDegraded, err := s.continuousSideIsDegraded(ctx, q, q.BaseFrom, q.BaseTo, baseFound)
+	if err != nil {
+		return ProfileDiffFlamegraph{}, false, err
+	}
+	compareDegraded, err := s.continuousSideIsDegraded(ctx, q, q.CompareFrom, q.CompareTo, compareFound)
+	if err != nil {
+		return ProfileDiffFlamegraph{}, false, err
+	}
+	if baseDegraded || compareDegraded {
+		return ProfileDiffFlamegraph{
+			Empty:       true,
+			Degraded:    true,
+			Message:     "对比的时间范围里有一段原始数据已过期清理，只剩降采样摘要，无法生成调用树差分火焰图，请改用表格 diff 视图",
+			Source:      "mini-drop-native-cold",
+			GeneratedAt: time.Now(),
+		}, true, nil
+	}
+	if !baseFound && !compareFound {
+		// 两侧都真的什么都没有（不是冷层，是压根没采集过），交回调用方
+		// 走原有的"未找到"兜底分支。
+		return ProfileDiffFlamegraph{}, false, nil
+	}
+
+	var baseRoot, compareRoot *continuousTreeNode
+	baseTotal, compareTotal := 0.0, 0.0
+	baseUnit, compareUnit := "", ""
+	if baseFound {
+		baseRoot = baseAgg.Root
+		baseTotal = baseAgg.Total
+		baseUnit = baseAgg.Unit
+	}
+	if compareFound {
+		compareRoot = compareAgg.Root
+		compareTotal = compareAgg.Total
+		compareUnit = compareAgg.Unit
+	}
+
+	diffRoot := diffContinuousTreeNode("root", baseRoot, compareRoot)
+	maxNodes := q.MaxNodes
+	if maxNodes == 0 {
+		maxNodes = continuousDefaultMaxNodes
+	}
+	truncatedRoot, truncated := truncateDiffTree(diffRoot, maxNodes)
+
+	out := ProfileDiffFlamegraph{
+		Root:         truncatedRoot,
+		BaseTotal:    baseTotal,
+		CompareTotal: compareTotal,
+		Unit:         firstNonEmpty(baseUnit, compareUnit, "samples"),
+		Empty:        len(truncatedRoot.Children) == 0,
+		Source:       "mini-drop-native",
+		Truncated:    truncated,
+		GeneratedAt:  time.Now(),
+	}
+	if out.Empty {
+		out.Message = "暂无可对比数据"
+	}
+	return out, true, nil
+}
+
+// continuousSideIsDegraded 判断 base/compare 里的一侧要不要标记成"降级到
+// 冷层"——只有"原始查询没找到、但冷层确实有摘要"才算，纯粹没采集过不算。
+func (s *APIServer) continuousSideIsDegraded(ctx context.Context, q ProfileDiffQuery, from, to time.Time, found bool) (bool, error) {
+	if found {
+		return false, nil
+	}
+	return s.continuousHasSummaryForRange(ctx, ProfileQuery{
+		Host: q.Host, From: from, To: to, OwnerUIDs: q.OwnerUIDs, CanReadAll: q.CanReadAll,
+	})
+}
+
 func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuery) (ProfileTopN, bool, error) {
 	agg, found, err := s.queryNativeContinuousAggregate(ctx, q)
 	if err != nil {
@@ -2156,6 +2253,124 @@ func continuousTreeToProfileNodes(root *continuousTreeNode, prefix string) []Pro
 
 // continuousTreeToProfileNodesTruncated 带节点数上限的火焰图构建。
 // 借鉴 Pyroscope maxNodes 查询保护：超过上限时按值排序截断，并返回 truncated=true。
+// diffContinuousTreeNode 递归对齐 base/compare 两棵 continuousTreeNode，
+// 按 (父节点路径, frame 名) 配对——名字相同的子节点在同一层配成一对递归
+// 下去，只在一侧出现的子节点另一侧按 nil 处理（值为 0，纯新增/纯消失）。
+// Value 用 inclusive，和普通火焰图口径一致；孩子按 max(base,compare) 值
+// 降序排（不是按 delta 排），这样渲染出来的树形状还是符合"宽的分支排
+// 前面"的火焰图直觉，delta 只用来着色，不用来决定布局顺序。
+func diffContinuousTreeNode(name string, base, compare *continuousTreeNode) ProfileDiffNode {
+	var baseValue, compareValue float64
+	if base != nil {
+		baseValue = base.Value
+	}
+	if compare != nil {
+		compareValue = compare.Value
+	}
+	node := ProfileDiffNode{
+		Name:         name,
+		BaseValue:    baseValue,
+		CompareValue: compareValue,
+		Delta:        compareValue - baseValue,
+	}
+	switch {
+	case baseValue > 0:
+		node.DeltaPercent = node.Delta / baseValue * 100
+	case compareValue > 0:
+		node.DeltaPercent = 100
+	}
+
+	seen := map[string]bool{}
+	names := make([]string, 0)
+	if base != nil {
+		for _, c := range base.Order {
+			if !seen[c.Name] {
+				seen[c.Name] = true
+				names = append(names, c.Name)
+			}
+		}
+	}
+	if compare != nil {
+		for _, c := range compare.Order {
+			if !seen[c.Name] {
+				seen[c.Name] = true
+				names = append(names, c.Name)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return node
+	}
+
+	children := make([]ProfileDiffNode, 0, len(names))
+	for _, childName := range names {
+		var baseChild, compareChild *continuousTreeNode
+		if base != nil {
+			baseChild = base.Children[childName]
+		}
+		if compare != nil {
+			compareChild = compare.Children[childName]
+		}
+		children = append(children, diffContinuousTreeNode(childName, baseChild, compareChild))
+	}
+	sort.Slice(children, func(i, j int) bool {
+		wi := maxFloat(children[i].BaseValue, children[i].CompareValue)
+		wj := maxFloat(children[j].BaseValue, children[j].CompareValue)
+		if wi == wj {
+			return children[i].Name < children[j].Name
+		}
+		return wi > wj
+	})
+	node.Children = children
+	return node
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// truncateDiffTree 和 continuousTreeToProfileNodesTruncated 用一样的策略：
+// 总节点数超过 maxNodes 才截断，DFS 预算用完就停——因为孩子已经按权重
+// 降序排过，DFS 优先顺序天然保留权重最大的分支。
+func truncateDiffTree(root ProfileDiffNode, maxNodes int) (ProfileDiffNode, bool) {
+	if maxNodes <= 0 {
+		maxNodes = continuousDefaultMaxNodes
+	}
+	if countDiffNodes(root) <= maxNodes {
+		return root, false
+	}
+	remaining := maxNodes
+	return truncateDiffTreeBudget(root, &remaining), true
+}
+
+func countDiffNodes(node ProfileDiffNode) int {
+	count := len(node.Children)
+	for _, child := range node.Children {
+		count += countDiffNodes(child)
+	}
+	return count
+}
+
+func truncateDiffTreeBudget(node ProfileDiffNode, remaining *int) ProfileDiffNode {
+	if remaining == nil || *remaining <= 0 || len(node.Children) == 0 {
+		node.Children = nil
+		return node
+	}
+	kept := make([]ProfileDiffNode, 0, len(node.Children))
+	for _, child := range node.Children {
+		if *remaining <= 0 {
+			break
+		}
+		*remaining--
+		kept = append(kept, truncateDiffTreeBudget(child, remaining))
+	}
+	node.Children = kept
+	return node
+}
+
 func continuousTreeToProfileNodesTruncated(root *continuousTreeNode, prefix string, maxNodes int) ([]ProfileNode, bool) {
 	if root == nil {
 		return []ProfileNode{}, false

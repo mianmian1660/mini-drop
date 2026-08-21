@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { select } from 'd3-selection';
 import { flamegraph as createFlamegraph } from 'd3-flame-graph';
 import 'd3-flame-graph/dist/d3-flamegraph.css';
-import { formatFlamegraphLabel } from '../utils/profileMetrics';
+import { formatFlamegraphLabel, formatMetricValue } from '../utils/profileMetrics';
 
 const SAFE_MAX_DEPTH = 80;
 const SAFE_MAX_NODES = 3500;
@@ -30,6 +30,12 @@ export default function InteractiveFlamegraph({
     searchText = '',
     onRenderStats,
     onSearchStats,
+    // diffMode=true 时按 base_value/compare_value/delta 的差分着色（红=变热，
+    // 蓝=变冷，深浅按变化幅度），不用 d3-flame-graph 默认的按名字哈希配色。
+    // 节点形状还是普通的 {name, value, children}——调用方(ContinuousProfilingPanel)
+    // 负责把 ProfileDiffFlamegraph.root.children 铺成 nodes 数组传进来，
+    // 这个组件不需要知道"diff 数据"和"普通数据"是两种不同的后端响应体。
+    diffMode = false,
 }) {
     const graphRef = useRef(null);
     const chartRef = useRef(null);
@@ -76,8 +82,11 @@ export default function InteractiveFlamegraph({
                     const samplePercent = totalValue > 0 ? (Number(searchSum || 0) / Number(totalValue)) * 100 : 0;
                     onSearchStats?.({ matches, samplePercent });
                 })
-                .label(d => formatFlamegraphLabel(d, data.unit))
+                .label(d => (diffMode ? formatDiffFlamegraphLabel(d, data.unit) : formatFlamegraphLabel(d, data.unit)))
                 .title('');
+            if (diffMode) {
+                chart.color(diffFlamegraphColor);
+            }
             chartRef.current = chart;
             selection.datum(d3Data).call(chart);
             const actualNodes = Math.max(0, selection.selectAll('g.frame').size() - 1);
@@ -99,7 +108,7 @@ export default function InteractiveFlamegraph({
             chartRef.current = null;
             selection.selectAll('*').remove();
         };
-    }, [data, d3Data, hasData, minWidth, onRenderStats, onSearchStats, profileStats.nodes, renderData, renderMode]);
+    }, [data, d3Data, diffMode, hasData, minWidth, onRenderStats, onSearchStats, profileStats.nodes, renderData, renderMode]);
 
     useEffect(() => {
         chartRef.current?.search(String(searchText || '').trim());
@@ -154,6 +163,13 @@ function toD3Nodes(nodes) {
             name: node.name || 'unknown',
             value: Math.max(0, Number(node.value || 0)),
         };
+        // 差分节点额外带 base_value/compare_value/delta/delta_percent——原样
+        // 透传进 d3 节点数据，diffFlamegraphColor/formatDiffFlamegraphLabel
+        // 从 d.data 里读。普通(非 diff)节点没有这些字段，透传是空操作。
+        if (node.base_value !== undefined) output.base_value = Number(node.base_value) || 0;
+        if (node.compare_value !== undefined) output.compare_value = Number(node.compare_value) || 0;
+        if (node.delta !== undefined) output.delta = Number(node.delta) || 0;
+        if (node.delta_percent !== undefined) output.delta_percent = Number(node.delta_percent) || 0;
         const children = Array.isArray(node.children) ? node.children : [];
         if (children.length > 0) {
             output.children = [];
@@ -195,6 +211,42 @@ export function flamegraphRenderConfig(nodeCount) {
         minFrameSize: 0,
         transitionDuration: Number(nodeCount) > SAFE_MAX_NODES ? 0 : 120,
     };
+}
+
+// diffFlamegraphColor — Brendan Gregg 差分火焰图的惯例：红=变热，蓝=变冷，
+// 深浅对应变化幅度(按 delta_percent 归一化)；base_value===0 的纯新增函数
+// 单独用深红强调，不套用普通的渐变(delta_percent 恒为 100，走同一档最深红
+// 也说得通，但单独判一下语义更明确，方便以后要独立改新增函数的颜色时
+// 不用牵动渐变公式)。根节点(depth===0，对应 miniDropToD3Flamegraph 包的
+// 那层 name==='root')固定用中性灰，不参与着色。
+export function diffFlamegraphColor(d) {
+    if (!d || d.depth === 0) return '#e4e7ec';
+    const baseValue = Number(d?.data?.base_value || 0);
+    const compareValue = Number(d?.data?.compare_value || 0);
+    const delta = Number(d?.data?.delta || 0);
+    if (baseValue === 0 && compareValue > 0) return '#b42318'; // 新增函数：深红强调
+    if (compareValue === 0 && baseValue > 0) return '#175cd3'; // 消失函数：深蓝强调
+    if (delta === 0) return '#eaecf0'; // 无变化：中性灰
+    const deltaPercent = Math.abs(Number(d?.data?.delta_percent || 0));
+    const intensity = Math.max(0, Math.min(1, deltaPercent / 100));
+    const lightness = 88 - intensity * 48; // 88%(几乎不变) -> 40%(变化剧烈)
+    return delta > 0 ? `hsl(4, 76%, ${lightness}%)` : `hsl(212, 76%, ${lightness}%)`;
+}
+
+// formatDiffFlamegraphLabel — 悬浮提示显示 base→compare 的具体数值和变化量，
+// 而不是普通火焰图那种"占比+绝对值"，因为 diff 场景下用户关心的是变化
+// 本身，不是这一帧在整体里占多少比例。
+export function formatDiffFlamegraphLabel(d, unit) {
+    const name = d?.data?.name || 'unknown';
+    const baseValue = Number(d?.data?.base_value || 0);
+    const compareValue = Number(d?.data?.compare_value || 0);
+    const delta = Number(d?.data?.delta || 0);
+    const deltaPercent = d?.data?.delta_percent;
+    const sign = delta > 0 ? '+' : '';
+    const percentText = baseValue === 0 && compareValue > 0
+        ? '新增'
+        : (compareValue === 0 && baseValue > 0 ? '消失' : `${sign}${Number(deltaPercent || 0).toFixed(1)}%`);
+    return `${name} (${formatMetricValue(baseValue, unit)} → ${formatMetricValue(compareValue, unit)}, ${percentText})`;
 }
 
 export function matchesFlamegraphFrame(name, term) {
