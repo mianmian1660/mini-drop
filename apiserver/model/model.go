@@ -243,6 +243,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&ContinuousAgentState{},
 		&ProfileBatch{},
 		&ProfileWindow{},
+		&ContinuousWindowSummary{},
 		&SymbolFile{},
 		&KernelSymbolFile{},
 		&TaskBuildID{},

@@ -922,12 +922,36 @@ enum class BuildIdAttemptState
 struct BuildIdAttempt
 {
     BuildIdAttemptState state;
-    int64_t retryAfterMs; // 仅 TransientFail 有意义
+    int64_t retryAfterMs;  // 仅 TransientFail 有意义
+    int64_t lastTouchedMs; // 淘汰排序用；PermanentFail 的 retryAfterMs 固定是 0，不能复用它做排序
 };
 
 static std::mutex g_buildIdAttemptMutex;
 static std::map<std::string, BuildIdAttempt> g_buildIdAttempts;
 static constexpr int64_t kBuildIdTransientRetryMs = 5 * 60 * 1000; // 5 分钟
+// 长时间运行的 Agent 会遇到很多不同的 build-id，这张表只清成功、不淘汰
+// 失败，原本没有上限。参考 RuntimeSymbolMap.cpp 的 g_javaLastRefreshMap
+// 同款做法：超过上限时线性扫一遍淘汰最久没碰过的一条。
+static constexpr size_t kBuildIdAttemptMaxEntries = 4096;
+
+// 调用方必须持有 g_buildIdAttemptMutex。
+static void evict_oldest_build_id_attempt_locked()
+{
+    if (g_buildIdAttempts.size() <= kBuildIdAttemptMaxEntries)
+        return;
+    int64_t oldest = INT64_MAX;
+    std::string oldestKey;
+    for (const auto &kv : g_buildIdAttempts)
+    {
+        if (kv.second.lastTouchedMs < oldest)
+        {
+            oldest = kv.second.lastTouchedMs;
+            oldestKey = kv.first;
+        }
+    }
+    if (!oldestKey.empty())
+        g_buildIdAttempts.erase(oldestKey);
+}
 
 static bool should_skip_build_id_attempt(const std::string &buildId, int64_t nowMs)
 {
@@ -946,13 +970,15 @@ static bool should_skip_build_id_attempt(const std::string &buildId, int64_t now
 static void record_build_id_transient_fail(const std::string &buildId, int64_t nowMs)
 {
     std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
-    g_buildIdAttempts[buildId] = {BuildIdAttemptState::TransientFail, nowMs + kBuildIdTransientRetryMs};
+    g_buildIdAttempts[buildId] = {BuildIdAttemptState::TransientFail, nowMs + kBuildIdTransientRetryMs, nowMs};
+    evict_oldest_build_id_attempt_locked();
 }
 
 static void record_build_id_permanent_fail(const std::string &buildId)
 {
     std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
-    g_buildIdAttempts[buildId] = {BuildIdAttemptState::PermanentFail, 0};
+    g_buildIdAttempts[buildId] = {BuildIdAttemptState::PermanentFail, 0, now_ms()};
+    evict_oldest_build_id_attempt_locked();
 }
 
 static void clear_build_id_attempt(const std::string &buildId)

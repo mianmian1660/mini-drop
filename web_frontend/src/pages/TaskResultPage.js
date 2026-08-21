@@ -821,7 +821,7 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN', isPpro
                                     <th style={styles.th}>#</th>
                                     <th style={styles.th}>函数名</th>
                                 <th style={styles.th}>{isSeconds ? '自身 CPU 时间' : '采样次数'}</th>
-                                <th style={styles.th}>占比</th>
+                                <th style={styles.th} title="该函数自身（栈顶）采样次数 ÷ 全部函数自身采样总数，不含它调用的子函数">占比（自身 / 总采样）</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -830,7 +830,7 @@ function TopFunctionsPanel({ topFunctions, status, title = '热点 TopN', isPpro
                                     <td style={styles.td}>{item.rank || index + 1}</td>
                                     <td style={styles.td}>{item.function || item.name || '-'}</td>
                                     <td style={styles.td}>{formatSampleValue(item.samples ?? item.count ?? 0, item.sample_unit || unit)}</td>
-                                    <td style={styles.td}>{formatPercent(item.percentage ?? item.percent)}</td>
+                                    <td style={styles.td} title="自身采样占比，不含子函数">{formatPercent(item.percentage ?? item.percent)}</td>
                                 </tr>
                             ))}
                         </tbody>

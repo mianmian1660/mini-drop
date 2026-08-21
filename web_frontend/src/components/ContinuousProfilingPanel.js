@@ -119,6 +119,15 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [diffResult, setDiffResult] = useState(null);
     const [diffLoading, setDiffLoading] = useState(false);
     const [diffError, setDiffError] = useState('');
+    // diffViewMode 控制"表格 / 火焰图"两种 diff 展现形式，和上面的
+    // diffMode('quick'/'custom'，控制 baseline/compare 时间窗怎么选)是两个
+    // 不同维度的开关，不要搞混。表格走 diffResult，火焰图走独立的
+    // diffFlamegraphResult——两条查询互不影响，切换 tab 不会清掉另一个
+    // tab 已经查出来的结果。
+    const [diffViewMode, setDiffViewMode] = useState('table');
+    const [diffFlamegraphResult, setDiffFlamegraphResult] = useState(null);
+    const [diffFlamegraphLoading, setDiffFlamegraphLoading] = useState(false);
+    const [diffFlamegraphError, setDiffFlamegraphError] = useState('');
     // Memory tab: recent Go pprof heap tasks
     const [heapTasks, setHeapTasks] = useState([]);
     const [heapTasksLoading, setHeapTasksLoading] = useState(false);
@@ -286,49 +295,59 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         if (profileType === 'memory') loadHeapTasks();
     }, [profileType, loadHeapTasks]);
 
+    // buildDiffParams 是表格 diff 和火焰图 diff 共用的部分——算 baseline/compare
+    // 时间窗、拼 target/filters 这些查询参数，两条路径只在要不要加
+    // format=flamegraph 上分叉，不要各写一份容易漂移。
+    const buildDiffParams = useCallback(() => {
+        let baseWindow;
+        let compareWindow;
+        if (diffMode === 'custom') {
+            const baseResult = validateCustomTimeWindow(diffBaseFrom, diffBaseTo, sessionMeta.retentionHours, 'Baseline');
+            const compareResult = validateCustomTimeWindow(diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, 'Compare');
+            if (baseResult.error || compareResult.error) {
+                return { error: baseResult.error || compareResult.error };
+            }
+            baseWindow = baseResult.window;
+            compareWindow = compareResult.window;
+            const durationDelta = Math.abs(
+                (new Date(baseWindow.to).getTime() - new Date(baseWindow.from).getTime())
+                - (new Date(compareWindow.to).getTime() - new Date(compareWindow.from).getTime()),
+            );
+            if (durationDelta >= 1000) {
+                return { error: 'Baseline 与 Compare 必须使用等长时间窗' };
+            }
+            setAppliedDiffCustomWindows({ baseWindow, compareWindow });
+        } else {
+            ({ baseWindow, compareWindow } = makeSequentialDiffWindows(diffRange));
+        }
+        const params = {
+            session_sid: sessionSID,
+            target_id: target.id,
+            host: target.ip,
+            service: target.service_name || 'hotmethod',
+            profile_type: 'cpu',
+            base_from: baseWindow.from,
+            base_to: baseWindow.to,
+            compare_from: compareWindow.from,
+            compare_to: compareWindow.to,
+            max_nodes: maxNodes,
+        };
+        if (stackScope !== 'all') params.stack_scope = stackScope;
+        if (Object.keys(activeFilters).length > 0) params.filters = JSON.stringify(activeFilters);
+        return { params };
+    }, [target, sessionSID, diffMode, diffRange, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFilters]);
+
     const runDiff = useCallback(async () => {
         if (!target) return;
         setDiffLoading(true);
         setDiffError('');
         setDiffResult(null);
         try {
-            let baseWindow;
-            let compareWindow;
-            if (diffMode === 'custom') {
-                const baseResult = validateCustomTimeWindow(diffBaseFrom, diffBaseTo, sessionMeta.retentionHours, 'Baseline');
-                const compareResult = validateCustomTimeWindow(diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, 'Compare');
-                if (baseResult.error || compareResult.error) {
-                    setDiffError(baseResult.error || compareResult.error);
-                    return;
-                }
-                baseWindow = baseResult.window;
-                compareWindow = compareResult.window;
-                const durationDelta = Math.abs(
-                    (new Date(baseWindow.to).getTime() - new Date(baseWindow.from).getTime())
-                    - (new Date(compareWindow.to).getTime() - new Date(compareWindow.from).getTime()),
-                );
-                if (durationDelta >= 1000) {
-                    setDiffError('Baseline 与 Compare 必须使用等长时间窗');
-                    return;
-                }
-                setAppliedDiffCustomWindows({ baseWindow, compareWindow });
-            } else {
-                ({ baseWindow, compareWindow } = makeSequentialDiffWindows(diffRange));
+            const { params, error } = buildDiffParams();
+            if (error) {
+                setDiffError(error);
+                return;
             }
-			const params = {
-				session_sid: sessionSID,
-                target_id: target.id,
-                host: target.ip,
-                service: target.service_name || 'hotmethod',
-                profile_type: 'cpu',
-                base_from: baseWindow.from,
-                base_to: baseWindow.to,
-                compare_from: compareWindow.from,
-                compare_to: compareWindow.to,
-                max_nodes: maxNodes,
-            };
-            if (stackScope !== 'all') params.stack_scope = stackScope;
-            if (Object.keys(activeFilters).length > 0) params.filters = JSON.stringify(activeFilters);
             const res = await profiles.diff(params);
             if (res.code === 0) {
                 setDiffResult(res.data);
@@ -340,7 +359,66 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setDiffLoading(false);
         }
-	}, [target, sessionSID, diffMode, diffRange, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFilters]);
+    }, [target, buildDiffParams]);
+
+    const runDiffFlamegraph = useCallback(async () => {
+        if (!target) return;
+        setDiffFlamegraphLoading(true);
+        setDiffFlamegraphError('');
+        setDiffFlamegraphResult(null);
+        try {
+            const { params, error } = buildDiffParams();
+            if (error) {
+                setDiffFlamegraphError(error);
+                return;
+            }
+            const res = await profiles.diff({ ...params, format: 'flamegraph' });
+            if (res.code === 0) {
+                setDiffFlamegraphResult(res.data);
+            } else {
+                setDiffFlamegraphError(res.message || 'Diff 火焰图查询失败');
+            }
+        } catch (e) {
+            setDiffFlamegraphError(e?.message || 'Diff 火焰图查询失败');
+        } finally {
+            setDiffFlamegraphLoading(false);
+        }
+    }, [target, buildDiffParams]);
+
+    const runActiveDiffView = useCallback(() => {
+        if (diffViewMode === 'flamegraph') return runDiffFlamegraph();
+        return runDiff();
+    }, [diffViewMode, runDiff, runDiffFlamegraph]);
+
+    // diffFlamegraphNodes 把 ProfileDiffFlamegraph.root.children 铺成
+    // InteractiveFlamegraph 期待的 nodes 数组，同时把每个节点的 value 补成
+    // max(base_value, compare_value)——差分火焰图的宽度用两边较大值，
+    // 保证"消失的函数"(compare_value=0)也还是按它原来的权重占位可见，
+    // 不会因为宽度塌成 0 而在图上完全消失、看不出"这里少了一块"。
+    const diffFlamegraphNodes = useMemo(() => {
+        if (!diffFlamegraphResult || diffFlamegraphResult.empty || !diffFlamegraphResult.root) return null;
+        const convert = (node) => ({
+            name: node.name,
+            value: Math.max(Number(node.base_value) || 0, Number(node.compare_value) || 0),
+            base_value: node.base_value,
+            compare_value: node.compare_value,
+            delta: node.delta,
+            delta_percent: node.delta_percent,
+            children: Array.isArray(node.children) ? node.children.map(convert) : [],
+        });
+        return (diffFlamegraphResult.root.children || []).map(convert);
+    }, [diffFlamegraphResult]);
+
+    const diffFlamegraphData = useMemo(() => {
+        if (!diffFlamegraphResult) return null;
+        return {
+            nodes: diffFlamegraphNodes || [],
+            total: Math.max(Number(diffFlamegraphResult.base_total) || 0, Number(diffFlamegraphResult.compare_total) || 0),
+            unit: diffFlamegraphResult.unit,
+            empty: diffFlamegraphResult.empty || !diffFlamegraphNodes || diffFlamegraphNodes.length === 0,
+            message: diffFlamegraphResult.message,
+        };
+    }, [diffFlamegraphResult, diffFlamegraphNodes]);
 
     const changeDiffMode = useCallback((nextMode) => {
         setDiffMode(nextMode);
@@ -697,13 +775,17 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                                     </div>
                                 </div>
                             )}
-                            <div style={{ marginTop: 10 }}>
-                                <button type="button" style={S.btn} onClick={runDiff} disabled={diffLoading || !target}>
-                                    {diffLoading ? '查询中...' : '执行 Diff'}
+                            <div style={{ marginTop: 10, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                                <span style={S.segmented}>
+                                    <button type="button" style={S.segment(diffViewMode === 'table')} onClick={() => setDiffViewMode('table')}>表格</button>
+                                    <button type="button" style={{ ...S.segment(diffViewMode === 'flamegraph'), borderRight: 'none' }} onClick={() => setDiffViewMode('flamegraph')}>火焰图</button>
+                                </span>
+                                <button type="button" style={S.btn} onClick={runActiveDiffView} disabled={(diffViewMode === 'flamegraph' ? diffFlamegraphLoading : diffLoading) || !target}>
+                                    {(diffViewMode === 'flamegraph' ? diffFlamegraphLoading : diffLoading) ? '查询中...' : '执行 Diff'}
                                 </button>
                             </div>
-                            {diffError && <div style={{ ...S.error, marginTop: 8 }}>{diffError}</div>}
-                            {diffResult && !diffResult.empty && Array.isArray(diffResult.items) && diffResult.items.length > 0 && (
+                            {diffViewMode === 'table' && diffError && <div style={{ ...S.error, marginTop: 8 }}>{diffError}</div>}
+                            {diffViewMode === 'table' && diffResult && !diffResult.empty && Array.isArray(diffResult.items) && diffResult.items.length > 0 && (
                                 <div style={{ marginTop: 12, overflowX: 'auto' }}>
                                     <table style={{ ...S.table, width: '100%' }}>
                                         <thead>
@@ -738,9 +820,30 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                                     </table>
                                 </div>
                             )}
-                            {diffResult && (diffResult.empty || !diffResult.items || diffResult.items.length === 0) && (
+                            {diffViewMode === 'table' && diffResult && (diffResult.empty || !diffResult.items || diffResult.items.length === 0) && (
                                 <div style={{ ...S.warn, marginTop: 8 }}>
                                     Diff 结果为空：{diffResult.message || '所选时间窗内无匹配样本，请扩大时间范围或检查 backend 是否有数据。'}
+                                </div>
+                            )}
+                            {diffViewMode === 'flamegraph' && diffFlamegraphError && <div style={{ ...S.error, marginTop: 8 }}>{diffFlamegraphError}</div>}
+                            {diffViewMode === 'flamegraph' && diffFlamegraphResult?.degraded && (
+                                <div style={{ ...S.warn, marginTop: 8 }}>
+                                    {diffFlamegraphResult.message || '所选时间范围里有一段数据已降级为冷层摘要，无法生成调用树差分火焰图，请切换到表格视图查看。'}
+                                </div>
+                            )}
+                            {diffViewMode === 'flamegraph' && diffFlamegraphResult && !diffFlamegraphResult.degraded && (
+                                <div style={{ marginTop: 12 }}>
+                                    <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 8, fontSize: 13, color: '#475467' }}>
+                                        <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#b42318', marginRight: 4 }} />变热/新增</span>
+                                        <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#175cd3', marginRight: 4 }} />变冷/消失</span>
+                                        <span><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: '#eaecf0', marginRight: 4 }} />基本不变</span>
+                                    </div>
+                                    <InteractiveFlamegraph
+                                        data={diffFlamegraphData}
+                                        loading={diffFlamegraphLoading}
+                                        emptyMessage="暂无可对比数据"
+                                        diffMode
+                                    />
                                 </div>
                             )}
                         </div>
