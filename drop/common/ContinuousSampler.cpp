@@ -3507,7 +3507,24 @@ static WindowPayload collect_db_window(const ContinuousSamplerConfig &cfg)
         // PostgreSQL 标量指标 + digest/锁查询留待后续子任务，架构上两者共
         // 用同一个 collect_db_window 入口，按 engine 分支接入即可。
     }
+
+    // run_continuous_spool_loop 对所有 collector 一视同仁地紧邻着循环调
+    // 用，没有任何节流；CPU/eBPF 的 collector 天然靠内部阻塞采样撑满
+    // aggregationWindowSec，这里的 SQL 查询是毫秒级返回，不补一个 sleep
+    // 就会以 CPU 能跑多快就跑多快的频率狂轮询目标数据库。睡到凑满窗口时
+    // 长再收窗，也让 window.endMs 落在下一个采集周期开始之前，跟其他
+    // 信号"一个 window = 一个采集周期"的语义对齐。
+    const int64_t elapsedMs = now_ms() - window.startMs;
+    const int64_t targetMs = static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1000;
+    if (elapsedMs < targetMs)
+        std::this_thread::sleep_for(std::chrono::milliseconds(targetMs - elapsedMs));
+
     window.endMs = now_ms();
+    // 兜底：即使节流到位，系统时钟粒度理论上仍可能让两次 now_ms() 撞在同一
+    // 毫秒——服务端要求 start < end（continuous.go 的 !StartTime.Before(EndTime)
+    // 检查），撞上就会导致整个 batch 被拒收，db_snapshot 数据零入库。
+    if (window.endMs <= window.startMs)
+        window.endMs = window.startMs + 1;
     return window;
 }
 
