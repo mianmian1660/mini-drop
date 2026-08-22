@@ -21,6 +21,7 @@ import HomePage from './pages/HomePage';
 import TaskListPage from './pages/TaskListPage';
 import TaskResultPage from './pages/TaskResultPage';
 import TimelinePage from './pages/TimelinePage';
+import ScheduleDetailPage from './pages/ScheduleDetailPage';
 import TaskDiffPage from './pages/TaskDiffPage';
 import LoginPage from './pages/LoginPage';
 import ProfilesPage from './pages/ProfilesPage';
@@ -126,8 +127,7 @@ export default function App() {
                     <span style={{ fontSize: 12, color: '#888' }}>性能分析平台</span>
                 </div>
                 <nav className="app-nav" style={styles.nav}>
-                    <Link to="/" style={styles.navLink}>主机</Link>
-                    <Link to="/tasks" style={styles.navLink}>全部任务</Link>
+                    <Link to="/" style={styles.navLink}>首页</Link>
                     <span style={{ color: '#555' }}>|</span>
                     <span style={styles.userInfo}>
                         👤 {userName}
@@ -142,6 +142,8 @@ export default function App() {
                 <Route path="/hosts/:targetId" element={<HostDetailPage />} />
 				<Route path="/hosts/:targetId/continuous/:sid" element={<ContinuousSessionDetailPage />} />
 				<Route path="/continuous/sessions/:sid" element={<ContinuousSessionDetailPage />} />
+				<Route path="/hosts/:targetId/schedules/:sid" element={<ScheduleDetailPage />} />
+				<Route path="/schedules/:sid" element={<ScheduleDetailPage />} />
                 <Route path="/tasks" element={<TaskListPage />} />
                 <Route path="/profiles" element={<ProfilesPage />} />
                 <Route path="/task/result" element={<TaskResultPage />} />

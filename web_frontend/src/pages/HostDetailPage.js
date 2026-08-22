@@ -4,11 +4,10 @@ import { agents, continuous, profiles, schedules, tasks } from '../api';
 import CreateTaskModal from '../components/CreateTaskModal';
 import CreateContinuousSessionModal from '../components/CreateContinuousSessionModal';
 import ContinuousSessionList from '../components/ContinuousSessionList';
+import ScheduleList from '../components/ScheduleList';
 import Pagination from '../components/Pagination';
-import TimelineChart, { statusColor } from '../components/TimelineChart';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
-import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
 import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
 
 const S = {
@@ -88,14 +87,13 @@ const S = {
 
 const tabs = [
     { id: 'overview', label: '概览' },
-	{ id: 'tasks', label: '任务列表' },
-	{ id: 'timeline', label: '周期性深度采样' },
+	{ id: 'tasks', label: '单次任务列表' },
+	{ id: 'timeline', label: '周期任务' },
 	{ id: 'profiling', label: '持续采集' },
     { id: 'logs', label: 'Agent 日志' },
 ];
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed' };
 const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
-const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
 
 export default function HostDetailPage() {
     const { targetId: rawTargetId } = useParams();
@@ -138,7 +136,7 @@ export default function HostDetailPage() {
 
     const loadHostTasks = useCallback(async (ip) => {
         if (!ip) return;
-        const res = await tasks.list({ page: 1, pageSize: 5, target_ip: ip, owner_filter: 'all' });
+        const res = await tasks.list({ page: 1, pageSize: 5, target_ip: ip, owner_filter: 'all', task_scope: 'single' });
         if (res.code === 0) setHostTasks(res.data?.tasks || []);
     }, []);
 
@@ -422,7 +420,7 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
 
             <section style={S.card}>
                 <div style={S.sectionHead}>
-                    <h3 style={S.sectionTitle}>最近任务</h3>
+                    <h3 style={S.sectionTitle}>最近单次任务</h3>
                     <button style={S.btnSm} onClick={() => onTab('tasks')}>查看任务列表</button>
                 </div>
                 <MiniTaskList tasks={taskItems} />
@@ -430,20 +428,15 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
 
             <section style={S.card}>
                 <div style={S.sectionHead}>
-                    <h3 style={S.sectionTitle}>最近深度采样窗口</h3>
-                    <button style={S.btnSm} onClick={() => onTab('timeline')}>查看时间轴</button>
+                    <h3 style={S.sectionTitle}>最近周期任务</h3>
+                    <button style={S.btnSm} onClick={() => onTab('timeline')}>查看周期任务</button>
                 </div>
-                {scheduleItems.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划</div> : (
-                    <div style={S.auditList}>
-                        {scheduleItems.slice(0, 5).map(s => (
-                            <div key={s.sid} style={S.auditItem}>
-                                <span>{s.cron_expr}</span>
-                                <StatusPill value={s.enabled ? 'online' : 'offline'} />
-                                <span>{s.name}</span>
-                            </div>
-                        ))}
-                    </div>
-                )}
+                <ScheduleList
+                    compact
+                    bare
+                    targetIp={target.ip}
+                    detailPrefix={`/hosts/${encodeURIComponent(target.id)}/schedules`}
+                />
             </section>
 
             <RunningSessionsCard target={target} onTab={onTab} />
@@ -591,7 +584,7 @@ function HostTasksPanel({ target }) {
     const loadTasks = useCallback(async () => {
         setLoading(true);
         try {
-            const res = await tasks.list({ page, pageSize, target_ip: target.ip, owner_filter: 'all', status: statusFilter || undefined });
+            const res = await tasks.list({ page, pageSize, target_ip: target.ip, owner_filter: 'all', status: statusFilter || undefined, task_scope: 'single' });
             if (res.code === 0) {
                 const list = res.data?.tasks || [];
                 const q = keyword.trim().toLowerCase();
@@ -633,203 +626,11 @@ function HostTasksPanel({ target }) {
 }
 
 function HostTimelinePanel({ target }) {
-    const [scheduleList, setScheduleList] = useState([]);
-    const [masterTid, setMasterTid] = useState('');
-    const [points, setPoints] = useState([]);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState('');
-    const [statusFilter, setStatusFilter] = useState('');
-    const [kindFilter, setKindFilter] = useState('');
-    const [hasResultFilter, setHasResultFilter] = useState('');
-    const [range, setRange] = useState('all');
-    const [customFrom, setCustomFrom] = useState('');
-    const [customTo, setCustomTo] = useState('');
-    const [appliedCustomFrom, setAppliedCustomFrom] = useState('');
-    const [appliedCustomTo, setAppliedCustomTo] = useState('');
-    const [baselineTid, setBaselineTid] = useState('');
-
-    const timelineFilters = useCallback(() => ({
-        status: statusFilter || undefined,
-        task_kind: kindFilter || undefined,
-        has_result: hasResultFilter || undefined,
-    }), [statusFilter, kindFilter, hasResultFilter]);
-
-    const loadSchedules = useCallback(async () => {
-        const res = await schedules.list();
-        if (res.code === 0) {
-            const list = (res.data?.schedules || []).filter(s => s.target_ip === target.ip);
-            setScheduleList(list);
-            if (!masterTid && list.length > 0) setMasterTid(list[0].sid);
-        }
-    }, [target.ip, masterTid]);
-
-    const loadTimeline = useCallback(async (sid = masterTid, override = {}) => {
-        if (!sid) return;
-        setMasterTid(sid);
-        setLoading(true);
-        setError('');
-        try {
-            const opts = { ...timelineFilters() };
-            const effectiveRange = override.range || range;
-            if (effectiveRange === 'custom') {
-                const from = override.from || appliedCustomFrom;
-                const to = override.to || appliedCustomTo;
-                if (!from || !to) {
-                    setPoints([]);
-                    setError('请选择自定义开始时间和结束时间后再查询');
-                    return;
-                }
-                opts.from = from;
-                opts.to = to;
-            } else if (effectiveRange !== 'all') {
-                const hours = Number(effectiveRange);
-                const to = new Date();
-                const from = new Date(to.getTime() - hours * 3600 * 1000);
-                opts.from = from.toISOString();
-                opts.to = to.toISOString();
-            }
-            const res = await tasks.timeline(sid, opts);
-            if (res.code === 0) setPoints(res.data?.points || []);
-            else setError(res.message || '查询时间轴失败');
-        } catch (err) {
-            setError(err?.message || '查询时间轴失败');
-        } finally {
-            setLoading(false);
-        }
-    }, [masterTid, range, appliedCustomFrom, appliedCustomTo, timelineFilters]);
-
-    useEffect(() => { loadSchedules(); }, [loadSchedules]);
-    useEffect(() => {
-        if (!masterTid || range === 'custom') return;
-        loadTimeline(masterTid);
-    }, [masterTid, range, statusFilter, kindFilter, hasResultFilter, loadTimeline]);
-
-    const applyCustomRange = useCallback(() => {
-        if (!customFrom || !customTo) {
-            setError('请选择自定义开始时间和结束时间后再查询');
-            return;
-        }
-        const fromISO = localDateTimeToISO(customFrom);
-        const toISO = localDateTimeToISO(customTo);
-        if (!fromISO || !toISO) {
-            setError('自定义时间格式无效');
-            return;
-        }
-        if (new Date(toISO) < new Date(fromISO)) {
-            setError('结束时间不能早于开始时间');
-            return;
-        }
-        setRange('custom');
-        setAppliedCustomFrom(fromISO);
-        setAppliedCustomTo(toISO);
-        loadTimeline(masterTid, { range: 'custom', from: fromISO, to: toISO });
-    }, [customFrom, customTo, masterTid, loadTimeline]);
-
-    const refreshTimeline = useCallback(() => {
-        if (range === 'custom') {
-            loadTimeline(masterTid, { range: 'custom' });
-            return;
-        }
-        loadTimeline(masterTid);
-    }, [range, masterTid, loadTimeline]);
-
     return (
-        <>
-            <section style={S.card}>
-                <div style={S.sectionHead}>
-                    <h3 style={S.sectionTitle}>该主机周期性深度采样时间轴</h3>
-                    <span style={S.subtle}>只显示 target_ip = {target.ip} 的周期性深度采样窗口 · 时间按浏览器本地时区显示：{browserTimeZoneLabel()}</span>
-                </div>
-				{scheduleList.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划。点击“新建单次采样”并勾选周期性深度采样后会出现在这里。</div> : (
-                    <>
-                        <div style={S.toolbar}>
-                            <select style={S.select} value={masterTid} onChange={e => setMasterTid(e.target.value)}>
-                                {scheduleList.map(s => <option key={s.sid} value={s.sid}>{s.name} · {s.cron_expr}</option>)}
-                            </select>
-                            <select style={S.select} value={range} onChange={e => setRange(e.target.value)}>
-                                <option value="all">全部窗口</option>
-                                <option value="1">最近 1 小时</option>
-                                <option value="24">最近 24 小时</option>
-                                <option value="168">最近 7 天</option>
-                                <option value="custom">自定义区间</option>
-                            </select>
-                            <select style={S.select} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
-                                <option value="">全部状态</option>
-                                <option value="2">已完成</option>
-                                <option value="3">失败</option>
-                                <option value="1">执行中</option>
-                            </select>
-                            <input style={S.input} value={kindFilter} onChange={e => setKindFilter(e.target.value)} placeholder="task_kind" />
-                            <select style={S.select} value={hasResultFilter} onChange={e => setHasResultFilter(e.target.value)}>
-                                <option value="">全部结果</option>
-                                <option value="true">有结果</option>
-                                <option value="false">无结果</option>
-                            </select>
-                            <button style={S.btnSm} onClick={refreshTimeline}>刷新</button>
-                        </div>
-                        {range === 'custom' && (
-                            <div style={S.toolbar}>
-                                <input
-                                    type="datetime-local"
-                                    style={S.input}
-                                    value={customFrom}
-                                    onChange={e => setCustomFrom(e.target.value)}
-                                    aria-label="自定义开始时间"
-                                />
-                                <span style={S.subtle}>→</span>
-                                <input
-                                    type="datetime-local"
-                                    style={S.input}
-                                    value={customTo}
-                                    onChange={e => setCustomTo(e.target.value)}
-                                    aria-label="自定义结束时间"
-                                />
-                                <button style={S.btnSm} onClick={applyCustomRange}>查询</button>
-                            </div>
-                        )}
-                        {error && <div style={S.error}>{error}</div>}
-                        {loading ? <div style={S.loading}>加载时间轴...</div> : points.length === 0 ? <div style={S.empty}>当前筛选条件下没有采集窗口</div> : (
-                            <TimelineResult points={points} baselineTid={baselineTid} setBaselineTid={setBaselineTid} />
-                        )}
-                    </>
-                )}
-            </section>
-        </>
-    );
-}
-
-function TimelineResult({ points, baselineTid, setBaselineTid }) {
-    return (
-        <div>
-            <TimelineChart points={points} />
-            <div style={{ marginTop: 16 }}>
-                {points.map((p, i) => (
-                    <div key={p.tid} style={{ ...S.card, boxShadow: 'none', padding: 14, marginBottom: 10 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-                            <div>
-                                <strong>{i + 1}. {p.name || p.tid}</strong>
-                                <span style={{ ...S.badge, marginLeft: 8, background: statusColor(p.status), color: '#fff' }}>{ST[p.status] || '未知'}</span>
-                                {p.task_kind && <span style={{ marginLeft: 8, fontSize: 12, color: '#667085' }}>{p.task_kind}</span>}
-                                {p.has_result && <span style={{ marginLeft: 8, fontSize: 12, color: '#16a34a' }}>有结果</span>}
-                            </div>
-                            <div style={{ display: 'flex', gap: 8 }}>
-                                {p.has_result && (baselineTid === p.tid ? (
-                                    <button style={S.btnSm} onClick={() => setBaselineTid('')}>基线</button>
-                                ) : baselineTid ? (
-                                    <Link to={`/task/diff?baseline=${baselineTid}&compare=${p.tid}`} style={S.btnSm}>与基线对比</Link>
-                                ) : (
-                                    <button style={S.btnSm} onClick={() => setBaselineTid(p.tid)}>设为基线</button>
-                                ))}
-                                <Link to={p.result_url || `/task/result?tid=${p.tid}`} style={S.btnSm}>查看详情</Link>
-                            </div>
-                        </div>
-                        <div style={S.subtle}>
-                            窗口 {formatDateTime(p.window_start || p.create_time)} → {formatDateTime(p.window_end || p.end_time) || '进行中'}
-                        </div>
-                    </div>
-                ))}
-            </div>
-        </div>
+        <ScheduleList
+            targetIp={target.ip}
+            detailPrefix={`/hosts/${encodeURIComponent(target.id)}/schedules`}
+        />
     );
 }
 

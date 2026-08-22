@@ -672,6 +672,24 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 		return
 	}
 
+	// task_scope 过滤（周期性采样与单次任务列表重构）：
+	//   - all（默认）：不过滤，保持接口兼容；
+	//   - single：排除由周期计划直接生成的采集窗口（master_task_tid 以 "sch-" 开头），
+	//     但保留普通任务、复合任务及人工重试任务（它们的 master_task_tid 是任务 tid 或空）；
+	//   - periodic：只返回周期计划生成的采集窗口。
+	// 周期计划删除后其历史窗口 master_task_tid 仍是 "sch-*"，因此仍归为周期窗口，
+	// 不会重新出现在单次任务列表。
+	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("task_scope", "all"))) {
+	case "", "all":
+	case "single":
+		query = query.Where("master_task_tid = '' OR master_task_tid NOT LIKE 'sch-%'")
+	case "periodic":
+		query = query.Where("master_task_tid LIKE 'sch-%'")
+	default:
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "task_scope 仅支持 all/single/periodic")
+		return
+	}
+
 	query.Count(&total)
 
 	offset := (page - 1) * pageSize
