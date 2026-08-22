@@ -1575,7 +1575,7 @@ func (s *APIServer) downsampleContinuousWindows(ctx context.Context, session mod
 				agg = &continuousAggregate{
 					Top:                map[string]*ProfileTopItem{},
 					Root:               &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
-					LabelValue:         map[string]map[string]bool{"comm": {}, "pid": {}, "exe": {}, "runtime": {}},
+					LabelValue:         map[string]map[string]bool{"comm": {}, "pid": {}, "process_start_ms": {}, "process_instance": {}, "exe": {}, "runtime": {}},
 					Backends:           map[string]bool{},
 					SymbolReasons:      map[string]bool{},
 					RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
@@ -2604,6 +2604,9 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 	}
 	for _, key := range []string{"comm", "pid", "process_start_ms", "process_instance", "exe", "runtime"} {
 		if value := continuousSampleLabel(sample, windowLabels, key); value != "" {
+			if agg.LabelValue[key] == nil {
+				agg.LabelValue[key] = map[string]bool{}
+			}
 			agg.LabelValue[key][value] = true
 		}
 	}
