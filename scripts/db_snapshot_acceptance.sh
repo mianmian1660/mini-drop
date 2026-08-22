@@ -145,10 +145,20 @@ docker exec "$MYSQL_CTN" mysql -uroot -proot -e "
         status VARCHAR(10),
         created_at DATETIME);
     INSERT INTO order_line(status, created_at)
-        VALUES ('new', NOW()),('new', NOW()),('ship', NOW());
-    SELECT COUNT(*) FROM order_line WHERE status='new';" >/dev/null 2>&1 \
+        VALUES ('new', NOW()),('new', NOW()),('ship', NOW());" >/dev/null 2>&1 \
     || fail "seed slow-query data"
 pass "slow-query data seeded"
+
+# digest 采集是"本窗口内新发生的调用"增量（deltaCalls>0 才上报），seed 只跑
+# 一次的话窗口增量恒为 0。所以起一个后台循环，持续执行慢查询，保证每个窗口
+# 都有新调用产生增量。
+( for _ in $(seq 1 40); do
+      docker exec "$MYSQL_CTN" mysql -uroot -proot -N -e \
+          "SELECT COUNT(*) FROM orders.order_line WHERE status='new';" >/dev/null 2>&1
+      sleep 1
+  done ) &
+SLOW_LOOP_PID=$!
+pass "slow-query loop started (pid $SLOW_LOOP_PID)"
 
 # ---------- 7.（可选）造锁等待 ----------
 if [[ "$LOCK_WAIT_TEST" == "1" ]]; then
@@ -164,9 +174,10 @@ if [[ "$LOCK_WAIT_TEST" == "1" ]]; then
     pass "lock-wait scenario injected (pid $LOCKER_PID / $BLOCKED_PID)"
 fi
 
-# ---------- 8. 等增量窗口（让造的数据产生 digest 增量并上报） ----------
+# ---------- 8. 等增量窗口（让持续流量产生 digest 增量并上报） ----------
 sleep 24
-wait "$LOCKER_PID" "$BLOCKED_PID" >/dev/null 2>&1 || true
+wait "$SLOW_LOOP_PID" >/dev/null 2>&1 || true
+[[ "$LOCK_WAIT_TEST" == "1" ]] && wait "$LOCKER_PID" "$BLOCKED_PID" >/dev/null 2>&1 || true
 
 # ---------- 9. 查询并断言 ----------
 FROM_MS=$(( $(date +%s%3N) - 120000 ))
