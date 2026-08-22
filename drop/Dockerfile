@@ -84,6 +84,8 @@ RUN sed -i s@/archive.ubuntu.com/@/mirrors.tencentyun.com/@g /etc/apt/sources.li
 #   perl            = 火焰图脚本需要
 #   curl            = 健康检查 + MinIO API 调用
 #   wget            = 下载 mc (MinIO Client)
+#   default-mysql-client = DBSnapshotSampler 执行 mysql 系统视图查询需要
+#                          （SHOW GLOBAL STATUS / digest / innodb_lock_waits）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgrpc++1 \
     libprotobuf23 \
@@ -98,6 +100,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     ca-certificates \
+    default-mysql-client \
     && perf_real="$(find /usr/lib -type f -path '*/linux-tools*/perf' | sort -V | tail -n 1)" \
     && test -n "$perf_real" \
     && ln -sf "$perf_real" /usr/local/bin/perf-real \

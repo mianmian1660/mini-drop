@@ -820,3 +820,188 @@ TEST(SharedContinuousEngine, RefusesUnapprovedDegradedFallback)
     EXPECT_EQ(::rmdir(session_spool_directory(cfg).c_str()), 0);
     EXPECT_EQ(::rmdir(directory), 0);
 }
+
+// ============================================================
+// digest 增量边界单测（3a6230f 专项）：首轮基线 / 窗口增量 / 零增量 /
+// 计数器回退重建基线 / 跨 Session 隔离 / 字段解析 / JSON 序列化
+// ============================================================
+
+// ---- 首轮只建立基线 ----
+TEST(ContinuousSampler, DigestDeltaFirstSeenBaselineOnly)
+{
+    DigestCounterState first{100, 5000000000ULL, 50};
+    DigestDeltaResult delta = compute_digest_delta(nullptr, first);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::FirstSeen);
+    EXPECT_EQ(delta.deltaCalls, 0u);
+    EXPECT_EQ(delta.deltaLatencyUs, 0u);
+    EXPECT_EQ(delta.deltaRows, 0u);
+}
+
+// ---- 后续仅上报窗口增量，latency 从 ps 换算成 us ----
+TEST(ContinuousSampler, DigestDeltaReportsWindowIncrement)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{120, 5200000000ULL, 60};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
+    EXPECT_EQ(delta.deltaCalls, 20u);
+    // (5.2e12 - 5.0e12) ps = 200000000 ps = 200 us（ps -> us 除以 1e6）
+    EXPECT_EQ(delta.deltaLatencyUs, 200ULL);
+    EXPECT_EQ(delta.deltaRows, 10u);
+}
+
+// ---- 零增量不输出（deltaCalls == 0）----
+TEST(ContinuousSampler, DigestDeltaZeroCallsNotEmitted)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{100, 5100000000ULL, 55};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
+    EXPECT_EQ(delta.deltaCalls, 0u);
+    // 调用方应据此跳过上报
+}
+
+// ---- countStar 回退：重建基线，本轮不上报 ----
+TEST(ContinuousSampler, DigestDeltaCounterResetRebuildsBaseline)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{3, 5000000000ULL, 50};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
+}
+
+// ---- sumTimerWaitPs 回退：重建基线，避免无符号下溢 ----
+TEST(ContinuousSampler, DigestDeltaLatencyResetRebuildsBaseline)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{120, 4000000000ULL, 60};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
+    // 旧实现只检查 countStar，这里 sumTimerWaitPs 回退会触发无符号下溢
+}
+
+// ---- sumRowsExamined 回退：重建基线，避免无符号下溢 ----
+TEST(ContinuousSampler, DigestDeltaRowsResetRebuildsBaseline)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{120, 5200000000ULL, 10};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
+}
+
+// ---- 跨 Session / 跨实例状态隔离 ----
+TEST(ContinuousSampler, DigestStateKeyIsolatesSessionAndInstance)
+{
+    const std::string k1 = digest_state_key("session-a", "mysql-a", "digest-1");
+    const std::string k2 = digest_state_key("session-b", "mysql-a", "digest-1");
+    const std::string k3 = digest_state_key("session-a", "mysql-b", "digest-1");
+    const std::string k4 = digest_state_key("session-a", "mysql-a", "digest-2");
+    EXPECT_NE(k1, k2); // 不同 Session 采同一实例
+    EXPECT_NE(k1, k3); // 同一 Session 采不同实例
+    EXPECT_NE(k1, k4); // 同一 Session 同一实例不同 digest
+    EXPECT_EQ(k1, digest_state_key("session-a", "mysql-a", "digest-1"));
+}
+
+// ---- digest 行解析：正常 6 列 ----
+TEST(ContinuousSampler, DigestRowParsesValidLine)
+{
+    ParsedDigestRow row;
+    EXPECT_TRUE(parse_digest_row("mydb\tdigest123\tSELECT * FROM t WHERE id = ?\t42\t5000000000\t99", &row));
+    EXPECT_EQ(row.schemaName, "mydb");
+    EXPECT_EQ(row.digest, "digest123");
+    EXPECT_EQ(row.digestText, "SELECT * FROM t WHERE id = ?");
+    EXPECT_EQ(row.countStar, 42u);
+    EXPECT_EQ(row.sumTimerWaitPs, 5000000000ULL);
+    EXPECT_EQ(row.sumRowsExamined, 99u);
+}
+
+// ---- digest 行解析：列数不足 / 计数列非数字 -> false ----
+TEST(ContinuousSampler, DigestRowRejectsMalformedLines)
+{
+    ParsedDigestRow row;
+    EXPECT_FALSE(parse_digest_row("mydb\tdigest123\ttext\t42\t5000", &row));           // 只有 5 列
+    EXPECT_FALSE(parse_digest_row("mydb\tdigest123\ttext\tnotnum\t5000\t1", &row));    // count 非数字
+    EXPECT_FALSE(parse_digest_row("mydb\tdigest123\ttext\t42\tnotnum\t1", &row));      // latency 非数字
+    EXPECT_FALSE(parse_digest_row("mydb\tdigest123\ttext\t42\t5000\tnotnum", &row));   // rows 非数字
+    EXPECT_FALSE(parse_digest_row("", &row));
+}
+
+// ---- digest JSON 序列化：字段、转义、时间戳、signal_types ----
+TEST(ContinuousSampler, BatchJsonEmitsDigestSnapshot)
+{
+    ContinuousSamplerConfig cfg = make_cfg();
+    WindowPayload window;
+    window.startMs = 1700000000000;
+    window.endMs = 1700000001000;
+    window.backendStatus = "ok";
+    DBSnapshotSample snap;
+    snap.kind = "digest";
+    snap.instanceLabel = "mysql-a";
+    snap.timestampMs = 1700000000500;
+    snap.schemaName = "mydb";
+    snap.digestText = "SELECT * FROM t WHERE id = \"1\" AND x = '\\'";
+    snap.callCount = 7;
+    snap.totalLatencyUs = 123456;
+    snap.rowsExaminedTotal = 88;
+    window.dbSnapshots.push_back(snap);
+
+    const std::string json = build_batch_json(cfg, "cpb-db-digest", {window});
+    EXPECT_NE(json.find("\"db_snapshots\":[{"), std::string::npos);
+    EXPECT_NE(json.find("\"kind\":\"digest\""), std::string::npos);
+    EXPECT_NE(json.find("\"instance_label\":\"mysql-a\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema_name\":\"mydb\""), std::string::npos);
+    // digest_text 中的引号/反斜杠被转义
+    EXPECT_NE(json.find("\"digest_text\":\"SELECT * FROM t WHERE id = \\\"1\\\" AND x = '\\\\'\""), std::string::npos);
+    EXPECT_NE(json.find("\"call_count\":7"), std::string::npos);
+    EXPECT_NE(json.find("\"total_latency_us\":123456"), std::string::npos);
+    EXPECT_NE(json.find("\"rows_examined_total\":88"), std::string::npos);
+    // 时间戳 RFC3339
+    EXPECT_NE(json.find("\"timestamp\":\"2023-11-14T22:13:20.500Z\""), std::string::npos);
+    // signal_types / backends 包含 db_snapshot
+    EXPECT_NE(json.find("\"db_snapshot\""), std::string::npos);
+    EXPECT_NE(json.find("\"db_system_views\""), std::string::npos);
+}
+
+// ---- lock_wait JSON 序列化：字段齐全 ----
+TEST(ContinuousSampler, BatchJsonEmitsLockWaitSnapshot)
+{
+    ContinuousSamplerConfig cfg = make_cfg();
+    WindowPayload window;
+    window.startMs = 1700000000000;
+    window.endMs = 1700000001000;
+    window.backendStatus = "ok";
+    DBSnapshotSample snap;
+    snap.kind = "lock_wait";
+    snap.instanceLabel = "mysql-a";
+    snap.timestampMs = 1700000000500;
+    snap.waitingPid = 1001;
+    snap.waitingQuery = "UPDATE t SET x=1";
+    snap.blockingPid = 1002;
+    snap.blockingQuery = "SELECT * FROM t FOR UPDATE";
+    snap.waitSeconds = 12;
+    snap.lockedTable = "db.t";
+    window.dbSnapshots.push_back(snap);
+
+    const std::string json = build_batch_json(cfg, "cpb-db-lock", {window});
+    EXPECT_NE(json.find("\"kind\":\"lock_wait\""), std::string::npos);
+    EXPECT_NE(json.find("\"waiting_pid\":1001"), std::string::npos);
+    EXPECT_NE(json.find("\"waiting_query\":\"UPDATE t SET x=1\""), std::string::npos);
+    EXPECT_NE(json.find("\"blocking_pid\":1002"), std::string::npos);
+    EXPECT_NE(json.find("\"blocking_query\":\"SELECT * FROM t FOR UPDATE\""), std::string::npos);
+    EXPECT_NE(json.find("\"wait_seconds\":12"), std::string::npos);
+    EXPECT_NE(json.find("\"locked_table\":\"db.t\""), std::string::npos);
+}
+
+// ---- 密码文件缺失 / 无密码引用：读密码降级不崩溃 ----
+TEST(ContinuousSampler, ReadDbPasswordMissingFileDegrades)
+{
+    DBTargetConfig target;
+    target.instanceLabel = "mysql-a";
+    target.passwordRef = "/tmp/definitely-missing-password-file-xyz";
+    std::string password;
+    EXPECT_FALSE(read_db_target_password(target, &password));
+
+    DBTargetConfig empty;
+    EXPECT_TRUE(read_db_target_password(empty, &password));
+    EXPECT_TRUE(password.empty());
+}

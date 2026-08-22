@@ -46,6 +46,8 @@ import {
     sliderMinutesToInputs,
     runtimeLabel,
     validateCustomTimeWindow,
+    DBSnapshotPanel,
+    signalTabsForSession,
 } from './ContinuousProfilingPanel';
 import { continuous, profiles } from '../api';
 
@@ -410,4 +412,117 @@ test('session signal tabs only show signals configured on the session', async ()
 
     act(() => root.unmount());
     container.remove();
+});
+
+// ============================================================
+// 数据库快照面板（3a6230f 专项）
+// ============================================================
+
+test('数据库快照面板：加载态显示正在查询', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<DBSnapshotPanel data={null} loading />);
+    });
+    expect(container.textContent).toContain('正在查询数据库快照');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('数据库快照面板：空态显示暂无数据', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<DBSnapshotPanel data={{ empty: true, message: '该时间范围暂无数据库快照数据' }} loading={false} />);
+    });
+    expect(container.textContent).toContain('该时间范围暂无数据库快照数据');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('数据库快照面板：digest 表渲染各列', () => {
+    const data = {
+        digests: [{
+            instance_label: 'mysql-a',
+            schema_name: 'mydb',
+            digest_text: 'SELECT * FROM t WHERE id = ?',
+            call_count: 42,
+            total_latency_us: 1000000,
+            avg_latency_us: 23809,
+            rows_examined: 100,
+        }],
+        lock_waits: [],
+    };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<DBSnapshotPanel data={data} loading={false} />);
+    });
+    expect(container.textContent).toContain('慢查询 digest');
+    expect(container.textContent).toContain('SELECT * FROM t WHERE id = ?');
+    expect(container.textContent).toContain('mysql-a');
+    expect(container.textContent).toContain('mydb');
+    expect(container.textContent).toContain('调用次数');
+    expect(container.textContent).toContain('累计耗时');
+    expect(container.textContent).toContain('平均耗时');
+    expect(container.textContent).toContain('扫描行数');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('数据库快照面板：锁等待表渲染阻塞关系', () => {
+    const data = {
+        digests: [],
+        lock_waits: [{
+            instance_label: 'mysql-a',
+            timestamp: '2026-08-22T00:00:00Z',
+            waiting_pid: 1001,
+            waiting_query: 'UPDATE t SET x=1',
+            blocking_pid: 1002,
+            blocking_query: 'SELECT * FROM t FOR UPDATE',
+            wait_seconds: 12,
+            locked_table: 'db.t',
+        }],
+    };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<DBSnapshotPanel data={data} loading={false} />);
+    });
+    expect(container.textContent).toContain('锁等待链');
+    expect(container.textContent).toContain('最长锁等待');
+    expect(container.textContent).toContain('1001');
+    expect(container.textContent).toContain('1002');
+    expect(container.textContent).toContain('12 s');
+    expect(container.textContent).toContain('db.t');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('数据库快照面板：空 digest/锁等待 显示对应空态文案', () => {
+    const data = { digests: [], lock_waits: [], source: 'mini-drop-native' };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<DBSnapshotPanel data={data} loading={false} />);
+    });
+    // 无 digests 且无 lock_waits -> 空态
+    expect(container.textContent).toContain('该时间范围暂无数据库快照数据');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('signalTabsForSession 始终包含数据库 tab', () => {
+    const tabs = signalTabsForSession('cpu_profile|io_latency');
+    const dbTab = tabs.find(t => t.tab === 'db');
+    expect(dbTab).toBeTruthy();
+    expect(dbTab.label).toBe('数据库');
+    // 纯 db_snapshot 信号也至少给出数据库 tab
+    const dbOnly = signalTabsForSession('db_snapshot');
+    expect(dbOnly.some(t => t.tab === 'db')).toBe(true);
 });

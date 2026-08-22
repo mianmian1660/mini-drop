@@ -3251,6 +3251,96 @@ struct DigestCounterState
 static std::mutex g_digestStateMutex;
 static std::unordered_map<std::string, DigestCounterState> g_digestState;
 
+// ---- digest 增量状态的纯逻辑（与 mysql 命令行解耦，便于单测） ----
+
+// 解析 events_statements_summary_by_digest 的 --batch 输出行（6 列制表符分隔）：
+// SCHEMA_NAME, DIGEST, DIGEST_TEXT, COUNT_STAR, SUM_TIMER_WAIT, SUM_ROWS_EXAMINED。
+// 列数不对或任一计数列不是数字时返回 false（调用方跳过该行，不做状态变更）。
+struct ParsedDigestRow
+{
+    std::string schemaName;
+    std::string digest;
+    std::string digestText;
+    uint64_t countStar = 0;
+    uint64_t sumTimerWaitPs = 0;
+    uint64_t sumRowsExamined = 0;
+};
+
+static bool parse_digest_row(const std::string &line, ParsedDigestRow *out)
+{
+    std::vector<std::string> cols;
+    size_t start = 0;
+    for (size_t i = 0; i <= line.size(); ++i)
+    {
+        if (i == line.size() || line[i] == '\t')
+        {
+            cols.push_back(line.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (cols.size() != 6)
+        return false;
+    char *end = nullptr;
+    const uint64_t countStar = std::strtoull(cols[3].c_str(), &end, 10);
+    if (end == cols[3].c_str())
+        return false;
+    const uint64_t sumTimerWaitPs = std::strtoull(cols[4].c_str(), &end, 10);
+    if (end == cols[4].c_str())
+        return false;
+    const uint64_t sumRowsExamined = std::strtoull(cols[5].c_str(), &end, 10);
+    if (end == cols[5].c_str())
+        return false;
+    out->schemaName = cols[0];
+    out->digest = cols[1];
+    out->digestText = cols[2];
+    out->countStar = countStar;
+    out->sumTimerWaitPs = sumTimerWaitPs;
+    out->sumRowsExamined = sumRowsExamined;
+    return true;
+}
+
+// 增量状态机的结果类型。
+enum class DigestDeltaKind
+{
+    FirstSeen, // 首次见到该 digest：只建立基线，本轮不上报
+    Reset,     // 任一累计计数器回退（TRUNCATE/服务重启）：重建基线，本轮不上报
+    Increment, // 正常窗口增量（deltaCalls 可能为 0，调用方据此决定是否输出）
+};
+
+struct DigestDeltaResult
+{
+    DigestDeltaKind kind = DigestDeltaKind::FirstSeen;
+    uint64_t deltaCalls = 0;
+    uint64_t deltaLatencyUs = 0; // 增量总耗时（us），仅 Increment 有意义
+    uint64_t deltaRows = 0;      // 增量扫描行数，仅 Increment 有意义
+};
+
+// 纯函数：由上一轮状态与当前计数计算窗口增量。prev 为空指针表示首轮
+// （FirstSeen，只建立基线）。任一累计计数器回退都视为新基线（Reset），
+// 避免无符号整数下溢把 (cur - prev) 变成一个天文数字。
+static DigestDeltaResult compute_digest_delta(const DigestCounterState *prev, const DigestCounterState &cur)
+{
+    if (prev == nullptr)
+        return DigestDeltaResult{};
+    if (cur.countStar < prev->countStar || cur.sumTimerWaitPs < prev->sumTimerWaitPs ||
+        cur.sumRowsExamined < prev->sumRowsExamined)
+        return DigestDeltaResult{DigestDeltaKind::Reset, 0, 0, 0};
+    DigestDeltaResult out;
+    out.kind = DigestDeltaKind::Increment;
+    out.deltaCalls = cur.countStar - prev->countStar;
+    out.deltaLatencyUs = (cur.sumTimerWaitPs - prev->sumTimerWaitPs) / 1000000ULL; // ps -> us
+    out.deltaRows = cur.sumRowsExamined - prev->sumRowsExamined;
+    return out;
+}
+
+// digest 增量状态的隔离 key：sessionSID + instanceLabel + digest 三重组合，
+// 保证不同 Session 采集同一实例、同一 Session 采集多个实例都互不串扰。
+static std::string digest_state_key(const std::string &sessionSID, const std::string &instanceLabel,
+                                    const std::string &digest)
+{
+    return sessionSID + "|" + instanceLabel + "|" + digest;
+}
+
 // 借鉴 pg_stat_monitor/PMM Query Analytics 的聚合思路：按 DIGEST 做增量
 // diff，只上报本窗口内真正新增的调用次数/耗时，不是累计值。SQL 只存归一
 // 化 digest_text（占位符形式），不落原始参数。查询里用 REPLACE 把
@@ -3293,55 +3383,39 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
     std::lock_guard<std::mutex> lock(g_digestStateMutex);
     while (std::getline(lines, line))
     {
-        std::vector<std::string> cols;
-        size_t start = 0;
-        for (size_t i = 0; i <= line.size(); ++i)
-        {
-            if (i == line.size() || line[i] == '\t')
-            {
-                cols.push_back(line.substr(start, i - start));
-                start = i + 1;
-            }
-        }
-        if (cols.size() != 6)
+        ParsedDigestRow row;
+        if (!parse_digest_row(line, &row))
             continue;
-        const std::string &schema = cols[0];
-        const std::string &digest = cols[1];
-        const std::string &digestText = cols[2];
-        char *end = nullptr;
-        uint64_t countStar = std::strtoull(cols[3].c_str(), &end, 10);
-        uint64_t sumTimerWaitPs = std::strtoull(cols[4].c_str(), &end, 10);
-        uint64_t sumRowsExamined = std::strtoull(cols[5].c_str(), &end, 10);
 
-        const std::string stateKey = target.instanceLabel + "|" + digest;
+        // 状态 key 同时带上 sessionSID 与 instanceLabel：不同 Session 采集同一
+        // 实例、同一 Session 采集多个实例都能正确隔离，互不串扰。
+        const std::string stateKey = digest_state_key(cfg.sessionSID, target.instanceLabel, row.digest);
         auto it = g_digestState.find(stateKey);
         if (it == g_digestState.end())
         {
             // 第一次见到这个 digest：只记基线，不上报（否则会把"自服务器启动
             // 以来的全部历史调用"当成本窗口发生的调用，数字会失真）。
-            g_digestState[stateKey] = {countStar, sumTimerWaitPs, sumRowsExamined};
+            g_digestState[stateKey] = {row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
             continue;
         }
         DigestCounterState prev = it->second;
-        it->second = {countStar, sumTimerWaitPs, sumRowsExamined};
-        if (countStar < prev.countStar)
-        {
-            // 计数器被 TRUNCATE 或服务器重启过，视为新基线，本轮不上报。
-            continue;
-        }
-        uint64_t deltaCalls = countStar - prev.countStar;
-        if (deltaCalls == 0)
-            continue;
+        const DigestCounterState cur{row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
+        it->second = cur;
+        DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+        if (delta.kind != DigestDeltaKind::Increment)
+            continue; // 首轮基线或任一计数器回退（TRUNCATE/重启）：本轮不上报
+        if (delta.deltaCalls == 0)
+            continue; // 零增量：不上报，但状态已更新为当前累计值
 
         DBSnapshotSample sample;
         sample.kind = "digest";
         sample.instanceLabel = target.instanceLabel;
         sample.timestampMs = nowMillis;
-        sample.schemaName = schema;
-        sample.digestText = digestText;
-        sample.callCount = deltaCalls;
-        sample.totalLatencyUs = (sumTimerWaitPs - prev.sumTimerWaitPs) / 1000000ULL; // ps -> us
-        sample.rowsExaminedTotal = sumRowsExamined - prev.sumRowsExamined;
+        sample.schemaName = row.schemaName;
+        sample.digestText = row.digestText;
+        sample.callCount = delta.deltaCalls;
+        sample.totalLatencyUs = delta.deltaLatencyUs;
+        sample.rowsExaminedTotal = delta.deltaRows;
         window->dbSnapshots.push_back(std::move(sample));
     }
 }

@@ -102,6 +102,7 @@ const SIGNAL_TAB_OPTIONS = [
     { tab: 'io', signal: 'io_latency', label: '块 IO' },
     { tab: 'io_syscall', signal: 'io_syscall_latency', label: '系统调用 IO' },
     { tab: 'sched', signal: 'sched_latency', label: '调度延迟' },
+    { tab: 'db', signal: 'db_snapshot', label: '数据库' },
 ];
 
 const RANGE_OPTIONS = [
@@ -853,7 +854,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 />
                 {sampleNotice && <div style={{ ...S.info, marginTop: 12 }}>{sampleNotice}</div>}
                 {coverageAlert && <CoverageAlert alert={coverageAlert} />}
-			</section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
+			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} />
+                : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
 
             {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
                 <div style={{ ...S.warn, marginTop: 10 }}>
@@ -1510,10 +1512,14 @@ function continuousSessionMeta(target, fixedSession = null) {
     };
 }
 
-function signalTabsForSession(signalKey) {
+export function signalTabsForSession(signalKey) {
     const signals = new Set(String(signalKey || 'cpu_profile').split('|').filter(Boolean));
     if (signals.size === 0) signals.add('cpu_profile');
     const tabs = SIGNAL_TAB_OPTIONS.filter(option => signals.has(option.signal));
+    // 数据库快照是独立采集器（DBSnapshotSampler 不依赖 perf/eBPF signals），
+    // 只要 Session 存在就始终展示数据库 tab，方便查看 digest/锁等待链。
+    const dbTab = SIGNAL_TAB_OPTIONS.find(o => o.tab === 'db');
+    if (dbTab && !tabs.some(t => t.tab === 'db')) tabs.push(dbTab);
     return tabs.length ? tabs : [SIGNAL_TAB_OPTIONS[0]];
 }
 
@@ -1730,7 +1736,7 @@ export function HistogramPanel({ data, loading, title }) {
 // 锁等待链单独成表而不是并进 digest 表：digest 是"这段时间哪些 SQL 累计
 // 最慢"（聚合量），锁等待是"某一时刻谁在等谁"（时点事实），两者聚合口径不
 // 同，合并展示会让人误以为锁等待也是累计值。
-function DBSnapshotPanel({ data, loading }) {
+export function DBSnapshotPanel({ data, loading }) {
     if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询数据库快照...</div></section>;
     const digests = data?.digests || [];
     const lockWaits = data?.lock_waits || [];

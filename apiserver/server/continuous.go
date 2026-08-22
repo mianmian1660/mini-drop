@@ -2465,7 +2465,7 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 		"empty":        empty,
 		"message":      message,
 		"source":       "mini-drop-native",
-		"profile_url":  s.continuousProfileURL(ctx, objectKeys),
+		"profile_url":  s.continuousProfileURL(ctx, q, objectKeys),
 		"generated_at": time.Now(),
 	}, true, nil
 }
