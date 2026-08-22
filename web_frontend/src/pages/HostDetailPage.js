@@ -6,6 +6,8 @@ import CreateContinuousSessionModal from '../components/CreateContinuousSessionM
 import ContinuousSessionList from '../components/ContinuousSessionList';
 import Pagination from '../components/Pagination';
 import TimelineChart, { statusColor } from '../components/TimelineChart';
+import TaskCancelButton from '../components/TaskCancelButton';
+import InlineDiffPanel from '../components/InlineDiffPanel';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
 import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
@@ -425,7 +427,7 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                     <h3 style={S.sectionTitle}>最近任务</h3>
                     <button style={S.btnSm} onClick={() => onTab('tasks')}>查看任务列表</button>
                 </div>
-                <MiniTaskList tasks={taskItems} />
+                <MiniTaskList tasks={taskItems} onCancelled={onRefresh} />
             </section>
 
             <section style={S.card}>
@@ -626,7 +628,7 @@ function HostTasksPanel({ target }) {
                     <option value="3">失败</option>
                 </select>
             </div>
-            {loading && taskList.length === 0 ? <div style={S.loading}>加载任务...</div> : <TaskTable tasks={taskList} />}
+            {loading && taskList.length === 0 ? <div style={S.loading}>加载任务...</div> : <TaskTable tasks={taskList} onCancelled={loadTasks} />}
             <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
         </section>
     );
@@ -647,6 +649,7 @@ function HostTimelinePanel({ target }) {
     const [appliedCustomFrom, setAppliedCustomFrom] = useState('');
     const [appliedCustomTo, setAppliedCustomTo] = useState('');
     const [baselineTid, setBaselineTid] = useState('');
+    const [diffCompareTid, setDiffCompareTid] = useState('');
 
     const timelineFilters = useCallback(() => ({
         status: statusFilter || undefined,
@@ -859,12 +862,12 @@ function AgentLogsPanel({ audits, detailLoading, onRefresh }) {
     );
 }
 
-function MiniTaskList({ tasks: taskItems }) {
+function MiniTaskList({ tasks: taskItems, onCancelled }) {
     if (taskItems.length === 0) return <div style={S.empty}>该主机暂无按需任务</div>;
-    return <TaskTable tasks={taskItems.slice(0, 5)} compact />;
+    return <TaskTable tasks={taskItems.slice(0, 5)} compact onCancelled={onCancelled} />;
 }
 
-function TaskTable({ tasks: taskItems, compact = false }) {
+function TaskTable({ tasks: taskItems, compact = false, onCancelled }) {
     if (taskItems.length === 0) return <div style={S.empty}>没有匹配的任务</div>;
     return (
         <div className="table-scroll">
@@ -889,7 +892,10 @@ function TaskTable({ tasks: taskItems, compact = false }) {
                         <td style={S.td}><span style={{ ...S.badge, background: statusColors[task.status] || '#999', color: '#fff' }}>{statusNames[task.status] || '未知'}</span></td>
                         <td style={S.td}>{formatTime(task.create_time)}</td>
                         <td style={S.td}>{task.user_name || '系统'}</td>
-                        <td style={S.td}><Link to={`/task/result?tid=${task.tid}`} style={{ color: '#315efb', fontWeight: 700 }}>查看</Link></td>
+                        <td style={S.td}>
+                            <Link to={`/task/result?tid=${task.tid}`} style={{ color: '#315efb', fontWeight: 700, marginRight: 10 }}>查看</Link>
+                            <TaskCancelButton tid={task.tid} status={task.status} canManage={task.can_manage} onCancelled={onCancelled} />
+                        </td>
                     </tr>
                 ))}
             </tbody>
