@@ -8,6 +8,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks } from '../api';
 import Pagination from '../components/Pagination';
+import TaskCancelButton from '../components/TaskCancelButton';
 import { collectorLabelFromTask } from '../utils/collectors';
 
 const styles = {
@@ -196,6 +197,13 @@ export default function TaskListPage() {
                                     <td style={styles.td}>{t.user_name || '系统'}</td>
                                     <td style={styles.td}>
                                         <Link to={`/task/result?tid=${t.tid}`} style={{ color: '#4a6cf7', marginRight: 12 }}>查看</Link>
+                                        <TaskCancelButton
+                                            tid={t.tid}
+                                            status={t.status}
+                                            canManage={t.can_manage}
+                                            onCancelled={loadTasks}
+                                            style={{ marginRight: 12 }}
+                                        />
                                         {t.can_manage && <button style={styles.deleteBtn} onClick={() => handleDelete(t.tid)}>删除</button>}
                                     </td>
                                 </tr>

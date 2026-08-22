@@ -109,6 +109,7 @@ export const continuous = {
     timeline: (sid, params = {}) => client.get(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}/timeline`, { params }),
     query: (params = {}) => client.get('/api/v1/continuous/query', { params }),
     histogram: (params = {}) => client.get('/api/v1/continuous/histogram', { params }),
+    dbSnapshot: (params = {}) => client.get('/api/v1/continuous/db-snapshot', { params }),
 };
 
 // ---------- 分析结果 ----------

@@ -8,6 +8,8 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks, schedules } from '../api';
 import TimelineChart, { statusColor } from '../components/TimelineChart';
+import TaskCancelButton from '../components/TaskCancelButton';
+import InlineDiffPanel from '../components/InlineDiffPanel';
 import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
 
 const S = {
@@ -40,6 +42,16 @@ const S = {
         background: active ? '#e8f0ff' : '#fafafa', border: active ? '1px solid #4a6cf7' : '1px solid #e0e0e0',
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
     }),
+    // 表格样式对齐 ContinuousSessionList，让周期性深度采样列表与持续采集列表视觉一致
+    tableWrap: { width: '100%', minWidth: 0, maxWidth: '100%', overflowX: 'auto', overflowY: 'hidden' },
+    table: { width: '100%', borderCollapse: 'collapse', minWidth: 680 },
+    th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d5dd', color: '#475467', background: '#f8fafc', fontSize: 12, whiteSpace: 'nowrap' },
+    td: { padding: '11px 12px', borderBottom: '1px solid #edf0f3', color: '#344054', fontSize: 13, verticalAlign: 'top' },
+    rowName: { color: '#101828', fontWeight: 700, marginBottom: 3 },
+    badge: { display: 'inline-flex', borderRadius: 999, padding: '3px 8px', fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap' },
+    link: { color: '#315efb', fontWeight: 700, textDecoration: 'none', marginRight: 10, whiteSpace: 'nowrap' },
+    baselineBtn: { color: '#315efb', background: 'transparent', border: 0, padding: 0, fontWeight: 700, cursor: 'pointer', fontSize: 13, marginRight: 10, whiteSpace: 'nowrap' },
+    baselineActiveBtn: { color: '#315efb', background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 6, padding: '3px 9px', fontWeight: 700, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap' },
 };
 
 const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };

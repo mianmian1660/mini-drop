@@ -81,25 +81,48 @@ type ContinuousBatchIngestReq struct {
 }
 
 type ContinuousWindowIngest struct {
-	WindowStart       time.Time                   `json:"window_start"`
-	WindowEnd         time.Time                   `json:"window_end"`
-	ObjectKey         string                      `json:"object_key"`
-	SampleCount       uint64                      `json:"sample_count"`
-	SignalType        string                      `json:"signal_type"`
-	SchemaVersion     uint32                      `json:"schema_version"`
-	Backend           string                      `json:"backend"`
-	Labels            map[string]interface{}      `json:"labels"`
-	ProfileFormat     string                      `json:"profile_format"`
-	BackendStatus     string                      `json:"backend_status"`
-	BackendReason     string                      `json:"backend_reason"`
-	AttemptedBackends []string                    `json:"attempted_backends"`
-	SelectedBackend   string                      `json:"selected_backend"`
-	SymbolRefs        map[string]interface{}      `json:"symbol_refs"`
-	Samples           []ContinuousStackSample     `json:"samples"`
-	Profiles          []ContinuousProfileIngest   `json:"profiles"`
-	Histograms        []ContinuousHistogramIngest `json:"histograms"`
-	Metrics           []ContinuousMetricIngest    `json:"metrics"`
-	RSSTruncated      int                         `json:"rss_truncated"`
+	WindowStart       time.Time                    `json:"window_start"`
+	WindowEnd         time.Time                    `json:"window_end"`
+	ObjectKey         string                       `json:"object_key"`
+	SampleCount       uint64                       `json:"sample_count"`
+	SignalType        string                       `json:"signal_type"`
+	SchemaVersion     uint32                       `json:"schema_version"`
+	Backend           string                       `json:"backend"`
+	Labels            map[string]interface{}       `json:"labels"`
+	ProfileFormat     string                       `json:"profile_format"`
+	BackendStatus     string                       `json:"backend_status"`
+	BackendReason     string                       `json:"backend_reason"`
+	AttemptedBackends []string                     `json:"attempted_backends"`
+	SelectedBackend   string                       `json:"selected_backend"`
+	SymbolRefs        map[string]interface{}       `json:"symbol_refs"`
+	Samples           []ContinuousStackSample      `json:"samples"`
+	Profiles          []ContinuousProfileIngest    `json:"profiles"`
+	Histograms        []ContinuousHistogramIngest  `json:"histograms"`
+	Metrics           []ContinuousMetricIngest     `json:"metrics"`
+	DBSnapshots       []ContinuousDBSnapshotIngest `json:"db_snapshots"`
+	RSSTruncated      int                          `json:"rss_truncated"`
+}
+
+// ContinuousDBSnapshotIngest 对应 Agent 侧的 DBSnapshotSample（阶段二）。
+// Kind 区分 "digest"（SQL 摘要增量）与 "lock_wait"（锁等待链），未用到的
+// 字段为零值。DigestText 是数据库自身归一化后的占位符形式 SQL，不含原始参数。
+type ContinuousDBSnapshotIngest struct {
+	Kind          string    `json:"kind"`
+	InstanceLabel string    `json:"instance_label"`
+	Timestamp     time.Time `json:"timestamp"`
+
+	SchemaName        string `json:"schema_name"`
+	DigestText        string `json:"digest_text"`
+	CallCount         uint64 `json:"call_count"`
+	TotalLatencyUs    uint64 `json:"total_latency_us"`
+	RowsExaminedTotal uint64 `json:"rows_examined_total"`
+
+	WaitingPID    int64  `json:"waiting_pid"`
+	WaitingQuery  string `json:"waiting_query"`
+	BlockingPID   int64  `json:"blocking_pid"`
+	BlockingQuery string `json:"blocking_query"`
+	WaitSeconds   uint64 `json:"wait_seconds"`
+	LockedTable   string `json:"locked_table"`
 }
 
 type ContinuousStackSample struct {
@@ -2137,6 +2160,159 @@ func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q Profil
 	}, true, nil
 }
 
+// QueryContinuousDBSnapshot 返回时间范围内的数据库快照：慢查询 digest 排行
+// （按窗口累加后按总耗时排序）与锁等待链（逐条保留，因为"谁在等谁"是时点
+// 事实，聚合会丢掉关键信息）。
+func (s *APIServer) QueryContinuousDBSnapshot(c *gin.Context) {
+	q, ok := s.profileQueryFromRequest(c)
+	if !ok {
+		return
+	}
+	data, found, err := s.queryNativeContinuousDBSnapshot(c.Request.Context(), q)
+	if err != nil {
+		s.respondProfileDependencyError(c, err)
+		return
+	}
+	if !found {
+		s.RespondOK(c, gin.H{
+			"query":        profileLabelSelector(q),
+			"signal_type":  "db_snapshot",
+			"empty":        true,
+			"message":      "该时间范围暂无数据库快照数据",
+			"source":       "mini-drop-native",
+			"generated_at": time.Now(),
+			"digests":      []gin.H{},
+			"lock_waits":   []gin.H{},
+		})
+		return
+	}
+	s.RespondOK(c, data)
+}
+
+func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q ProfileQuery) (gin.H, bool, error) {
+	var windows []model.ProfileWindow
+	sessionQuery := s.continuousSessionSelection(q)
+	err := s.DB.Where("session_sid IN (?)", sessionQuery).
+		Where("signal_type = ?", "db_snapshot").
+		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
+		Order("window_start ASC").
+		Limit(continuousMaxWindowCount + 1).
+		Find(&windows).Error
+	if err != nil {
+		return nil, false, err
+	}
+	if len(windows) > continuousMaxWindowCount {
+		return nil, true, errContinuousWindowLimit
+	}
+	if len(windows) == 0 {
+		return nil, false, nil
+	}
+	if !s.StorageConnected() {
+		return nil, true, errProfileUnavailable
+	}
+
+	type digestAgg struct {
+		InstanceLabel  string
+		SchemaName     string
+		DigestText     string
+		CallCount      uint64
+		TotalLatencyUs uint64
+		RowsExamined   uint64
+	}
+	digests := map[string]*digestAgg{}
+	lockWaits := []gin.H{}
+	objectKeys := []string{}
+	seenObject := map[string]bool{}
+
+	for _, objectKey := range orderedContinuousObjectKeys(windows) {
+		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+		if err != nil {
+			return nil, true, err
+		}
+		if !seenObject[objectKey] {
+			objectKeys = append(objectKeys, objectKey)
+			seenObject[objectKey] = true
+		}
+		for _, window := range batch.Windows {
+			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+				continue
+			}
+			for _, snap := range window.DBSnapshots {
+				switch snap.Kind {
+				case "digest":
+					key := snap.InstanceLabel + "|" + snap.SchemaName + "|" + snap.DigestText
+					item := digests[key]
+					if item == nil {
+						item = &digestAgg{
+							InstanceLabel: snap.InstanceLabel,
+							SchemaName:    snap.SchemaName,
+							DigestText:    snap.DigestText,
+						}
+						digests[key] = item
+					}
+					item.CallCount = addContinuousCount(item.CallCount, snap.CallCount)
+					item.TotalLatencyUs = addContinuousCount(item.TotalLatencyUs, snap.TotalLatencyUs)
+					item.RowsExamined = addContinuousCount(item.RowsExamined, snap.RowsExaminedTotal)
+				case "lock_wait":
+					lockWaits = append(lockWaits, gin.H{
+						"instance_label": snap.InstanceLabel,
+						"timestamp":      snap.Timestamp,
+						"waiting_pid":    snap.WaitingPID,
+						"waiting_query":  snap.WaitingQuery,
+						"blocking_pid":   snap.BlockingPID,
+						"blocking_query": snap.BlockingQuery,
+						"wait_seconds":   snap.WaitSeconds,
+						"locked_table":   snap.LockedTable,
+					})
+				}
+			}
+		}
+	}
+
+	digestList := make([]gin.H, 0, len(digests))
+	for _, item := range digests {
+		avgLatencyUs := uint64(0)
+		if item.CallCount > 0 {
+			avgLatencyUs = item.TotalLatencyUs / item.CallCount
+		}
+		digestList = append(digestList, gin.H{
+			"instance_label":   item.InstanceLabel,
+			"schema_name":      item.SchemaName,
+			"digest_text":      item.DigestText,
+			"call_count":       item.CallCount,
+			"total_latency_us": item.TotalLatencyUs,
+			"avg_latency_us":   avgLatencyUs,
+			"rows_examined":    item.RowsExamined,
+		})
+	}
+	sort.Slice(digestList, func(i, j int) bool {
+		return digestList[i]["total_latency_us"].(uint64) > digestList[j]["total_latency_us"].(uint64)
+	})
+	if len(digestList) > continuousSummaryTopLimit {
+		digestList = digestList[:continuousSummaryTopLimit]
+	}
+	sort.Slice(lockWaits, func(i, j int) bool {
+		return lockWaits[i]["wait_seconds"].(uint64) > lockWaits[j]["wait_seconds"].(uint64)
+	})
+
+	empty := len(digestList) == 0 && len(lockWaits) == 0
+	message := ""
+	if empty {
+		message = "该时间范围暂无数据库快照数据"
+	}
+	return gin.H{
+		"query":        profileLabelSelector(q),
+		"signal_type":  "db_snapshot",
+		"digests":      digestList,
+		"lock_waits":   lockWaits,
+		"empty":        empty,
+		"message":      message,
+		"source":       "mini-drop-native",
+		"profile_url":  s.continuousProfileURL(ctx, objectKeys),
+		"generated_at": time.Now(),
+	}, true, nil
+}
+
 func (s *APIServer) loadContinuousStoredBatch(ctx context.Context, objectKey string) (continuousStoredBatch, error) {
 	rc, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, objectKey)
 	if err != nil {
@@ -2724,6 +2900,9 @@ func continuousWindowSignalRows(window ContinuousWindowIngest) []continuousSigna
 	if len(window.Metrics) > 0 {
 		add("python_rss", "procfs")
 	}
+	if len(window.DBSnapshots) > 0 {
+		add("db_snapshot", "db_system_views")
+	}
 	if len(rows) == 0 {
 		add(firstNonEmpty(window.SignalType, "cpu_profile"), window.Backend)
 	}
@@ -2764,6 +2943,9 @@ func continuousWindowSampleCount(window ContinuousWindowIngest, signalType strin
 				count = addContinuousCount(count, 1)
 			}
 		}
+	}
+	if signalType == "db_snapshot" {
+		count = addContinuousCount(count, uint64(len(window.DBSnapshots)))
 	}
 	for _, hist := range window.Histograms {
 		if strings.ToLower(strings.TrimSpace(hist.SignalType)) == signalType {
@@ -2820,6 +3002,9 @@ func normalizeContinuousSignalTypes(req ContinuousBatchIngestReq) []string {
 		}
 		for _, hist := range window.Histograms {
 			add(hist.SignalType)
+		}
+		if len(window.DBSnapshots) > 0 {
+			add("db_snapshot")
 		}
 	}
 	if len(out) == 0 {

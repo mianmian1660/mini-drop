@@ -87,6 +87,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [flamegraph, setFlamegraph] = useState(null);
     const [topn, setTopn] = useState(null);
     const [histogram, setHistogram] = useState(null);
+    const [dbSnapshot, setDbSnapshot] = useState(null);
     const [querying, setQuerying] = useState(false);
     const [error, setError] = useState('');
     const [reliability, setReliability] = useState(null);
@@ -197,6 +198,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 : Promise.resolve(null);
             if (signalTab === 'cpu') {
                 setHistogram(null);
+                setDbSnapshot(null);
                 const cpuParams = { ...params };
                 if (stackScope !== 'all') cpuParams.stack_scope = stackScope;
                 const requests = [
@@ -213,9 +215,23 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 if (fgRes.code !== 0 || topRes.code !== 0) {
                     setError(fgRes.message || topRes.message || 'Native Continuous Profiling 查询失败');
                 }
+            } else if (signalTab === 'db') {
+                setFlamegraph(null);
+                setTopn(null);
+                setHistogram(null);
+                const [dbRes, timelineRes] = await Promise.all([
+                    continuous.dbSnapshot(params),
+                    timelinePromise,
+                ]);
+                setReliability(timelineRes?.code === 0 ? timelineRes.data : null);
+                if (dbRes.code === 0) setDbSnapshot(dbRes.data);
+                if (dbRes.code !== 0) {
+                    setError(dbRes.message || '数据库快照查询失败');
+                }
             } else {
                 setFlamegraph(null);
                 setTopn(null);
+                setDbSnapshot(null);
 				const signalType = signalTab === 'io' ? 'io_latency' : signalTab === 'io_syscall' ? 'io_syscall_latency' : 'sched_latency';
                 const [histRes, timelineRes] = await Promise.all([
                     continuous.histogram({ ...params, signal_type: signalType }),
@@ -231,6 +247,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setFlamegraph(null);
             setTopn(null);
             setHistogram(null);
+            setDbSnapshot(null);
             setRssSeries([]);
             setReliability(null);
             setError(err?.message || 'Native Continuous Profiling 查询失败');
@@ -595,7 +612,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             <button type="button" style={S.segment(signalTab === 'cpu')} onClick={() => setSignalTab('cpu')}>CPU</button>
 							<button type="button" style={S.segment(signalTab === 'io')} onClick={() => setSignalTab('io')}>块 IO</button>
 							<button type="button" style={S.segment(signalTab === 'io_syscall')} onClick={() => setSignalTab('io_syscall')}>系统调用 IO</button>
-                            <button type="button" style={{ ...S.segment(signalTab === 'sched'), borderRight: 'none' }} onClick={() => setSignalTab('sched')}>调度延迟</button>
+                            <button type="button" style={S.segment(signalTab === 'sched')} onClick={() => setSignalTab('sched')}>调度延迟</button>
+                            <button type="button" style={{ ...S.segment(signalTab === 'db'), borderRight: 'none' }} onClick={() => setSignalTab('db')}>数据库</button>
                         </span>
                     </Field>
                     {signalTab === 'cpu' && (
@@ -661,8 +679,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
                 </div>
                 <div style={{ ...S.info, marginTop: 14 }}>
-					{signalTab === 'cpu' ? scopeLabel : `${taskScope === 'process' ? '进程范围' : '整机范围'} ${signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} / eBPF histogram`}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。
-                    {signalTab === 'cpu' ? ' comm 是 Linux task comm，可能被截断到约 15 字符。' : ` 当前 backend：${histogram?.backend || signalBackend(sessionMeta, signalTab) || '-'}`}
+					{signalTab === 'cpu' ? scopeLabel : signalTab === 'db' ? '数据库快照 / 系统视图轮询' : `${taskScope === 'process' ? '进程范围' : '整机范围'} ${signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} / eBPF histogram`}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。
+                    {signalTab === 'cpu' ? ' comm 是 Linux task comm，可能被截断到约 15 字符。'
+                        : signalTab === 'db' ? ' SQL 仅保留数据库归一化后的 digest（占位符形式），不含原始参数。'
+                        : ` 当前 backend：${histogram?.backend || signalBackend(sessionMeta, signalTab) || '-'}`}
                     {scope === 'process' && commMessage ? ` ${commMessage}` : ''}
                 </div>
                 <CoverageBand reliability={reliability} />
@@ -712,7 +732,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     onRenderStats={setRenderStats}
                     onSearchStats={setSearchStats}
                 />
-			</section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
+			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} />
+                : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
 
             {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
                 <div style={{ ...S.warn, marginTop: 10 }}>
@@ -1223,6 +1244,115 @@ function HistogramPanel({ data, loading, title }) {
                                 </tbody>
                             </table>
                         </div>
+                    </div>
+                </>
+            )}
+        </section>
+    );
+}
+
+// 锁等待链单独成表而不是并进 digest 表：digest 是"这段时间哪些 SQL 累计
+// 最慢"（聚合量），锁等待是"某一时刻谁在等谁"（时点事实），两者聚合口径不
+// 同，合并展示会让人误以为锁等待也是累计值。
+function DBSnapshotPanel({ data, loading }) {
+    if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询数据库快照...</div></section>;
+    const digests = data?.digests || [];
+    const lockWaits = data?.lock_waits || [];
+    return (
+        <section style={S.card}>
+            <div style={S.sectionHead}>
+                <div>
+                    <h3 style={S.title}>数据库快照</h3>
+                    <div style={S.subtle}>{data?.source || 'mini-drop-native'} · 数据库系统视图轮询</div>
+                </div>
+                <span style={S.subtle}>{digests.length} 条 digest · {lockWaits.length} 条锁等待</span>
+            </div>
+            {data?.empty || (digests.length === 0 && lockWaits.length === 0) ? (
+                <ProfileEmpty message={data?.message || '该时间范围暂无数据库快照数据'} url={data?.profile_url} />
+            ) : (
+                <>
+                    <div style={S.summaryGrid}>
+                        <Metric label="慢查询 digest" value={String(digests.length)} />
+                        <Metric label="锁等待事件" value={String(lockWaits.length)} />
+                        <Metric label="最长锁等待" value={lockWaits.length ? `${Math.max(...lockWaits.map(w => Number(w.wait_seconds) || 0))} s` : '-'} />
+                    </div>
+                    <div style={{ marginTop: 16 }}>
+                        <div style={S.sectionHead}>
+                            <h3 style={S.title}>锁等待链</h3>
+                            <span style={S.subtle}>按等待时长排序</span>
+                        </div>
+                        {lockWaits.length === 0 ? (
+                            <div style={S.empty}>该时间范围内没有观测到锁等待</div>
+                        ) : (
+                            <div className="table-scroll" style={S.tableWrap}>
+                                <table style={S.table}>
+                                    <thead>
+                                        <tr>
+                                            <th style={S.th}>时间</th>
+                                            <th style={S.th}>实例</th>
+                                            <th style={S.th}>等待时长</th>
+                                            <th style={S.th}>锁定表</th>
+                                            <th style={{ ...S.th, width: '26%' }}>被阻塞 SQL</th>
+                                            <th style={{ ...S.th, width: '26%' }}>阻塞方 SQL</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {lockWaits.slice(0, 50).map((item, index) => (
+                                            <tr key={`${item.waiting_pid}-${item.blocking_pid}-${index}`}>
+                                                <td style={S.td}>{formatTime(item.timestamp)}</td>
+                                                <td style={S.td}>{item.instance_label || '-'}</td>
+                                                <td style={S.td}>{item.wait_seconds} s</td>
+                                                <td style={S.td}>{item.locked_table || '-'}</td>
+                                                <td style={S.td} title={item.waiting_query}>
+                                                    <div>pid {item.waiting_pid}</div>
+                                                    {truncate(item.waiting_query || '-', 60)}
+                                                </td>
+                                                <td style={S.td} title={item.blocking_query}>
+                                                    <div>pid {item.blocking_pid}</div>
+                                                    {truncate(item.blocking_query || '-', 60)}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </div>
+                    <div style={{ marginTop: 16 }}>
+                        <div style={S.sectionHead}>
+                            <h3 style={S.title}>慢查询 digest</h3>
+                            <span style={S.subtle}>按窗口内累计耗时排序</span>
+                        </div>
+                        {digests.length === 0 ? (
+                            <div style={S.empty}>该时间范围内没有采到 SQL digest</div>
+                        ) : (
+                            <div className="table-scroll" style={S.tableWrap}>
+                                <table style={S.table}>
+                                    <thead>
+                                        <tr>
+                                            <th style={{ ...S.th, width: '44%' }}>SQL digest</th>
+                                            <th style={S.th}>实例 / schema</th>
+                                            <th style={S.th}>调用次数</th>
+                                            <th style={S.th}>累计耗时</th>
+                                            <th style={S.th}>平均耗时</th>
+                                            <th style={S.th}>扫描行数</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {digests.map((item, index) => (
+                                            <tr key={`${item.digest_text}-${index}`}>
+                                                <td style={S.td} title={item.digest_text}>{truncate(item.digest_text || '-', 90)}</td>
+                                                <td style={S.td}>{item.instance_label || '-'} / {item.schema_name || '-'}</td>
+                                                <td style={S.td}>{formatMetricValue(item.call_count || 0, 'samples')}</td>
+                                                <td style={S.td}>{formatLatency(item.total_latency_us, 'us')}</td>
+                                                <td style={S.td}>{formatLatency(item.avg_latency_us, 'us')}</td>
+                                                <td style={S.td}>{formatMetricValue(item.rows_examined || 0, 'samples')}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
                     </div>
                 </>
             )}

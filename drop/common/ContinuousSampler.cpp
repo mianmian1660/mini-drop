@@ -441,6 +441,32 @@ struct HistogramPayload
     int pid = 0;
 };
 
+// 阶段二：结构化数据库快照（SQL digest 聚合 / 锁等待链），与阶段一的标量
+// MetricPayload 并存于同一个 WindowPayload。kind 区分两种语义，未用到的字段
+// 留空/留 0 即可（和 HistogramPayload 的 unavailable/reason 一样，不为每种
+// kind 单独开结构体，减少序列化分支）。
+struct DBSnapshotSample
+{
+    std::string kind;          // "digest" | "lock_wait"
+    std::string instanceLabel; // 对应 DBTargetConfig.instanceLabel
+    int64_t timestampMs = 0;
+
+    // kind == "digest"：跨轮次增量（本窗口内新发生的调用），不是累计值
+    std::string schemaName;
+    std::string digestText;     // 归一化 SQL（占位符形式），不落原始参数
+    uint64_t callCount = 0;
+    uint64_t totalLatencyUs = 0;
+    uint64_t rowsExaminedTotal = 0;
+
+    // kind == "lock_wait"
+    int64_t waitingPid = 0;
+    std::string waitingQuery;
+    int64_t blockingPid = 0;
+    std::string blockingQuery;
+    uint64_t waitSeconds = 0;
+    std::string lockedTable;
+};
+
 struct WindowPayload
 {
     int64_t startMs = 0;
@@ -449,6 +475,7 @@ struct WindowPayload
     std::vector<ProfilePayload> profiles;
     std::vector<HistogramPayload> histograms;
     std::vector<MetricPayload> metrics;
+    std::vector<DBSnapshotSample> dbSnapshots;
     size_t rssTruncated = 0;
     // Backend metadata (5-8: strict fallback strategy)
     std::string backendStatus;                   // "ok" | "degraded" | "failed"
@@ -1862,6 +1889,11 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             signalTypes.insert("python_rss");
             backends["python_rss"] = "procfs";
         }
+        if (!window.dbSnapshots.empty())
+        {
+            signalTypes.insert("db_snapshot");
+            backends["db_snapshot"] = "db_system_views";
+        }
     }
 
     std::string body = "{";
@@ -2088,6 +2120,30 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
                 body += "}";
             }
             body += "]}";
+        }
+        body += "],";
+        body += "\"db_snapshots\":[";
+        for (size_t di = 0; di < window.dbSnapshots.size(); ++di)
+        {
+            const auto &snap = window.dbSnapshots[di];
+            if (di)
+                body += ",";
+            body += "{";
+            body += "\"kind\":\"" + json_escape(snap.kind) + "\",";
+            body += "\"instance_label\":\"" + json_escape(snap.instanceLabel) + "\",";
+            body += "\"timestamp\":\"" + rfc3339_from_ms(snap.timestampMs) + "\",";
+            body += "\"schema_name\":\"" + json_escape(snap.schemaName) + "\",";
+            body += "\"digest_text\":\"" + json_escape(snap.digestText) + "\",";
+            body += "\"call_count\":" + std::to_string(snap.callCount) + ",";
+            body += "\"total_latency_us\":" + std::to_string(snap.totalLatencyUs) + ",";
+            body += "\"rows_examined_total\":" + std::to_string(snap.rowsExaminedTotal) + ",";
+            body += "\"waiting_pid\":" + std::to_string(snap.waitingPid) + ",";
+            body += "\"waiting_query\":\"" + json_escape(snap.waitingQuery) + "\",";
+            body += "\"blocking_pid\":" + std::to_string(snap.blockingPid) + ",";
+            body += "\"blocking_query\":\"" + json_escape(snap.blockingQuery) + "\",";
+            body += "\"wait_seconds\":" + std::to_string(snap.waitSeconds) + ",";
+            body += "\"locked_table\":\"" + json_escape(snap.lockedTable) + "\"";
+            body += "}";
         }
         body += "]}";
     }
@@ -3181,6 +3237,185 @@ static void collect_mysql_target_metrics(const ContinuousSamplerConfig &cfg, con
     }
 }
 
+// 阶段二状态：SQL digest 表（events_statements_summary_by_digest）里的计数
+// 器是自服务器启动（或上次 TRUNCATE）以来的累计值，要换算成"本窗口新发生
+// 的调用"，需要保存上一轮的累计值做差分——这是跨采集轮次的状态，只能用
+// 进程内静态 map 存（不同 Session 可能采同一实例，key 里带 instanceLabel
+// 区分；不同 DBSnapshotSampler 实例跑在各自线程里，故用 mutex 保护）。
+struct DigestCounterState
+{
+    uint64_t countStar = 0;
+    uint64_t sumTimerWaitPs = 0;
+    uint64_t sumRowsExamined = 0;
+};
+static std::mutex g_digestStateMutex;
+static std::unordered_map<std::string, DigestCounterState> g_digestState;
+
+// 借鉴 pg_stat_monitor/PMM Query Analytics 的聚合思路：按 DIGEST 做增量
+// diff，只上报本窗口内真正新增的调用次数/耗时，不是累计值。SQL 只存归一
+// 化 digest_text（占位符形式），不落原始参数。查询里用 REPLACE 把
+// digest_text/query 里可能出现的 \n \t 换成空格——这两个字符会破坏
+// --batch 输出的行/列分隔，比在 C++ 侧做转义解析更简单可靠。
+static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, const DBTargetConfig &target,
+                                          WindowPayload *window)
+{
+    std::string password;
+    if (!read_db_target_password(target, &password))
+        return;
+    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
+    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+        return;
+    const std::string query =
+        "SELECT SCHEMA_NAME, DIGEST, "
+        "REPLACE(REPLACE(DIGEST_TEXT, '\\n', ' '), '\\t', ' '), "
+        "COUNT_STAR, SUM_TIMER_WAIT, SUM_ROWS_EXAMINED "
+        "FROM performance_schema.events_statements_summary_by_digest "
+        "WHERE SCHEMA_NAME IS NOT NULL AND DIGEST IS NOT NULL "
+        "ORDER BY SUM_TIMER_WAIT DESC LIMIT 50";
+    std::vector<std::string> argv = {
+        "mysql", "--defaults-extra-file=" + defaultsPath,
+        "-h", target.host, "-P", std::to_string(target.port),
+        "--connect-timeout=2", "--batch", "--skip-column-names",
+        "-e", query};
+    std::string output;
+    int rc = drop::exec_capture(argv, &output, 256 * 1024);
+    ::unlink(defaultsPath.c_str());
+    if (rc != 0)
+    {
+        std::cout << "[native-cp] db target=" << target.instanceLabel << " digest query failed rc=" << rc
+                  << std::endl;
+        return;
+    }
+
+    const int64_t nowMillis = now_ms();
+    std::istringstream lines(output);
+    std::string line;
+    std::lock_guard<std::mutex> lock(g_digestStateMutex);
+    while (std::getline(lines, line))
+    {
+        std::vector<std::string> cols;
+        size_t start = 0;
+        for (size_t i = 0; i <= line.size(); ++i)
+        {
+            if (i == line.size() || line[i] == '\t')
+            {
+                cols.push_back(line.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (cols.size() != 6)
+            continue;
+        const std::string &schema = cols[0];
+        const std::string &digest = cols[1];
+        const std::string &digestText = cols[2];
+        char *end = nullptr;
+        uint64_t countStar = std::strtoull(cols[3].c_str(), &end, 10);
+        uint64_t sumTimerWaitPs = std::strtoull(cols[4].c_str(), &end, 10);
+        uint64_t sumRowsExamined = std::strtoull(cols[5].c_str(), &end, 10);
+
+        const std::string stateKey = target.instanceLabel + "|" + digest;
+        auto it = g_digestState.find(stateKey);
+        if (it == g_digestState.end())
+        {
+            // 第一次见到这个 digest：只记基线，不上报（否则会把"自服务器启动
+            // 以来的全部历史调用"当成本窗口发生的调用，数字会失真）。
+            g_digestState[stateKey] = {countStar, sumTimerWaitPs, sumRowsExamined};
+            continue;
+        }
+        DigestCounterState prev = it->second;
+        it->second = {countStar, sumTimerWaitPs, sumRowsExamined};
+        if (countStar < prev.countStar)
+        {
+            // 计数器被 TRUNCATE 或服务器重启过，视为新基线，本轮不上报。
+            continue;
+        }
+        uint64_t deltaCalls = countStar - prev.countStar;
+        if (deltaCalls == 0)
+            continue;
+
+        DBSnapshotSample sample;
+        sample.kind = "digest";
+        sample.instanceLabel = target.instanceLabel;
+        sample.timestampMs = nowMillis;
+        sample.schemaName = schema;
+        sample.digestText = digestText;
+        sample.callCount = deltaCalls;
+        sample.totalLatencyUs = (sumTimerWaitPs - prev.sumTimerWaitPs) / 1000000ULL; // ps -> us
+        sample.rowsExaminedTotal = sumRowsExamined - prev.sumRowsExamined;
+        window->dbSnapshots.push_back(std::move(sample));
+    }
+}
+
+// 锁等待链：直接查 MySQL 内置的 sys.innodb_lock_waits 视图（5.7.7+ 默认启
+// 用的系统 schema，不是第三方工具），它已经把 blocking/waiting 事务、SQL、
+// 等待时长、锁定的表拼好了，比自己手写 data_locks/data_lock_waits/
+// innodb_trx 三表 join 更不容易出错，且同样是"自己写 SQL、自己解析"，
+// 不是部署 pg_wait_tracer 这类第三方工具。
+static void collect_mysql_target_lock_waits(const ContinuousSamplerConfig &cfg, const DBTargetConfig &target,
+                                             WindowPayload *window)
+{
+    std::string password;
+    if (!read_db_target_password(target, &password))
+        return;
+    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
+    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+        return;
+    const std::string query =
+        "SELECT waiting_pid, "
+        "REPLACE(REPLACE(IFNULL(waiting_query,''), '\\n', ' '), '\\t', ' '), "
+        "blocking_pid, "
+        "REPLACE(REPLACE(IFNULL(blocking_query,''), '\\n', ' '), '\\t', ' '), "
+        "wait_age_secs, IFNULL(locked_table,'') "
+        "FROM sys.innodb_lock_waits";
+    std::vector<std::string> argv = {
+        "mysql", "--defaults-extra-file=" + defaultsPath,
+        "-h", target.host, "-P", std::to_string(target.port),
+        "--connect-timeout=2", "--batch", "--skip-column-names",
+        "-e", query};
+    std::string output;
+    int rc = drop::exec_capture(argv, &output, 128 * 1024);
+    ::unlink(defaultsPath.c_str());
+    if (rc != 0)
+    {
+        // sys schema 可能被 DBA 删掉/禁用，这种情况只记日志，不影响标量指
+        // 标和 digest 采集继续跑。
+        std::cout << "[native-cp] db target=" << target.instanceLabel << " lock wait query failed rc=" << rc
+                  << std::endl;
+        return;
+    }
+
+    const int64_t nowMillis = now_ms();
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+        std::vector<std::string> cols;
+        size_t start = 0;
+        for (size_t i = 0; i <= line.size(); ++i)
+        {
+            if (i == line.size() || line[i] == '\t')
+            {
+                cols.push_back(line.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (cols.size() != 6)
+            continue;
+        char *end = nullptr;
+        DBSnapshotSample sample;
+        sample.kind = "lock_wait";
+        sample.instanceLabel = target.instanceLabel;
+        sample.timestampMs = nowMillis;
+        sample.waitingPid = std::strtoll(cols[0].c_str(), &end, 10);
+        sample.waitingQuery = cols[1];
+        sample.blockingPid = std::strtoll(cols[2].c_str(), &end, 10);
+        sample.blockingQuery = cols[3];
+        sample.waitSeconds = std::strtoull(cols[4].c_str(), &end, 10);
+        sample.lockedTable = cols[5];
+        window->dbSnapshots.push_back(std::move(sample));
+    }
+}
+
 static WindowPayload collect_db_window(const ContinuousSamplerConfig &cfg)
 {
     WindowPayload window;
@@ -3190,9 +3425,13 @@ static WindowPayload collect_db_window(const ContinuousSamplerConfig &cfg)
     for (const auto &target : cfg.dbTargets)
     {
         if (target.engine == "mysql")
+        {
             collect_mysql_target_metrics(cfg, target, &window);
-        // PostgreSQL 标量指标 + 阶段二的 digest/锁查询在后续子任务补上，
-        // 这里先只覆盖 MySQL，架构上两者共用同一个 collect_db_window 入口。
+            collect_mysql_target_digests(cfg, target, &window);
+            collect_mysql_target_lock_waits(cfg, target, &window);
+        }
+        // PostgreSQL 标量指标 + digest/锁查询留待后续子任务，架构上两者共
+        // 用同一个 collect_db_window 入口，按 engine 分支接入即可。
     }
     window.endMs = now_ms();
     return window;
