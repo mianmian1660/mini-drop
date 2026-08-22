@@ -93,6 +93,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bpftrace \
     libbpf0 \
     perl \
+    mysql-client \
     curl \
     unzip \
     python3 \
