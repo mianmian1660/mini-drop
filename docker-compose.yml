@@ -151,6 +151,9 @@ services:
       DROP_GO_SYMBOL_GOGC: "${DROP_GO_SYMBOL_GOGC:-20}"
       DROP_GO_SYMBOL_CACHE_MAX_BYTES: "${DROP_GO_SYMBOL_CACHE_MAX_BYTES:-536870912}"
       DROP_GO_SYMBOL_CACHE_MAX_FILES: "${DROP_GO_SYMBOL_CACHE_MAX_FILES:-256}"
+      # 整机磁盘采集的 statvfs 路径：容器 overlay 容量无意义，指向宿主机
+      # 根分区上的绑定目录（/tmp 挂载宿主根分区），页面统一标记为"系统盘 /"。
+      DROP_HOST_DISK_MOUNT: "${DROP_HOST_DISK_MOUNT:-/tmp}"
     cpus: "${DROP_AGENT_CPU_LIMIT:-1.0}"
     mem_limit: "${DROP_AGENT_MEMORY_LIMIT:-2g}"
     memswap_limit: "${DROP_AGENT_MEMORY_LIMIT:-2g}"

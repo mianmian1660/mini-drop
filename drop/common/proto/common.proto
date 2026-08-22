@@ -27,6 +27,27 @@ message PidStats {
 // 不是默认值！它们是 protobuf 用来识别字段的序号
 
 // ----------------------------------------------------------
+// HostStats：整台宿主机的资源占用情况（与 PidStats 的进程维度不同）
+// 由 drop_agent 随心跳上报；旧 Agent 不填该字段（has_host_stats()==false）。
+// 每个维度带 *_available 标志：读取失败时只把对应维度置 false，
+// 绝不能用 0% 冒充"无数据"。字段均为追加编号，兼容旧 Agent/Server。
+// ----------------------------------------------------------
+message HostStats {
+  double cpu_percent        = 1;  // 整机 CPU 使用率 0-100
+  bool   cpu_available      = 2;  // CPU 是否可用（/proc/stat 读取失败=false）
+  uint64 memory_used_bytes  = 3;  // 已用内存（字节）
+  uint64 memory_total_bytes = 4;  // 内存总量（字节）
+  double memory_percent     = 5;  // 内存占用率 0-100
+  bool   memory_available   = 6;  // 内存是否可用（/proc/meminfo 读取失败=false）
+  uint64 disk_used_bytes    = 7;  // 磁盘已用（字节）
+  uint64 disk_total_bytes   = 8;  // 磁盘总量（字节）
+  double disk_percent       = 9;  // 磁盘占用率 0-100
+  bool   disk_available     = 10; // 磁盘是否可用（statvfs 失败=false）
+  string disk_mount         = 11; // 逻辑挂载点标签，如 "/"
+  int64  collected_at_unix_ms = 12; // 采集时间（Unix 毫秒）
+}
+
+// ----------------------------------------------------------
 // AttemptStatus：Agent 心跳里汇报的执行尝试
 // ----------------------------------------------------------
 message AttemptStatus {

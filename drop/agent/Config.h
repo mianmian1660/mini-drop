@@ -43,6 +43,11 @@ namespace drop_agent
         uint32_t taskDirRetentionSec = 3600; // 任务目录保留时长（秒），超过此时长的 /tmp/drop_agent/tasks/<taskID>/<attemptID>/ 会被清理
         uint32_t orphanPidGraceSec = 300;    // pid 登记表宽限期（秒），远大于任何 Runner 自身的 timeoutSec+gracePeriodSec，超过仍未摘牌视为孤儿进程
 
+        // 整机磁盘采集的 statvfs 路径。Docker 部署下容器 overlay 容量没有
+        // 意义，这里应指向宿主机根分区上的绑定目录（如 /tmp），页面统一
+        // 标记为"系统盘 /"。默认 "/"（裸机部署时即宿主机根分区）。
+        std::string hostDiskMount = "/";
+
         /// 从 JSON 文件加载配置
         static AgentConfig LoadFromFile(const std::string &configPath);
 

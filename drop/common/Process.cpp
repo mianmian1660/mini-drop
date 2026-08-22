@@ -9,13 +9,21 @@
 #include <vector>
 #include <thread>
 #include <chrono>
-#include <unistd.h>   // getpid, sysconf
-#include <sys/stat.h> // stat, S_ISDIR
-#include <dirent.h>   // opendir, readdir
-#include <cstdlib>    // atoi, atol
+#include <algorithm>   // std::min
+#include <unistd.h>    // getpid, sysconf
+#include <sys/stat.h>      // stat, S_ISDIR
+#include <sys/statvfs.h>   // statvfs
+#include <dirent.h>        // opendir, readdir
+#include <cstdlib>         // atoi, atol, strtoull
 
 namespace drop
 {
+
+    // 前向声明：把一次采样窗口的整机数据填充进 protobuf HostStats
+    static void fill_host_stats(common::HostStats &out,
+                                const HostCpuSample &before,
+                                const HostCpuSample &after,
+                                const std::string &diskMountPath);
 
     ProcStat read_proc_stat(int pid)
     {
@@ -82,7 +90,8 @@ namespace drop
         return io;
     }
 
-    common::PidStats collect_self_pidstats()
+    common::PidStats collect_self_pidstats(common::HostStats *hostStatsOut,
+                                           const std::string &diskMountPath)
     {
         common::PidStats ps;
         int mypid = getpid();
@@ -90,13 +99,15 @@ namespace drop
 
         ProcStat s1 = read_proc_stat(mypid);
         ProcIO io1 = read_proc_io(mypid);
+        HostCpuSample hostCpu1 = read_host_cpu_jiffies();
         long hz = sysconf(_SC_CLK_TCK);
 
-        // 等 1 秒
+        // 等 1 秒（同时作为整机 CPU 两次采样的间隔，不额外拖慢心跳）
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
         ProcStat s2 = read_proc_stat(mypid);
         ProcIO io2 = read_proc_io(mypid);
+        HostCpuSample hostCpu2 = read_host_cpu_jiffies();
 
         if (s1.valid && s2.valid)
         {
@@ -115,7 +126,161 @@ namespace drop
             ps.set_readkbpers(readDelta / 1024);
             ps.set_writekbpers(writeDelta / 1024);
         }
+
+        if (hostStatsOut)
+        {
+            fill_host_stats(*hostStatsOut, hostCpu1, hostCpu2, diskMountPath);
+        }
         return ps;
+    }
+
+    // ------------------------------------------------------------
+    // 整机（宿主机）资源采集实现
+    // ------------------------------------------------------------
+
+    HostCpuSample read_host_cpu_jiffies(const std::string &path)
+    {
+        HostCpuSample sample;
+        std::ifstream f(path);
+        if (!f.is_open())
+            return sample;
+        std::string line;
+        while (std::getline(f, line))
+        {
+            if (line.rfind("cpu ", 0) == 0)
+            {
+                // 第一行 "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
+                // total 统计所有字段，idle 统计 idle+iowait（guest/guest_nice 已含在 user/nice 中）
+                std::istringstream iss(line);
+                std::string tag;
+                iss >> tag;
+                uint64_t value = 0;
+                uint64_t total = 0;
+                uint64_t idle = 0;
+                int fieldIdx = 0;
+                while (iss >> value)
+                {
+                    total += value;
+                    // 字段顺序：user=0 nice=1 system=2 idle=3 iowait=4 ...
+                    if (fieldIdx == 3 || fieldIdx == 4)
+                        idle += value;
+                    fieldIdx++;
+                }
+                if (fieldIdx >= 4)
+                {
+                    sample.total_jiffies = total;
+                    sample.idle_jiffies = idle;
+                    sample.valid = true;
+                }
+                break;
+            }
+        }
+        return sample;
+    }
+
+    double compute_host_cpu_percent(const HostCpuSample &before,
+                                    const HostCpuSample &after)
+    {
+        // 任一采样无效：无法计算，返回 0（由调用方结合 *_available 判定不可用）
+        if (!before.valid || !after.valid)
+            return 0.0;
+        // 零增量或计数器异常（after 不增反减）：不能算出负数，返回 0%
+        if (after.total_jiffies <= before.total_jiffies || after.idle_jiffies < before.idle_jiffies)
+            return 0.0;
+
+        uint64_t totalDelta = after.total_jiffies - before.total_jiffies;
+        uint64_t idleDelta = after.idle_jiffies - before.idle_jiffies;
+        if (idleDelta > totalDelta)
+            idleDelta = totalDelta;
+        uint64_t busyDelta = totalDelta - idleDelta;
+        if (totalDelta == 0)
+            return 0.0;
+
+        double percent = (double)busyDelta / (double)totalDelta * 100.0;
+        if (percent < 0.0)
+            percent = 0.0;
+        if (percent > 100.0)
+            percent = 100.0;
+        return percent;
+    }
+
+    HostMemInfo read_host_meminfo(const std::string &path)
+    {
+        HostMemInfo mem;
+        std::ifstream f(path);
+        if (!f.is_open())
+            return mem;
+        std::string line;
+        while (std::getline(f, line))
+        {
+            if (line.rfind("MemTotal:", 0) == 0)
+            {
+                mem.total_bytes = (uint64_t)strtoull(line.c_str() + 9, nullptr, 10) * 1024;
+            }
+            else if (line.rfind("MemAvailable:", 0) == 0)
+            {
+                mem.available_bytes = (uint64_t)strtoull(line.c_str() + 13, nullptr, 10) * 1024;
+            }
+        }
+        mem.valid = (mem.total_bytes > 0);
+        return mem;
+    }
+
+    HostDiskInfo read_host_disk(const std::string &mountPath)
+    {
+        HostDiskInfo disk;
+        struct statvfs vfs;
+        if (statvfs(mountPath.c_str(), &vfs) != 0)
+            return disk;
+        // 使用 f_frsize（基础块大小）与 f_bavail（非 root 可用块）计算
+        uint64_t frsize = vfs.f_frsize > 0 ? (uint64_t)vfs.f_frsize : (uint64_t)vfs.f_bsize;
+        if (frsize == 0 || vfs.f_blocks == 0)
+            return disk;
+        disk.total_bytes = (uint64_t)vfs.f_blocks * frsize;
+        uint64_t free_bytes = (uint64_t)vfs.f_bavail * frsize;
+        disk.used_bytes = (free_bytes <= disk.total_bytes) ? (disk.total_bytes - free_bytes) : 0;
+        disk.valid = true;
+        disk.mount = "/"; // 页面统一标记为"系统盘 /"，避免误读容器 overlay 容量
+        return disk;
+    }
+
+    // 把一次采样窗口的整机数据填充进 protobuf HostStats
+    static void fill_host_stats(common::HostStats &out,
+                                const HostCpuSample &before,
+                                const HostCpuSample &after,
+                                const std::string &diskMountPath)
+    {
+        out.set_cpu_available(before.valid && after.valid);
+        if (out.cpu_available())
+            out.set_cpu_percent(compute_host_cpu_percent(before, after));
+
+        HostMemInfo mem = read_host_meminfo();
+        out.set_memory_available(mem.valid);
+        if (mem.valid)
+        {
+            out.set_memory_total_bytes(mem.total_bytes);
+            out.set_memory_used_bytes(mem.total_bytes - std::min(mem.available_bytes, mem.total_bytes));
+            out.set_memory_percent(mem.total_bytes > 0
+                                       ? (double)out.memory_used_bytes() / (double)mem.total_bytes * 100.0
+                                       : 0.0);
+        }
+
+        HostDiskInfo disk = read_host_disk(diskMountPath);
+        out.set_disk_available(disk.valid);
+        if (disk.valid)
+        {
+            out.set_disk_total_bytes(disk.total_bytes);
+            out.set_disk_used_bytes(disk.used_bytes);
+            out.set_disk_percent(disk.total_bytes > 0
+                                     ? (double)disk.used_bytes / (double)disk.total_bytes * 100.0
+                                     : 0.0);
+            out.set_disk_mount(disk.mount);
+        }
+
+        out.set_collected_at_unix_ms(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
     }
 
     std::vector<common::PidStats> collect_children_pidstats()

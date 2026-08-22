@@ -9,6 +9,7 @@ import TimelineChart, { statusColor } from '../components/TimelineChart';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { formatMetricValue, metricColumnLabel } from '../utils/profileMetrics';
 import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
+import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
 
 const S = {
     container: { width: '100%', maxWidth: 1320, minWidth: 0, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
@@ -17,16 +18,29 @@ const S = {
     title: { margin: 0, fontSize: 28, lineHeight: 1.2, letterSpacing: 0 },
     actions: { display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' },
     card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 20, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
-    contextDetails: { background: '#fff', border: '1px solid #eaecf0', borderRadius: 8, marginBottom: 14 },
-    contextSummary: { cursor: 'pointer', padding: '12px 14px', display: 'flex', justifyContent: 'space-between', gap: 14, alignItems: 'center', color: '#667085', fontSize: 13, listStyle: 'none' },
-    contextSummaryMain: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 },
-    contextSummaryTitle: { color: '#111827', fontSize: 14, fontWeight: 700 },
-    contextSummaryText: { color: '#475467', fontSize: 13, lineHeight: 1.4 },
     contextGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: '14px 28px', padding: '14px', borderTop: '1px solid #f2f4f7' },
     contextItem: { minWidth: 0 },
     contextItemWide: { gridColumn: '1 / -1' },
     contextLabel: { color: '#667085', fontSize: 12, marginBottom: 5 },
     contextValue: { color: '#111827', fontSize: 14, fontWeight: 650, wordBreak: 'break-word', lineHeight: 1.45 },
+    // 主机上下文常显摘要卡 + 整机资源块
+    contextCard: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: '16px 18px', marginBottom: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
+    contextHeader: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' },
+    contextHeaderTitle: { color: '#111827', fontSize: 15, fontWeight: 700, marginBottom: 8 },
+    contextHeaderMeta: { display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', color: '#475467', fontSize: 13 },
+    contextMetaItem: { display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0 },
+    contextLiveInfo: { display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-end', color: '#667085', fontSize: 12, whiteSpace: 'nowrap' },
+    hostResourceGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 12, marginTop: 14 },
+    hostResource: { background: '#fbfcfe', border: '1px solid #edf0f3', borderRadius: 6, padding: '12px 14px', minWidth: 0 },
+    hostResourceHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10, marginBottom: 8 },
+    hostResourceTitle: { color: '#475467', fontSize: 12, fontWeight: 700 },
+    hostResourcePct: { color: '#111827', fontSize: 20, fontWeight: 700, fontVariantNumeric: 'tabular-nums' },
+    hostBarTrack: { height: 6, background: '#eef2f7', borderRadius: 999, overflow: 'hidden' },
+    hostBar: { height: '100%', borderRadius: 999, transition: 'width 0.4s ease' },
+    hostResourceValue: { marginTop: 6, color: '#667085', fontSize: 12, wordBreak: 'break-all' },
+    hostMissingNote: { marginTop: 12, color: '#667085', fontSize: 12, background: '#f8fafc', border: '1px dashed #d0d7de', borderRadius: 6, padding: '8px 12px' },
+    contextFooter: { display: 'flex', justifyContent: 'flex-end', marginTop: 12, borderTop: '1px solid #f2f4f7', paddingTop: 10 },
+    contextToggle: { background: '#f8fafc', color: '#315efb', border: '1px solid #d0d7de', padding: '5px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700 },
     tabBar: { display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 16, borderBottom: '1px solid #e5e7eb' },
     tab: (active) => ({ padding: '10px 0 11px', borderRadius: 0, border: 'none', borderBottom: active ? '2px solid #315efb' : '2px solid transparent', background: 'transparent', color: active ? '#315efb' : '#667085', cursor: 'pointer', fontSize: 14, fontWeight: 700 }),
     grid: { display: 'grid', gridTemplateColumns: 'minmax(280px, 0.8fr) minmax(420px, 1.2fr)', gap: 16, minWidth: 0, maxWidth: '100%' },
@@ -221,7 +235,7 @@ export default function HostDetailPage() {
                 </div>
             </div>
 
-            <HostContext target={target} activeTab={activeTab} />
+            <HostContext target={target} activeTab={activeTab} agent={agent} stat={stat} capabilities={capabilities} />
             {!dropOnline && <DropAgentNotice target={target} activeTab={activeTab} />}
 
             <div className="performance-tabs" style={S.tabBar}>
@@ -277,34 +291,111 @@ export default function HostDetailPage() {
     );
 }
 
-function HostContext({ target, activeTab }) {
-    const profileText = statusLabel(String(target.profile_status || 'unknown'), 'profile');
-    const summary = [
-        target.hostname || target.ip || '-',
-        target.ip || '-',
-        target.service_name || '-',
-        `Native profiling ${profileText}`,
-    ].join(' · ');
+function HostContext({ target, activeTab, agent, stat, capabilities }) {
+    const [expanded, setExpanded] = useState(false);
+    const host = stat?.host || null;
+    const online = agent?.online === true || target?.drop_agent_status === 'online';
+    const sourceLabel = stat?.source === 'grpc' ? '实时 gRPC' : '数据库快照';
+    const collectedAt = host ? formatCollectedAt(host.collected_at) : '--';
+
+    // 每个维度独立降级：后端 *_available=false 时该维度显示 "--"，
+    // 不因某一个维度失败而让整个区域消失。
+    const cpuAvailable = hostMetricAvailable(host, 'cpu');
+    const memAvailable = hostMetricAvailable(host, 'memory');
+    const diskAvailable = hostMetricAvailable(host, 'disk');
+
+    // host 整体缺失：区分"Agent 离线"与"当前 Agent 版本暂不支持"
+    const missingReason = host
+        ? null
+        : (online
+            ? '当前 Agent 版本暂不支持整机资源上报，升级 drop_agent 后即可查看 CPU / 内存 / 系统盘。'
+            : 'Agent 离线，暂无整机资源。');
+
+    const capabilitySummary = capabilities?.length
+        ? capabilities.map(cap => capabilityLabel(cap)).join('、')
+        : '未声明采集能力';
+
     return (
-        <details style={S.contextDetails}>
-            <summary style={S.contextSummary}>
-                <span style={S.contextSummaryMain}>
-                    <span style={S.contextSummaryTitle}>主机上下文</span>
-                    <span style={S.contextSummaryText}>{summary}</span>
-                </span>
-                <span style={S.subtle}>详情</span>
-            </summary>
-            <div style={S.contextGrid}>
-                <ContextItem label="host" value={target.hostname || '-'} />
-                <ContextItem label="ip" value={target.ip || '-'} />
-                <ContextItem label="service" value={target.service_name || '-'} />
-                <ContextItem label="environment" value={target.environment || '-'} />
-                <ContextItem label="按需采样 drop_agent" value={<StatusPill value={target.drop_agent_status} kind="drop" />} />
-                <ContextItem label="Native Continuous Profiling" value={<StatusPill value={target.profile_status} kind="profile" />} />
-                <ContextItem label="time range" value={activeTab === 'profiling' ? 'Tab 内选择' : '当前主机上下文'} />
-                <ContextItem label="labels" value={labelSummary(target.labels)} wide />
+        <section style={S.contextCard}>
+            <div style={S.contextHeader}>
+                <div style={{ minWidth: 0 }}>
+                    <div style={S.contextHeaderTitle}>主机上下文</div>
+                    <div style={S.contextHeaderMeta}>
+                        <span style={S.contextMetaItem} title="主机名">{target.hostname || target.ip || '-'}</span>
+                        <span style={S.contextMetaItem} title="IP">{target.ip || '-'}</span>
+                        <span style={S.contextMetaItem} title="环境">{target.environment || 'environment'}</span>
+                        <span style={S.contextMetaItem} title="按需采样 drop_agent 状态">drop_agent <StatusPill value={target.drop_agent_status} kind="drop" /></span>
+                        <span style={S.contextMetaItem} title="Native Continuous Profiling 状态">Native Profiling <StatusPill value={target.profile_status} kind="profile" /></span>
+                    </div>
+                </div>
+                <div style={S.contextLiveInfo}>
+                    <span>实时数据 · 10 秒刷新</span>
+                    <span>最近采集 {collectedAt}</span>
+                </div>
             </div>
-        </details>
+
+            {/* 整机资源块：无数据时保留稳定布局，数值显示 "--" */}
+            <div style={S.hostResourceGrid}>
+                <HostResourceBlock
+                    title="CPU"
+                    percent={host?.cpu_percent}
+                    available={cpuAvailable}
+                    detail={cpuAvailable ? '整机 CPU 使用率' : null}
+                />
+                <HostResourceBlock
+                    title="内存"
+                    percent={host?.memory_percent}
+                    available={memAvailable}
+                    detail={memAvailable ? `已用 ${formatCapacity(host.memory_used_bytes)} / 总量 ${formatCapacity(host.memory_total_bytes)}` : null}
+                />
+                <HostResourceBlock
+                    title="系统盘 /"
+                    percent={host?.disk_percent}
+                    available={diskAvailable}
+                    detail={diskAvailable ? `已用 ${formatCapacity(host.disk_used_bytes)} / 总量 ${formatCapacity(host.disk_total_bytes)}` : null}
+                />
+            </div>
+
+            {missingReason && <div style={S.hostMissingNote}>{missingReason}</div>}
+
+            <div style={S.contextFooter}>
+                <button style={S.contextToggle} onClick={() => setExpanded(prev => !prev)}>
+                    {expanded ? '收起主机详情' : '展开主机详情'}
+                </button>
+            </div>
+
+            {expanded && (
+                <div style={S.contextGrid}>
+                    <ContextItem label="服务" value={target.service_name || '-'} />
+                    <ContextItem label="环境" value={target.environment || '-'} />
+                    <ContextItem label="按需采样 drop_agent" value={<StatusPill value={target.drop_agent_status} kind="drop" />} />
+                    <ContextItem label="Native Continuous Profiling" value={<StatusPill value={target.profile_status} kind="profile" />} />
+                    <ContextItem label="采集能力" value={capabilitySummary} wide />
+                    <ContextItem label="标签" value={labelSummary(target.labels)} wide />
+                    <ContextItem label="时间范围" value={activeTab === 'profiling' ? 'Tab 内选择' : '当前主机上下文'} />
+                    <ContextItem label="数据来源" value={sourceLabel} />
+                </div>
+            )}
+        </section>
+    );
+}
+
+// 单个整机资源块（CPU / 内存 / 系统盘）。细进度条颜色按使用率：
+// <70% 品牌蓝，70-89% 警告橙，>=90% 危险红。
+function HostResourceBlock({ title, percent, available, detail }) {
+    const pct = clampPercent(percent);
+    const color = usageColor(pct);
+    return (
+        <div style={S.hostResource}>
+            <div style={S.hostResourceHead}>
+                <span style={S.hostResourceTitle}>{title}</span>
+                <span style={S.hostResourcePct}>{available ? `${formatMetric(pct, 1)}%` : '--'}</span>
+            </div>
+            <div style={S.hostBarTrack}>
+                {available ? <div style={{ ...S.hostBar, width: `${pct}%`, background: color }} /> : null}
+            </div>
+            <div style={S.hostResourceValue}>{available && detail ? detail : '--'}</div>
+        </div>
     );
 }
 
@@ -338,8 +429,8 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                 <div style={S.metricGrid}>
                     <Metric label="Agent 在线" value={agent.online ? 'ONLINE' : target.drop_agent_status || 'unknown'} />
                     <Metric label="资源数据源" value={stat.source === 'grpc' ? '实时 gRPC' : '数据库快照'} />
-                    <Metric label="CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
-                    <Metric label="内存" value={formatMemory(stat.memory_kb)} />
+                    <Metric label="Agent CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
+                    <Metric label="Agent 内存" value={formatMemory(stat.memory_kb)} />
                     <Metric label="深度采样窗口" value={scheduleItems.length} />
                     <Metric label="Native profiling" value={profilingMsg} />
                 </div>

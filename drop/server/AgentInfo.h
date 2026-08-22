@@ -9,7 +9,7 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
-#include "common/proto/common.pb.h" // common::PidStats
+#include "common/proto/common.pb.h" // common::PidStats, common::HostStats
 
 namespace drop_server
 {
@@ -30,6 +30,10 @@ namespace drop_server
         int64_t lastSeenUnixMs = 0;
         common::PidStats lastSelfPstats;
         std::vector<common::PidStats> lastChildrenPstats;
+        // 整机资源：hasHostStats 区分"旧 Agent 未上报"（false）与
+        // "已上报但部分指标不可用"（true，靠各 *_available 标志降级）
+        common::HostStats lastHostStats;
+        bool hasHostStats = false;
         std::vector<common::AttemptStatus> runningAttempts;
         std::vector<common::AttemptStatus> completedAttempts;
     };

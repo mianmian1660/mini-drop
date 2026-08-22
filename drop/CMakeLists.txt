@@ -199,7 +199,10 @@ target_link_libraries(drop_server
 # 才会碰到它——测试代码的任何问题都不会拖累主构建/部署。
 find_package(GTest)
 if(GTest_FOUND)
-    add_executable(drop_tests EXCLUDE_FROM_ALL
+    # CoreEbpfCollector 的测试只在本机具备 libbpf（NATIVE_CP_CORE_ENABLED）时
+    # 才有意义——没有 libbpf 的机器（如本机 macOS 开发环境）上它的方法/系统
+    # 调用是空壳，无法编译该测试文件。用变量承载源码列表，按能力条件追加。
+    set(DROP_TEST_SOURCES
         tests/test_task_queue.cpp
         tests/test_process_executor.cpp
         tests/test_runners.cpp
@@ -213,7 +216,7 @@ if(GTest_FOUND)
         tests/test_go_symbolizer.cpp
         tests/test_continuous_sampler.cpp
 		tests/test_continuous_session_manager.cpp
-        tests/test_core_ebpf_collector.cpp
+        tests/test_process.cpp
         server/TaskQueue.cpp
         common/ProcessExecutor.cpp
         common/Process.cpp
@@ -238,6 +241,10 @@ if(GTest_FOUND)
         agent/runners/BpfRunner.cpp
         ${PROTO_SRCS}
     )
+    if(NATIVE_CP_CORE_ENABLED)
+        list(APPEND DROP_TEST_SOURCES tests/test_core_ebpf_collector.cpp)
+    endif()
+    add_executable(drop_tests EXCLUDE_FROM_ALL ${DROP_TEST_SOURCES})
     target_include_directories(drop_tests PRIVATE
         ${PROTO_GEN_DIR}
         ${CMAKE_SOURCE_DIR}

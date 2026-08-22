@@ -51,6 +51,12 @@ namespace drop_server
             {
                 info.lastSelfPstats.CopyFrom(request->selfpstats());
             }
+            // 整机资源（可选字段）：旧 Agent 不携带时保持 hasHostStats=false
+            if (request->has_host_stats())
+            {
+                info.lastHostStats.CopyFrom(request->host_stats());
+                info.hasHostStats = true;
+            }
             info.lastChildrenPstats.clear();
             if (request->has_childrenpstats())
             {
@@ -78,6 +84,13 @@ namespace drop_server
         {
             cout << " CPU=" << request->selfpstats().cpupercent() << "%"
                  << " RSS=" << request->selfpstats().rsskb() << "KB";
+        }
+        if (request->has_host_stats())
+        {
+            const auto &h = request->host_stats();
+            cout << " 整机CPU=" << (h.cpu_available() ? h.cpu_percent() : -1.0) << "%"
+                 << " 内存=" << (h.memory_available() ? h.memory_percent() : -1.0) << "%"
+                 << " 磁盘=" << (h.disk_available() ? h.disk_percent() : -1.0) << "%";
         }
         cout << endl;
 
