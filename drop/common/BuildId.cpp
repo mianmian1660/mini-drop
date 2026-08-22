@@ -11,6 +11,9 @@
 #include <map>
 #include <sstream>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <thread>
 
 using namespace std;
 
@@ -115,8 +118,14 @@ namespace drop
             return false;
 
         // 先写临时文件再 rename，避免和"同一 build-id 并发预热两次"
-        // 竞态时读到写了一半的文件（rename 是原子操作）。
-        string tmp = dest + ".tmp";
+        // 竞态时读到写了一半的文件（rename 是原子操作）。临时文件名必须
+        // 带上 pid+线程 id：同一进程内两个线程（比如 PerfEventSampler 和
+        // DualTrackContinuousSampler）同时预热同一个 build-id 时，如果
+        // 共用固定的 "<dest>.tmp"，会并发写同一个临时文件——rename 的
+        // 原子性保护不了这一步，写坏的内容仍可能被 rename 进最终缓存。
+        std::ostringstream tmpSuffix;
+        tmpSuffix << ".tmp." << ::getpid() << "." << std::this_thread::get_id();
+        string tmp = dest + tmpSuffix.str();
         {
             ofstream out(tmp, ios::binary);
             if (!out.is_open())
