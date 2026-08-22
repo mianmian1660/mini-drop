@@ -24,6 +24,13 @@ export default function ProfilesPage() {
 
     const selectedTarget = useMemo(() => targets.find(t => t.id === targetId) || null, [targets, targetId]);
     const hasExplicitTarget = Boolean(searchParams.get('target_id'));
+    const initialQuery = useMemo(() => ({
+        from: searchParams.get('from') || '',
+        to: searchParams.get('to') || '',
+        profileType: searchParams.get('profile_type') || 'cpu',
+        stackScope: searchParams.get('stack_scope') || 'all',
+        filters: parseFilters(searchParams.get('filters')),
+    }), [searchParams]);
 
     const loadTargets = useCallback(async () => {
         setLoading(true);
@@ -95,8 +102,19 @@ export default function ProfilesPage() {
                         targetId={targetId}
                         onTargetChange={changeTarget}
                         showTargetSelect
+                        initialQuery={initialQuery}
                     />
             )}
         </div>
     );
+}
+
+function parseFilters(value) {
+    if (!value) return {};
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (error) {
+        return {};
+    }
 }

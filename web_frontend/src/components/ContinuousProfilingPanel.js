@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { continuous, profiles } from '../api';
 import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
 import { localDateTimeToISO } from '../utils/time';
@@ -20,7 +20,7 @@ const S = {
     subtitle: { margin: '5px 0 0', color: '#667085', fontSize: 13 },
     actions: { display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' },
     controls: { display: 'flex', gap: 12, alignItems: 'end', flexWrap: 'wrap' },
-    customRange: { display: 'flex', gap: 10, alignItems: 'end', flexWrap: 'wrap', marginTop: 10, paddingTop: 10, borderTop: '1px solid #eef2f6' },
+    customRange: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 12, alignItems: 'end', marginTop: 10, paddingTop: 10, borderTop: '1px solid #eef2f6' },
     field: { minWidth: 180, flex: '1 1 180px' },
     fieldWide: { minWidth: 260, flex: '2 1 300px' },
     label: { display: 'block', color: '#475467', fontSize: 12, fontWeight: 700, marginBottom: 6 },
@@ -41,6 +41,7 @@ const S = {
     metaItem: { display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid #eaecf0', background: '#fff', color: '#344054', borderRadius: 999, padding: '5px 9px', fontSize: 12, fontWeight: 700 },
     metaItemWarn: { borderColor: '#fda29b', background: '#fff6f5', color: '#b42318' },
     metaKey: { color: '#667085', fontWeight: 700 },
+    compactDetails: { marginTop: 12, borderTop: '1px solid #eef2f6', paddingTop: 10 },
     chipWrap: { display: 'flex', flexWrap: 'wrap', gap: 8 },
     chip: { display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid #eaecf0', background: '#fff', color: '#344054', borderRadius: 999, padding: '4px 8px', fontSize: 12, fontWeight: 700 },
     chipKey: { color: '#667085', fontWeight: 700 },
@@ -53,18 +54,55 @@ const S = {
     warn: { color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '9px 12px', fontSize: 13 },
     info: { color: '#475467', background: '#fff', border: '1px solid #eaecf0', borderRadius: 6, padding: '8px 10px', fontSize: 12, lineHeight: 1.55 },
     coverage: { marginTop: 14, borderTop: '1px solid #eaecf0', paddingTop: 12 },
+    coverageWrap: { position: 'relative' },
     coverageBar: { display: 'flex', width: '100%', height: 14, overflow: 'hidden', borderRadius: 4, background: '#f2f4f7', border: '1px solid #d0d5dd' },
-    coverageOK: { height: '100%', background: '#12b76a' },
-    coverageGap: { height: '100%', background: '#d92d20', minWidth: 2 },
+    coverageOK: { height: '100%', background: '#12b76a', cursor: 'default' },
+    coverageGap: { height: '100%', background: '#d92d20', minWidth: 2, cursor: 'default' },
+    coverageTooltip: { position: 'absolute', top: 22, zIndex: 5, minWidth: 220, maxWidth: 320, padding: 10, color: '#344054', background: '#fff', border: '1px solid #d0d5dd', borderRadius: 6, boxShadow: '0 8px 20px rgba(16,24,40,.12)', fontSize: 12, lineHeight: 1.45, pointerEvents: 'none' },
+    coverageTooltipTitle: { color: '#111827', fontWeight: 700, marginBottom: 5 },
+    coverageAlert: { marginTop: 12, borderRadius: 6, border: '1px solid #fedf89', background: '#fffaeb', padding: '10px 12px', color: '#92400e', fontSize: 13, lineHeight: 1.5 },
+    coverageAlertWarn: { borderColor: '#fecd6f', background: '#fff7e6' },
+    coverageAlertTitle: { fontWeight: 700, marginBottom: 4 },
     gapList: { display: 'grid', gap: 5, marginTop: 8, color: '#b42318', fontSize: 12 },
+    timeSlider: { minWidth: 0, display: 'grid', gap: 10 },
+    sliderFrame: { border: '1px solid #eaecf0', borderRadius: 8, background: '#fbfcfe', padding: 12 },
+    sliderTrack: { position: 'relative', height: 34, margin: '10px 8px 4px', touchAction: 'none' },
+    sliderBase: { position: 'absolute', left: 0, right: 0, top: 15, height: 4, borderRadius: 999, background: '#d0d5dd' },
+    sliderSelection: { position: 'absolute', top: 12, height: 10, borderRadius: 999, background: '#315efb', cursor: 'grab' },
+    sliderWindowA: { position: 'absolute', top: 12, height: 10, borderRadius: '999px 0 0 999px', background: '#667085', cursor: 'grab' },
+    sliderWindowB: { position: 'absolute', top: 12, height: 10, borderRadius: '0 999px 999px 0', background: '#315efb', cursor: 'grab' },
+    sliderSplit: { position: 'absolute', top: 9, width: 2, height: 16, background: '#fff', borderRadius: 2, transform: 'translateX(-1px)', zIndex: 2 },
+    sliderThumb: { position: 'absolute', top: 5, width: 22, height: 22, borderRadius: '50%', background: '#fff', border: '2px solid #315efb', boxShadow: '0 1px 4px rgba(16,24,40,.18)', transform: 'translateX(-50%)', cursor: 'ew-resize', zIndex: 3 },
+    sliderThumbMuted: { borderColor: '#667085' },
+    sliderMeta: { display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', color: '#667085', fontSize: 12 },
+    sliderInputs: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(min(210px,100%),1fr))', gap: 10, marginTop: 10 },
+    diffWindows: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(min(260px,100%),1fr))', gap: 10, marginTop: 10 },
     tableWrap: { width: '100%', minWidth: 0, maxWidth: '100%', overflowX: 'auto', overflowY: 'hidden' },
     table: { width: '100%', borderCollapse: 'collapse' },
     th: { textAlign: 'left', padding: '9px 10px', borderBottom: '1px solid #eaecf0', color: '#475467', fontSize: 12, background: '#fff' },
     td: { padding: '8px 10px', borderBottom: '1px solid #f2f4f7', fontSize: 13, verticalAlign: 'top', lineHeight: 1.45 },
+    tdMuted: { color: '#667085', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
+    tdNowrap: { whiteSpace: 'nowrap' },
+    histogramBucketCell: { minWidth: 150, whiteSpace: 'nowrap', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', color: '#344054' },
+    histogramBarCell: { minWidth: 220 },
+    histogramCountCell: { width: 140, whiteSpace: 'nowrap', color: '#344054', fontWeight: 700 },
+    barWithLabel: { display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) 56px', gap: 10, alignItems: 'center', minWidth: 0 },
+    barTrack: { height: 10, minWidth: 120, borderRadius: 999, background: '#f2f4f7', border: '1px solid #eaecf0', overflow: 'hidden' },
+    bar: { height: '100%', borderRadius: 999, minWidth: 2 },
+    barPercent: { color: '#667085', fontSize: 12, textAlign: 'right', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' },
     details: { width: '100%', minWidth: 0, maxWidth: '100%', borderTop: '1px solid #eaecf0', padding: '10px 0 0', background: '#fff' },
     detailsSummary: { cursor: 'pointer', color: '#475467', fontSize: 13, fontWeight: 700 },
+    diagnosticToolbar: { display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', margin: '10px 0 8px' },
+    diagnosticCopy: { background: '#fff', color: '#315efb', border: '1px solid #c7d2fe', borderRadius: 6, padding: '6px 10px', cursor: 'pointer', fontSize: 12, fontWeight: 700 },
     mono: { width: '100%', minWidth: 0, maxWidth: '100%', margin: '10px 0 0', padding: 10, background: '#111827', color: '#e5e7eb', borderRadius: 6, overflowX: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 12, lineHeight: 1.5 },
 };
+
+const SIGNAL_TAB_OPTIONS = [
+    { tab: 'cpu', signal: 'cpu_profile', label: 'CPU' },
+    { tab: 'io', signal: 'io_latency', label: '块 IO' },
+    { tab: 'io_syscall', signal: 'io_syscall_latency', label: '系统调用 IO' },
+    { tab: 'sched', signal: 'sched_latency', label: '调度延迟' },
+];
 
 const RANGE_OPTIONS = [
     ['15m', '最近 15 分钟', 15],
@@ -75,15 +113,20 @@ const RANGE_OPTIONS = [
     ['24h', '最近 24 小时', 1440],
 ];
 
-export default function ContinuousProfilingPanel({ target, targets = [], targetId = '', onTargetChange, showTargetSelect = false, fixedSession = null }) {
-    const [range, setRange] = useState('30m');
-    const [timeWindow, setTimeWindow] = useState(() => makeTimeWindow('30m'));
-    const [customFrom, setCustomFrom] = useState('');
-    const [customTo, setCustomTo] = useState('');
+export default function ContinuousProfilingPanel({ target, targets = [], targetId = '', onTargetChange, showTargetSelect = false, fixedSession = null, initialQuery = null }) {
+    const initialWindow = initialQuery?.from && initialQuery?.to
+        ? { from: initialQuery.from, to: initialQuery.to }
+        : null;
+    const initialFilters = initialQuery?.filters || {};
+    const [range, setRange] = useState(() => initialWindow ? 'custom' : '30m');
+    const [timeWindow, setTimeWindow] = useState(() => initialWindow || makeTimeWindow('30m'));
+    const [customFrom, setCustomFrom] = useState(() => initialWindow ? toLocalDateTimeInput(initialWindow.from) : '');
+    const [customTo, setCustomTo] = useState(() => initialWindow ? toLocalDateTimeInput(initialWindow.to) : '');
+    const [customAnchorNow, setCustomAnchorNow] = useState(() => new Date().toISOString());
     const [appliedCustomWindow, setAppliedCustomWindow] = useState(null);
-    const [profileType, setProfileType] = useState('cpu');
+    const [profileType, setProfileType] = useState(() => initialQuery?.profileType || 'cpu');
     const [signalTab, setSignalTab] = useState('cpu');
-    const [stackScope, setStackScope] = useState('all');
+    const [stackScope, setStackScope] = useState(() => initialQuery?.stackScope || 'all');
     const [flamegraph, setFlamegraph] = useState(null);
     const [topn, setTopn] = useState(null);
     const [histogram, setHistogram] = useState(null);
@@ -93,14 +136,14 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [reliability, setReliability] = useState(null);
     const [resetKey, setResetKey] = useState(0);
     const [scope, setScope] = useState('host');
-    const [selectedComm, setSelectedComm] = useState('');
+    const [selectedComm, setSelectedComm] = useState(() => String(initialFilters.comm || ''));
 	const [selectedInstance, setSelectedInstance] = useState('');
 	const [historicalInstanceValues, setHistoricalInstanceValues] = useState([]);
     const [commValues, setCommValues] = useState([]);
     const [commAvailable, setCommAvailable] = useState(false);
     const [commMessage, setCommMessage] = useState('');
     const [commLoading, setCommLoading] = useState(false);
-    const [selectedRuntime, setSelectedRuntime] = useState('');
+    const [selectedRuntime, setSelectedRuntime] = useState(() => String(initialFilters.runtime || ''));
     const [runtimeValues, setRuntimeValues] = useState([]);
     const [rssSeries, setRssSeries] = useState([]);
     const [maxNodes, setMaxNodes] = useState(5000);
@@ -110,7 +153,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [searchStats, setSearchStats] = useState({ matches: 0, samplePercent: 0 });
     // diff selector state (baseline vs compare)
     const [diffOpen, setDiffOpen] = useState(false);
-    const [diffMode, setDiffMode] = useState('quick');
     const [diffRange, setDiffRange] = useState('15m');
     const [diffBaseFrom, setDiffBaseFrom] = useState('');
     const [diffBaseTo, setDiffBaseTo] = useState('');
@@ -132,21 +174,37 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     // Memory tab: recent Go pprof heap tasks
     const [heapTasks, setHeapTasks] = useState([]);
     const [heapTasksLoading, setHeapTasksLoading] = useState(false);
-    const profileURL = flamegraph?.profile_url || topn?.profile_url || target?.profile_url;
+    const [symbolCheck, setSymbolCheck] = useState(null);
+    const [symbolChecking, setSymbolChecking] = useState(false);
+    const [symbolCheckError, setSymbolCheckError] = useState('');
+    const querySequence = useRef(0);
+    const targetKey = target?.id || '';
+    const targetHost = target?.ip || '';
+    const targetService = target?.service_name || 'hotmethod';
+    const targetTitle = target?.hostname || target?.ip || '';
+    const targetProfileURL = target?.profile_url || '';
+    const profileURL = flamegraph?.profile_url || topn?.profile_url || targetProfileURL;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
 	const sampleState = sampleStateForTarget(target, flamegraph, topn, fixedSession);
 	const sessionMeta = continuousSessionMeta(target, fixedSession);
     const sessionSID = sessionMeta.sid;
+    const signalKey = (sessionMeta.signals || []).join('|');
+    const availableSignalTabs = useMemo(() => signalTabsForSession(signalKey), [signalKey]);
 	const taskScope = fixedSession?.scope === 'process' ? 'process' : 'host';
 	const activeProcesses = useMemo(() => decodeJSONField(fixedSession?.active_processes, []), [fixedSession?.active_processes]);
 	const processInstances = useMemo(
-		() => processInstanceOptions(activeProcesses, historicalInstanceValues),
+		() => sampledProcessInstanceOptions(activeProcesses, historicalInstanceValues),
 		[activeProcesses, historicalInstanceValues],
 	);
+    const activeProcessCount = activeProcesses.length;
     const rangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours), [sessionMeta.retentionHours]);
     const diffRangeOptions = useMemo(() => rangeOptionsForRetention(sessionMeta.retentionHours, true), [sessionMeta.retentionHours]);
     const uploadState = uploadFreshness(sessionMeta);
     const unit = flamegraph?.unit || topn?.unit || '';
+    const profileData = flamegraph || topn;
+    const sampleNotice = lowSampleGuidance(profileData, sessionMeta, querying);
+    const symbolStatus = flamegraph?.symbol_status || topn?.symbol_status || '';
+    const symbolNeedsCheck = symbolStatus === 'partial' || symbolStatus === 'missing';
 	const activeFilters = useMemo(() => ({
 		...(taskScope === 'process' && fixedSession?.selector_exe ? { exe: fixedSession.selector_exe } : {}),
 		...(taskScope === 'process' && selectedInstance ? instanceFilters(selectedInstance) : {}),
@@ -155,14 +213,22 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 	}), [taskScope, fixedSession?.selector_exe, selectedInstance, scope, selectedComm, selectedRuntime]);
     const activeFilterText = Object.entries(activeFilters).map(([key, value]) => `${key}=${value}`).join(', ');
     const stackScopeLabel = stackScope === 'user' ? '用户栈' : stackScope === 'kernel' ? '内核栈' : '混合栈';
-	const scopeLabel = taskScope === 'process'
+    const scopeLabel = taskScope === 'process'
 		? `进程持续采集 / ${fixedSession?.selector_exe || '-'} / ${selectedInstance ? '单实例' : '全部实例'} / ${stackScopeLabel}`
 		: activeFilters.comm ? `整机任务查询过滤 / ${activeFilterText} / ${stackScopeLabel}` : `整机持续采集 / ${stackScopeLabel}`;
+    const activeFiltersKey = useMemo(() => JSON.stringify(activeFilters), [activeFilters]);
+    const coverageAlert = useMemo(() => coverageAlertForReliability(reliability), [reliability]);
 
     useEffect(() => {
         const timer = setTimeout(() => setFlameSearchText(flameSearchInput.trim()), 250);
         return () => clearTimeout(timer);
     }, [flameSearchInput]);
+
+    useEffect(() => {
+        if (!availableSignalTabs.some(option => option.tab === signalTab)) {
+            setSignalTab('cpu');
+        }
+    }, [availableSignalTabs, signalTab]);
 
     useEffect(() => {
         if (range !== 'custom' && !rangeOptions.some(([value]) => value === range)) {
@@ -176,29 +242,48 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     }, [diffRange, diffRangeOptions, range, rangeOptions]);
 
     const queryProfiles = useCallback(async (queryWindow) => {
-        if (!target) return;
+        if (!targetKey || !targetHost) return;
+        const requestID = ++querySequence.current;
         setQuerying(true);
         setError('');
+        setReliability(null);
+        setSymbolCheck(null);
+        setSymbolCheckError('');
+        if (signalTab === 'cpu') {
+            setFlamegraph(null);
+            setTopn(null);
+            setHistogram(null);
+            setRssSeries([]);
+        } else {
+            setFlamegraph(null);
+            setTopn(null);
+            setHistogram(null);
+            setRssSeries([]);
+        }
+        const parsedFilters = activeFiltersKey ? JSON.parse(activeFiltersKey) : {};
 		const params = {
 			session_sid: sessionSID,
-            target_id: target.id,
-            host: target.ip,
-            service: target.service_name || 'hotmethod',
+            target_id: targetKey,
+            host: targetHost,
+            service: targetService,
             from: queryWindow.from,
             to: queryWindow.to,
             profile_type: profileType,
             max_nodes: maxNodes,
         };
-			if (signalTab === 'cpu' && Object.keys(activeFilters).length > 0) {
-                params.filters = JSON.stringify(activeFilters);
+			if (signalTab === 'cpu' && Object.keys(parsedFilters).length > 0) {
+                params.filters = activeFiltersKey;
             }
         try {
             const timelinePromise = sessionSID
                 ? continuous.timeline(sessionSID, { from: queryWindow.from, to: queryWindow.to }).catch(() => null)
                 : Promise.resolve(null);
+            timelinePromise.then(timelineRes => {
+                if (requestID === querySequence.current) {
+                    setReliability(timelineRes?.code === 0 ? timelineRes.data : null);
+                }
+            });
             if (signalTab === 'cpu') {
-                setHistogram(null);
-                setDbSnapshot(null);
                 const cpuParams = { ...params };
                 if (stackScope !== 'all') cpuParams.stack_scope = stackScope;
                 const requests = [
@@ -206,9 +291,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     profiles.topn(cpuParams),
                 ];
                 if (profileType === 'memory') requests.push(profiles.timeseries({ ...cpuParams, metric: 'rss_bytes' }));
-                const [profileResults, timelineRes] = await Promise.all([Promise.all(requests), timelinePromise]);
+                const profileResults = await Promise.all(requests);
+                if (requestID !== querySequence.current) return;
                 const [fgRes, topRes, rssRes] = profileResults;
-                setReliability(timelineRes?.code === 0 ? timelineRes.data : null);
                 if (fgRes.code === 0) setFlamegraph(fgRes.data);
                 if (topRes.code === 0) setTopn(topRes.data);
                 if (profileType === 'memory') setRssSeries(rssRes?.code === 0 ? (rssRes.data?.series || []) : []);
@@ -229,21 +314,16 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     setError(dbRes.message || '数据库快照查询失败');
                 }
             } else {
-                setFlamegraph(null);
-                setTopn(null);
-                setDbSnapshot(null);
 				const signalType = signalTab === 'io' ? 'io_latency' : signalTab === 'io_syscall' ? 'io_syscall_latency' : 'sched_latency';
-                const [histRes, timelineRes] = await Promise.all([
-                    continuous.histogram({ ...params, signal_type: signalType }),
-                    timelinePromise,
-                ]);
-                setReliability(timelineRes?.code === 0 ? timelineRes.data : null);
+                const histRes = await continuous.histogram({ ...params, signal_type: signalType });
+                if (requestID !== querySequence.current) return;
                 if (histRes.code === 0) setHistogram(histRes.data);
                 if (histRes.code !== 0) {
                     setError(histRes.message || 'Native Continuous eBPF histogram 查询失败');
                 }
             }
         } catch (err) {
+            if (requestID !== querySequence.current) return;
             setFlamegraph(null);
             setTopn(null);
             setHistogram(null);
@@ -252,9 +332,24 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setReliability(null);
             setError(err?.message || 'Native Continuous Profiling 查询失败');
         } finally {
-            setQuerying(false);
+            if (requestID === querySequence.current) setQuerying(false);
         }
-    }, [target, profileType, activeFilters, signalTab, stackScope, maxNodes, sessionSID]);
+    }, [targetKey, targetHost, targetService, profileType, activeFiltersKey, signalTab, stackScope, maxNodes, sessionSID]);
+
+    const checkSymbols = useCallback(async () => {
+        if (!sessionSID || symbolChecking) return;
+        setSymbolChecking(true);
+        setSymbolCheckError('');
+        try {
+            const response = await continuous.symbolCheck(sessionSID, { from: timeWindow.from, to: timeWindow.to });
+            if (response.code !== 0) throw new Error(response.message || '符号检查失败');
+            setSymbolCheck(response.data?.symbol_check || null);
+        } catch (err) {
+            setSymbolCheckError(err?.response?.data?.message || err?.message || '符号检查失败');
+        } finally {
+            setSymbolChecking(false);
+        }
+    }, [sessionSID, symbolChecking, timeWindow.from, timeWindow.to]);
 
     useEffect(() => {
         queryProfiles(timeWindow);
@@ -273,6 +368,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         setError('');
         if (nextRange === 'custom') {
             const source = appliedCustomWindow || timeWindow;
+            setCustomAnchorNow(new Date().toISOString());
             setCustomFrom(toLocalDateTimeInput(source.from));
             setCustomTo(toLocalDateTimeInput(source.to));
             return;
@@ -294,10 +390,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 
     // Load recent Go pprof heap tasks for the Memory tab link.
     const loadHeapTasks = useCallback(async () => {
-        if (!target) return;
+        if (!targetHost) return;
         setHeapTasksLoading(true);
         try {
-            const res = await profiles.heapTasks({ host: target.ip, limit: 5 });
+            const res = await profiles.heapTasks({ host: targetHost, limit: 5 });
             if (res.code === 0) {
                 setHeapTasks(res.data?.tasks || res.data || []);
             }
@@ -306,7 +402,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setHeapTasksLoading(false);
         }
-    }, [target]);
+    }, [targetHost]);
 
     useEffect(() => {
         if (profileType === 'memory') loadHeapTasks();
@@ -316,32 +412,28 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     // 时间窗、拼 target/filters 这些查询参数，两条路径只在要不要加
     // format=flamegraph 上分叉，不要各写一份容易漂移。
     const buildDiffParams = useCallback(() => {
-        let baseWindow;
-        let compareWindow;
-        if (diffMode === 'custom') {
-            const baseResult = validateCustomTimeWindow(diffBaseFrom, diffBaseTo, sessionMeta.retentionHours, 'Baseline');
-            const compareResult = validateCustomTimeWindow(diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, 'Compare');
-            if (baseResult.error || compareResult.error) {
-                return { error: baseResult.error || compareResult.error };
-            }
-            baseWindow = baseResult.window;
-            compareWindow = compareResult.window;
-            const durationDelta = Math.abs(
-                (new Date(baseWindow.to).getTime() - new Date(baseWindow.from).getTime())
-                - (new Date(compareWindow.to).getTime() - new Date(compareWindow.from).getTime()),
-            );
-            if (durationDelta >= 1000) {
-                return { error: 'Baseline 与 Compare 必须使用等长时间窗' };
-            }
-            setAppliedDiffCustomWindows({ baseWindow, compareWindow });
-        } else {
-            ({ baseWindow, compareWindow } = makeSequentialDiffWindows(diffRange));
+        if (!targetKey || !targetHost) return { error: '缺少观测对象' };
+        const baseResult = validateCustomTimeWindow(diffBaseFrom, diffBaseTo, sessionMeta.retentionHours, 'Baseline');
+        const compareResult = validateCustomTimeWindow(diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, 'Compare');
+        if (baseResult.error || compareResult.error) {
+            return { error: baseResult.error || compareResult.error };
         }
+        const baseWindow = baseResult.window;
+        const compareWindow = compareResult.window;
+        const durationDelta = Math.abs(
+            (new Date(baseWindow.to).getTime() - new Date(baseWindow.from).getTime())
+            - (new Date(compareWindow.to).getTime() - new Date(compareWindow.from).getTime()),
+        );
+        if (durationDelta >= 1000) {
+            return { error: 'Baseline 与 Compare 必须使用等长时间窗' };
+        }
+        setAppliedDiffCustomWindows({ baseWindow, compareWindow });
+        const parsedFilters = activeFiltersKey ? JSON.parse(activeFiltersKey) : {};
         const params = {
             session_sid: sessionSID,
-            target_id: target.id,
-            host: target.ip,
-            service: target.service_name || 'hotmethod',
+            target_id: targetKey,
+            host: targetHost,
+            service: targetService,
             profile_type: 'cpu',
             base_from: baseWindow.from,
             base_to: baseWindow.to,
@@ -350,12 +442,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             max_nodes: maxNodes,
         };
         if (stackScope !== 'all') params.stack_scope = stackScope;
-        if (Object.keys(activeFilters).length > 0) params.filters = JSON.stringify(activeFilters);
+        if (Object.keys(parsedFilters).length > 0) params.filters = activeFiltersKey;
         return { params };
-    }, [target, sessionSID, diffMode, diffRange, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFilters]);
+    }, [targetKey, targetHost, targetService, sessionSID, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFiltersKey]);
 
     const runDiff = useCallback(async () => {
-        if (!target) return;
+        if (!targetKey) return;
         setDiffLoading(true);
         setDiffError('');
         setDiffResult(null);
@@ -376,10 +468,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setDiffLoading(false);
         }
-    }, [target, buildDiffParams]);
+    }, [targetKey, buildDiffParams]);
 
     const runDiffFlamegraph = useCallback(async () => {
-        if (!target) return;
+        if (!targetKey) return;
         setDiffFlamegraphLoading(true);
         setDiffFlamegraphError('');
         setDiffFlamegraphResult(null);
@@ -400,7 +492,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setDiffFlamegraphLoading(false);
         }
-    }, [target, buildDiffParams]);
+    }, [targetKey, buildDiffParams]);
 
     const runActiveDiffView = useCallback(() => {
         if (diffViewMode === 'flamegraph') return runDiffFlamegraph();
@@ -437,27 +529,37 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         };
     }, [diffFlamegraphResult, diffFlamegraphNodes]);
 
-    const changeDiffMode = useCallback((nextMode) => {
-        setDiffMode(nextMode);
+    const applyDiffWindows = useCallback(({ baseWindow, compareWindow }) => {
         setDiffError('');
-        if (nextMode === 'custom') {
-            const { baseWindow, compareWindow } = appliedDiffCustomWindows || makeSequentialDiffWindows(diffRange);
-            setDiffBaseFrom(toLocalDateTimeInput(baseWindow.from));
-            setDiffBaseTo(toLocalDateTimeInput(baseWindow.to));
-            setDiffCompareFrom(toLocalDateTimeInput(compareWindow.from));
-            setDiffCompareTo(toLocalDateTimeInput(compareWindow.to));
-        }
-    }, [appliedDiffCustomWindows, diffRange]);
+        setDiffBaseFrom(toLocalDateTimeInput(baseWindow.from));
+        setDiffBaseTo(toLocalDateTimeInput(baseWindow.to));
+        setDiffCompareFrom(toLocalDateTimeInput(compareWindow.from));
+        setDiffCompareTo(toLocalDateTimeInput(compareWindow.to));
+    }, []);
+
+    const changeDiffManualInput = useCallback((field, value) => {
+        setDiffError('');
+        if (field === 'baseFrom') setDiffBaseFrom(value);
+        if (field === 'baseTo') setDiffBaseTo(value);
+        if (field === 'compareFrom') setDiffCompareFrom(value);
+        if (field === 'compareTo') setDiffCompareTo(value);
+        setAppliedDiffCustomWindows(null);
+    }, []);
+
+    useEffect(() => {
+        const windows = appliedDiffCustomWindows || makeSequentialDiffWindows(diffRange);
+        applyDiffWindows(windows);
+    }, [diffRange, applyDiffWindows, appliedDiffCustomWindows]);
 
     useEffect(() => {
         setSelectedComm('');
 		setSelectedRuntime('');
 		setSelectedInstance('');
 		setScope(taskScope === 'process' ? 'process' : 'host');
-	}, [target?.id, sessionSID, taskScope]);
+	}, [targetKey, sessionSID, taskScope]);
 
     useEffect(() => {
-        if (!target) {
+        if (!targetKey || !targetHost) {
             setCommValues([]);
             setCommAvailable(false);
             setCommMessage('');
@@ -468,9 +570,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         setCommMessage('');
 		profiles.labelValues({
 			session_sid: sessionSID,
-            target_id: target.id,
-            host: target.ip,
-            service: target.service_name || 'hotmethod',
+            target_id: targetKey,
+            host: targetHost,
+            service: targetService,
             from: timeWindow.from,
             to: timeWindow.to,
             profile_type: profileType,
@@ -502,28 +604,28 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         return () => {
             cancelled = true;
         };
-	}, [target, sessionSID, timeWindow, profileType, selectedComm]);
+	}, [targetKey, targetHost, targetService, sessionSID, timeWindow, profileType, selectedComm]);
 
 	useEffect(() => {
-		if (!target) return undefined;
+		if (!targetKey || !targetHost) return undefined;
         let cancelled = false;
-		profiles.labelValues({ session_sid: sessionSID, target_id: target.id, host: target.ip, service: target.service_name || 'hotmethod', from: timeWindow.from, to: timeWindow.to, profile_type: profileType, label: 'runtime' })
+		profiles.labelValues({ session_sid: sessionSID, target_id: targetKey, host: targetHost, service: targetService, from: timeWindow.from, to: timeWindow.to, profile_type: profileType, label: 'runtime' })
             .then(res => { if (!cancelled && res.code === 0) setRuntimeValues(res.data?.values || []); })
             .catch(() => { if (!cancelled) setRuntimeValues([]); });
         return () => { cancelled = true; };
-	}, [target, sessionSID, timeWindow, profileType]);
+	}, [targetKey, targetHost, targetService, sessionSID, timeWindow, profileType]);
 
 	useEffect(() => {
-		if (!target || taskScope !== 'process' || !sessionSID || profileType !== 'cpu') {
+		if (!targetKey || !targetHost || taskScope !== 'process' || !sessionSID || profileType !== 'cpu') {
 			setHistoricalInstanceValues([]);
 			return undefined;
 		}
 		let cancelled = false;
 		profiles.labelValues({
 			session_sid: sessionSID,
-			target_id: target.id,
-			host: target.ip,
-			service: target.service_name || 'hotmethod',
+			target_id: targetKey,
+			host: targetHost,
+			service: targetService,
 			from: timeWindow.from,
 			to: timeWindow.to,
 			profile_type: 'cpu',
@@ -534,7 +636,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 			if (!cancelled) setHistoricalInstanceValues([]);
 		});
 		return () => { cancelled = true; };
-	}, [target, taskScope, sessionSID, profileType, timeWindow]);
+	}, [targetKey, targetHost, targetService, taskScope, sessionSID, profileType, timeWindow]);
 
 	useEffect(() => {
 		if (selectedInstance && !processInstances.some(instance => instance.value === selectedInstance)) {
@@ -563,7 +665,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 							<h3 style={S.title}>{sessionMeta.name}</h3>
                             <span style={S.stateBadge}>{sampleState}</span>
                         </div>
-                        <p style={S.subtitle}>{target.hostname || target.ip} · {target.service_name || 'hotmethod'}</p>
+                        <p style={S.subtitle}>{targetTitle} · {targetService}</p>
                     </div>
                     <div style={S.actions}>
                         {profileURL && <a href={profileURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Profile</a>}
@@ -609,11 +711,16 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     )}
                     <Field label="信号">
                         <span style={S.segmented}>
-                            <button type="button" style={S.segment(signalTab === 'cpu')} onClick={() => setSignalTab('cpu')}>CPU</button>
-							<button type="button" style={S.segment(signalTab === 'io')} onClick={() => setSignalTab('io')}>块 IO</button>
-							<button type="button" style={S.segment(signalTab === 'io_syscall')} onClick={() => setSignalTab('io_syscall')}>系统调用 IO</button>
-                            <button type="button" style={S.segment(signalTab === 'sched')} onClick={() => setSignalTab('sched')}>调度延迟</button>
-                            <button type="button" style={{ ...S.segment(signalTab === 'db'), borderRight: 'none' }} onClick={() => setSignalTab('db')}>数据库</button>
+                            {availableSignalTabs.map((option, index) => (
+                                <button
+                                    key={option.tab}
+                                    type="button"
+                                    style={{ ...S.segment(signalTab === option.tab), ...(index === availableSignalTabs.length - 1 ? { borderRight: 'none' } : {}) }}
+                                    onClick={() => setSignalTab(option.tab)}
+                                >
+                                    {option.label}
+                                </button>
+                            ))}
                         </span>
                     </Field>
                     {signalTab === 'cpu' && (
@@ -648,19 +755,28 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     )}
 					{taskScope === 'process' && signalTab === 'cpu' && <Field label="进程实例" wide>
 						<select style={S.select} value={selectedInstance} onChange={event => setSelectedInstance(event.target.value)}>
-							<option value="">全部实例</option>
+							<option value="">全部有样本实例</option>
 							{processInstances.map(instance => <option key={instance.value} value={instance.value}>PID {instance.pid} · {formatTime(instance.processStartMs)}{instance.active ? ' · 活动' : ' · 历史'}</option>)}
 						</select>
+                        <div style={S.inlineNote}>
+                            {processInstances.length === 0
+                                ? '当前查询窗口没有可选进程实例样本。'
+                                : `当前窗口 ${processInstances.length} 个实例有样本${activeProcessCount > processInstances.length ? `；另有 ${activeProcessCount - processInstances.length} 个活动实例当前无样本` : ''}。`}
+                        </div>
 					</Field>}
                 </div>
                 {range === 'custom' && (
                     <div style={S.customRange}>
-                        <Field label="开始时间">
-                            <input type="datetime-local" step="60" style={S.textInput} value={customFrom} onChange={e => setCustomFrom(e.target.value)} />
-                        </Field>
-                        <Field label="结束时间">
-                            <input type="datetime-local" step="60" style={S.textInput} value={customTo} onChange={e => setCustomTo(e.target.value)} />
-                        </Field>
+                        <TimeRangeSlider
+                            fromInput={customFrom}
+                            toInput={customTo}
+                            retentionHours={sessionMeta.retentionHours}
+                            anchorNow={customAnchorNow}
+                            onChange={({ fromInput, toInput }) => {
+                                setCustomFrom(fromInput);
+                                setCustomTo(toInput);
+                            }}
+                        />
                         <button type="button" style={S.btn} onClick={applyCustomRange} disabled={querying}>查询</button>
                     </div>
                 )}
@@ -670,14 +786,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <Metric label="聚合窗口" value={formatDurationSec(sessionMeta.aggregationWindowSec)} />
                     <Metric label="上传周期" value={formatDurationSec(sessionMeta.uploadBatchSec)} />
                 </div>
-                <div style={S.metaLine}>
-                    <span style={S.metaItem}><span style={S.metaKey}>数据保留</span>{formatHours(sessionMeta.retentionHours)}</span>
-                    <span style={uploadState.warn ? { ...S.metaItem, ...S.metaItemWarn } : S.metaItem} title={uploadState.title}>
-                        <span style={S.metaKey}>最近上传</span>{uploadState.label}
-                    </span>
-                    <span style={S.metaItem}><span style={S.metaKey}>Session</span>{shortSessionID(sessionMeta.sid)}</span>
-                    <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
-                </div>
                 <div style={{ ...S.info, marginTop: 14 }}>
 					{signalTab === 'cpu' ? scopeLabel : signalTab === 'db' ? '数据库快照 / 系统视图轮询' : `${taskScope === 'process' ? '进程范围' : '整机范围'} ${signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} / eBPF histogram`}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。
                     {signalTab === 'cpu' ? ' comm 是 Linux task comm，可能被截断到约 15 字符。'
@@ -685,8 +793,19 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         : ` 当前 backend：${histogram?.backend || signalBackend(sessionMeta, signalTab) || '-'}`}
                     {scope === 'process' && commMessage ? ` ${commMessage}` : ''}
                 </div>
+                <details style={S.compactDetails}>
+                    <summary style={S.detailsSummary}>采集元信息</summary>
+                    <div style={S.metaLine}>
+                        <span style={S.metaItem}><span style={S.metaKey}>数据保留</span>{formatHours(sessionMeta.retentionHours)}</span>
+                        <span style={uploadState.warn ? { ...S.metaItem, ...S.metaItemWarn } : S.metaItem} title={uploadState.title}>
+                            <span style={S.metaKey}>最近上传</span>{uploadState.label}
+                        </span>
+                        <span style={S.metaItem}><span style={S.metaKey}>Session</span>{shortSessionID(sessionMeta.sid)}</span>
+                        <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
+                    </div>
+                    <LabelChips target={target} />
+                </details>
                 <CoverageBand reliability={reliability} />
-                <LabelChips target={target} />
             </section>
 
             {error && <div style={S.error}>{error}</div>}
@@ -732,15 +851,25 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     onRenderStats={setRenderStats}
                     onSearchStats={setSearchStats}
                 />
-			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} />
-                : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
+                {sampleNotice && <div style={{ ...S.info, marginTop: 12 }}>{sampleNotice}</div>}
+                {coverageAlert && <CoverageAlert alert={coverageAlert} />}
+			</section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
 
             {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
                 <div style={{ ...S.warn, marginTop: 10 }}>
                     {flamegraph?.truncated && <span>火焰图节点数超过 {maxNodes} 上限，已截断展示。请缩小时间范围或提高最大节点数以查看完整栈。</span>}
                     {flamegraph?.truncated && flamegraph?.symbol_status && ' · '}
                     {flamegraph?.symbol_status && flamegraph?.symbol_status !== 'not_applicable' && (
-                        <span>符号状态：{symbolStatusLabel(flamegraph.symbol_status, flamegraph.symbol_diagnostics)}</span>
+                        <span>
+                            符号状态：{symbolStatusLabel(flamegraph.symbol_status, flamegraph.symbol_diagnostics)}
+                            {symbolNeedsCheck && sessionSID && (
+                                <button type="button" style={{ ...S.diagnosticCopy, marginLeft: 10 }} onClick={checkSymbols} disabled={symbolChecking}>
+                                    {symbolChecking ? '检查中...' : '重新检查符号'}
+                                </button>
+                            )}
+                            {symbolCheck && <div style={{ marginTop: 8, color: '#475467' }}>{symbolCheckSummary(symbolCheck)}</div>}
+                            {symbolCheckError && <div style={{ marginTop: 8 }}>{symbolCheckError}</div>}
+                        </span>
                     )}
                 </div>
             )}
@@ -770,32 +899,19 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     </div>
                     {diffOpen && (
                         <div>
-                            <div style={{ marginBottom: 12 }}>
-                                <span style={S.segmented}>
-                                    <button type="button" style={S.segment(diffMode === 'quick')} onClick={() => changeDiffMode('quick')}>快捷</button>
-                                    <button type="button" style={{ ...S.segment(diffMode === 'custom'), borderRight: 'none' }} onClick={() => changeDiffMode('custom')}>自定义</button>
-                                </span>
-                            </div>
-                            {diffMode === 'quick' ? (
-                                <div style={S.controls}>
-                                    <Field label="相邻窗口时长">
-                                        <select style={S.select} value={diffRange} onChange={e => setDiffRange(e.target.value)}>
-                                            {diffRangeOptions.map(([v, l]) => <option key={v} value={v}>{l.replace('最近 ', '')}</option>)}
-                                        </select>
-                                    </Field>
-                                </div>
-                            ) : (
-                                <div style={{ display: 'grid', gap: 10 }}>
-                                    <div style={S.controls}>
-                                        <Field label="Baseline 开始"><input type="datetime-local" step="60" style={S.textInput} value={diffBaseFrom} onChange={e => setDiffBaseFrom(e.target.value)} /></Field>
-                                        <Field label="Baseline 结束"><input type="datetime-local" step="60" style={S.textInput} value={diffBaseTo} onChange={e => setDiffBaseTo(e.target.value)} /></Field>
-                                    </div>
-                                    <div style={S.controls}>
-                                        <Field label="Compare 开始"><input type="datetime-local" step="60" style={S.textInput} value={diffCompareFrom} onChange={e => setDiffCompareFrom(e.target.value)} /></Field>
-                                        <Field label="Compare 结束"><input type="datetime-local" step="60" style={S.textInput} value={diffCompareTo} onChange={e => setDiffCompareTo(e.target.value)} /></Field>
-                                    </div>
-                                </div>
-                            )}
+                            <DiffWindowSlider
+                                diffRange={diffRange}
+                                diffRangeOptions={diffRangeOptions}
+                                retentionHours={sessionMeta.retentionHours}
+                                baseFromInput={diffBaseFrom}
+                                compareToInput={diffCompareTo}
+                                onRangeChange={setDiffRange}
+                                onChange={(windows) => {
+                                    setAppliedDiffCustomWindows(windows);
+                                    applyDiffWindows(windows);
+                                }}
+                                onManualInput={changeDiffManualInput}
+                            />
                             <div style={{ marginTop: 10, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                                 <span style={S.segmented}>
                                     <button type="button" style={S.segment(diffViewMode === 'table')} onClick={() => setDiffViewMode('table')}>表格</button>
@@ -916,15 +1032,241 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 }
 
 export function DiagnosticDetails(props) {
+    const [copied, setCopied] = useState(false);
+    const text = diagnosticText(props);
+    const copy = async () => {
+        try {
+            await navigator.clipboard.writeText(text);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1200);
+        } catch (err) {
+            setCopied(false);
+        }
+    };
     return (
         <details className="diagnostic-details" style={S.details}>
             <summary style={S.detailsSummary}>诊断信息</summary>
-            <pre className="diagnostic-output" style={S.mono}>{diagnosticText(props)}</pre>
+            <div style={S.diagnosticToolbar}>
+                <span style={S.subtle}>调试用</span>
+                <button type="button" style={S.diagnosticCopy} onClick={copy}>{copied ? '已复制' : '复制诊断'}</button>
+            </div>
+            <pre className="diagnostic-output" style={S.mono}>{text}</pre>
         </details>
     );
 }
 
-function CoverageBand({ reliability }) {
+function TimeRangeSlider({ fromInput, toInput, retentionHours, anchorNow, onChange }) {
+    const slider = customInputsToSlider(fromInput, toInput, retentionHours, anchorNow);
+    const updateWindow = (fromMinute, toMinute) => {
+        onChange(sliderMinutesToInputs(fromMinute, toMinute, retentionHours, slider.now));
+    };
+    const drag = useRangeDrag({
+        maxMinute: slider.maxMinute,
+        fromMinute: slider.fromMinute,
+        toMinute: slider.toMinute,
+        minSpan: 1,
+        onChange: updateWindow,
+    });
+    const spanSeconds = Math.max(0, (slider.toMinute - slider.fromMinute) * 60);
+    return (
+        <div className="continuous-time-slider" style={S.timeSlider}>
+            <div style={S.sliderFrame}>
+                <div style={S.sliderMeta}>
+                    <span>保留期 {formatTime(slider.bounds.from.toISOString())}</span>
+                    <strong style={{ color: '#344054' }}>跨度 {spanSeconds > 0 ? formatGapDuration(spanSeconds) : '-'}</strong>
+                    <span>{formatTime(slider.bounds.to.toISOString())}</span>
+                </div>
+                <RangeTrack
+                    fromMinute={slider.fromMinute}
+                    toMinute={slider.toMinute}
+                    maxMinute={slider.maxMinute}
+                    onStartDrag={drag.startDrag}
+                    selectionLabel="拖动自定义时间范围"
+                    leftLabel="拖动开始时间"
+                    rightLabel="拖动结束时间"
+                />
+                <div style={S.sliderInputs}>
+                    <Field label="开始时间">
+                        <input type="datetime-local" step="60" style={S.textInput} value={fromInput} onChange={event => onChange({ fromInput: event.target.value, toInput })} />
+                    </Field>
+                    <Field label="结束时间">
+                        <input type="datetime-local" step="60" style={S.textInput} value={toInput} onChange={event => onChange({ fromInput, toInput: event.target.value })} />
+                    </Field>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function DiffWindowSlider({ diffRange, diffRangeOptions, retentionHours, baseFromInput, compareToInput, onRangeChange, onChange, onManualInput }) {
+    const duration = rangeMinutes(diffRange) || 15;
+    const bounds = retentionBounds(retentionHours);
+    const maxMinute = Math.max(2, Math.round((bounds.to.getTime() - bounds.from.getTime()) / 60000));
+    const currentStart = localInputToMinuteOffset(baseFromInput, bounds);
+    const currentEnd = localInputToMinuteOffset(compareToInput, bounds);
+    const fallback = sequentialDiffWindowMinutes(maxMinute, duration);
+    const fromMinute = clampNumber(Number.isFinite(currentStart) ? currentStart : fallback.fromMinute, 0, maxMinute - 2);
+    const toMinute = clampNumber(Number.isFinite(currentEnd) ? currentEnd : fallback.toMinute, fromMinute + 2, maxMinute);
+    const safeSpan = normalizeEvenSpan(fromMinute, toMinute, maxMinute);
+    const windows = diffWindowsFromMinutes(safeSpan.fromMinute, safeSpan.toMinute, bounds);
+    const drag = useRangeDrag({
+        maxMinute,
+        fromMinute: safeSpan.fromMinute,
+        toMinute: safeSpan.toMinute,
+        minSpan: 2,
+        snapEven: true,
+        onChange: (nextFrom, nextTo) => onChange(diffWindowsFromMinutes(nextFrom, nextTo, bounds)),
+    });
+    const updateRange = (value) => {
+        onRangeChange(value);
+        const nextDuration = rangeMinutes(value) || duration;
+        const next = sequentialDiffWindowMinutes(maxMinute, nextDuration);
+        onChange(diffWindowsFromMinutes(next.fromMinute, next.toMinute, bounds));
+    };
+    return (
+        <div style={S.sliderFrame}>
+            <div style={S.controls}>
+                <Field label="窗口时长">
+                    <select style={S.select} value={diffRange} onChange={event => updateRange(event.target.value)}>
+                        {diffRangeOptions.map(([v, l]) => <option key={v} value={v}>{l.replace('最近 ', '')}</option>)}
+                    </select>
+                </Field>
+            </div>
+            <div style={{ ...S.sliderMeta, marginTop: 10 }}>
+                <span>Baseline {formatTime(windows.baseWindow.from)} - {formatTime(windows.baseWindow.to)}</span>
+                <strong style={{ color: '#344054' }}>相邻等长</strong>
+                <span>Compare {formatTime(windows.compareWindow.from)} - {formatTime(windows.compareWindow.to)}</span>
+            </div>
+            <RangeTrack
+                fromMinute={safeSpan.fromMinute}
+                toMinute={safeSpan.toMinute}
+                maxMinute={maxMinute}
+                splitMinute={(safeSpan.fromMinute + safeSpan.toMinute) / 2}
+                onStartDrag={drag.startDrag}
+                selectionLabel="拖动 Diff 双窗"
+                leftLabel="拖动 Diff 左边界"
+                rightLabel="拖动 Diff 右边界"
+            />
+            <div style={S.diffWindows}>
+                <Field label="Baseline 开始">
+                    <input type="datetime-local" step="60" style={S.textInput} value={toLocalDateTimeInput(windows.baseWindow.from)} onChange={event => onManualInput('baseFrom', event.target.value)} />
+                </Field>
+                <Field label="Baseline 结束">
+                    <input type="datetime-local" step="60" style={S.textInput} value={toLocalDateTimeInput(windows.baseWindow.to)} onChange={event => onManualInput('baseTo', event.target.value)} />
+                </Field>
+                <Field label="Compare 开始">
+                    <input type="datetime-local" step="60" style={S.textInput} value={toLocalDateTimeInput(windows.compareWindow.from)} onChange={event => onManualInput('compareFrom', event.target.value)} />
+                </Field>
+                <Field label="Compare 结束">
+                    <input type="datetime-local" step="60" style={S.textInput} value={toLocalDateTimeInput(windows.compareWindow.to)} onChange={event => onManualInput('compareTo', event.target.value)} />
+                </Field>
+            </div>
+        </div>
+    );
+}
+
+function RangeTrack({ fromMinute, toMinute, maxMinute, splitMinute = null, onStartDrag, selectionLabel, leftLabel, rightLabel }) {
+    const trackRef = useRef(null);
+    const leftPct = minutePercent(fromMinute, maxMinute);
+    const rightPct = minutePercent(toMinute, maxMinute);
+    const widthPct = Math.max(0, rightPct - leftPct);
+    const splitPct = splitMinute === null ? null : minutePercent(splitMinute, maxMinute);
+    return (
+        <div ref={trackRef} style={S.sliderTrack}>
+            <div style={S.sliderBase} />
+            {splitPct === null ? (
+                <div
+                    role="slider"
+                    aria-label={selectionLabel}
+                    tabIndex={0}
+                    style={{ ...S.sliderSelection, left: `${leftPct}%`, width: `${widthPct}%` }}
+                    onPointerDown={event => onStartDrag(event, 'window', trackRef)}
+                />
+            ) : (
+                <>
+                    <div
+                        role="slider"
+                        aria-label={selectionLabel}
+                        tabIndex={0}
+                        style={{ ...S.sliderWindowA, left: `${leftPct}%`, width: `${Math.max(0, splitPct - leftPct)}%` }}
+                        onPointerDown={event => onStartDrag(event, 'window', trackRef)}
+                    />
+                    <div
+                        role="slider"
+                        aria-label={selectionLabel}
+                        tabIndex={0}
+                        style={{ ...S.sliderWindowB, left: `${splitPct}%`, width: `${Math.max(0, rightPct - splitPct)}%` }}
+                        onPointerDown={event => onStartDrag(event, 'window', trackRef)}
+                    />
+                    <span style={{ ...S.sliderSplit, left: `${splitPct}%` }} />
+                </>
+            )}
+            <button
+                type="button"
+                aria-label={leftLabel}
+                style={{ ...S.sliderThumb, ...S.sliderThumbMuted, left: `${leftPct}%` }}
+                onPointerDown={event => onStartDrag(event, 'left', trackRef)}
+            />
+            <button
+                type="button"
+                aria-label={rightLabel}
+                style={{ ...S.sliderThumb, left: `${rightPct}%` }}
+                onPointerDown={event => onStartDrag(event, 'right', trackRef)}
+            />
+        </div>
+    );
+}
+
+function useRangeDrag({ maxMinute, fromMinute, toMinute, minSpan = 1, snapEven = false, onChange }) {
+    const startDrag = useCallback((event, mode, trackRef) => {
+        const track = trackRef.current;
+        if (!track) return;
+        event.preventDefault();
+        track.setPointerCapture?.(event.pointerId);
+        const rect = track.getBoundingClientRect();
+        const startX = event.clientX;
+        const startFrom = fromMinute;
+        const startTo = toMinute;
+        const span = startTo - startFrom;
+        const minuteFromEvent = (clientX) => {
+            const ratio = rect.width <= 0 ? 0 : (clientX - rect.left) / rect.width;
+            return clampNumber(Math.round(ratio * maxMinute), 0, maxMinute);
+        };
+        const apply = (clientX) => {
+            let nextFrom = startFrom;
+            let nextTo = startTo;
+            if (mode === 'window') {
+                const delta = minuteFromEvent(clientX) - minuteFromEvent(startX);
+                nextFrom = clampNumber(startFrom + delta, 0, Math.max(0, maxMinute - span));
+                nextTo = nextFrom + span;
+            } else if (mode === 'left') {
+                nextFrom = clampNumber(minuteFromEvent(clientX), 0, startTo - minSpan);
+                nextTo = startTo;
+            } else {
+                nextFrom = startFrom;
+                nextTo = clampNumber(minuteFromEvent(clientX), startFrom + minSpan, maxMinute);
+            }
+            if (snapEven) {
+                ({ fromMinute: nextFrom, toMinute: nextTo } = normalizeEvenSpan(nextFrom, nextTo, maxMinute));
+            }
+            onChange(nextFrom, nextTo);
+        };
+        const move = (moveEvent) => apply(moveEvent.clientX);
+        const stop = () => {
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', stop);
+            window.removeEventListener('pointercancel', stop);
+        };
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', stop);
+        window.addEventListener('pointercancel', stop);
+        apply(event.clientX);
+    }, [fromMinute, maxMinute, minSpan, onChange, snapEven, toMinute]);
+    return { startDrag };
+}
+
+export function CoverageBand({ reliability }) {
+    const [hover, setHover] = useState(null);
     if (!reliability?.coverage) return null;
     const segments = coverageSegments(reliability.coverage, reliability.gaps || []);
     const ratio = Math.max(0, Math.min(1, Number(reliability.coverage.ratio) || 0));
@@ -939,14 +1281,19 @@ function CoverageBand({ reliability }) {
                     {(ratio * 100).toFixed(1)}% · {reliability.gaps?.length || 0} 个缺口
                 </span>
             </div>
-            <div style={S.coverageBar} role="img" aria-label={`采集覆盖率 ${(ratio * 100).toFixed(1)}%`}>
-                {segments.map((segment, index) => (
-                    <span
-                        key={`${segment.type}-${index}`}
-                        style={{ ...(segment.type === 'gap' ? S.coverageGap : S.coverageOK), width: `${segment.percent}%` }}
-                        title={`${segment.type === 'gap' ? '缺口' : '已覆盖'} ${formatTime(segment.start)} - ${formatTime(segment.end)}`}
-                    />
-                ))}
+            <div style={S.coverageWrap} onMouseLeave={() => setHover(null)}>
+                <div style={S.coverageBar} role="img" aria-label={`采集覆盖率 ${(ratio * 100).toFixed(1)}%`}>
+                    {segments.map((segment, index) => (
+                        <span
+                            key={`${segment.type}-${index}`}
+                            data-testid={`coverage-${segment.type}`}
+                            style={{ ...(segment.type === 'gap' ? S.coverageGap : S.coverageOK), width: `${segment.percent}%` }}
+                            onMouseEnter={event => setCoverageHover(event, segment, setHover)}
+                            onMouseMove={event => setCoverageHover(event, segment, setHover)}
+                        />
+                    ))}
+                </div>
+                {hover && <CoverageTooltip hover={hover} />}
             </div>
             <div style={S.metaLine}>
                 <span style={clockBad ? { ...S.metaItem, ...S.metaItemWarn } : S.metaItem}>
@@ -968,6 +1315,56 @@ function CoverageBand({ reliability }) {
     );
 }
 
+function setCoverageHover(event, segment, setHover) {
+    const target = event.currentTarget;
+    if (!target) return;
+    const offsetX = Number(event.nativeEvent?.offsetX);
+    const fallback = target.offsetWidth / 2;
+    setHover({
+        segment,
+        x: target.offsetLeft + (Number.isFinite(offsetX) ? offsetX : fallback),
+    });
+}
+
+function CoverageTooltip({ hover }) {
+    const { segment, x } = hover;
+    const isGap = segment.type === 'gap';
+    const left = `min(max(${Math.round(x)}px, 110px), calc(100% - 110px))`;
+    return (
+        <div role="tooltip" style={{ ...S.coverageTooltip, left, transform: 'translateX(-50%)' }}>
+            <div style={S.coverageTooltipTitle}>{isGap ? '采集缺口' : '已覆盖'}</div>
+            <div>{formatTime(segment.start)} - {formatTime(segment.end)}</div>
+            <div>持续 {formatGapDuration((segment.end - segment.start) / 1000)} · 占比 {segment.percent.toFixed(1)}%</div>
+            {isGap && <div style={{ color: '#b42318', marginTop: 4 }}>该时段无样本或存在上传空档</div>}
+        </div>
+    );
+}
+
+function CoverageAlert({ alert }) {
+    return (
+        <div style={{ ...S.coverageAlert, ...(alert.severity === 'warn' ? S.coverageAlertWarn : {}) }}>
+            <div style={S.coverageAlertTitle}>采集缺口</div>
+            <div>{alert.summary}</div>
+            <div style={{ marginTop: 2 }}>{alert.detail}</div>
+        </div>
+    );
+}
+
+export function coverageAlertForReliability(reliability) {
+    if (!reliability?.coverage) return null;
+    const gaps = Array.isArray(reliability.gaps) ? reliability.gaps : [];
+    if (gaps.length === 0) return null;
+    const ratio = Math.max(0, Math.min(1, Number(reliability.coverage.ratio) || 0));
+    const longest = gaps.reduce((max, gap) => Math.max(max, Number(gap?.duration_seconds) || 0), 0);
+    const total = gaps.reduce((sum, gap) => sum + (Number(gap?.duration_seconds) || 0), 0);
+    const severity = ratio < 0.97 || longest >= 15 ? 'warn' : 'info';
+    return {
+        severity,
+        summary: `覆盖 ${(ratio * 100).toFixed(1)}% · ${gaps.length} 个缺口 · 最长 ${formatGapDuration(longest)}`,
+        detail: `累计缺口 ${formatGapDuration(total)}，常见于 agent 短暂卡顿、上传滞后或当前窗口内进程空闲。`,
+    };
+}
+
 function RuntimeDiagnostics({ diagnostics }) {
     const entries = Object.entries(diagnostics || {});
     if (entries.length === 0) return null;
@@ -978,15 +1375,73 @@ function RuntimeDiagnostics({ diagnostics }) {
                 <thead><tr><th style={S.th}>语言</th><th style={S.th}>状态</th><th style={S.th}>模式</th><th style={S.th}>进程</th><th style={S.th}>诊断</th></tr></thead>
                 <tbody>{entries.map(([runtime, item]) => (
                     <tr key={runtime}>
-                        <td style={S.td}>{runtimeLabel(runtime)}</td><td style={S.td}>{item.status}</td>
+                        <td style={S.td}>{runtimeLabel(runtime)}</td><td style={S.td}>{runtimeStatusLabel(item)}</td>
                         <td style={S.td}>{(item.modes || []).join(', ') || '-'}</td>
-                        <td style={S.td}>{item.ready_count || 0}/{item.detected_count || 0}{item.limited_count ? ` · 受限 ${item.limited_count}` : ''}</td>
-                        <td style={S.td}>{(item.reasons || []).join('; ') || '-'}</td>
+                        <td style={S.td}>{runtimeProcessLabel(item)}</td>
+                        <td style={S.td}>{(item.reasons || []).join('; ') || runtimeReasonLabel(item) || '-'}</td>
                     </tr>
                 ))}</tbody>
             </table></div>
         </section>
     );
+}
+
+function runtimeStatusLabel(item = {}) {
+    const detected = Number(item.detected_count) || 0;
+    const ready = Number(item.ready_count) || 0;
+    const missing = Number(item.missing_count) || 0;
+    const limited = Number(item.limited_count) || 0;
+    if (detected === 0) return '未检测到进程';
+    if (ready === detected && limited === 0) return '已检测';
+    if (ready > 0 && (missing > 0 || limited > 0)) return '部分可用';
+    return '缺少采集能力';
+}
+
+function runtimeProcessLabel(item = {}) {
+    const detected = Number(item.detected_count) || 0;
+    const ready = Number(item.ready_count) || 0;
+    const missing = Number(item.missing_count) || 0;
+    const limited = Number(item.limited_count) || 0;
+    if (detected === 0) return '未检测到进程';
+    return `已检测 ${detected} · 可采集 ${ready}${missing ? ` · 缺少 ${missing}` : ''}${limited ? ` · 受限 ${limited}` : ''}`;
+}
+
+function runtimeReasonLabel(item = {}) {
+    const detected = Number(item.detected_count) || 0;
+    const ready = Number(item.ready_count) || 0;
+    if (detected === 0) return '当前查询窗口没有检测到该语言进程';
+    if (ready === 0) return '检测到进程，但当前没有可用采集模式';
+    return '';
+}
+
+function lowSampleGuidance(data, sessionMeta, querying) {
+    if (querying || !data || data.empty) return '';
+    const total = Number(data.total) || 0;
+    if (total <= 0 || total > 100) return '';
+    const rate = numberOrDefault(sessionMeta.sampleRateHz, 19);
+    return `当前窗口共 ${formatCompactCount(total)} 个样本。${rate} Hz 低频采样遇到空闲进程时，样本少和大量 1 sample 函数属于正常现象；可扩大时间范围或切换到活跃时段再判断。`;
+}
+
+function formatCompactCount(value) {
+    const num = Number(value) || 0;
+    if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
+    if (num >= 1000) return `${(num / 1000).toFixed(1)}K`;
+    return Math.round(num).toString();
+}
+
+function formatEventCount(value) {
+    return `${formatCompactCount(value)} 个`;
+}
+
+function symbolCheckSummary(check = {}) {
+    const missing = Array.isArray(check.missing) ? check.missing : [];
+    const buildIDs = Object.keys(check.build_ids || {});
+    const presentCount = buildIDs.filter(key => check.build_ids[key]).length;
+    const parts = [`符号存储状态：${symbolStatusLabel(check.symbol_status || 'unknown', {})}`];
+    if (buildIDs.length > 0) parts.push(`build-id ${presentCount}/${buildIDs.length} 可用`);
+    if (check.kallsyms !== undefined) parts.push(`kallsyms ${check.kallsyms ? '可用' : '缺失'}`);
+    if (missing.length > 0) parts.push(`缺失：${missing.slice(0, 3).join(', ')}${missing.length > 3 ? '…' : ''}`);
+    return parts.join(' · ');
 }
 
 function RSSTrend({ series = [], loading }) {
@@ -1037,6 +1492,7 @@ function Metric({ label, value }) {
 function continuousSessionMeta(target, fixedSession = null) {
 	const raw = fixedSession || target?.continuous_session || {};
 	const caps = decodeJSONField(raw.capabilities, {});
+    const signals = decodeJSONField(raw.signals, ['cpu_profile']).filter(Boolean);
     return {
         sid: raw.sid || '',
         name: raw.name || 'Native Continuous Profiling',
@@ -1050,7 +1506,15 @@ function continuousSessionMeta(target, fixedSession = null) {
         startedAt: raw.started_at || '',
         stoppedAt: raw.stopped_at || '',
         capabilities: caps,
+        signals: signals.length ? signals : ['cpu_profile'],
     };
+}
+
+function signalTabsForSession(signalKey) {
+    const signals = new Set(String(signalKey || 'cpu_profile').split('|').filter(Boolean));
+    if (signals.size === 0) signals.add('cpu_profile');
+    const tabs = SIGNAL_TAB_OPTIONS.filter(option => signals.has(option.signal));
+    return tabs.length ? tabs : [SIGNAL_TAB_OPTIONS[0]];
 }
 
 function uploadFreshness(meta) {
@@ -1127,7 +1591,7 @@ function LabelChips({ target }) {
     );
 }
 
-function TopNTable({ data, loading, profileURL, filterText = '' }) {
+export function TopNTable({ data, loading, profileURL, filterText = '' }) {
     if (loading && !data) return <div style={S.empty}>正在查询 TopN...</div>;
     const items = data?.items || [];
     if (data?.empty || items.length === 0) {
@@ -1138,17 +1602,23 @@ function TopNTable({ data, loading, profileURL, filterText = '' }) {
             <table style={S.table}>
                 <thead>
                     <tr>
-                        <th style={{ ...S.th, width: '62%' }}>函数</th>
-                        <th style={S.th}>{metricColumnLabel(data.unit, '累计占用时长')}</th>
-                        <th style={S.th}>{metricColumnLabel(data.unit, '自身占用时长')}</th>
+                        <th style={{ ...S.th, width: '48%' }}>函数</th>
+                        <th style={S.th}>{metricColumnLabel(data.unit, '累计')}</th>
+                        <th style={S.th}>累计占比</th>
+                        <th style={S.th}>{metricColumnLabel(data.unit, '自身')}</th>
+                        <th style={S.th}>自身占比</th>
                     </tr>
                 </thead>
                 <tbody>
                     {items.slice(0, 20).map((item, index) => (
                         <tr key={`${item.name}-${index}`}>
-                            <td style={S.td} title={item.name}>{truncate(item.name, 72)}</td>
+                            <td style={{ ...S.td, ...(item.unresolved ? S.tdMuted : {}) }} title={item.name}>
+                                {truncate(item.display_name || item.name, 72)}
+                            </td>
                             <td style={S.td}>{formatMetricValue(item.value, item.unit || data.unit)}</td>
+                            <td style={S.td}>{formatPercent(item.percent)}</td>
                             <td style={S.td}>{formatMetricValue(item.self, item.unit || data.unit)}</td>
+                            <td style={S.td}>{formatPercent(item.self_percent)}</td>
                         </tr>
                     ))}
                 </tbody>
@@ -1166,7 +1636,7 @@ function ProfileEmpty({ message, url }) {
     );
 }
 
-function HistogramPanel({ data, loading, title }) {
+export function HistogramPanel({ data, loading, title }) {
     if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询 {title} histogram...</div></section>;
     const buckets = data?.buckets || [];
     const trend = data?.trend || [];
@@ -1179,7 +1649,7 @@ function HistogramPanel({ data, loading, title }) {
                     <h3 style={S.title}>{title} Histogram</h3>
                     <div style={S.subtle}>{data?.source || 'mini-drop-native'} · backend {data?.backend || '-'} · unit {data?.unit || 'us'}</div>
                 </div>
-                <span style={S.subtle}>{formatMetricValue(data?.event_count || 0, 'samples')} events</span>
+                <span style={S.subtle}>总事件 {formatEventCount(data?.event_count || 0)}</span>
             </div>
             {data?.empty || buckets.length === 0 ? (
                 <ProfileEmpty message={data?.message || `${title} 暂无 histogram 样本`} url={data?.profile_url} />
@@ -1189,27 +1659,33 @@ function HistogramPanel({ data, loading, title }) {
                         <Metric label="P50" value={formatLatency(summary.p50, data?.unit)} />
                         <Metric label="P95" value={formatLatency(summary.p95, data?.unit)} />
                         <Metric label="P99" value={formatLatency(summary.p99, data?.unit)} />
-                        <Metric label="事件数" value={formatMetricValue(data?.event_count || 0, 'samples')} />
+                        <Metric label="事件数" value={formatEventCount(data?.event_count || 0)} />
                     </div>
                     <div className="table-scroll" style={{ ...S.tableWrap, marginTop: 14 }}>
                         <table style={S.table}>
                             <thead>
                                 <tr>
-                                    <th style={{ ...S.th, width: '24%' }}>延迟桶</th>
+                                    <th style={{ ...S.th, width: 170 }}>延迟桶</th>
                                     <th style={S.th}>分布</th>
-                                    <th style={{ ...S.th, width: 120 }}>事件数</th>
+                                    <th style={{ ...S.th, width: 140 }}>事件数</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {buckets.map((bucket, index) => (
                                     <tr key={`${bucket.range}-${index}`}>
-                                        <td style={S.td}>{bucket.range}</td>
-                                        <td style={S.td}>
-                                            <div style={S.barTrack}>
-                                                <div style={{ ...S.bar, width: `${Math.max(3, (Number(bucket.count) || 0) / maxCount * 100)}%`, background: '#12b76a' }} />
+                                        <td style={{ ...S.td, ...S.histogramBucketCell }}>{bucket.range}</td>
+                                        <td style={{ ...S.td, ...S.histogramBarCell }}>
+                                            <div style={S.barWithLabel}>
+                                                <div style={S.barTrack} data-testid="histogram-bar-track">
+                                                    <div
+                                                        data-testid="histogram-bar"
+                                                        style={{ ...S.bar, width: `${Math.max(3, (Number(bucket.count) || 0) / maxCount * 100)}%`, background: '#12b76a' }}
+                                                    />
+                                                </div>
+                                                <span style={S.barPercent}>{formatPercent((Number(bucket.count) || 0) / maxCount * 100)}</span>
                                             </div>
                                         </td>
-                                        <td style={S.td}>{formatMetricValue(bucket.count, 'samples')}</td>
+                                        <td style={{ ...S.td, ...S.histogramCountCell }}>{formatEventCount(bucket.count)}</td>
                                     </tr>
                                 ))}
                             </tbody>
@@ -1238,7 +1714,7 @@ function HistogramPanel({ data, loading, title }) {
                                             <td style={S.td}>{formatLatency(point.p50, data?.unit)}</td>
                                             <td style={S.td}>{formatLatency(point.p95, data?.unit)}</td>
                                             <td style={S.td}>{formatLatency(point.p99, data?.unit)}</td>
-                                            <td style={S.td}>{formatMetricValue(point.event_count || 0, 'samples')}</td>
+                                            <td style={{ ...S.td, ...S.tdNowrap }}>{formatEventCount(point.event_count || 0)}</td>
                                         </tr>
                                     ))}
                                 </tbody>
@@ -1413,6 +1889,19 @@ export function processInstanceOptions(activeProcesses, historicalValues) {
 		|| right.processStartMs - left.processStartMs || left.pid - right.pid);
 }
 
+export function sampledProcessInstanceOptions(activeProcesses, sampledValues) {
+    const activeKeys = new Set((activeProcesses || []).map(process => `${process?.pid}|${process?.process_start_ms}`));
+    return (sampledValues || []).map(raw => {
+        const value = String(raw || '');
+        const [pidText, startText] = value.split('|');
+        const pid = Number(pidText);
+        const processStartMs = Number(startText);
+        if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(processStartMs) || processStartMs <= 0) return null;
+        return { value, pid, processStartMs, active: activeKeys.has(value) };
+    }).filter(Boolean).sort((left, right) => Number(right.active) - Number(left.active)
+        || right.processStartMs - left.processStartMs || left.pid - right.pid);
+}
+
 function formatLatency(value, unit = 'us') {
     const num = Number(value);
     if (!Number.isFinite(num)) return '-';
@@ -1480,6 +1969,7 @@ export function diagnosticText({ target, flamegraph, topn, timeWindow, profileTy
         `unit: ${flamegraph?.unit || topn?.unit || '-'}`,
         `total_raw_value: ${formatRawMetric(flamegraph?.total || topn?.total || 0, flamegraph?.unit || topn?.unit || '')}`,
         `profile_url: ${flamegraph?.profile_url || topn?.profile_url || target?.profile_url || '-'}`,
+        `raw_profile_url_debug_only: ${flamegraph?.raw_profile_url || topn?.raw_profile_url || '-'}`,
         `symbol_status: ${flamegraph?.symbol_status || topn?.symbol_status || 'not_applicable'}`,
         diagnosticJSONField('symbol_diagnostics', flamegraph?.symbol_diagnostics || topn?.symbol_diagnostics || {}),
         diagnosticJSONField('runtime_diagnostics', flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics || {}),
@@ -1531,6 +2021,83 @@ export function makeSequentialDiffWindows(range, now = new Date()) {
         baseWindow: { from: baseFrom.toISOString(), to: baseTo.toISOString() },
         compareWindow: { from: compareFrom.toISOString(), to: compareTo.toISOString() },
     };
+}
+
+export function retentionBounds(retentionHours = 24, nowValue = new Date()) {
+    const now = new Date(nowValue);
+    const retentionMs = Math.max(1, Number(retentionHours) || 24) * 60 * 60 * 1000;
+    return { from: new Date(now.getTime() - retentionMs), to: now };
+}
+
+export function customInputsToSlider(fromInput, toInput, retentionHours = 24, nowValue = new Date()) {
+    const bounds = retentionBounds(retentionHours, nowValue);
+    const maxMinute = Math.max(1, Math.round((bounds.to.getTime() - bounds.from.getTime()) / 60000));
+    const fallbackTo = maxMinute;
+    const fallbackFrom = Math.max(0, fallbackTo - 30);
+    let fromMinute = localInputToMinuteOffset(fromInput, bounds);
+    let toMinute = localInputToMinuteOffset(toInput, bounds);
+    if (!Number.isFinite(fromMinute)) fromMinute = fallbackFrom;
+    if (!Number.isFinite(toMinute)) toMinute = fallbackTo;
+    fromMinute = clampNumber(Math.round(fromMinute), 0, maxMinute - 1);
+    toMinute = clampNumber(Math.round(toMinute), fromMinute + 1, maxMinute);
+    return { bounds, maxMinute, fromMinute, toMinute, now: bounds.to };
+}
+
+export function sliderMinutesToInputs(fromMinute, toMinute, retentionHours = 24, nowValue = new Date()) {
+    const bounds = retentionBounds(retentionHours, nowValue);
+    const maxMinute = Math.max(1, Math.round((bounds.to.getTime() - bounds.from.getTime()) / 60000));
+    const safeFrom = clampNumber(Math.round(Number(fromMinute) || 0), 0, maxMinute - 1);
+    const safeTo = clampNumber(Math.round(Number(toMinute) || 0), safeFrom + 1, maxMinute);
+    return {
+        fromInput: toLocalDateTimeInput(new Date(bounds.from.getTime() + safeFrom * 60000).toISOString()),
+        toInput: toLocalDateTimeInput(new Date(bounds.from.getTime() + safeTo * 60000).toISOString()),
+    };
+}
+
+export function sequentialDiffWindowsFromStart(startMinute, durationMinutes, bounds) {
+    const duration = Math.max(1, Math.round(Number(durationMinutes) || 15));
+    const maxMinute = Math.max(duration * 2, Math.round((bounds.to.getTime() - bounds.from.getTime()) / 60000));
+    const start = clampNumber(Math.round(Number(startMinute) || 0), 0, Math.max(0, maxMinute - duration * 2));
+    const baseFrom = new Date(bounds.from.getTime() + start * 60000);
+    const baseTo = new Date(baseFrom.getTime() + duration * 60000);
+    const compareFrom = baseTo;
+    const compareTo = new Date(compareFrom.getTime() + duration * 60000);
+    return {
+        baseWindow: { from: baseFrom.toISOString(), to: baseTo.toISOString() },
+        compareWindow: { from: compareFrom.toISOString(), to: compareTo.toISOString() },
+    };
+}
+
+export function sequentialDiffWindowMinutes(maxMinute, durationMinutes) {
+    const duration = Math.max(1, Math.round(Number(durationMinutes) || 15));
+    const span = Math.min(maxMinute, duration * 2);
+    const toMinute = maxMinute;
+    return { fromMinute: Math.max(0, toMinute - span), toMinute };
+}
+
+export function diffWindowsFromMinutes(fromMinute, toMinute, bounds) {
+    const maxMinute = Math.max(2, Math.round((bounds.to.getTime() - bounds.from.getTime()) / 60000));
+    const normalized = normalizeEvenSpan(fromMinute, toMinute, maxMinute);
+    const middle = normalized.fromMinute + ((normalized.toMinute - normalized.fromMinute) / 2);
+    const baseFrom = new Date(bounds.from.getTime() + normalized.fromMinute * 60000);
+    const baseTo = new Date(bounds.from.getTime() + middle * 60000);
+    const compareFrom = baseTo;
+    const compareTo = new Date(bounds.from.getTime() + normalized.toMinute * 60000);
+    return {
+        baseWindow: { from: baseFrom.toISOString(), to: baseTo.toISOString() },
+        compareWindow: { from: compareFrom.toISOString(), to: compareTo.toISOString() },
+    };
+}
+
+export function normalizeEvenSpan(fromMinute, toMinute, maxMinute) {
+    let start = clampNumber(Math.round(Number(fromMinute) || 0), 0, Math.max(0, maxMinute - 2));
+    let end = clampNumber(Math.round(Number(toMinute) || 0), start + 2, maxMinute);
+    if ((end - start) % 2 !== 0) {
+        if (end < maxMinute) end += 1;
+        else if (start > 0) start -= 1;
+    }
+    if (end - start < 2) end = Math.min(maxMinute, start + 2);
+    return { fromMinute: start, toMinute: end };
 }
 
 export function validateCustomTimeWindow(fromInput, toInput, retentionHours = 24, label = '', nowValue = new Date()) {
@@ -1606,9 +2173,32 @@ function toLocalDateTimeInput(value) {
     return local.toISOString().slice(0, 16);
 }
 
+function localInputToMinuteOffset(value, bounds) {
+    const iso = localDateTimeToISO(value);
+    if (!iso) return NaN;
+    const time = new Date(iso).getTime();
+    if (!Number.isFinite(time)) return NaN;
+    return Math.round((time - bounds.from.getTime()) / 60000);
+}
+
+function clampNumber(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function minutePercent(value, maxMinute) {
+    const max = Math.max(1, Number(maxMinute) || 1);
+    return clampNumber((Number(value) || 0) / max * 100, 0, 100);
+}
+
 function formatSearchPercent(value) {
     const num = Number(value);
     if (!Number.isFinite(num)) return '0%';
+    return `${num >= 10 ? num.toFixed(1) : num.toFixed(2)}%`;
+}
+
+function formatPercent(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '-';
     return `${num >= 10 ? num.toFixed(1) : num.toFixed(2)}%`;
 }
 

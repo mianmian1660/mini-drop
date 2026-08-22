@@ -137,6 +137,10 @@ namespace drop_server
                 response->set_memorykb(info.lastSelfPstats.rsskb());
                 response->set_readkbpers(info.lastSelfPstats.readkbpers());
                 response->set_writekbpers(info.lastSelfPstats.writekbpers());
+                // 整机资源（可选）：旧 Agent 未上报时不返回该字段，
+                // apiserver 据此返回 host:null
+                if (info.hasHostStats)
+                    response->mutable_host_stats()->CopyFrom(info.lastHostStats);
                 response->set_agent_id(info.agentID);
                 response->set_hostname(info.hostname);
                 response->set_version(info.version);
@@ -152,7 +156,8 @@ namespace drop_server
                 cout << "[server] StatAgent: ip=" << targetIP
                      << " host=" << info.hostname
                      << " online=" << info.online
-                     << " cpu=" << info.lastSelfPstats.cpupercent() << "%" << endl;
+                     << " cpu=" << info.lastSelfPstats.cpupercent() << "%"
+                     << " hostStats=" << (info.hasHostStats ? "yes" : "no") << endl;
                 return grpc::Status::OK;
             }
         }

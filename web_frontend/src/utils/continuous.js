@@ -1,4 +1,5 @@
 export const CONTINUOUS_SIGNALS = ['cpu_profile', 'io_latency', 'io_syscall_latency', 'sched_latency'];
+export const DEFAULT_CONTINUOUS_SIGNALS = ['cpu_profile'];
 
 export function decodeJSONField(value, fallback = []) {
     if (value == null || value === '') return fallback;

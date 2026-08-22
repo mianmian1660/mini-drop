@@ -20,9 +20,16 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net/http"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/mini-drop/apiserver/model"
 )
 
 type ContinuousSymbolCheckReq struct {
@@ -97,4 +104,158 @@ func (s *APIServer) ContinuousSymbolCheck(c *gin.Context) {
 	}
 
 	s.RespondOK(c, gin.H{"symbol_check": resp})
+}
+
+func (s *APIServer) CheckContinuousSessionSymbols(c *gin.Context) {
+	auth := s.AuthContext(c)
+	session, ok := s.loadReadableContinuousSession(c, strings.TrimSpace(c.Param("sid")), auth)
+	if !ok {
+		return
+	}
+	if !s.StorageConnected() {
+		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接，暂时无法检查符号")
+		return
+	}
+	var req struct {
+		From time.Time `json:"from"`
+		To   time.Time `json:"to"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误: "+err.Error())
+		return
+	}
+	now := time.Now()
+	from := req.From
+	to := req.To
+	if to.IsZero() {
+		to = now
+	}
+	if from.IsZero() {
+		from = to.Add(-time.Duration(firstNonZeroUint32(session.RetentionHours, 24)) * time.Hour)
+	}
+	if !from.Before(to) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "符号检查时间范围不合法")
+		return
+	}
+	var windows []model.ProfileWindow
+	if err := s.DB.Where("session_sid = ? AND window_end >= ? AND window_start <= ?", session.SID, from, to).
+		Order("window_start ASC").Limit(continuousMaxWindowCount + 1).Find(&windows).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 Continuous 符号引用失败")
+		return
+	}
+	if len(windows) > continuousMaxWindowCount {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "符号检查时间范围过大，请缩小范围")
+		return
+	}
+	buildIDs := map[string]bool{}
+	kallsyms := ""
+	seenObjects := map[string]bool{}
+	for _, objectKey := range orderedContinuousObjectKeys(windows) {
+		if objectKey == "" || seenObjects[objectKey] {
+			continue
+		}
+		seenObjects[objectKey] = true
+		batch, err := s.loadContinuousStoredBatch(c.Request.Context(), objectKey)
+		if err != nil {
+			continue
+		}
+		collectContinuousSymbolRefs(batch.SymbolRefs, buildIDs, &kallsyms)
+		for _, window := range batch.Windows {
+			if windowOverlaps(window.WindowStart, window.WindowEnd, from, to) {
+				collectContinuousSymbolRefs(window.SymbolRefs, buildIDs, &kallsyms)
+			}
+		}
+	}
+	buildIDList := make([]string, 0, len(buildIDs))
+	for buildID := range buildIDs {
+		buildIDList = append(buildIDList, buildID)
+	}
+	sort.Strings(buildIDList)
+	resp := s.checkContinuousSymbols(c.Request.Context(), buildIDList, kallsyms)
+	s.RespondOK(c, gin.H{
+		"symbol_check": resp,
+		"session_sid":  session.SID,
+		"from":         from,
+		"to":           to,
+		"object_count": len(seenObjects),
+	})
+}
+
+func (s *APIServer) checkContinuousSymbols(ctx context.Context, buildIDs []string, kallsymsSHA256 string) ContinuousSymbolCheckResp {
+	resp := ContinuousSymbolCheckResp{
+		BuildIDs:     map[string]bool{},
+		Missing:      []string{},
+		SymbolStatus: "complete",
+	}
+	anyPresent := false
+	anyMissing := false
+	for _, bid := range buildIDs {
+		if bid == "" {
+			continue
+		}
+		exists := false
+		if s.StorageConnected() {
+			key := "symbols/" + bid
+			if ok, err := s.Storage.ObjectExists(ctx, s.Config.Storage.Bucket, key); err == nil {
+				exists = ok
+			}
+		}
+		resp.BuildIDs[bid] = exists
+		if exists {
+			anyPresent = true
+		} else {
+			anyMissing = true
+			resp.Missing = append(resp.Missing, bid)
+		}
+	}
+	if kallsymsSHA256 != "" {
+		exists := false
+		if s.StorageConnected() {
+			key := kernelSymbolObjectKey(kallsymsSHA256)
+			if ok, err := s.Storage.ObjectExists(ctx, s.Config.Storage.Bucket, key); err == nil {
+				exists = ok
+			}
+		}
+		resp.Kallsyms = exists
+		if exists {
+			anyPresent = true
+		} else {
+			anyMissing = true
+		}
+	}
+	switch {
+	case !anyPresent && (len(buildIDs) > 0 || kallsymsSHA256 != ""):
+		resp.SymbolStatus = "missing"
+	case anyMissing:
+		resp.SymbolStatus = "partial"
+	}
+	return resp
+}
+
+func collectContinuousSymbolRefs(value interface{}, buildIDs map[string]bool, kallsyms *string) {
+	var walk func(interface{}, string)
+	walk = func(raw interface{}, key string) {
+		switch item := raw.(type) {
+		case map[string]interface{}:
+			for childKey, child := range item {
+				walk(child, strings.ToLower(strings.TrimSpace(childKey)))
+			}
+		case []interface{}:
+			for _, child := range item {
+				walk(child, key)
+			}
+		case string:
+			text := strings.TrimSpace(item)
+			if text == "" {
+				return
+			}
+			switch {
+			case strings.Contains(key, "build_id") || key == "buildids":
+				buildIDs[text] = true
+			case strings.Contains(key, "kallsyms") && *kallsyms == "":
+				*kallsyms = text
+			}
+		}
+	}
+	walk(value, "")
 }

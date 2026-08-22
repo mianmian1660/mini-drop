@@ -152,8 +152,10 @@ namespace drop_agent
 
         while (running_)
         {
-            // 自监控
-            common::PidStats selfPs = drop::collect_self_pidstats();
+            // 自监控（复用同一个 1 秒采样窗口，同时填充整机 HostStats，
+            // 不额外拖慢心跳）
+            common::HostStats hostStats;
+            common::PidStats selfPs = drop::collect_self_pidstats(&hostStats, cfg_.hostDiskMount);
             vector<common::PidStats> childrenPs = drop::collect_children_pidstats();
 
             healthcheck::HealthCheckRequest req;
@@ -169,6 +171,7 @@ namespace drop_agent
                 req.add_labels(label);
             req.set_resource_budget(cfg_.resourceBudget);
             *req.mutable_selfpstats() = selfPs;
+            *req.mutable_host_stats() = hostStats;
             if (!childrenPs.empty())
                 *req.mutable_childrenpstats() = childrenPs[0];
             for (const auto &attempt : attemptTracker_.RunningSnapshot())
@@ -178,7 +181,10 @@ namespace drop_agent
 
             cout << "[heartbeat] 自监控: CPU=" << selfPs.cpupercent()
                  << "% RSS=" << selfPs.rsskb() << "KB"
-                 << " 子进程=" << childrenPs.size() << endl;
+                 << " 子进程=" << childrenPs.size()
+                 << " 整机CPU=" << (hostStats.cpu_available() ? hostStats.cpu_percent() : -1.0) << "%"
+                 << " 内存=" << (hostStats.memory_available() ? hostStats.memory_percent() : -1.0) << "%"
+                 << " 磁盘=" << (hostStats.disk_available() ? hostStats.disk_percent() : -1.0) << "%" << endl;
 
             healthcheck::HealthCheckResponse resp;
             ClientContext ctx;

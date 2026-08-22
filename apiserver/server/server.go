@@ -723,6 +723,8 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/continuous/sessions", s.ListContinuousSessions)
 		api.GET("/continuous/sessions/:sid", s.GetContinuousSession)
 		api.POST("/continuous/sessions/:sid/stop", s.StopContinuousSession)
+		api.DELETE("/continuous/sessions/:sid", s.DeleteContinuousSession)
+		api.POST("/continuous/sessions/:sid/symbol-check", s.CheckContinuousSessionSymbols)
 		api.GET("/continuous/processes", s.ListContinuousProcesses)
 		api.POST("/internal/continuous/sessions", s.CreateInternalContinuousSession)
 		api.POST("/internal/continuous/reconcile", s.ReconcileContinuousSessions)

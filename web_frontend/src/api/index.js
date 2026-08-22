@@ -106,6 +106,8 @@ export const continuous = {
 	detail: (sid) => client.get(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}`),
 	processes: (params = {}) => client.get('/api/v1/continuous/processes', { params }),
     stopSession: (sid) => client.post(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}/stop`),
+    deleteSession: (sid) => client.delete(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}`),
+    symbolCheck: (sid, data = {}) => client.post(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}/symbol-check`, data),
     timeline: (sid, params = {}) => client.get(`/api/v1/continuous/sessions/${encodeURIComponent(sid)}/timeline`, { params }),
     query: (params = {}) => client.get('/api/v1/continuous/query', { params }),
     histogram: (params = {}) => client.get('/api/v1/continuous/histogram', { params }),

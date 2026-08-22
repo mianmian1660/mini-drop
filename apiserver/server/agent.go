@@ -21,6 +21,7 @@ import (
 
 	"github.com/mini-drop/apiserver/model"
 	pb "github.com/mini-drop/apiserver/proto/control"
+	commonpb "github.com/mini-drop/apiserver/proto/common"
 	"github.com/mini-drop/apiserver/util"
 	"gorm.io/gorm"
 )
@@ -77,6 +78,33 @@ func (s *APIServer) ListAgents(c *gin.Context) {
 			"total":  len(agents),
 		},
 	})
+}
+
+// hostStatsFromPB 把 gRPC HostStats 转成前端可用的 host 对象。
+// 旧 Agent/Server 未上报整机资源时返回 nil（前端据此显示缺失原因，
+// 而不是用 0% 冒充无数据）。各 *_available 字段区分"读取失败"与"未支持"。
+func hostStatsFromPB(h *commonpb.HostStats) map[string]interface{} {
+	if h == nil {
+		return nil
+	}
+	var collectedAt string
+	if h.GetCollectedAtUnixMs() > 0 {
+		collectedAt = time.UnixMilli(h.GetCollectedAtUnixMs()).UTC().Format(time.RFC3339)
+	}
+	return gin.H{
+		"cpu_percent":        h.GetCpuPercent(),
+		"cpu_available":      h.GetCpuAvailable(),
+		"memory_used_bytes":  h.GetMemoryUsedBytes(),
+		"memory_total_bytes": h.GetMemoryTotalBytes(),
+		"memory_percent":     h.GetMemoryPercent(),
+		"memory_available":   h.GetMemoryAvailable(),
+		"disk_used_bytes":    h.GetDiskUsedBytes(),
+		"disk_total_bytes":   h.GetDiskTotalBytes(),
+		"disk_percent":       h.GetDiskPercent(),
+		"disk_available":     h.GetDiskAvailable(),
+		"disk_mount":         h.GetDiskMount(),
+		"collected_at":       collectedAt,
+	}
 }
 
 func agentMetadataFromStat(resp *pb.StatAgentResponse) map[string]interface{} {
@@ -486,6 +514,7 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 					"memory_kb":       resp.GetMemoryKb(),
 					"read_kb_per_s":   resp.GetReadKbPerS(),
 					"write_kb_per_s":  resp.GetWriteKbPerS(),
+					"host":            hostStatsFromPB(resp.GetHostStats()),
 				},
 			})
 			return
@@ -525,6 +554,7 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 			"memory_kb":       0,
 			"read_kb_per_s":   0.0,
 			"write_kb_per_s":  0.0,
+			"host":            nil, // gRPC 不可达，无整机实时数据
 		},
 	})
 }
@@ -564,6 +594,7 @@ func (s *APIServer) GetAgentDetail(c *gin.Context) {
 		"read_kb_per_s":  0.0,
 		"write_kb_per_s": 0.0,
 		"source":         "db",
+		"host":           nil, // gRPC 不可达或旧 Agent 未上报时保持 null
 	}
 
 	if s.ControlCli != nil {
@@ -586,6 +617,7 @@ func (s *APIServer) GetAgentDetail(c *gin.Context) {
 				"read_kb_per_s":  resp.GetReadKbPerS(),
 				"write_kb_per_s": resp.GetWriteKbPerS(),
 				"source":         "grpc",
+				"host":           hostStatsFromPB(resp.GetHostStats()),
 			}
 		} else if err != nil {
 			s.Logger.Warn("Agent 详情实时探测失败", zap.String("ip", ip), zap.Error(err))

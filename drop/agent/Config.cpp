@@ -194,6 +194,11 @@ namespace drop_agent
         if (cfg.orphanPidGraceSec == 0)
             cfg.orphanPidGraceSec = 300;
 
+        // 整机磁盘采集路径（Docker 下指向宿主机根分区绑定目录）
+        const char *envDiskMount = getenv("DROP_HOST_DISK_MOUNT");
+        if (envDiskMount && *envDiskMount)
+            cfg.hostDiskMount = envDiskMount;
+
         cout << "[config] 加载配置文件: " << configPath << endl;
         cout << "[config]   hostname=" << cfg.hostname << endl;
         cout << "[config]   ipAddr=" << cfg.ipAddr << endl;
@@ -238,6 +243,9 @@ namespace drop_agent
         cfg.cleanupIntervalSec = 60;
         cfg.taskDirRetentionSec = 3600;
         cfg.orphanPidGraceSec = 300;
+        const char *envDiskMount = getenv("DROP_HOST_DISK_MOUNT");
+        if (envDiskMount && *envDiskMount)
+            cfg.hostDiskMount = envDiskMount;
         return cfg;
     }
 

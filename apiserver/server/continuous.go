@@ -484,11 +484,158 @@ func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 	if sessions == nil {
 		sessions = []model.ContinuousSession{}
 	}
+	sampleCounts, err := s.continuousSessionSampleCounts(sessions)
+	if err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询持续采集样本数失败")
+		return
+	}
 	for index := range sessions {
 		markContinuousSessionOffline(&sessions[index], time.Now())
 		sessions[index].CanManage = s.canManageOwner(sessions[index].UID, auth)
+		sessions[index].SampleCount = sampleCounts[sessions[index].SID]
 	}
 	s.RespondOK(c, gin.H{"sessions": sessions, "total": total, "page": page, "page_size": pageSize})
+}
+
+func (s *APIServer) DeleteContinuousSession(c *gin.Context) {
+	auth := s.AuthContext(c)
+	if !auth.CanWrite() {
+		s.forbid(c)
+		return
+	}
+	session, ok := s.loadManageableContinuousSession(c, strings.TrimSpace(c.Param("sid")), auth)
+	if !ok {
+		return
+	}
+	if session.DesiredState != model.ContinuousDesiredStateStopped ||
+		(session.ObservedState != model.ContinuousObservedStateStopped && session.ObservedState != model.ContinuousObservedStateError) {
+		s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, "只能删除已经停止的持续采集任务")
+		return
+	}
+	if !continuousLooksLikeTestSession(session.Name) {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "为避免误删，只能清理明显的测试任务")
+		return
+	}
+	if sampleCount := s.continuousSessionSampleCount(session.SID); sampleCount > 0 {
+		s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, "该任务已有样本，不能作为无样本测试任务清理")
+		return
+	}
+	var batches, windows, summaries int64
+	if err := s.DB.Model(&model.ProfileBatch{}).Where("session_sid = ?", session.SID).Count(&batches).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "检查持续采集数据失败")
+		return
+	}
+	if err := s.DB.Model(&model.ProfileWindow{}).Where("session_sid = ?", session.SID).Count(&windows).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "检查持续采集窗口失败")
+		return
+	}
+	if err := s.DB.Model(&model.ContinuousWindowSummary{}).Where("session_sid = ?", session.SID).Count(&summaries).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "检查持续采集摘要失败")
+		return
+	}
+	if batches > 0 || windows > 0 || summaries > 0 {
+		s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, "该任务已有采集记录，不能作为无样本测试任务清理")
+		return
+	}
+	if err := s.DB.Delete(&session).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "清理持续采集任务失败")
+		return
+	}
+	s.RespondOK(c, gin.H{"sid": session.SID, "deleted": true})
+}
+
+func (s *APIServer) continuousSessionSampleCount(sid string) uint64 {
+	var total uint64
+	if err := s.DB.Model(&model.ProfileWindow{}).
+		Where("session_sid = ? AND (signal_type = ? OR signal_type = '')", sid, "cpu_profile").
+		Select("COALESCE(SUM(sample_count), 0)").Scan(&total).Error; err == nil && total > 0 {
+		return total
+	}
+	_ = s.DB.Model(&model.ProfileWindow{}).
+		Where("session_sid = ?", sid).
+		Select("COALESCE(SUM(sample_count), 0)").Scan(&total).Error
+	if total > 0 {
+		return total
+	}
+	_ = s.DB.Model(&model.ContinuousWindowSummary{}).
+		Where("session_sid = ? AND (signal_type = ? OR signal_type = '')", sid, "cpu_profile").
+		Select("COALESCE(SUM(sample_count), 0)").Scan(&total).Error
+	return total
+}
+
+func (s *APIServer) continuousSessionSampleCounts(sessions []model.ContinuousSession) (map[string]uint64, error) {
+	counts := make(map[string]uint64, len(sessions))
+	if len(sessions) == 0 {
+		return counts, nil
+	}
+	sids := make([]string, 0, len(sessions))
+	for _, session := range sessions {
+		if session.SID != "" {
+			sids = append(sids, session.SID)
+		}
+	}
+	if len(sids) == 0 {
+		return counts, nil
+	}
+	type groupedCount struct {
+		SessionSID string
+		SignalType string
+		Total      uint64
+	}
+	var windows []groupedCount
+	if err := s.DB.Model(&model.ProfileWindow{}).
+		Select("session_sid, signal_type, COALESCE(SUM(sample_count), 0) AS total").
+		Where("session_sid IN ?", sids).
+		Group("session_sid, signal_type").
+		Scan(&windows).Error; err != nil {
+		return nil, err
+	}
+	allWindowCounts := make(map[string]uint64, len(sids))
+	cpuWindowCounts := make(map[string]uint64, len(sids))
+	for _, row := range windows {
+		allWindowCounts[row.SessionSID] += row.Total
+		if row.SignalType == "cpu_profile" || row.SignalType == "" {
+			cpuWindowCounts[row.SessionSID] += row.Total
+		}
+	}
+	for sid, total := range cpuWindowCounts {
+		if total > 0 {
+			counts[sid] = total
+		}
+	}
+	for sid, total := range allWindowCounts {
+		if counts[sid] == 0 {
+			counts[sid] = total
+		}
+	}
+	var summaries []groupedCount
+	if err := s.DB.Model(&model.ContinuousWindowSummary{}).
+		Select("session_sid, signal_type, COALESCE(SUM(sample_count), 0) AS total").
+		Where("session_sid IN ?", sids).
+		Where("signal_type = ? OR signal_type = ''", "cpu_profile").
+		Group("session_sid, signal_type").
+		Scan(&summaries).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range summaries {
+		if counts[row.SessionSID] == 0 {
+			counts[row.SessionSID] = row.Total
+		}
+	}
+	return counts, nil
+}
+
+func continuousLooksLikeTestSession(name string) bool {
+	value := strings.ToLower(strings.TrimSpace(name))
+	if value == "" {
+		return false
+	}
+	for _, marker := range []string{"boundary-", "multilang-", "test", "smoke", "测试"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *APIServer) StopContinuousSession(c *gin.Context) {
@@ -905,17 +1052,18 @@ func (s *APIServer) QueryContinuousProfile(c *gin.Context) {
 		return
 	}
 	s.RespondOK(c, gin.H{
-		"query":          fg.Query,
-		"nodes":          fg.Nodes,
-		"items":          topn.Items,
-		"total":          fg.Total,
-		"unit":           fg.Unit,
-		"empty":          fg.Empty,
-		"message":        fg.Message,
-		"source":         fg.Source,
-		"profile_source": fg.ProfileSource,
-		"profile_url":    fg.ProfileURL,
-		"generated_at":   fg.GeneratedAt,
+		"query":           fg.Query,
+		"nodes":           fg.Nodes,
+		"items":           topn.Items,
+		"total":           fg.Total,
+		"unit":            fg.Unit,
+		"empty":           fg.Empty,
+		"message":         fg.Message,
+		"source":          fg.Source,
+		"profile_source":  fg.ProfileSource,
+		"profile_url":     fg.ProfileURL,
+		"raw_profile_url": fg.RawProfileURL,
+		"generated_at":    fg.GeneratedAt,
 	})
 }
 
@@ -1087,7 +1235,8 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 		Empty:              len(nodes) == 0 || agg.Total == 0,
 		Source:             "mini-drop-native",
 		ProfileSource:      "native",
-		ProfileURL:         s.continuousProfileURL(ctx, agg.ObjectKeys),
+		ProfileURL:         s.continuousProfileURL(ctx, q, agg.ObjectKeys),
+		RawProfileURL:      s.continuousRawProfileURL(ctx, agg.ObjectKeys),
 		Query:              profileLabelSelector(q),
 		SymbolStatus:       agg.SymbolStatus,
 		SymbolDiagnostics:  continuousSymbolDiagnostics(agg),
@@ -1211,6 +1360,7 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 	}
 	items := make([]ProfileTopItem, 0, len(agg.Top))
 	for _, item := range agg.Top {
+		continuousFinalizeTopItem(item, agg.Total)
 		items = append(items, *item)
 	}
 	// 按栈顶（self）排序，不是按 value（inclusive，函数在调用链任意位置出现都算）。
@@ -1238,7 +1388,8 @@ func (s *APIServer) queryNativeContinuousTopN(ctx context.Context, q ProfileQuer
 		Empty:              len(items) == 0 || agg.Total == 0,
 		Source:             "mini-drop-native",
 		ProfileSource:      "native",
-		ProfileURL:         s.continuousProfileURL(ctx, agg.ObjectKeys),
+		ProfileURL:         s.continuousProfileURL(ctx, q, agg.ObjectKeys),
+		RawProfileURL:      s.continuousRawProfileURL(ctx, agg.ObjectKeys),
 		Query:              profileLabelSelector(q),
 		SymbolStatus:       agg.SymbolStatus,
 		SymbolDiagnostics:  continuousSymbolDiagnostics(agg),
@@ -1310,10 +1461,11 @@ func (s *APIServer) queryNativeContinuousSummary(ctx context.Context, q ProfileQ
 			continue
 		}
 		for _, item := range items {
-			existing, ok := merged[item.Name]
+			key, displayName, unresolved := continuousTopFrameKey(item.Name)
+			existing, ok := merged[key]
 			if !ok {
-				existing = &ProfileTopItem{Name: item.Name, Unit: firstNonEmpty(item.Unit, "samples")}
-				merged[item.Name] = existing
+				existing = &ProfileTopItem{Name: key, DisplayName: displayName, Unit: firstNonEmpty(item.Unit, "samples"), Unresolved: unresolved}
+				merged[key] = existing
 			}
 			// 冷层不再区分 inclusive/exclusive——Value 退化成等于 Self，
 			// 前端排序/占比逻辑复用同一套字段不用特殊分支。
@@ -1325,6 +1477,7 @@ func (s *APIServer) queryNativeContinuousSummary(ctx context.Context, q ProfileQ
 
 	items := make([]ProfileTopItem, 0, len(merged))
 	for _, item := range merged {
+		continuousFinalizeTopItem(item, float64(totalSamples))
 		items = append(items, *item)
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -1494,7 +1647,10 @@ func (s *APIServer) mergeContinuousWindowSummary(ctx context.Context, sessionSID
 
 	items := make([]ProfileTopItem, 0, len(merged))
 	for name, self := range merged {
-		items = append(items, ProfileTopItem{Name: name, Self: self, Value: self, Unit: "samples"})
+		key, displayName, unresolved := continuousTopFrameKey(name)
+		item := ProfileTopItem{Name: key, DisplayName: displayName, Self: self, Value: self, Unit: "samples", Unresolved: unresolved}
+		continuousFinalizeTopItem(&item, float64(sampleCount))
+		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Self == items[j].Self {
@@ -2143,20 +2299,21 @@ func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q Profil
 		message = "部分窗口不可用: " + unavailableReason
 	}
 	return gin.H{
-		"query":        profileLabelSelector(q),
-		"signal_type":  signalType,
-		"buckets":      buckets,
-		"summary":      summary,
-		"trend":        trend,
-		"event_count":  totalEvents,
-		"unit":         "us",
-		"backend":      strings.Join(backendList, ","),
-		"backends":     backendList,
-		"empty":        empty,
-		"message":      message,
-		"source":       "mini-drop-native",
-		"profile_url":  s.continuousProfileURL(ctx, objectKeys),
-		"generated_at": time.Now(),
+		"query":           profileLabelSelector(q),
+		"signal_type":     signalType,
+		"buckets":         buckets,
+		"summary":         summary,
+		"trend":           trend,
+		"event_count":     totalEvents,
+		"unit":            "us",
+		"backend":         strings.Join(backendList, ","),
+		"backends":        backendList,
+		"empty":           empty,
+		"message":         message,
+		"source":          "mini-drop-native",
+		"profile_url":     s.continuousProfileURL(ctx, q, objectKeys),
+		"raw_profile_url": s.continuousRawProfileURL(ctx, objectKeys),
+		"generated_at":    time.Now(),
 	}, true, nil
 }
 
@@ -2462,10 +2619,11 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		if continuousFrameLooksUnresolved(frame) {
 			agg.UnresolvedFrameWeight += count
 		}
-		item := agg.Top[frame]
+		topKey, displayName, unresolved := continuousTopFrameKey(frame)
+		item := agg.Top[topKey]
 		if item == nil {
-			item = &ProfileTopItem{Name: frame, Unit: firstNonEmpty(agg.Unit, "samples")}
-			agg.Top[frame] = item
+			item = &ProfileTopItem{Name: topKey, DisplayName: displayName, Unresolved: unresolved, Unit: firstNonEmpty(agg.Unit, "samples")}
+			agg.Top[topKey] = item
 		}
 		item.Value += count
 		if i == len(stack)-1 {
@@ -2518,6 +2676,49 @@ func continuousFrameLooksUnresolved(frame string) bool {
 		break
 	}
 	return hexLen >= 6 && (hexLen == len(address) || address[hexLen] == ' ' || address[hexLen] == '\t')
+}
+
+func continuousTopFrameKey(frame string) (string, string, bool) {
+	frame = strings.TrimSpace(frame)
+	if frame == "" {
+		frame = "unknown"
+	}
+	if !continuousFrameLooksUnresolved(frame) {
+		return frame, frame, false
+	}
+	module := continuousUnresolvedFrameModule(frame)
+	if module != "" {
+		display := "[未解析] " + module
+		return display, display, true
+	}
+	display := "[未解析] " + frame
+	return frame, display, true
+}
+
+func continuousUnresolvedFrameModule(frame string) string {
+	frame = strings.TrimSpace(frame)
+	start := strings.LastIndex(frame, "[")
+	end := strings.LastIndex(frame, "]")
+	if start >= 0 && end > start {
+		module := strings.TrimSpace(frame[start+1 : end])
+		if module != "" && strings.ToLower(module) != "unknown" {
+			return module
+		}
+	}
+	return ""
+}
+
+func continuousFinalizeTopItem(item *ProfileTopItem, total float64) {
+	if item == nil {
+		return
+	}
+	if item.DisplayName == "" {
+		item.DisplayName = item.Name
+	}
+	if total > 0 {
+		item.Percent = minFloat(item.Value, total) / total * 100
+		item.SelfPercent = item.Self / total * 100
+	}
 }
 
 func continuousBackendList(backends map[string]bool) string {
@@ -2693,6 +2894,13 @@ func maxFloat(a, b float64) float64 {
 	return b
 }
 
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // truncateDiffTree 和 continuousTreeToProfileNodesTruncated 用一样的策略：
 // 总节点数超过 maxNodes 才截断，DFS 预算用完就停——因为孩子已经按权重
 // 降序排过，DFS 优先顺序天然保留权重最大的分支。
@@ -2793,7 +3001,44 @@ func countTreeNodes(node *continuousTreeNode) int {
 	return count
 }
 
-func (s *APIServer) continuousProfileURL(ctx context.Context, objectKeys []string) string {
+func (s *APIServer) continuousProfileURL(ctx context.Context, q ProfileQuery, objectKeys []string) string {
+	base := "/profiles"
+	if q.SessionSID != "" {
+		base = "/continuous/sessions/" + url.PathEscape(q.SessionSID)
+	} else if sid := continuousSessionSIDFromObjectKeys(objectKeys); sid != "" && q.TargetID == "" {
+		// Legacy callers may omit target_id. A single-session object is still a
+		// valid detail-page fallback; multi-session aggregate links stay on the
+		// generic visual profile page below.
+		base = "/continuous/sessions/" + url.PathEscape(sid)
+	}
+	values := url.Values{}
+	if q.SessionSID == "" && q.TargetID != "" {
+		values.Set("target_id", q.TargetID)
+	}
+	if !q.From.IsZero() {
+		values.Set("from", q.From.Format(time.RFC3339Nano))
+	}
+	if !q.To.IsZero() {
+		values.Set("to", q.To.Format(time.RFC3339Nano))
+	}
+	if q.ProfileType != "" && q.ProfileType != "cpu" {
+		values.Set("profile_type", q.ProfileType)
+	}
+	if q.StackScope != "" {
+		values.Set("stack_scope", q.StackScope)
+	}
+	if len(q.Filters) > 0 {
+		if encoded, err := json.Marshal(q.Filters); err == nil {
+			values.Set("filters", string(encoded))
+		}
+	}
+	if encoded := values.Encode(); encoded != "" {
+		return base + "?" + encoded
+	}
+	return base
+}
+
+func (s *APIServer) continuousRawProfileURL(ctx context.Context, objectKeys []string) string {
 	if len(objectKeys) == 0 || !s.StorageConnected() {
 		return ""
 	}
@@ -2802,6 +3047,15 @@ func (s *APIServer) continuousProfileURL(ctx context.Context, objectKeys []strin
 		return ""
 	}
 	return "/api/v1/continuous/raw?key=" + url.QueryEscape(key)
+}
+
+func continuousSessionSIDFromObjectKeys(objectKeys []string) string {
+	for _, objectKey := range objectKeys {
+		if sid := continuousSessionSIDFromObjectKey(objectKey); sid != "" {
+			return sid
+		}
+	}
+	return ""
 }
 
 func continuousSessionSIDFromObjectKey(key string) string {
@@ -2842,12 +3096,7 @@ func applyContinuousDefaults(req *CreateContinuousSessionReq) {
 	if req.ContinuityMode == "" {
 		req.ContinuityMode = "strict"
 	}
-	if len(req.Signals) == 0 {
-		req.Signals = append([]string(nil), continuousDefaultSignals...)
-	} else {
-		// The first user-driven version exposes one complete, coherent signal set.
-		req.Signals = append([]string(nil), continuousDefaultSignals...)
-	}
+	req.Signals = normalizeContinuousRequestedSignals(req.Signals)
 	if req.SampleRateHz == 0 {
 		req.SampleRateHz = 19
 	}

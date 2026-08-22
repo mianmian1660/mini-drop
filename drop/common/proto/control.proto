@@ -10,6 +10,7 @@ package control;
 option go_package = "github.com/mini-drop/apiserver/proto/control";
 
 import "common/proto/hotmethod.proto";  // 需要用到 TaskDesc
+import "common/proto/common.proto";     // 需要用到 HostStats
 
 // ----------------------------------------------------------
 // Control 服务：API 后台 → Drop Server 的指挥接口
@@ -74,6 +75,7 @@ message StatAgentResponse {
   string resource_budget = 13;
   bool online = 14;
   int64 last_seen_unix_ms = 15;
+  common.HostStats host_stats = 16; // 整机资源（可选；旧 Agent/Server 不返回时前端显示缺失原因）
 }
 
 // ---------- CancelTask ----------

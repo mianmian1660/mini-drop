@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { continuous, profiles } from '../api';
 import ContinuousProfilingPanel from '../components/ContinuousProfilingPanel';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime } from '../utils/continuous';
@@ -23,10 +23,13 @@ const S = {
     loading: { textAlign: 'center', padding: 48, color: '#667085' },
     instances: { display: 'flex', flexWrap: 'wrap', gap: 7, marginTop: 10 },
     instance: { border: '1px solid #eaecf0', background: '#f8fafc', color: '#344054', borderRadius: 6, padding: '5px 8px', fontSize: 12 },
+    details: { marginTop: 12, borderTop: '1px solid #eef2f6', paddingTop: 10 },
+    summary: { cursor: 'pointer', color: '#475467', fontSize: 13, fontWeight: 700 },
 };
 
 export default function ContinuousSessionDetailPage() {
     const { targetId: rawTargetId, sid: rawSID } = useParams();
+    const [searchParams] = useSearchParams();
     const targetId = decodeURIComponent(rawTargetId || '');
     const sid = decodeURIComponent(rawSID || '');
     const [target, setTarget] = useState(null);
@@ -34,6 +37,13 @@ export default function ContinuousSessionDetailPage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [stopping, setStopping] = useState(false);
+    const initialQuery = useMemo(() => ({
+        from: searchParams.get('from') || '',
+        to: searchParams.get('to') || '',
+        profileType: searchParams.get('profile_type') || 'cpu',
+        stackScope: searchParams.get('stack_scope') || 'all',
+        filters: parseFilters(searchParams.get('filters')),
+    }), [searchParams]);
 
     const load = useCallback(async (silent = false) => {
         if (!silent) setLoading(true);
@@ -42,10 +52,14 @@ export default function ContinuousSessionDetailPage() {
             const [targetsResponse, sessionResponse] = await Promise.all([profiles.targets(), continuous.detail(sid)]);
             if (targetsResponse.code !== 0) throw new Error(targetsResponse.message || '加载主机失败');
             if (sessionResponse.code !== 0) throw new Error(sessionResponse.message || '加载持续采集任务失败');
-            const selected = (targetsResponse.data?.targets || []).find(item => item.id === targetId);
-            if (!selected) throw new Error('未找到当前主机或无权限访问');
             const loadedSession = sessionResponse.data?.session || null;
-            if (!loadedSession || loadedSession.target_ip !== selected.ip) throw new Error('持续采集任务不属于当前主机');
+            if (!loadedSession) throw new Error('未找到持续采集任务或无权限访问');
+            const targets = targetsResponse.data?.targets || [];
+            const selected = targetId
+                ? targets.find(item => item.id === targetId)
+                : targets.find(item => item.ip === loadedSession.target_ip);
+            if (!selected) throw new Error('未找到当前主机或无权限访问');
+            if (targetId && loadedSession.target_ip !== selected.ip) throw new Error('持续采集任务不属于当前主机');
             setTarget(selected);
             setSession(loadedSession);
         } catch (err) {
@@ -100,13 +114,27 @@ export default function ContinuousSessionDetailPage() {
                 <Metric label="创建者" value={session.user_name || '系统'} />
                 <Metric label="最近上传" value={formatRelativeTime(session.last_upload_at)} />
                 <Metric label="连续性" value={session.continuity_mode === 'strict' ? '严格连续' : '降级'} />
-                <Metric label="活动 PID" value={session.scope === 'process' ? `${activeProcesses.length} 个` : '整机'} />
+                <Metric label="活动实例" value={session.scope === 'process' ? `${activeProcesses.length} 个` : '整机'} />
             </div>
-            {session.scope === 'process' && <><div style={{ ...S.label, marginTop: 12 }}>跟随 exe</div><div style={S.value}>{session.selector_exe}</div><div style={S.instances}>{activeProcesses.length ? activeProcesses.map(process => <span key={`${process.pid}-${process.process_start_ms}`} style={S.instance}>PID {process.pid} · {formatStart(process.process_start_ms)}</span>) : <span style={S.instance}>等待匹配进程</span>}</div></>}
+            {session.scope === 'process' && <details style={S.details}>
+                <summary style={S.summary}>进程实例明细</summary>
+                <div style={{ ...S.label, marginTop: 12 }}>跟随 exe</div>
+                <div style={S.value}>{session.selector_exe}</div>
+                <div style={S.instances}>{activeProcesses.length ? activeProcesses.map(process => <span key={`${process.pid}-${process.process_start_ms}`} style={S.instance}>PID {process.pid} · {formatStart(process.process_start_ms)}</span>) : <span style={S.instance}>等待匹配进程</span>}</div>
+            </details>}
         </section>
-        <ContinuousProfilingPanel target={target} fixedSession={session} />
+        <ContinuousProfilingPanel target={target} fixedSession={session} initialQuery={initialQuery} />
     </div>;
 }
 
 function Metric({ label, value }) { return <div style={S.metric}><div style={S.label}>{label}</div><div style={S.value}>{value || '-'}</div></div>; }
 function formatStart(value) { const date = new Date(Number(value)); return Number.isNaN(date.getTime()) ? `start ${value}` : date.toLocaleString(); }
+function parseFilters(value) {
+    if (!value) return {};
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (error) {
+        return {};
+    }
+}
