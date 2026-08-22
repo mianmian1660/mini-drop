@@ -3,7 +3,9 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +28,16 @@ var (
 	metricContinuousSourceDeleteRetryTotal int64
 	metricContinuousCompactionSkipTotal    int64
 	metricContinuousReclaimedBytesTotal    int64
+	// 阶段 0：磁盘止血指标
+	metricStorageTotalBytes     int64 // gauge：受监控文件系统总字节数
+	metricStorageAvailableBytes int64 // gauge：受监控文件系统剩余字节数
+	metricStoragePressureLevel  int64 // gauge：0=normal 1=warning 2=critical 3=emergency 4=unknown
+)
+
+// 按来源计数的低磁盘拒收计数（label: source）。
+var (
+	metricCollectionRejectedLowDiskMu sync.Mutex
+	metricCollectionRejectedLowDisk   = map[string]int64{}
 )
 
 func incTasksCreated()         { atomic.AddInt64(&metricTasksCreatedTotal, 1) }
@@ -48,6 +60,46 @@ func incContinuousReclaimedBytes(bytes int64) {
 	atomic.AddInt64(&metricContinuousReclaimedBytesTotal, bytes)
 }
 
+// storagePressureLevelNumeric 把等级映射为数值（供 gauge 使用）。
+func storagePressureLevelNumeric(level StoragePressureLevel) int64 {
+	switch level {
+	case StoragePressureNormal:
+		return 0
+	case StoragePressureWarning:
+		return 1
+	case StoragePressureCritical:
+		return 2
+	case StoragePressureEmergency:
+		return 3
+	default:
+		return 4 // unknown
+	}
+}
+
+// updateStorageMetrics 用最新磁盘快照刷新 gauge 指标。
+func updateStorageMetrics(snap StorageDiskSnapshot) {
+	atomic.StoreInt64(&metricStorageTotalBytes, int64(snap.TotalBytes))
+	atomic.StoreInt64(&metricStorageAvailableBytes, int64(snap.AvailableBytes))
+	atomic.StoreInt64(&metricStoragePressureLevel, storagePressureLevelNumeric(snap.Level))
+}
+
+// incCollectionRejectedLowDisk 累加"低磁盘拒收"计数（按采集入口来源）。
+func incCollectionRejectedLowDisk(source string) {
+	metricCollectionRejectedLowDiskMu.Lock()
+	metricCollectionRejectedLowDisk[source]++
+	metricCollectionRejectedLowDiskMu.Unlock()
+}
+
+func snapshotRejectedLowDiskCounts() map[string]int64 {
+	metricCollectionRejectedLowDiskMu.Lock()
+	defer metricCollectionRejectedLowDiskMu.Unlock()
+	out := make(map[string]int64, len(metricCollectionRejectedLowDisk))
+	for k, v := range metricCollectionRejectedLowDisk {
+		out[k] = v
+	}
+	return out
+}
+
 func currentSSEActive() int64 { return atomic.LoadInt64(&metricSSEActiveConnections) }
 
 func resetMetricsForTest() {
@@ -62,6 +114,12 @@ func resetMetricsForTest() {
 	atomic.StoreInt64(&metricContinuousSourceDeleteRetryTotal, 0)
 	atomic.StoreInt64(&metricContinuousCompactionSkipTotal, 0)
 	atomic.StoreInt64(&metricContinuousReclaimedBytesTotal, 0)
+	atomic.StoreInt64(&metricStorageTotalBytes, 0)
+	atomic.StoreInt64(&metricStorageAvailableBytes, 0)
+	atomic.StoreInt64(&metricStoragePressureLevel, 4) // unknown 兜底
+	metricCollectionRejectedLowDiskMu.Lock()
+	metricCollectionRejectedLowDisk = map[string]int64{}
+	metricCollectionRejectedLowDiskMu.Unlock()
 }
 
 func (s *APIServer) Metrics(c *gin.Context) {
@@ -88,6 +146,28 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_continuous_compaction_skip_total %d\n", atomic.LoadInt64(&metricContinuousCompactionSkipTotal))
 	writeMetricHeader(&b, "mini_drop_continuous_reclaimed_bytes_total", "counter", "Bytes reclaimed by block/source-object garbage collection.")
 	fmt.Fprintf(&b, "mini_drop_continuous_reclaimed_bytes_total %d\n", atomic.LoadInt64(&metricContinuousReclaimedBytesTotal))
+	writeMetricHeader(&b, "mini_drop_storage_total_bytes", "gauge", "Total bytes of the monitored storage filesystem.")
+	fmt.Fprintf(&b, "mini_drop_storage_total_bytes %d\n", atomic.LoadInt64(&metricStorageTotalBytes))
+	writeMetricHeader(&b, "mini_drop_storage_available_bytes", "gauge", "Available bytes of the monitored storage filesystem.")
+	fmt.Fprintf(&b, "mini_drop_storage_available_bytes %d\n", atomic.LoadInt64(&metricStorageAvailableBytes))
+	writeMetricHeader(&b, "mini_drop_storage_pressure_level", "gauge", "Storage pressure level: 0=normal 1=warning 2=critical 3=emergency 4=unknown.")
+	fmt.Fprintf(&b, "mini_drop_storage_pressure_level %d\n", atomic.LoadInt64(&metricStoragePressureLevel))
+	writeMetricHeader(&b, "mini_drop_collection_rejected_low_disk_total", "counter", "Collection attempts rejected because of low disk, by entry source.")
+	sources := make([]string, 0, len(metricCollectionRejectedLowDisk))
+	metricCollectionRejectedLowDiskMu.Lock()
+	for source := range metricCollectionRejectedLowDisk {
+		sources = append(sources, source)
+	}
+	metricCollectionRejectedLowDiskMu.Unlock()
+	sort.Strings(sources)
+	for _, source := range sources {
+		count := func() int64 {
+			metricCollectionRejectedLowDiskMu.Lock()
+			defer metricCollectionRejectedLowDiskMu.Unlock()
+			return metricCollectionRejectedLowDisk[source]
+		}()
+		fmt.Fprintf(&b, "mini_drop_collection_rejected_low_disk_total{source=%q} %d\n", prometheusLabel(source), count)
+	}
 
 	if s != nil && s.DB != nil {
 		s.writeDBMetrics(&b)

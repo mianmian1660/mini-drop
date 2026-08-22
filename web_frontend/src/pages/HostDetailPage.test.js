@@ -23,6 +23,7 @@ jest.mock('../api', () => ({
     continuous: { sessions: jest.fn(), stopSession: jest.fn() },
     profiles: { targets: jest.fn() },
     schedules: { list: jest.fn() },
+    storage: { status: jest.fn() },
     tasks: { list: jest.fn() },
 }));
 
@@ -35,7 +36,7 @@ jest.mock('../components/ScheduleList', () => ({ detailPrefix, targetIp }) => (
 ));
 
 import HostDetailPage from './HostDetailPage';
-import { agents, continuous, profiles, schedules, tasks } from '../api';
+import { agents, continuous, profiles, schedules, storage, tasks } from '../api';
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -60,6 +61,7 @@ async function setupApiMocks() {
     tasks.list.mockResolvedValue({ code: 0, data: { tasks: singleTasks, total: 1 } });
     schedules.list.mockResolvedValue({ code: 0, data: { schedules: hostSchedules, total: 1 } });
     continuous.sessions.mockResolvedValue({ code: 0, data: { sessions: [] } });
+    storage.status.mockResolvedValue({ code: 0, data: { level: 'normal', available_bytes: 20 * 1024 * 1024 * 1024 } });
 }
 
 beforeEach(() => {
@@ -106,6 +108,52 @@ test('周期任务 Tab 只展示当前主机的周期任务列表', async () => 
     expect(list.getAttribute('data-prefix')).toBe('/hosts/target-1/schedules');
     expect(list.getAttribute('data-target')).toBe('1.2.3.4');
 
+    act(() => root.unmount());
+    container.remove();
+});
+
+// ---------- 阶段 0：存储压力提示条 ----------
+
+test('存储压力 normal 时主机上下文不渲染提示条', async () => {
+    await setupApiMocks();
+    const { container, root } = await renderHost();
+    expect(container.querySelector('[data-testid="storage-pressure-banner"]')).toBeNull();
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('存储压力 warning 时主机上下文渲染单行提示并显示剩余容量', async () => {
+    await setupApiMocks();
+    storage.status.mockResolvedValue({ code: 0, data: { level: 'warning', available_bytes: 6 * 1024 * 1024 * 1024 } });
+    const { container, root } = await renderHost();
+
+    const banner = container.querySelector('[data-testid="storage-pressure-banner"]');
+    expect(banner).toBeTruthy();
+    expect(banner.textContent).toContain('服务端存储空间偏低');
+    expect(banner.textContent).toContain('6.0 GiB');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('存储压力 emergency 时显示新采集已暂停', async () => {
+    await setupApiMocks();
+    storage.status.mockResolvedValue({ code: 0, data: { level: 'emergency', available_bytes: 512 * 1024 * 1024 } });
+    const { container, root } = await renderHost();
+
+    const banner = container.querySelector('[data-testid="storage-pressure-banner"]');
+    expect(banner).toBeTruthy();
+    expect(banner.textContent).toContain('新采集已暂停');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('存储状态接口失败时不渲染错误横幅（静默保留上一次成功状态）', async () => {
+    await setupApiMocks();
+    storage.status.mockRejectedValue(new Error('network down'));
+    const { container, root } = await renderHost();
+    expect(container.querySelector('[data-testid="storage-pressure-banner"]')).toBeNull();
     act(() => root.unmount());
     container.remove();
 });

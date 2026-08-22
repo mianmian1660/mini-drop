@@ -137,13 +137,15 @@ func TestKernelSymbolCheckUploadDeduplicatesAndRecordsArtifacts(t *testing.T) {
 
 func TestDiskGuardRejectsBelowOneGiB(t *testing.T) {
 	s := newTestAPIServer(t)
-	s.Config = &config.Config{StorageDisk: config.StorageDiskConfig{Path: "/tmp", MinFreeBytes: 1 << 30}}
-	original := storageFreeBytes
-	t.Cleanup(func() { storageFreeBytes = original })
-	storageFreeBytes = func(string) (uint64, error) { return (1 << 30) - 1, nil }
-	ok, message, free, minimum := s.canStartCollection()
-	if ok || free != minimum-1 || !strings.Contains(message, "采集被拒绝") {
-		t.Fatalf("low disk guard = ok:%v free:%d min:%d message:%q", ok, free, minimum, message)
+	s.Config = &config.Config{StorageDisk: config.StorageDiskConfig{
+		Path: "/tmp", WarningFreeBytes: 8 << 30, CriticalFreeBytes: 4 << 30, MinFreeBytes: 1 << 30,
+	}}
+	original := readStorageDiskSnapshot
+	t.Cleanup(func() { readStorageDiskSnapshot = original })
+	readStorageDiskSnapshot = func(string) (uint64, uint64, uint64, error) { return 0, (1 << 30) - 1, 0, nil }
+	ok, message, snap := s.canStartCollection(CollectionSourceOneShot)
+	if ok || snap.Level != StoragePressureEmergency || snap.CollectionAllowed || !strings.Contains(message, "采集被拒绝") {
+		t.Fatalf("low disk guard = ok:%v level:%s allowed:%v message:%q", ok, snap.Level, snap.CollectionAllowed, message)
 	}
 }
 

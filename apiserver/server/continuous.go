@@ -293,7 +293,7 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, message)
 		return
 	}
-	if ok, message, _, _ := s.canStartCollection(); !ok {
+	if ok, message, _ := s.canStartCollection(CollectionSourceContinuous); !ok {
 		s.RespondHTTPError(c, http.StatusInsufficientStorage, ErrCodeStorageLowDisk, message)
 		return
 	}

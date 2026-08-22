@@ -458,14 +458,17 @@ func (s *APIServer) runContinuousBlockCompaction(ctx context.Context) {
 	}
 }
 
-// blockCompactionDiskOK 根盘余量检查：至少保留 1GiB，且必须容纳本次输入
-// 大小的两倍。inputBytes<=0 时仅检查保护线。
+// blockCompactionDiskOK 根盘余量检查：emergency/unknown 一律跳过（并计数），
+// 其余等级下至少保留 min_free_bytes，且必须容纳本次输入大小的两倍。
+// inputBytes<=0 时仅检查保护线。
 func (s *APIServer) blockCompactionDiskOK(inputBytes int64) (bool, string) {
-	path, minFree := diskGuardConfig(s.Config)
-	free, err := storageFreeBytes(path)
-	if err != nil {
-		return false, fmt.Sprintf("无法检查根盘 %s: %v", path, err)
+	snap := s.currentStorageSnapshot()
+	if snap.Level == StoragePressureEmergency || snap.Level == StoragePressureUnknown {
+		incCollectionRejectedLowDisk(CollectionSourceCompactor)
+		return false, fmt.Sprintf("根盘 %s 状态 %s，compaction 跳过", snap.Path, snap.Level)
 	}
+	_, _, _, minFree := diskGuardConfig(s.Config)
+	free := snap.AvailableBytes
 	if free < minFree {
 		return false, fmt.Sprintf("根盘可用 %d bytes 低于保护线 %d bytes", free, minFree)
 	}

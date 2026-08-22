@@ -838,9 +838,9 @@ func TestContinuousLowDiskSkipsCompaction(t *testing.T) {
 	blockSeedBatch(t, s, "cps-block-lowdisk", ip, "cpb-lowdisk-1", start, start.Add(time.Minute),
 		[]ContinuousWindowIngest{blockSeedCPUWindow(start.Add(10*time.Second), start.Add(20*time.Second), 1)})
 
-	oldFree := storageFreeBytes
-	storageFreeBytes = func(string) (uint64, error) { return 512 * 1024 * 1024, nil } // 低于 1GiB
-	defer func() { storageFreeBytes = oldFree }()
+	oldFree := readStorageDiskSnapshot
+	readStorageDiskSnapshot = func(string) (uint64, uint64, uint64, error) { return 0, 512 * 1024 * 1024, 0, nil } // 低于 1GiB
+	defer func() { readStorageDiskSnapshot = oldFree }()
 
 	blockCompactRun(t, s)
 

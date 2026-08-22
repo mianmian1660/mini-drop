@@ -31,9 +31,18 @@ type Config struct {
 
 // StorageDiskConfig protects the host filesystem used by containers and
 // temporary capture files. It intentionally is separate from object storage.
+//
+// 阈值语义（全部是"剩余可用字节数"的硬下界）：
+//   - WarningFreeBytes：剩余低于该值 → level=warning（只告警，不拒收）
+//   - CriticalFreeBytes：剩余低于该值 → level=critical（严重告警，不拒收）
+//   - MinFreeBytes：剩余低于该值 → level=emergency（拒绝新采集）
+//
+// 必须满足 warning_free_bytes > critical_free_bytes > min_free_bytes > 0。
 type StorageDiskConfig struct {
-	Path         string `mapstructure:"path"`
-	MinFreeBytes uint64 `mapstructure:"min_free_bytes"`
+	Path              string `mapstructure:"path"`
+	WarningFreeBytes  uint64 `mapstructure:"warning_free_bytes"`
+	CriticalFreeBytes uint64 `mapstructure:"critical_free_bytes"`
+	MinFreeBytes      uint64 `mapstructure:"min_free_bytes"`
 }
 
 // ServerConfig HTTP 服务配置
@@ -192,6 +201,8 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("continuous_block.compaction_delay_sec", 600)
 	v.SetDefault("continuous_block.compaction_interval_sec", 300)
 	v.SetDefault("storage_disk.path", "/tmp")
+	v.SetDefault("storage_disk.warning_free_bytes", uint64(8<<30))
+	v.SetDefault("storage_disk.critical_free_bytes", uint64(4<<30))
 	v.SetDefault("storage_disk.min_free_bytes", uint64(1<<30))
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")
@@ -268,6 +279,12 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envDiskPath := os.Getenv("STORAGE_DISK_PATH"); envDiskPath != "" {
 		v.Set("storage_disk.path", envDiskPath)
+	}
+	if envWarningFree := os.Getenv("STORAGE_WARNING_FREE_BYTES"); envWarningFree != "" {
+		v.Set("storage_disk.warning_free_bytes", envWarningFree)
+	}
+	if envCriticalFree := os.Getenv("STORAGE_CRITICAL_FREE_BYTES"); envCriticalFree != "" {
+		v.Set("storage_disk.critical_free_bytes", envCriticalFree)
 	}
 	if envMinFree := os.Getenv("STORAGE_MIN_FREE_BYTES"); envMinFree != "" {
 		v.Set("storage_disk.min_free_bytes", envMinFree)
@@ -353,8 +370,20 @@ func (cfg *Config) Validate() error {
 	if strings.TrimSpace(cfg.StorageDisk.Path) == "" {
 		cfg.StorageDisk.Path = "/tmp"
 	}
+	if cfg.StorageDisk.WarningFreeBytes == 0 {
+		cfg.StorageDisk.WarningFreeBytes = 8 << 30
+	}
+	if cfg.StorageDisk.CriticalFreeBytes == 0 {
+		cfg.StorageDisk.CriticalFreeBytes = 4 << 30
+	}
 	if cfg.StorageDisk.MinFreeBytes == 0 {
 		cfg.StorageDisk.MinFreeBytes = 1 << 30
+	}
+	// 阈值链必须严格递减且为正；违反时直接拒绝启动，避免等级判定失真。
+	if cfg.StorageDisk.WarningFreeBytes <= cfg.StorageDisk.CriticalFreeBytes ||
+		cfg.StorageDisk.CriticalFreeBytes <= cfg.StorageDisk.MinFreeBytes {
+		return fmt.Errorf("存储磁盘阈值配置非法：必须满足 warning_free_bytes(%d) > critical_free_bytes(%d) > min_free_bytes(%d) > 0",
+			cfg.StorageDisk.WarningFreeBytes, cfg.StorageDisk.CriticalFreeBytes, cfg.StorageDisk.MinFreeBytes)
 	}
 	return nil
 }

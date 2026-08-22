@@ -80,7 +80,7 @@ func (svc *TaskService) CreateTask(req CreateTaskReq, auth AuthContext, idempote
 			return nil, serviceError(http.StatusInternalServerError, ErrCodeDependencyUnavailable, "服务器内部错误")
 		}
 	}
-	if ok, message, _, _ := s.canStartCollection(); !ok {
+	if ok, message, _ := s.canStartCollection(CollectionSourceOneShot); !ok {
 		return nil, serviceError(http.StatusInsufficientStorage, ErrCodeStorageLowDisk, message)
 	}
 
@@ -143,7 +143,7 @@ func (svc *TaskService) RetryTask(tid string, auth AuthContext) (gin.H, *Service
 	if !s.canManageOwner(oldTask.UID, auth) {
 		return nil, serviceError(http.StatusForbidden, ErrCodeAuthForbidden, "没有权限重试该任务")
 	}
-	if ok, message, _, _ := s.canStartCollection(); !ok {
+	if ok, message, _ := s.canStartCollection(CollectionSourceRetry); !ok {
 		return nil, serviceError(http.StatusInsufficientStorage, ErrCodeStorageLowDisk, message)
 	}
 

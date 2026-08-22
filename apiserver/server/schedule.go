@@ -109,11 +109,11 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 			zap.String("child_tid", trigger.ChildTID))
 		return
 	}
-	if ok, message, free, minimum := s.canStartCollection(); !ok {
+	if ok, message, _ := s.canStartCollection(CollectionSourceScheduled); !ok {
 		now := time.Now()
 		_ = s.DB.Model(&model.ScheduleTrigger{}).Where("id = ?", trigger.ID).
 			Updates(map[string]interface{}{"status": "skipped_low_disk", "updated_at": now}).Error
-		s.Logger.Warn("定时采集因低磁盘跳过", zap.String("sid", sch.SID), zap.String("reason", message), zap.Uint64("free_bytes", free), zap.Uint64("min_free_bytes", minimum))
+		s.Logger.Warn("定时采集因低磁盘跳过", zap.String("sid", sch.SID), zap.String("reason", message))
 		return
 	}
 	// Collection single-flight is deliberately independent from analysis: a

@@ -53,7 +53,9 @@ continuous_block:
 
 storage_disk:
   path: /tmp                    # 宿主机采集/临时文件所在文件系统
-  min_free_bytes: 1073741824    # 少于 1 GiB 时拒绝新的采集
+  warning_free_bytes: 8589934592    # 剩余低于 8 GiB 时告警（不拒收）
+  critical_free_bytes: 4294967296   # 剩余低于 4 GiB 时严重告警（不拒收）
+  min_free_bytes: 1073741824        # 剩余低于 1 GiB 时拒绝新的采集
 
 # 日志配置
 log:
