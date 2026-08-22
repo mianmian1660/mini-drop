@@ -14,7 +14,7 @@ jest.mock('react-router-dom', () => ({
 }));
 
 jest.mock('../api', () => ({
-    tasks: { timeline: jest.fn() },
+    tasks: { timeline: jest.fn(), cancel: jest.fn(), diff: jest.fn() },
     schedules: { list: jest.fn(), toggle: jest.fn(), delete: jest.fn() },
 }));
 
@@ -23,6 +23,12 @@ jest.mock('../components/TimelineChart', () => {
     MockTimelineChart.statusColor = () => '#4caf50';
     return MockTimelineChart;
 });
+
+// InlineDiffPanel 本身有自己的对比测试覆盖，这里只关心 TimelinePage 是否
+// 正确地在点击"与基线对比"后把它渲染出来（内嵌展开，而不是跳转独立页面）
+jest.mock('../components/InlineDiffPanel', () => ({ baselineTid, compareTid }) => (
+    <div data-testid="inline-diff-panel">内嵌对比：baseline={baselineTid} compare={compareTid}</div>
+));
 
 jest.mock('../utils/time', () => ({
     browserTimeZoneLabel: () => '本地时区',
@@ -83,16 +89,25 @@ test('加载定时任务并渲染已完成窗口，提供设为基线入口', as
     const baselineBtns = Array.from(container.querySelectorAll('button')).filter(b => b.textContent.includes('设为基线'));
     expect(baselineBtns.length).toBeGreaterThanOrEqual(2);
 
-    // 点击第一个窗口的"设为基线" -> 该窗口显示"★ 基线"，其他窗口出现"与基线对比"链接
+    // 列表按时间倒序展示，DOM 中第一行是最新窗口 t2；点击它的"设为基线"
+    // -> 该窗口显示"★ 基线"，另一窗口（t1）出现"与基线对比"按钮
     await act(async () => {
         Simulate.click(baselineBtns[0]);
     });
     await act(async () => { await Promise.resolve(); });
     expect(container.textContent).toContain('★ 基线');
-    const diffLink = Array.from(container.querySelectorAll('a')).find(a => a.textContent.includes('与基线对比'));
-    expect(diffLink).toBeTruthy();
-    expect(diffLink.getAttribute('href')).toContain('baseline=t1');
-    expect(diffLink.getAttribute('href')).toContain('compare=t2');
+    const diffBtn = Array.from(container.querySelectorAll('button')).find(b => b.textContent.includes('与基线对比'));
+    expect(diffBtn).toBeTruthy();
+
+    // 点击"与基线对比" -> 在当前页面内嵌展开对比面板，而不是跳转到独立页面
+    await act(async () => {
+        Simulate.click(diffBtn);
+    });
+    await act(async () => { await Promise.resolve(); });
+    const diffPanel = container.querySelector('[data-testid="inline-diff-panel"]');
+    expect(diffPanel).toBeTruthy();
+    expect(diffPanel.textContent).toContain('baseline=t2');
+    expect(diffPanel.textContent).toContain('compare=t1');
 
     act(() => root.unmount());
     container.remove();

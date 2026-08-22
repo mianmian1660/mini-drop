@@ -792,7 +792,14 @@ function HostTimelinePanel({ target }) {
                         )}
                         {error && <div style={S.error}>{error}</div>}
                         {loading ? <div style={S.loading}>加载时间轴...</div> : points.length === 0 ? <div style={S.empty}>当前筛选条件下没有采集窗口</div> : (
-                            <TimelineResult points={points} baselineTid={baselineTid} setBaselineTid={setBaselineTid} />
+                            <TimelineResult
+                                points={points}
+                                baselineTid={baselineTid}
+                                setBaselineTid={setBaselineTid}
+                                diffCompareTid={diffCompareTid}
+                                setDiffCompareTid={setDiffCompareTid}
+                                onCancelled={refreshTimeline}
+                            />
                         )}
                     </>
                 )}
@@ -801,35 +808,48 @@ function HostTimelinePanel({ target }) {
     );
 }
 
-function TimelineResult({ points, baselineTid, setBaselineTid }) {
+function TimelineResult({ points, baselineTid, setBaselineTid, diffCompareTid, setDiffCompareTid, onCancelled }) {
+    // 按时间倒序展示：最新窗口排最上面；序号沿用原始时间顺序（最早=1），只调整展示顺序
+    const ordered = points.map((p, i) => ({ ...p, _seq: i + 1 })).reverse();
     return (
         <div>
             <TimelineChart points={points} />
             <div style={{ marginTop: 16 }}>
-                {points.map((p, i) => (
-                    <div key={p.tid} style={{ ...S.card, boxShadow: 'none', padding: 14, marginBottom: 10 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-                            <div>
-                                <strong>{i + 1}. {p.name || p.tid}</strong>
-                                <span style={{ ...S.badge, marginLeft: 8, background: statusColor(p.status), color: '#fff' }}>{ST[p.status] || '未知'}</span>
-                                {p.task_kind && <span style={{ marginLeft: 8, fontSize: 12, color: '#667085' }}>{p.task_kind}</span>}
-                                {p.has_result && <span style={{ marginLeft: 8, fontSize: 12, color: '#16a34a' }}>有结果</span>}
+                {ordered.map(p => (
+                    <React.Fragment key={p.tid}>
+                        <div style={{ ...S.card, boxShadow: 'none', padding: 14, marginBottom: diffCompareTid === p.tid ? 0 : 10 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                                <div>
+                                    <strong>{p._seq}. {p.name || p.tid}</strong>
+                                    <span style={{ ...S.badge, marginLeft: 8, background: statusColor(p.status), color: '#fff' }}>{ST[p.status] || '未知'}</span>
+                                    {p.is_effective && <span style={{ marginLeft: 8, fontSize: 12, color: '#315efb', fontWeight: 700 }}>当时生效</span>}
+                                    {p.task_kind && <span style={{ marginLeft: 8, fontSize: 12, color: '#667085' }}>{p.task_kind}</span>}
+                                    {p.has_result && <span style={{ marginLeft: 8, fontSize: 12, color: '#16a34a' }}>有结果</span>}
+                                </div>
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                    <TaskCancelButton tid={p.tid} status={p.status} canManage={p.can_manage} onCancelled={onCancelled} />
+                                    {p.has_result && (baselineTid === p.tid ? (
+                                        <button style={S.btnSm} onClick={() => { setBaselineTid(''); setDiffCompareTid(''); }}>★ 基线</button>
+                                    ) : baselineTid ? (
+                                        <button style={S.btnSm} onClick={() => setDiffCompareTid(v => (v === p.tid ? '' : p.tid))}>
+                                            {diffCompareTid === p.tid ? '收起对比' : '与基线对比'}
+                                        </button>
+                                    ) : (
+                                        <button style={S.btnSm} onClick={() => setBaselineTid(p.tid)}>设为基线</button>
+                                    ))}
+                                    <Link to={p.result_url || `/task/result?tid=${p.tid}`} style={S.btnSm}>查看详情</Link>
+                                </div>
                             </div>
-                            <div style={{ display: 'flex', gap: 8 }}>
-                                {p.has_result && (baselineTid === p.tid ? (
-                                    <button style={S.btnSm} onClick={() => setBaselineTid('')}>基线</button>
-                                ) : baselineTid ? (
-                                    <Link to={`/task/diff?baseline=${baselineTid}&compare=${p.tid}`} style={S.btnSm}>与基线对比</Link>
-                                ) : (
-                                    <button style={S.btnSm} onClick={() => setBaselineTid(p.tid)}>设为基线</button>
-                                ))}
-                                <Link to={p.result_url || `/task/result?tid=${p.tid}`} style={S.btnSm}>查看详情</Link>
+                            <div style={S.subtle}>
+                                窗口 {formatDateTime(p.window_start || p.create_time)} → {formatDateTime(p.window_end || p.end_time) || '进行中'}
                             </div>
                         </div>
-                        <div style={S.subtle}>
-                            窗口 {formatDateTime(p.window_start || p.create_time)} → {formatDateTime(p.window_end || p.end_time) || '进行中'}
-                        </div>
-                    </div>
+                        {diffCompareTid === p.tid && baselineTid && baselineTid !== p.tid && (
+                            <div style={{ marginBottom: 10 }}>
+                                <InlineDiffPanel baselineTid={baselineTid} compareTid={p.tid} onClose={() => setDiffCompareTid('')} />
+                            </div>
+                        )}
+                    </React.Fragment>
                 ))}
             </div>
         </div>

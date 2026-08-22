@@ -63,21 +63,26 @@ curl -fsS "$BASE/healthz" >/dev/null || fail "apiserver healthz"
 docker rm -f "$MYSQL_CTN" >/dev/null 2>&1 || true
 docker run -d --name "$MYSQL_CTN" -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root "$MYSQL_IMAGE" >/dev/null \
     || fail "start MySQL container"
+# mysqladmin ping 只探测服务器存活、不校验凭据，MySQL 初始化临时服务器阶段也会
+# 返回成功（此时 root 密码尚未生效），所以用 mysql -e "SELECT 1" 验证真正可认证。
 for _ in $(seq 1 30); do
-    docker exec "$MYSQL_CTN" mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 && break
+    docker exec "$MYSQL_CTN" mysql -uroot -proot -e "SELECT 1" >/dev/null 2>&1 && break
     sleep 2
 done
-docker exec "$MYSQL_CTN" mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 \
+docker exec "$MYSQL_CTN" mysql -uroot -proot -e "SELECT 1" >/dev/null 2>&1 \
     || fail "MySQL did not become ready"
 pass "MySQL target ready"
 
 # ---------- 2. 建只读账号 + 前置条件检查 ----------
-docker exec "$MYSQL_CTN" mysql -uroot -proot -e "
+# 错误不吞：失败时把 stderr 打出来，便于定位是 Access denied 还是 sys schema 缺失。
+if ! docker exec "$MYSQL_CTN" mysql -uroot -proot -e "
     CREATE USER IF NOT EXISTS 'mini_drop'@'%' IDENTIFIED BY 'md_pass';
     GRANT PROCESS ON *.* TO 'mini_drop'@'%';
     GRANT SELECT ON performance_schema.* TO 'mini_drop'@'%';
     GRANT SELECT ON sys.* TO 'mini_drop'@'%';
-    FLUSH PRIVILEGES;" >/dev/null 2>&1 || fail "create mini_drop account"
+    FLUSH PRIVILEGES;" 2>&1; then
+    fail "create mini_drop account"
+fi
 docker exec "$MYSQL_CTN" mysql -uroot -proot -N -e \
     "SELECT @@performance_schema; SHOW DATABASES LIKE 'sys';" 2>/dev/null | grep -q "sys" \
     || fail "performance_schema/sys schema not available"
