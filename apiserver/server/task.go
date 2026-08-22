@@ -1743,6 +1743,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 master_tid 参数"})
 		return
 	}
+	auth := s.AuthContext(c)
 
 	// 生效窗口需要独立查询，不能共用已加过滤条件的 query，因此把基础条件封成构造函数
 	baseQuery := func() *gorm.DB {
@@ -1883,6 +1884,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		ScheduledAt time.Time  `json:"scheduled_at"`
 		DurationSec uint64     `json:"duration_seconds"`
 		ResultURL   string     `json:"result_url,omitempty"`
+		CanManage   bool       `json:"can_manage"`
 	}
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
@@ -1911,6 +1913,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			WindowStart:    t.CreateTime,
 			ScheduledAt:    scheduledAt,
 			IsEffective:    effective != nil && t.TID == effective.TID,
+			CanManage:      s.canManageOwner(t.UID, auth),
 		}
 		if t.BeginTime != nil {
 			tp.BeginTime = t.BeginTime

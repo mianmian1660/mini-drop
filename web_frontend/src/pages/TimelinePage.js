@@ -23,17 +23,6 @@ const S = {
         border: active ? '1px solid #4a6cf7' : '1px solid #dde1ec',
         padding: '6px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 13, marginRight: 8,
     }),
-    timeline: { position: 'relative', paddingLeft: 30, borderLeft: '3px solid #4a6cf7', marginLeft: 10 },
-    point: (st, eff) => ({
-        position: 'relative', marginBottom: 20, padding: '10px 16px',
-        background: st === 2 ? '#e8f5e9' : st === 3 ? '#ffebee' : st === 4 ? '#f3e8ff' : st === 1 ? '#e3f2fd' : '#f5f5f5',
-        borderRadius: 6, border: eff ? '2px solid #4a6cf7' : '1px solid #eee',
-    }),
-    dot: (st) => ({
-        position: 'absolute', left: -39, top: 12, width: 14, height: 14, borderRadius: '50%',
-        background: st === 2 ? '#4caf50' : st === 3 ? '#f44336' : st === 4 ? '#7c3aed' : st === 1 ? '#2196f3' : '#ccc',
-        border: '2px solid #fff', boxShadow: '0 0 0 2px #4a6cf7',
-    }),
     loading: { textAlign: 'center', padding: 60, color: '#999' },
     label: { display: 'block', marginBottom: 8, fontWeight: 'bold', fontSize: 14, color: '#555' },
     hint: { fontSize: 12, color: '#888', marginTop: 4 },
@@ -79,6 +68,7 @@ export default function TimelinePage() {
     const [kindFilter, setKindFilter] = useState('');
     const [hasResultFilter, setHasResultFilter] = useState('');
     const [trends, setTrends] = useState(null);
+    const [diffCompareTid, setDiffCompareTid] = useState(''); // 当前展开内嵌基线对比的窗口 tid
 
     const timelineFilters = useCallback(() => ({
         status: statusFilter || undefined,
@@ -164,6 +154,13 @@ export default function TimelinePage() {
         setActiveRange(-1);
         loadRange(fromISO, toISO);
     }, [fromInput, toInput, loadRange]);
+
+    // 重新拉取当前生效的查询（供筛选按钮、任务停止后刷新复用，避免各处各写一份）
+    const reloadCurrent = useCallback(() => {
+        if (queryMode === 'at') loadAt();
+        else if (queryMode === 'range') { if (rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo); }
+        else loadTimeline(masterTid);
+    }, [queryMode, rangeFrom, rangeTo, loadAt, loadRange, loadTimeline, masterTid]);
 
     // 自动轮询：沿用当前查询模式（全部窗口 / 时间区间 / 按时刻回溯）重新拉取
     useEffect(() => {
@@ -316,11 +313,7 @@ export default function TimelinePage() {
                             <option value="true">有结果</option>
                             <option value="false">无结果</option>
                         </select>
-                        <button style={S.btnSm} onClick={() => {
-                            if (queryMode === 'at') loadAt();
-                            else if (queryMode === 'range' && rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo);
-                            else loadTimeline(masterTid);
-                        }}>应用筛选</button>
+                        <button style={S.btnSm} onClick={reloadCurrent}>应用筛选</button>
                     </div>
 
                     <div style={{ borderTop: '1px solid #eee', paddingTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -375,61 +368,83 @@ export default function TimelinePage() {
                         </div>
                     )}
 
-                    <div style={{ ...S.timeline, marginTop: 20 }}>
-                        {points.map((p, i) => (
-                            <div key={p.tid} style={S.point(p.status, p.is_effective)}>
-                                <div style={S.dot(p.status)} />
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <div>
-                                        <strong>{i + 1}. {p.name || p.tid}</strong>
-                                        <span style={{
-                                            marginLeft: 10, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 'bold',
-                                            background: statusColor(p.status),
-                                            color: '#fff'
-                                        }}>{ST[p.status] || '未知'}</span>
-                                        {p.is_effective && <span style={{
-                                            marginLeft: 6, padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 'bold',
-                                            background: '#4a6cf7', color: '#fff'
-                                        }}>当时生效</span>}
-                                        {p.task_kind && <span style={{ marginLeft: 6, fontSize: 11, color: '#666' }}>{p.task_kind}</span>}
-                                        {p.has_result && <span style={{ marginLeft: 6, fontSize: 11, color: '#4caf50' }}>✅ 有结果</span>}
-                                    </div>
-                                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                                        {/* 只有分析完成的窗口才有 top.json，没有产物的窗口不给对比入口 */}
-                                        {p.has_result && (baselineTid === p.tid ? (
-                                            <button style={{ ...S.btnSm, background: '#4a6cf7', color: '#fff', marginRight: 0 }}
-                                                onClick={() => setBaselineTid('')}>
-                                                ★ 基线（点击取消）
-                                            </button>
-                                        ) : baselineTid ? (
-                                            <Link to={`/task/diff?baseline=${baselineTid}&compare=${p.tid}`}
-                                                style={{ ...S.btnSm, marginRight: 0, textDecoration: 'none', background: '#e8f0ff', color: '#4a6cf7' }}>
-                                                与基线对比
-                                            </Link>
-                                        ) : (
-                                            <button style={{ ...S.btnSm, marginRight: 0 }}
-                                                onClick={() => setBaselineTid(p.tid)}>
-                                                设为基线
-                                            </button>
-                                        ))}
-                                        <Link to={p.result_url || `/task/result?tid=${p.tid}`}
-                                            style={{ color: '#4a6cf7', fontSize: 13, fontWeight: 'bold', textDecoration: 'none' }}>
-                                            查看详情 →
-                                        </Link>
-                                    </div>
-                                </div>
-                                <div style={{ fontSize: 11, color: '#999', marginTop: 4 }}>
-                                    窗口 {formatDateTime(p.window_start || p.create_time)}
-                                    {' → '}
-                                    {p.window_end
-                                        ? formatDateTime(p.window_end)
-                                        : (p.end_time ? formatDateTime(p.end_time) : '进行中')}
-                                    {p.frequency_hz ? ` · ${p.frequency_hz}Hz` : ''}
-                                    {p.duration_seconds ? ` · ${p.duration_seconds}s` : ''}
-                                    {p.scheduled_at ? ` · 触发 ${formatDateTime(p.scheduled_at)}` : ''}
-                                </div>
-                            </div>
-                        ))}
+                    {/* 按时间倒序展示：最新窗口排最上面；序号沿用原始时间顺序（最早=1），只调整展示顺序 */}
+                    <div className="table-scroll" style={{ ...S.tableWrap, marginTop: 20 }}>
+                        <table style={S.table}>
+                            <thead>
+                                <tr>
+                                    <th style={S.th}>窗口</th>
+                                    <th style={S.th}>状态</th>
+                                    <th style={S.th}>采样参数</th>
+                                    <th style={S.th}>窗口时间</th>
+                                    <th style={S.th}>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {points.map((p, i) => ({ ...p, _seq: i + 1 })).reverse().map(p => (
+                                    <React.Fragment key={p.tid}>
+                                        <tr>
+                                            <td style={S.td}>
+                                                <div style={S.rowName}>{p._seq}. {p.name || p.tid}</div>
+                                                <span style={{ color: '#667085', fontSize: 12 }}>{p.tid}</span>
+                                            </td>
+                                            <td style={S.td}>
+                                                <span style={{ ...S.badge, background: statusColor(p.status), color: '#fff' }}>{ST[p.status] || '未知'}</span>
+                                                {p.is_effective && <div style={{ color: '#315efb', fontSize: 11, marginTop: 4, fontWeight: 700 }}>当时生效</div>}
+                                                {p.task_kind && <div style={{ color: '#667085', fontSize: 11, marginTop: 4 }}>{p.task_kind}</div>}
+                                                {p.has_result && <div style={{ color: '#12b76a', fontSize: 11, marginTop: 4 }}>有结果</div>}
+                                            </td>
+                                            <td style={S.td}>
+                                                {p.frequency_hz ? `${p.frequency_hz}Hz` : '-'}
+                                                {p.duration_seconds ? ` · ${p.duration_seconds}s` : ''}
+                                            </td>
+                                            <td style={S.td}>
+                                                窗口 {formatDateTime(p.window_start || p.create_time)}
+                                                {' → '}
+                                                {p.window_end ? formatDateTime(p.window_end) : (p.end_time ? formatDateTime(p.end_time) : '进行中')}
+                                                {p.scheduled_at && <div style={{ color: '#667085', fontSize: 11, marginTop: 4 }}>触发 {formatDateTime(p.scheduled_at)}</div>}
+                                            </td>
+                                            <td style={S.td}>
+                                                <Link style={S.link} to={p.result_url || `/task/result?tid=${p.tid}`}>查看</Link>
+                                                <TaskCancelButton
+                                                    tid={p.tid}
+                                                    status={p.status}
+                                                    canManage={p.can_manage}
+                                                    onCancelled={reloadCurrent}
+                                                    style={{ marginRight: 10 }}
+                                                />
+                                                {/* 只有分析完成的窗口才有 top.json，没有产物的窗口不给对比入口 */}
+                                                {p.has_result && (baselineTid === p.tid ? (
+                                                    <button style={S.baselineActiveBtn} onClick={() => { setBaselineTid(''); setDiffCompareTid(''); }}>
+                                                        ★ 基线（点击取消）
+                                                    </button>
+                                                ) : baselineTid ? (
+                                                    <button style={S.baselineActiveBtn}
+                                                        onClick={() => setDiffCompareTid(v => (v === p.tid ? '' : p.tid))}>
+                                                        {diffCompareTid === p.tid ? '收起对比' : '与基线对比'}
+                                                    </button>
+                                                ) : (
+                                                    <button style={S.baselineBtn} onClick={() => setBaselineTid(p.tid)}>
+                                                        设为基线
+                                                    </button>
+                                                ))}
+                                            </td>
+                                        </tr>
+                                        {diffCompareTid === p.tid && baselineTid && baselineTid !== p.tid && (
+                                            <tr>
+                                                <td colSpan={5} style={{ padding: '0 0 16px', borderBottom: '1px solid #edf0f3' }}>
+                                                    <InlineDiffPanel
+                                                        baselineTid={baselineTid}
+                                                        compareTid={p.tid}
+                                                        onClose={() => setDiffCompareTid('')}
+                                                    />
+                                                </td>
+                                            </tr>
+                                        )}
+                                    </React.Fragment>
+                                ))}
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             )}
