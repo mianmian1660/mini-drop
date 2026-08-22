@@ -1615,9 +1615,27 @@ func (s *APIServer) downsampleContinuousWindows(ctx context.Context, session mod
 // 已有的 ContinuousWindowSummary 行（如果存在）——因为 retention 清理是
 // 周期性跑的，同一个小时桶里的 window 很可能分几轮才全部过期，需要
 // 读出旧摘要、按函数名累加、重新排序截断，而不是覆盖。
+//
+// 读-改-写三步之间原来没有任何互斥：per-ingest 触发的清理和周期性
+// ticker 触发的清理可能并发跑到同一个 (session_sid, signal_type,
+// bucket_start) 桶，后写的会用自己读到的旧值覆盖，静默丢样本。这里用
+// Postgres 会话级 advisory lock（按桶 key 哈希）把同一个桶的读-改-写
+// 序列化：不同桶之间互不阻塞，同一个桶的并发调用变成排队执行，读到的
+// 一定是上一个调用已经写完的最新值。锁随事务提交/回滚自动释放
+// （pg_advisory_xact_lock），不需要手动 unlock。
 func (s *APIServer) mergeContinuousWindowSummary(ctx context.Context, sessionSID, signalType string, bucketStart, bucketEnd time.Time, agg *continuousAggregate) error {
+	lockKey := sessionSID + "|" + signalType + "|" + bucketStart.UTC().Format(time.RFC3339)
+	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", lockKey).Error; err != nil {
+			return err
+		}
+		return s.mergeContinuousWindowSummaryLocked(ctx, tx, sessionSID, signalType, bucketStart, bucketEnd, agg)
+	})
+}
+
+func (s *APIServer) mergeContinuousWindowSummaryLocked(ctx context.Context, tx *gorm.DB, sessionSID, signalType string, bucketStart, bucketEnd time.Time, agg *continuousAggregate) error {
 	var existing model.ContinuousWindowSummary
-	lookupErr := s.DB.WithContext(ctx).
+	lookupErr := tx.WithContext(ctx).
 		Where("session_sid = ? AND signal_type = ? AND bucket_start = ?", sessionSID, signalType, bucketStart).
 		First(&existing).Error
 
@@ -1668,7 +1686,7 @@ func (s *APIServer) mergeContinuousWindowSummary(ctx context.Context, sessionSID
 	}
 
 	row := model.ContinuousWindowSummary{}
-	result := s.DB.WithContext(ctx).
+	result := tx.WithContext(ctx).
 		Where(model.ContinuousWindowSummary{SessionSID: sessionSID, SignalType: signalType, BucketStart: bucketStart}).
 		Assign(map[string]interface{}{
 			"bucket_end":    bucketEnd,

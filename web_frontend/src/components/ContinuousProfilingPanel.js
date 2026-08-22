@@ -313,6 +313,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     continuous.dbSnapshot(params),
                     timelinePromise,
                 ]);
+                if (requestID !== querySequence.current) return;
                 setReliability(timelineRes?.code === 0 ? timelineRes.data : null);
                 if (dbRes.code === 0) setDbSnapshot(dbRes.data);
                 if (dbRes.code !== 0) {
