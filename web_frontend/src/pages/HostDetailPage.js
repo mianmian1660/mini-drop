@@ -337,13 +337,13 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
             {/* 整机资源块：无数据时保留稳定布局，数值显示 "--" */}
             <div style={S.hostResourceGrid}>
                 <HostResourceBlock
-                    title="CPU"
+                    title="整机 CPU"
                     percent={host?.cpu_percent}
                     available={cpuAvailable}
-                    detail={cpuAvailable ? '整机 CPU 使用率' : null}
+                    detail={cpuAvailable ? '使用率（0–100%）' : null}
                 />
                 <HostResourceBlock
-                    title="内存"
+                    title="整机内存"
                     percent={host?.memory_percent}
                     available={memAvailable}
                     detail={memAvailable ? `已用 ${formatCapacity(host.memory_used_bytes)} / 总量 ${formatCapacity(host.memory_total_bytes)}` : null}
@@ -427,11 +427,18 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                     <button style={S.btnSecondary} onClick={onRefresh} disabled={detailLoading}>{detailLoading ? '刷新中' : '刷新'}</button>
                 </div>
                 <div style={S.metricGrid}>
-                    <Metric label="Agent 在线" value={agent.online ? 'ONLINE' : target.drop_agent_status || 'unknown'} />
+                    <Metric
+                        label="Agent 在线"
+                        value={
+                            <span style={{ color: agent.online ? '#16a34a' : (target.drop_agent_status === 'offline' ? '#dc2626' : '#64748b'), fontWeight: 700 }}>
+                                {agent.online ? '在线' : statusLabel(target.drop_agent_status, 'drop')}
+                            </span>
+                        }
+                    />
                     <Metric label="资源数据源" value={stat.source === 'grpc' ? '实时 gRPC' : '数据库快照'} />
                     <Metric label="Agent CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
-                    <Metric label="Agent 内存" value={formatMemory(stat.memory_kb)} />
-                    <Metric label="深度采样窗口" value={scheduleItems.length} />
+                    <Metric label="Agent 内存" value={formatCapacity(stat.memory_kb * 1024)} />
+                    <Metric label="深度采样计划" value={scheduleItems.length} />
                     <Metric label="Native profiling" value={profilingMsg} />
                 </div>
                 <div style={S.capWrap}>
@@ -897,12 +904,6 @@ function formatMetric(value, digits = 1) {
     const num = Number(value);
     if (!Number.isFinite(num)) return '0.0';
     return num.toFixed(digits);
-}
-
-function formatMemory(kb) {
-    const num = Number(kb);
-    if (!Number.isFinite(num) || num <= 0) return '0 MB';
-    return `${(num / 1024).toFixed(1)} MB`;
 }
 
 function truncate(value, limit) {
