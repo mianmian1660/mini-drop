@@ -137,7 +137,9 @@ export const analysisResults = {
 // ---------- 周期性深度采样 / Periodic Deep Sampling ----------
 export const schedules = {
     create: (data) => client.post('/api/v1/schedule/task', data),
+    // 列表：支持 target_ip / keyword / enabled / owner_filter / page / page_size
     list: (params = {}) => client.get('/api/v1/schedule/tasks', { params }),
+    detail: (sid) => client.get(`/api/v1/schedule/${encodeURIComponent(sid)}`),
     delete: (sid) => client.delete(`/api/v1/schedule/${sid}`),
     toggle: (sid) => client.post(`/api/v1/schedule/${sid}/toggle`),
 };

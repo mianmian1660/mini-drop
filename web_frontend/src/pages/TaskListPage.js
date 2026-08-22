@@ -1,7 +1,9 @@
 // ============================================================
-// pages/TaskListPage.js — 全部任务列表页（/tasks）
+// pages/TaskListPage.js — 单次任务列表页（/tasks）
 // ============================================================
-// 功能：全部任务表格 + 后端搜索 + 分页 + 删除
+// 功能：单次任务表格 + 后端搜索 + 分页 + 删除
+// 只显示非周期计划直接触发的任务（task_scope=single）：
+// 普通任务、复合任务、人工重试任务；周期计划生成的采集窗口不在此列。
 // ============================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -54,6 +56,7 @@ export default function TaskListPage() {
                 keyword: searchText,
                 status: statusFilter || undefined,
                 owner_filter: ownerFilter,
+                task_scope: 'single',
             });
             if (res.code === 0) {
                 setTaskList(res.data?.tasks || []);
@@ -122,7 +125,7 @@ export default function TaskListPage() {
 
     return (
         <div style={styles.container}>
-            <h2>全部任务</h2>
+            <h2>单次任务</h2>
 
             {/* 搜索栏 + 状态筛选 */}
             <div style={styles.card}>

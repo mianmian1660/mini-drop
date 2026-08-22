@@ -8,6 +8,7 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -320,11 +321,30 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 // ----------------------------------------------------------
 // ListSchedules 获取定时任务列表
 // GET /api/v1/schedule/tasks
+// 支持过滤与分页：target_ip / keyword / enabled / owner_filter / page / page_size
 // ----------------------------------------------------------
 func (s *APIServer) ListSchedules(c *gin.Context) {
 	auth := s.AuthContext(c)
-	var schedules []model.ScheduleTask
-	query := s.DB.Order("created_at DESC")
+	query := s.DB.Model(&model.ScheduleTask{}).Order("created_at DESC")
+
+	// 目标 IP 过滤（主机周期 Tab 只展示当前主机的周期任务）
+	if targetIP := strings.TrimSpace(c.Query("target_ip")); targetIP != "" {
+		query = query.Where("target_ip = ?", targetIP)
+	}
+	// 关键词：名称 / SID / 目标 IP
+	if keyword := strings.TrimSpace(c.Query("keyword")); keyword != "" {
+		like := "%" + keyword + "%"
+		query = query.Where("name LIKE ? OR sid LIKE ? OR target_ip LIKE ?", like, like, like)
+	}
+	// 启停状态过滤
+	if enabled := strings.TrimSpace(c.Query("enabled")); enabled != "" {
+		switch enabled {
+		case "true":
+			query = query.Where("enabled = ?", true)
+		case "false":
+			query = query.Where("enabled = ?", false)
+		}
+	}
 	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("owner_filter", "all"))) {
 	case "", "all":
 	case "mine":
@@ -333,7 +353,22 @@ func (s *APIServer) ListSchedules(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "owner_filter 仅支持 all/mine")
 		return
 	}
-	if err := query.Find(&schedules).Error; err != nil {
+
+	// 分页（默认 50 条；保持旧调用方兼容：不传分页参数时返回全部）
+	page := 1
+	pageSize := 50
+	if p, err := strconv.Atoi(c.DefaultQuery("page", "1")); err == nil && p > 0 {
+		page = p
+	}
+	if ps, err := strconv.Atoi(c.DefaultQuery("page_size", "50")); err == nil && ps > 0 && ps <= 200 {
+		pageSize = ps
+	}
+
+	var total int64
+	query.Count(&total)
+
+	var schedules []model.ScheduleTask
+	if err := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&schedules).Error; err != nil {
 		s.Logger.Error("查询定时任务失败", zap.Error(err))
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询失败")
 		return
@@ -344,9 +379,41 @@ func (s *APIServer) ListSchedules(c *gin.Context) {
 	}
 	for index := range schedules {
 		schedules[index].CanManage = s.canManageOwner(schedules[index].UID, auth)
+		schedules[index].NextRunAt = s.scheduleNextRun(schedules[index])
 	}
 
-	s.RespondOK(c, gin.H{"schedules": schedules, "total": len(schedules)})
+	s.RespondOK(c, gin.H{"schedules": schedules, "total": total, "page": page, "pageSize": pageSize})
+}
+
+// ----------------------------------------------------------
+// GetScheduleDetail 获取单个定时任务详情
+// GET /api/v1/schedule/:sid
+// ----------------------------------------------------------
+func (s *APIServer) GetScheduleDetail(c *gin.Context) {
+	sid := c.Param("sid")
+	var sch model.ScheduleTask
+	if err := s.DB.Where("sid = ?", sid).First(&sch).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "定时任务不存在: "+sid)
+		return
+	}
+	sch.CanManage = s.canManageOwner(sch.UID, s.AuthContext(c))
+	sch.NextRunAt = s.scheduleNextRun(sch)
+	s.RespondOK(c, sch)
+}
+
+// scheduleNextRun 根据 cron 表达式计算下一次运行时间（仅 enabled 的计划）。
+// 用于列表/详情的"下次运行"展示；解析失败或计划停用时返回 nil。
+func (s *APIServer) scheduleNextRun(sch model.ScheduleTask) *time.Time {
+	if !sch.Enabled {
+		return nil
+	}
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	sched, err := parser.Parse(sch.CronExpr)
+	if err != nil {
+		return nil
+	}
+	next := sched.Next(time.Now())
+	return &next
 }
 
 // ----------------------------------------------------------

@@ -755,6 +755,7 @@ func (s *APIServer) registerRoutes() {
 		// 定时任务管理（W5）
 		api.POST("/schedule/task", s.CreateSchedule)
 		api.GET("/schedule/tasks", s.ListSchedules)
+		api.GET("/schedule/:sid", s.GetScheduleDetail)
 		api.DELETE("/schedule/:sid", s.DeleteSchedule)
 		api.POST("/schedule/:sid/toggle", s.ToggleSchedule)
 	}
