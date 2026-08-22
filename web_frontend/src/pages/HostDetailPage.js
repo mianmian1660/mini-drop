@@ -1,13 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { agents, profiles, schedules, tasks } from '../api';
+import { agents, continuous, profiles, schedules, tasks } from '../api';
 import CreateTaskModal from '../components/CreateTaskModal';
 import CreateContinuousSessionModal from '../components/CreateContinuousSessionModal';
 import ContinuousSessionList from '../components/ContinuousSessionList';
 import Pagination from '../components/Pagination';
 import TimelineChart, { statusColor } from '../components/TimelineChart';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
-import { formatMetricValue, metricColumnLabel } from '../utils/profileMetrics';
+import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
 import { browserTimeZoneLabel, formatDateTime, localDateTimeToISO } from '../utils/time';
 import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
 
@@ -43,13 +43,14 @@ const S = {
     contextToggle: { background: '#f8fafc', color: '#315efb', border: '1px solid #d0d7de', padding: '5px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700 },
     tabBar: { display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 16, borderBottom: '1px solid #e5e7eb' },
     tab: (active) => ({ padding: '10px 0 11px', borderRadius: 0, border: 'none', borderBottom: active ? '2px solid #315efb' : '2px solid transparent', background: 'transparent', color: active ? '#315efb' : '#667085', cursor: 'pointer', fontSize: 14, fontWeight: 700 }),
-    grid: { display: 'grid', gridTemplateColumns: 'minmax(280px, 0.8fr) minmax(420px, 1.2fr)', gap: 16, minWidth: 0, maxWidth: '100%' },
     sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 },
     sectionTitle: { margin: 0, fontSize: 18 },
     btn: { background: '#315efb', color: '#fff', border: 'none', padding: '9px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 700 },
     btnDisabled: { background: '#e5e7eb', color: '#667085', border: 'none', padding: '9px 14px', borderRadius: 6, cursor: 'not-allowed', fontSize: 13, fontWeight: 700 },
     btnSm: { background: '#f8fafc', color: '#475467', border: '1px solid #d0d7de', padding: '6px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, textDecoration: 'none' },
     btnSecondary: { background: '#fff', color: '#315efb', border: '1px solid #c7d2fe', padding: '8px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 700, textDecoration: 'none' },
+    btnDangerSm: { background: '#fff', color: '#b42318', border: '1px solid #fda29b', padding: '5px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700 },
+    mono: { maxWidth: 320, color: '#475467', fontSize: 12, fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', wordBreak: 'break-all' },
     badge: { display: 'inline-flex', alignItems: 'center', padding: '3px 9px', borderRadius: 999, fontSize: 12, fontWeight: 700 },
     metricGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10 },
     metric: { background: '#f8fafc', border: '1px solid #edf0f3', borderRadius: 6, padding: 12 },
@@ -104,7 +105,6 @@ export default function HostDetailPage() {
     const [agentDetail, setAgentDetail] = useState(null);
     const [hostTasks, setHostTasks] = useState([]);
     const [hostSchedules, setHostSchedules] = useState([]);
-    const [profileSummary, setProfileSummary] = useState(null);
     const [loading, setLoading] = useState(true);
     const [detailLoading, setDetailLoading] = useState(false);
     const [error, setError] = useState('');
@@ -150,25 +150,6 @@ export default function HostDetailPage() {
         }
     }, []);
 
-    const loadProfileSummary = useCallback(async (target) => {
-        if (!target) return;
-        const to = new Date();
-        const from = new Date(to.getTime() - 30 * 60 * 1000);
-        try {
-            const res = await profiles.topn({
-                target_id: target.id,
-                host: target.ip,
-                service: target.service_name || 'hotmethod',
-                from: from.toISOString(),
-                to: to.toISOString(),
-                profile_type: 'cpu',
-            });
-            if (res.code === 0) setProfileSummary(res.data || null);
-        } catch (err) {
-            setProfileSummary({ empty: true, message: err?.message || 'Native Continuous Profiling 查询失败' });
-        }
-    }, []);
-
     useEffect(() => {
         setLoading(true);
         setError('');
@@ -182,8 +163,7 @@ export default function HostDetailPage() {
         loadAgentDetail(target.ip);
         loadHostTasks(target.ip);
         loadHostSchedules(target.ip);
-        loadProfileSummary(target);
-    }, [target, loadAgentDetail, loadHostTasks, loadHostSchedules, loadProfileSummary]);
+    }, [target, loadAgentDetail, loadHostTasks, loadHostSchedules]);
 
     useEffect(() => {
         if (!target?.ip) return undefined;
@@ -273,12 +253,10 @@ export default function HostDetailPage() {
                     capabilities={capabilities}
                     tasks={hostTasks}
                     schedules={hostSchedules}
-                    profileSummary={profileSummary}
                     onRefresh={() => {
                         loadAgentDetail(target.ip);
                         loadHostTasks(target.ip);
                         loadHostSchedules(target.ip);
-                        loadProfileSummary(target);
                     }}
                     onTab={setTab}
                 />
@@ -415,10 +393,7 @@ function DropAgentNotice({ target, activeTab }) {
     );
 }
 
-function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks: taskItems, schedules: scheduleItems, profileSummary, onRefresh, onTab }) {
-    const profilingMsg = profileSummary?.empty
-        ? (profileSummary.message || '无 Native profiling 数据')
-        : `${profileSummary?.items?.length || 0} 个热点函数 · ${formatMetricValue(profileSummary?.total, profileSummary?.unit)}`;
+function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks: taskItems, schedules: scheduleItems, onRefresh, onTab }) {
     return (
         <>
             <section style={S.card}>
@@ -439,48 +414,167 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                     <Metric label="Agent CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
                     <Metric label="Agent 内存" value={formatCapacity(stat.memory_kb * 1024)} />
                     <Metric label="深度采样计划" value={scheduleItems.length} />
-                    <Metric label="Native profiling" value={profilingMsg} />
                 </div>
                 <div style={S.capWrap}>
                     {capabilities.length === 0 ? <span style={S.subtle}>未声明采集能力</span> : capabilities.map(cap => <span key={cap} style={S.capPill}>{capabilityLabel(cap)}</span>)}
                 </div>
             </section>
 
-            <div className="performance-overview-grid" style={S.grid}>
-                <section style={S.card}>
-                    <div style={S.sectionHead}>
-                        <h3 style={S.sectionTitle}>最近任务</h3>
-                        <button style={S.btnSm} onClick={() => onTab('tasks')}>查看任务列表</button>
-                    </div>
-                    <MiniTaskList tasks={taskItems} />
-                </section>
-                <section style={S.card}>
-                    <div style={S.sectionHead}>
-                        <h3 style={S.sectionTitle}>最近深度采样窗口</h3>
-                        <button style={S.btnSm} onClick={() => onTab('timeline')}>查看时间轴</button>
-                    </div>
-                    {scheduleItems.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划</div> : (
-                        <div style={S.auditList}>
-                            {scheduleItems.slice(0, 5).map(s => (
-                                <div key={s.sid} style={S.auditItem}>
-                                    <span>{s.cron_expr}</span>
-                                    <StatusPill value={s.enabled ? 'online' : 'offline'} />
-                                    <span>{s.name}</span>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </section>
-            </div>
+            <section style={S.card}>
+                <div style={S.sectionHead}>
+                    <h3 style={S.sectionTitle}>最近任务</h3>
+                    <button style={S.btnSm} onClick={() => onTab('tasks')}>查看任务列表</button>
+                </div>
+                <MiniTaskList tasks={taskItems} />
+            </section>
 
             <section style={S.card}>
                 <div style={S.sectionHead}>
-                    <h3 style={S.sectionTitle}>Native profiling 摘要</h3>
-                    <button style={S.btnSm} onClick={() => onTab('profiling')}>进入 Native profiling</button>
+                    <h3 style={S.sectionTitle}>最近深度采样窗口</h3>
+                    <button style={S.btnSm} onClick={() => onTab('timeline')}>查看时间轴</button>
                 </div>
-                {profileSummary?.empty ? <div style={S.empty}>{profileSummary.message || '暂无 Native profiling 数据'}</div> : <TopNTable data={profileSummary} compact />}
+                {scheduleItems.length === 0 ? <div style={S.empty}>该主机暂无周期性深度采样计划</div> : (
+                    <div style={S.auditList}>
+                        {scheduleItems.slice(0, 5).map(s => (
+                            <div key={s.sid} style={S.auditItem}>
+                                <span>{s.cron_expr}</span>
+                                <StatusPill value={s.enabled ? 'online' : 'offline'} />
+                                <span>{s.name}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
             </section>
+
+            <RunningSessionsCard target={target} onTab={onTab} />
         </>
+    );
+}
+
+// ============================================================
+// 概览卡：运行中的持续采集任务（仅概览页使用，不改动"持续采集"Tab）
+// 数据与字段格式与持续采集页（ContinuousSessionList）保持一致。
+// ============================================================
+function RunningSessionsCard({ target, onTab }) {
+    const [sessions, setSessions] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [stopping, setStopping] = useState('');
+
+    const load = useCallback(async (silent = false) => {
+        if (!target?.ip) return;
+        if (!silent) setLoading(true);
+        try {
+            const res = await continuous.sessions({ target_ip: target.ip, page_size: 20 });
+            if (res.code === 0) {
+                const all = res.data?.sessions || [];
+                // 仅运行中（含降级运行）：degraded 的 desired_state 也是 running
+                setSessions(all.filter(session => session.desired_state === 'running'));
+            }
+        } catch (err) {
+            console.error('加载运行中的持续采集失败:', err);
+        } finally {
+            if (!silent) setLoading(false);
+        }
+    }, [target?.ip]);
+
+    useEffect(() => { load(); }, [load]);
+    useEffect(() => {
+        const timer = window.setInterval(() => load(true), 10000);
+        return () => window.clearInterval(timer);
+    }, [load]);
+
+    const stop = async (session) => {
+        if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
+        setStopping(session.sid);
+        try {
+            const res = await continuous.stopSession(session.sid);
+            if (res.code !== 0) throw new Error(res.message || '停止失败');
+            await load(true);
+        } catch (err) {
+            console.error('停止持续采集失败:', err);
+        } finally {
+            setStopping('');
+        }
+    };
+
+    const running = sessions.slice(0, 5);
+
+    return (
+        <section style={S.card}>
+            <div style={S.sectionHead}>
+                <h3 style={S.sectionTitle}>运行中的持续采集</h3>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span style={S.subtle}>共 {sessions.length} 个</span>
+                    <button style={S.btnSm} onClick={() => onTab('profiling')}>进入持续采集</button>
+                </div>
+            </div>
+            {loading && sessions.length === 0 ? (
+                <div style={S.empty}>正在加载运行中的持续采集...</div>
+            ) : running.length === 0 ? (
+                <div style={S.empty}>
+                    <div style={{ fontWeight: 700, color: '#475467', marginBottom: 6 }}>暂无运行中的持续采集任务</div>
+                    <div style={{ ...S.subtle, marginBottom: 12 }}>可新建整机或进程持续采集，运行状态会实时显示在这里。</div>
+                    <button style={S.btnSecondary} onClick={() => onTab('profiling')}>进入持续采集</button>
+                </div>
+            ) : (
+                <div className="table-scroll">
+                    <table style={S.table}>
+                        <thead>
+                            <tr>
+                                <th style={S.th}>名称</th>
+                                <th style={S.th}>范围与目标</th>
+                                <th style={S.th}>状态</th>
+                                <th style={S.th}>信号</th>
+                                <th style={S.th}>最近上传</th>
+                                <th style={S.th}>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {running.map(session => {
+                                const state = session.observed_state || 'pending';
+                                const [background, color] = continuousStateColor(state);
+                                const signals = decodeJSONField(session.signals, ['cpu_profile']);
+                                const active = decodeJSONField(session.active_processes, []);
+                                const isProcess = session.scope === 'process';
+                                const isDegraded = session.continuity_mode === 'degraded' && session.desired_state === 'running';
+                                const detailUrl = `/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(session.sid)}`;
+                                return (
+                                    <tr key={session.sid}>
+                                        <td style={S.td}>
+                                            <Link to={detailUrl} style={S.linkStrong}>{session.name}</Link>
+                                            <div style={S.subtle}>{shortSID(session.sid)}</div>
+                                        </td>
+                                        <td style={S.td}>
+                                            {isProcess ? <strong>进程 · {active.length} 个活动实例</strong> : <strong>整机</strong>}
+                                            {session.selector_exe ? <div style={S.mono} title={session.selector_exe}>{session.selector_exe}</div> : null}
+                                            <div style={S.subtle}>样本 {formatCount(session.sample_count)}</div>
+                                        </td>
+                                        <td style={S.td}>
+                                            <span style={{ ...S.badge, background, color }}>{continuousStateLabel(state)}</span>
+                                            {isDegraded && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }}>降级连续性</div>}
+                                        </td>
+                                        <td style={S.td}>
+                                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                                {signals.map(sig => <span key={sig} style={S.capPill}>{signalLabel(sig)}</span>)}
+                                            </div>
+                                        </td>
+                                        <td style={S.td}>{formatRelativeTime(session.last_upload_at)}</td>
+                                        <td style={S.td}>
+                                            <Link style={S.linkStrong} to={detailUrl}>查看</Link>
+                                            {session.desired_state === 'running' && session.can_manage && (
+                                                <button style={{ ...S.btnDangerSm, marginLeft: 8 }} disabled={stopping === session.sid} onClick={() => stop(session)}>
+                                                    {stopping === session.sid ? '停止中' : '停止'}
+                                                </button>
+                                            )}
+                                        </td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+        </section>
     );
 }
 
@@ -804,54 +898,6 @@ function TaskTable({ tasks: taskItems, compact = false }) {
     );
 }
 
-function TopNTable({ data, loading, compact = false, profileURL }) {
-    if (loading && !data) return <div style={S.empty}>正在查询 TopN...</div>;
-    const items = data?.items || [];
-    if (data?.empty || items.length === 0) {
-        return <ProfileEmptyState profileURL={profileURL} compact={compact} />;
-    }
-    return (
-        <div className="table-scroll">
-        <table style={S.table}>
-            <thead>
-                <tr>
-                    <th style={S.th}>函数</th>
-                    <th style={S.th}>{metricColumnLabel(data.unit, '累计占用时长')}</th>
-                    <th style={S.th}>{metricColumnLabel(data.unit, '自身占用时长')}</th>
-                </tr>
-            </thead>
-            <tbody>
-                {items.slice(0, compact ? 5 : 14).map((item, index) => (
-                    <tr key={`${item.name}-${index}`}>
-                        <td style={S.td} title={item.name}>{truncate(item.name, compact ? 44 : 36)}</td>
-                        <td style={S.td}>{formatMetricValue(item.value, item.unit || data.unit)}</td>
-                        <td style={S.td}>{formatMetricValue(item.self, item.unit || data.unit)}</td>
-                    </tr>
-                ))}
-            </tbody>
-        </table>
-        </div>
-    );
-}
-
-function ProfileEmptyState({ profileURL, compact = false }) {
-    return (
-        <div style={S.empty}>
-            <div style={{ fontWeight: 700, color: '#475467', marginBottom: 6 }}>
-                暂无 Native profiling 样本
-            </div>
-            {!compact && (
-                <div style={{ ...S.subtle, marginBottom: 12 }}>
-                    请切换时间范围或打开 Native profiling 标签页查看详情。
-                </div>
-            )}
-            {profileURL && (
-                <a href={profileURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Profile 查询</a>
-            )}
-        </div>
-    );
-}
-
 function MessagePage({ message }) {
     return <div style={S.container}><div style={S.error}>{message}</div><Link to="/" style={S.btnSecondary}>返回主机列表</Link></div>;
 }
@@ -906,9 +952,15 @@ function formatMetric(value, digits = 1) {
     return num.toFixed(digits);
 }
 
-function truncate(value, limit) {
-    const text = String(value || '-');
-    return text.length > limit ? `${text.slice(0, limit - 1)}...` : text;
+function shortSID(value) {
+    return String(value || '').length > 18 ? `${value.slice(0, 10)}...${value.slice(-4)}` : value;
+}
+
+function formatCount(value) {
+    const count = Number(value) || 0;
+    if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
+    if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
+    return String(Math.round(count));
 }
 
 function auditName(event) {
