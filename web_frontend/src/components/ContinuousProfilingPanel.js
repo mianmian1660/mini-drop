@@ -102,6 +102,11 @@ const SIGNAL_TAB_OPTIONS = [
     { tab: 'io', signal: 'io_latency', label: '块 IO' },
     { tab: 'io_syscall', signal: 'io_syscall_latency', label: '系统调用 IO' },
     { tab: 'sched', signal: 'sched_latency', label: '调度延迟' },
+    // db_snapshot 不是 ContinuousSamplerConfig.signals 里的常规信号（那四个是
+    // perf/eBPF 的固定采集集合），而是由 session.labels.db_targets 是否配置
+    // 决定——见 continuousSessionMeta，配了 db_targets 才会把 'db_snapshot'
+    // 塞进这里复用的 signals 数组，不是服务端下发的。
+    { tab: 'db', signal: 'db_snapshot', label: '数据库' },
 ];
 
 const RANGE_OPTIONS = [
@@ -853,7 +858,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 />
                 {sampleNotice && <div style={{ ...S.info, marginTop: 12 }}>{sampleNotice}</div>}
                 {coverageAlert && <CoverageAlert alert={coverageAlert} />}
-			</section> : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
+			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} />
+                : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
 
             {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
                 <div style={{ ...S.warn, marginTop: 10 }}>
@@ -1493,6 +1499,12 @@ function continuousSessionMeta(target, fixedSession = null) {
 	const raw = fixedSession || target?.continuous_session || {};
 	const caps = decodeJSONField(raw.capabilities, {});
     const signals = decodeJSONField(raw.signals, ['cpu_profile']).filter(Boolean);
+    // labels 是 Go []byte jsonb 字段，序列化成 base64 字符串——decodeJSONField
+    // 已经处理了这个 gotcha（先试直接 JSON.parse，失败再 atob 解一层）。
+    const labels = decodeJSONField(raw.labels, {});
+    if (Array.isArray(labels.db_targets) && labels.db_targets.length > 0) {
+        signals.push('db_snapshot');
+    }
     return {
         sid: raw.sid || '',
         name: raw.name || 'Native Continuous Profiling',

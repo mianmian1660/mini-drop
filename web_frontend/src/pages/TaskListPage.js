@@ -13,11 +13,11 @@ import { collectorLabelFromTask } from '../utils/collectors';
 
 const styles = {
     container: { width: '100%', maxWidth: 1200, minWidth: 0, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif' },
-    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.1)' },
+    card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 24, marginBottom: 16, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
     table: { width: '100%', borderCollapse: 'collapse' },
-    th: { textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid #e0e0e0', color: '#666', fontSize: 13 },
-    td: { padding: '12px 16px', borderBottom: '1px solid #f0f0f0', fontSize: 14 },
-    badge: { padding: '2px 8px', borderRadius: 10, fontSize: 12, fontWeight: 'bold' },
+    th: { textAlign: 'left', padding: '10px 12px', borderBottom: '1px solid #d0d5dd', color: '#475467', background: '#f8fafc', fontSize: 12, whiteSpace: 'nowrap' },
+    td: { padding: '11px 12px', borderBottom: '1px solid #edf0f3', fontSize: 13, color: '#344054' },
+    badge: { display: 'inline-flex', padding: '3px 8px', borderRadius: 999, fontSize: 12, fontWeight: 700 },
     searchRow: { display: 'flex', gap: 12, flexWrap: 'wrap', minWidth: 0, marginBottom: 16 },
     input: { flex: '1 1 220px', minWidth: 0, padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14 },
     select: { padding: '8px 12px', border: '1px solid #ddd', borderRadius: 4, fontSize: 14, background: '#fff' },
