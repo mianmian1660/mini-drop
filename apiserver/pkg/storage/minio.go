@@ -72,8 +72,17 @@ func (m *MinIOStorage) EnsureBucket(ctx context.Context, bucket string) error {
 
 // PutObject 上传文件
 func (m *MinIOStorage) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, contentType string) error {
+	return m.PutObjectWithEncoding(ctx, bucket, key, reader, size, contentType, "")
+}
+
+// PutObjectWithEncoding stores content metadata used for transparent browser
+// decoding while retaining the original object key.
+func (m *MinIOStorage) PutObjectWithEncoding(ctx context.Context, bucket, key string, reader io.Reader, size int64, contentType, contentEncoding string) error {
 	opts := minio.PutObjectOptions{
 		ContentType: contentType,
+	}
+	if contentEncoding != "" {
+		opts.ContentEncoding = contentEncoding
 	}
 	if size > 0 {
 		// size 已知时直接传

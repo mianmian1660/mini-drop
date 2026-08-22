@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -103,6 +104,16 @@ func TestKernelSymbolCheckUploadDeduplicatesAndRecordsArtifacts(t *testing.T) {
 	if _, ok := mem.objects[key]; !ok {
 		t.Fatalf("kernel symbol object %s not uploaded", key)
 	}
+	compressed := mem.objects[key]
+	zr, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatalf("kallsyms must be stored gzip-compressed: %v", err)
+	}
+	plain, _ := io.ReadAll(zr)
+	_ = zr.Close()
+	if !bytes.Equal(plain, testKallsymsBody()) {
+		t.Fatal("compressed kallsyms content differs from raw hash input")
+	}
 
 	checkBody = `{"tid":"tid-two","sha256":"` + sum + `","size_bytes":64,"kernel_release":"5.15","hostname":"h","target_ip":"127.0.0.1"}`
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/kernel-symbols/check", strings.NewReader(checkBody))
@@ -121,6 +132,18 @@ func TestKernelSymbolCheckUploadDeduplicatesAndRecordsArtifacts(t *testing.T) {
 	s.DB.Model(&model.Artifact{}).Where("object_key = ?", key).Count(&rows)
 	if rows != 2 {
 		t.Fatalf("kallsyms artifact refs=%d, want 2", rows)
+	}
+}
+
+func TestDiskGuardRejectsBelowOneGiB(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Config = &config.Config{StorageDisk: config.StorageDiskConfig{Path: "/tmp", MinFreeBytes: 1 << 30}}
+	original := storageFreeBytes
+	t.Cleanup(func() { storageFreeBytes = original })
+	storageFreeBytes = func(string) (uint64, error) { return (1 << 30) - 1, nil }
+	ok, message, free, minimum := s.canStartCollection()
+	if ok || free != minimum-1 || !strings.Contains(message, "采集被拒绝") {
+		t.Fatalf("low disk guard = ok:%v free:%d min:%d message:%q", ok, free, minimum, message)
 	}
 }
 

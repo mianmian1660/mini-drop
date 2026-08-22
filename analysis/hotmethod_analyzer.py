@@ -24,6 +24,7 @@
 
 import argparse
 import configparser
+import gzip
 import json
 import os
 import shutil
@@ -56,6 +57,15 @@ TASK_TYPE_TRACING   = 2   # Tracing
 TASK_TYPE_MEMCHECK  = 4   # 内存泄漏
 TASK_TYPE_BPF       = 5   # eBPF 内核探针 (IO/调度延迟)
 TASK_TYPE_JAVA_HEAP = 6   # Java 堆 dump
+
+
+def work_file(tid: str, name: str) -> str:
+    """Return a job-private scratch path; legacy callers fall back to /tmp."""
+    root = os.environ.get("ANALYSIS_JOB_WORK_DIR", "").strip()
+    if not root:
+        root = os.path.join(os.environ.get("ANALYSIS_WORK_ROOT", "/tmp/mini-drop-analysis"), tid)
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, name)
 
 
 def env_enabled(name: str) -> bool:
@@ -418,9 +428,24 @@ def _download_kallsyms(storage, bucket: str, tid: str,
     优先读取 artifacts 表中记录的 RAW 产物，兼容后续对象 key 调整；如果元数据缺失，
     再回退到早期固定路径 {tid}/kallsyms。
     """
-    keys = _raw_artifact_keys(conn, tid, suffixes=["/kallsyms", ".kallsyms", "kallsyms"])
+    keys = _raw_artifact_keys(conn, tid, suffixes=["/kallsyms", ".kallsyms", "kallsyms", "kallsyms.gz"])
     keys.append(f"{tid}/kallsyms")
     if _download_first_existing(storage, bucket, keys, local_path, "kallsyms"):
+        # New shared objects use .gz, but key names are not authoritative: old
+        # data and proxies may preserve/change suffixes. perf must always see
+        # plain /proc/kallsyms text, so detect gzip by its magic bytes.
+        try:
+            with open(local_path, "rb") as source:
+                magic = source.read(2)
+            if magic == b"\x1f\x8b":
+                with gzip.open(local_path, "rb") as source:
+                    raw = source.read()
+                with open(local_path, "wb") as target:
+                    target.write(raw)
+                print(f"[analysis] 已解压 kallsyms: {local_path} ({len(raw)} bytes)", file=sys.stderr)
+        except (OSError, gzip.BadGzipFile) as exc:
+            print(f"[analysis] kallsyms gzip 解压失败: {exc}", file=sys.stderr)
+            return None
         return local_path
     print(f"[analysis] 无 kallsyms 快照，内核符号将无法解析", file=sys.stderr)
     return None
@@ -541,7 +566,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
 
     # --- 2. 获取 perf.data ---
     # 优先从 MinIO 下载，其次用本地测试文件
-    local_perf = f"/tmp/{tid}_perf.data"
+    local_perf = work_file(tid, "perf.data")
     has_perf = False
 
     if storage_ok:
@@ -550,7 +575,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     if not has_perf:
         # MinIO 不可用或文件不存在时，尝试用本地 perf.data（仅本地测试用）
         test_files = [
-            f"/tmp/{tid}_perf.data",
+            work_file(tid, "perf.data"),
             "/tmp/test_perf3.data",
             "/tmp/test_perf.data",
         ]
@@ -569,7 +594,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     local_kallsyms = None
     if storage_ok:
         local_kallsyms = _download_kallsyms(
-            storage, bucket, tid, f"/tmp/{tid}_kallsyms", conn)
+            storage, bucket, tid, work_file(tid, "kallsyms"), conn)
 
     # --- 2c. 按 build-id 安装用户态符号（缺失则降级，用户态帧显示为 [模块名]）---
     # 阶段三：不再整包下载 tar，改成查 task_build_ids 表按需逐个安装到
@@ -823,7 +848,7 @@ def _analyze_pprof_cpu(conn, storage_cfg: dict, task: dict, bucket: str, tid: st
                        local_dir: str = "") -> dict:
     """Analyse a gzip protobuf CPU profile with the official Go pprof CLI."""
     storage, storage_ok = _connect_storage(storage_cfg)
-    local_profile = f"/tmp/{tid}_pprof.pb.gz"
+    local_profile = work_file(tid, "pprof.pb.gz")
     # Try tid/profile.pb.gz first, then fall back to tid/perf.data (legacy)
     keys = _raw_artifact_keys(conn, tid, suffixes=["profile.pb.gz", ".pb.gz"])
     keys.append(f"{tid}/profile.pb.gz")
@@ -833,7 +858,7 @@ def _analyze_pprof_cpu(conn, storage_cfg: dict, task: dict, bucket: str, tid: st
     if not shutil.which("go"):
         raise RuntimeError("分析镜像缺少 go tool pprof")
 
-    svg_path = f"/tmp/{tid}_pprof.svg"
+    svg_path = work_file(tid, "pprof.svg")
     try:
         svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-output", svg_path, local_profile],
                                  text=True, capture_output=True, timeout=120)
@@ -874,7 +899,7 @@ def _analyze_pprof_heap(conn, storage_cfg: dict, task: dict, bucket: str, tid: s
     Generates flamegraph.svg and top.json with sample_unit="bytes".
     """
     storage, storage_ok = _connect_storage(storage_cfg)
-    local_profile = f"/tmp/{tid}_pprof_heap.pb.gz"
+    local_profile = work_file(tid, "pprof_heap.pb.gz")
     keys = _raw_artifact_keys(conn, tid, suffixes=["profile.pb.gz", ".pb.gz"])
     keys.append(f"{tid}/profile.pb.gz")
     if not storage_ok or not _download_first_existing(storage, bucket, keys, local_profile, "pprof heap profile"):
@@ -900,7 +925,7 @@ def _analyze_pprof_heap(conn, storage_cfg: dict, task: dict, bucket: str, tid: s
         if type_run.returncode != 0:
             raise RuntimeError("pprof heap TopN 生成失败（不是有效的 heap profile）: " + type_run.stderr.strip())
 
-    svg_path = f"/tmp/{tid}_pprof_heap.svg"
+    svg_path = work_file(tid, "pprof_heap.svg")
     try:
         svg_run = subprocess.run(["go", "tool", "pprof", "-svg", "-sample_index", sample_index, "-output", svg_path, local_profile],
                                  text=True, capture_output=True, timeout=120)
@@ -942,7 +967,7 @@ def _analyze_java_async_profiler(conn, storage_cfg: dict, task: dict,
     local_files = []
 
     storage, storage_ok = _connect_storage(storage_cfg)
-    local_profile = f"/tmp/{tid}_java_profile.data"
+    local_profile = work_file(tid, "java_profile.data")
     has_profile = False
 
     if storage_ok:
@@ -955,8 +980,8 @@ def _analyze_java_async_profiler(conn, storage_cfg: dict, task: dict,
 
     if not has_profile:
         test_files = [
-            f"/tmp/{tid}_java_profile.txt",
-            f"/tmp/{tid}_perf.data",
+            work_file(tid, "java_profile.txt"),
+            work_file(tid, "perf.data"),
             "/tmp/test_java_collapsed.txt",
         ]
         for tf in test_files:
@@ -1230,7 +1255,7 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
 
     storage, storage_ok = _connect_storage(storage_cfg)
 
-    local_bpf = f"/tmp/{tid}_bpf.txt"
+    local_bpf = work_file(tid, "bpf.txt")
     has_data = False
 
     if storage_ok:

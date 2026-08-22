@@ -216,10 +216,20 @@ services:
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"
       RETENTION_ENABLED: "true"
-      ARTIFACT_RAW_RETENTION_HOURS: "168"
+      ARTIFACT_RAW_RETENTION_HOURS: "24"
       ARTIFACT_RESULT_RETENTION_HOURS: "720"
-      RETENTION_CLEANUP_INTERVAL_SEC: "3600"
-      RETENTION_BATCH_LIMIT: "200"
+      RETENTION_CLEANUP_INTERVAL_SEC: "300"
+      RETENTION_BATCH_LIMIT: "1000"
+      STORAGE_DISK_PATH: "${STORAGE_DISK_PATH:-/tmp}"
+      STORAGE_MIN_FREE_BYTES: "${STORAGE_MIN_FREE_BYTES:-1073741824}"
+      CONTINUOUS_SUMMARY_RETENTION_HOURS: "168"
+      # 阶段三：内建持续剖析块存储（compactor）
+      # 每个 session 每小时一个 gzip 压缩块；开启后查询自动按 object_key+batch_bid
+      # 加载块（旧分钟对象兼容读取），未开启时行为与阶段二完全一致。
+      CONTINUOUS_BLOCK_ENABLED: "${CONTINUOUS_BLOCK_ENABLED:-true}"
+      CONTINUOUS_BLOCK_WINDOW_SEC: "${CONTINUOUS_BLOCK_WINDOW_SEC:-3600}"
+      CONTINUOUS_BLOCK_COMPACTION_DELAY_SEC: "${CONTINUOUS_BLOCK_COMPACTION_DELAY_SEC:-600}"
+      CONTINUOUS_BLOCK_COMPACTION_INTERVAL_SEC: "${CONTINUOUS_BLOCK_COMPACTION_INTERVAL_SEC:-300}"
     extra_hosts:
       - "localhost:host-gateway" # 让容器内也能通过 localhost 访问宿主机上的 MinIO 端口
     depends_on:
@@ -252,6 +262,7 @@ services:
       S3_ENDPOINT: "minio:9000"
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"
+      ANALYSIS_WORK_ROOT: "/tmp/mini-drop-analysis"
     depends_on:
       - postgres
       - minio

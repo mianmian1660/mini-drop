@@ -15,16 +15,25 @@ import (
 
 // Config 是全局配置结构体，包含所有运行时配置
 type Config struct {
-	Server         ServerConfig         `mapstructure:"server"`
-	Database       DatabaseConfig       `mapstructure:"database"`
-	GRPC           GRPCConfig           `mapstructure:"grpc"`
-	Storage        StorageConfig        `mapstructure:"storage"`
-	Retention      RetentionConfig      `mapstructure:"retention"`
-	Log            LogConfig            `mapstructure:"log"`
-	Security       SecurityConfig       `mapstructure:"security"`
-	Observability  ObservabilityConfig  `mapstructure:"observability"`
-	Profile        ProfileConfig        `mapstructure:"profile"`
-	AgentDiscovery AgentDiscoveryConfig `mapstructure:"agent_discovery"`
+	Server          ServerConfig          `mapstructure:"server"`
+	Database        DatabaseConfig        `mapstructure:"database"`
+	GRPC            GRPCConfig            `mapstructure:"grpc"`
+	Storage         StorageConfig         `mapstructure:"storage"`
+	Retention       RetentionConfig       `mapstructure:"retention"`
+	ContinuousBlock ContinuousBlockConfig `mapstructure:"continuous_block"`
+	StorageDisk     StorageDiskConfig     `mapstructure:"storage_disk"`
+	Log             LogConfig             `mapstructure:"log"`
+	Security        SecurityConfig        `mapstructure:"security"`
+	Observability   ObservabilityConfig   `mapstructure:"observability"`
+	Profile         ProfileConfig         `mapstructure:"profile"`
+	AgentDiscovery  AgentDiscoveryConfig  `mapstructure:"agent_discovery"`
+}
+
+// StorageDiskConfig protects the host filesystem used by containers and
+// temporary capture files. It intentionally is separate from object storage.
+type StorageDiskConfig struct {
+	Path         string `mapstructure:"path"`
+	MinFreeBytes uint64 `mapstructure:"min_free_bytes"`
 }
 
 // ServerConfig HTTP 服务配置
@@ -74,6 +83,23 @@ type RetentionConfig struct {
 	// 成这张摘要表，摘要本身再按这个全局配置单独过期——默认比原始数据
 	// 保留期长一个数量级（7 天），因为摘要体积小很多。
 	ContinuousSummaryRetentionHours int `mapstructure:"continuous_summary_retention_hours"`
+}
+
+// ContinuousBlockConfig 控制阶段三的持续采集块存储（compactor）：
+// 把同一 UTC 小时桶内的分钟 batch 合并为 gzip 压缩块。所有参数都支持
+// 环境变量覆盖（CONTINUOUS_BLOCK_*），并保持"未启用时完全等价于旧的
+// 每分钟一个 JSON 对象"的行为——默认 disabled，由部署显式开启。
+type ContinuousBlockConfig struct {
+	// Enabled 开启 compactor 与块读取。关闭时查询继续读旧分钟对象，
+	// 存量块对象仍可被读取（加载器按 key 后缀自动识别）。
+	Enabled bool `mapstructure:"enabled"`
+	// WindowSec 块覆盖的 UTC 小时桶长度（秒），默认 3600。
+	WindowSec int `mapstructure:"window_sec"`
+	// CompactionDelaySec 小时桶"已结束至少这么久"才允许 compaction，
+	// 给迟到的 batch 留出合并窗口，默认 600。
+	CompactionDelaySec int `mapstructure:"compaction_delay_sec"`
+	// CompactionIntervalSec compactor 扫描周期（秒），默认 300。
+	CompactionIntervalSec int `mapstructure:"compaction_interval_sec"`
 }
 
 // LogConfig 日志配置
@@ -156,10 +182,17 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("storage.bucket", "drop-data")
 	v.SetDefault("storage.presign_expire_sec", 900)
 	v.SetDefault("retention.enabled", true)
-	v.SetDefault("retention.raw_retention_hours", 168)
+	v.SetDefault("retention.raw_retention_hours", 24)
 	v.SetDefault("retention.result_retention_hours", 720)
-	v.SetDefault("retention.cleanup_interval_sec", 3600)
+	v.SetDefault("retention.cleanup_interval_sec", 300)
 	v.SetDefault("retention.batch_limit", 200)
+	v.SetDefault("retention.continuous_summary_retention_hours", 168)
+	v.SetDefault("continuous_block.enabled", false)
+	v.SetDefault("continuous_block.window_sec", 3600)
+	v.SetDefault("continuous_block.compaction_delay_sec", 600)
+	v.SetDefault("continuous_block.compaction_interval_sec", 300)
+	v.SetDefault("storage_disk.path", "/tmp")
+	v.SetDefault("storage_disk.min_free_bytes", uint64(1<<30))
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")
 	v.SetDefault("log.output", "stdout")
@@ -215,11 +248,29 @@ func Load(configPath string) (*Config, error) {
 	if envContinuousSummaryRetention := os.Getenv("CONTINUOUS_SUMMARY_RETENTION_HOURS"); envContinuousSummaryRetention != "" {
 		v.Set("retention.continuous_summary_retention_hours", envContinuousSummaryRetention)
 	}
+	if envBlockEnabled := os.Getenv("CONTINUOUS_BLOCK_ENABLED"); envBlockEnabled != "" {
+		v.Set("continuous_block.enabled", parseBoolEnv(envBlockEnabled))
+	}
+	if envBlockWindow := os.Getenv("CONTINUOUS_BLOCK_WINDOW_SEC"); envBlockWindow != "" {
+		v.Set("continuous_block.window_sec", envBlockWindow)
+	}
+	if envBlockDelay := os.Getenv("CONTINUOUS_BLOCK_COMPACTION_DELAY_SEC"); envBlockDelay != "" {
+		v.Set("continuous_block.compaction_delay_sec", envBlockDelay)
+	}
+	if envBlockInterval := os.Getenv("CONTINUOUS_BLOCK_COMPACTION_INTERVAL_SEC"); envBlockInterval != "" {
+		v.Set("continuous_block.compaction_interval_sec", envBlockInterval)
+	}
 	if envCleanupInterval := os.Getenv("RETENTION_CLEANUP_INTERVAL_SEC"); envCleanupInterval != "" {
 		v.Set("retention.cleanup_interval_sec", envCleanupInterval)
 	}
 	if envBatchLimit := os.Getenv("RETENTION_BATCH_LIMIT"); envBatchLimit != "" {
 		v.Set("retention.batch_limit", envBatchLimit)
+	}
+	if envDiskPath := os.Getenv("STORAGE_DISK_PATH"); envDiskPath != "" {
+		v.Set("storage_disk.path", envDiskPath)
+	}
+	if envMinFree := os.Getenv("STORAGE_MIN_FREE_BYTES"); envMinFree != "" {
+		v.Set("storage_disk.min_free_bytes", envMinFree)
 	}
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		v.Set("server.port", envPort)
@@ -276,19 +327,34 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("生产环境必须配置 gRPC mTLS 证书，或显式设置 ALLOW_INSECURE_TRANSPORT=true 承认 insecure 通道")
 	}
 	if cfg.Retention.RawRetentionHours <= 0 {
-		cfg.Retention.RawRetentionHours = 168
+		cfg.Retention.RawRetentionHours = 24
 	}
 	if cfg.Retention.ResultRetentionHours <= 0 {
 		cfg.Retention.ResultRetentionHours = 720
 	}
 	if cfg.Retention.CleanupIntervalSec <= 0 {
-		cfg.Retention.CleanupIntervalSec = 3600
+		cfg.Retention.CleanupIntervalSec = 300
 	}
 	if cfg.Retention.ContinuousSummaryRetentionHours <= 0 {
 		cfg.Retention.ContinuousSummaryRetentionHours = 168
 	}
+	if cfg.ContinuousBlock.WindowSec <= 0 {
+		cfg.ContinuousBlock.WindowSec = 3600
+	}
+	if cfg.ContinuousBlock.CompactionDelaySec <= 0 {
+		cfg.ContinuousBlock.CompactionDelaySec = 600
+	}
+	if cfg.ContinuousBlock.CompactionIntervalSec <= 0 {
+		cfg.ContinuousBlock.CompactionIntervalSec = 300
+	}
 	if cfg.Retention.BatchLimit <= 0 {
 		cfg.Retention.BatchLimit = 200
+	}
+	if strings.TrimSpace(cfg.StorageDisk.Path) == "" {
+		cfg.StorageDisk.Path = "/tmp"
+	}
+	if cfg.StorageDisk.MinFreeBytes == 0 {
+		cfg.StorageDisk.MinFreeBytes = 1 << 30
 	}
 	return nil
 }

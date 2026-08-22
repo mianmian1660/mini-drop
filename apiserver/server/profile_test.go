@@ -850,11 +850,12 @@ func (failingProfileClient) LabelValues(context.Context, ProfileQuery, string) (
 }
 
 type continuousMemoryStorage struct {
-	objects map[string]string
+	objects  map[string]string
+	modified map[string]time.Time
 }
 
 func newContinuousMemoryStorage() *continuousMemoryStorage {
-	return &continuousMemoryStorage{objects: map[string]string{}}
+	return &continuousMemoryStorage{objects: map[string]string{}, modified: map[string]time.Time{}}
 }
 
 func (m *continuousMemoryStorage) EnsureBucket(context.Context, string) error { return nil }
@@ -865,6 +866,7 @@ func (m *continuousMemoryStorage) PutObject(_ context.Context, _, key string, re
 		return err
 	}
 	m.objects[key] = string(body)
+	m.modified[key] = time.Now()
 	return nil
 }
 
@@ -880,12 +882,19 @@ func (m *continuousMemoryStorage) PresignedGetURL(context.Context, string, strin
 	return "http://example.test/continuous.json", nil
 }
 
-func (m *continuousMemoryStorage) ListObjects(context.Context, string, string) ([]storage.FileInfo, error) {
-	return []storage.FileInfo{}, nil
+func (m *continuousMemoryStorage) ListObjects(_ context.Context, _, prefix string) ([]storage.FileInfo, error) {
+	files := make([]storage.FileInfo, 0)
+	for key, body := range m.objects {
+		if strings.HasPrefix(key, prefix) {
+			files = append(files, storage.FileInfo{Name: key, Size: int64(len(body)), LastModified: m.modified[key]})
+		}
+	}
+	return files, nil
 }
 
 func (m *continuousMemoryStorage) DeleteObject(_ context.Context, _, key string) error {
 	delete(m.objects, key)
+	delete(m.modified, key)
 	return nil
 }
 

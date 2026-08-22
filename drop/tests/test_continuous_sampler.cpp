@@ -439,6 +439,16 @@ TEST(ContinuousSpool, RequiresExplicitMatchingAck)
         "{\"code\":0,\"data\":{\"accepted\":true,\"batch_id\":\"cpb-2\"}}", "cpb-1"));
 }
 
+TEST(ContinuousSpool, RecognizesOnlyExplicitNonRetryableClientErrorsAsPermanent)
+{
+    EXPECT_TRUE(response_is_permanent_rejection(
+        400, "{\"error\":{\"retryable\":false}}"));
+    EXPECT_FALSE(response_is_permanent_rejection(
+        400, "{\"error\":{\"retryable\":true}}"));
+    EXPECT_FALSE(response_is_permanent_rejection(
+        503, "{\"error\":{\"retryable\":false}}"));
+}
+
 TEST(ContinuousSpool, BatchIDIsStableAndUniqueAcrossSessions)
 {
     ContinuousSamplerConfig first = make_cfg();
@@ -483,6 +493,45 @@ TEST(ContinuousSpool, RekeysConflictingBatchWithoutDiscardingPayload)
     ::unlink(files.front().c_str());
     ::rmdir(session_spool_directory(cfg).c_str());
     ::rmdir(directory);
+}
+
+TEST(ContinuousSpool, QuarantinesPermanentlyRejectedBatchWithoutDeletingPayload)
+{
+    char directoryTemplate[] = "/tmp/mini-drop-spool-rejected-XXXXXX";
+    char *directory = ::mkdtemp(directoryTemplate);
+    ASSERT_NE(directory, nullptr);
+    ContinuousSamplerConfig cfg = make_cfg();
+    cfg.spoolDirectory = directory;
+    ASSERT_TRUE(ensure_directory(session_spool_directory(cfg)));
+    const std::string batchID = "cpb-rejected";
+    const std::string path = spool_path(cfg, batchID);
+    ASSERT_TRUE(atomic_write_file(path, "{\"batch_id\":\"cpb-rejected\"}"));
+
+    ASSERT_TRUE(quarantine_rejected_spooled_batch(path, batchID));
+    EXPECT_FALSE(file_exists_local(path));
+    EXPECT_TRUE(file_exists_local(path + ".rejected"));
+    EXPECT_TRUE(list_session_spool_files(cfg, ".json").empty());
+
+    ::unlink((path + ".rejected").c_str());
+    ::rmdir(session_spool_directory(cfg).c_str());
+    ::rmdir(directory);
+}
+
+TEST(ContinuousSampler, SortsSharedSlicesAndPreservesValidMergedBounds)
+{
+    WindowPayload later;
+    later.startMs = 20'000;
+    later.endMs = 30'000;
+    later.samples.push_back(make_sample("later", 2, 1));
+    WindowPayload earlier;
+    earlier.startMs = 10'000;
+    earlier.endMs = 20'050;
+    earlier.samples.push_back(make_sample("earlier", 1, 1));
+
+    const auto merged = merge_shared_slices_preserving_gaps({later, earlier});
+    ASSERT_EQ(merged.size(), 1u);
+    EXPECT_EQ(merged.front().startMs, 10'000);
+    EXPECT_EQ(merged.front().endMs, 30'000);
 }
 
 TEST(ContinuousSpool, FindsPendingBatchesFromPreviousSession)

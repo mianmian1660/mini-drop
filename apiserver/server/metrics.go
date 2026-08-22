@@ -19,6 +19,13 @@ var (
 	metricArtifactUploadFailedTotal int64
 	metricAnalysisQueuedTotal       int64
 	metricSSEActiveConnections      int64
+	// 阶段三：内建持续剖析块存储指标
+	metricContinuousBlocksCreatedTotal     int64
+	metricContinuousBlocksReplacedTotal    int64
+	metricContinuousBlocksReadTotal        int64
+	metricContinuousSourceDeleteRetryTotal int64
+	metricContinuousCompactionSkipTotal    int64
+	metricContinuousReclaimedBytesTotal    int64
 )
 
 func incTasksCreated()         { atomic.AddInt64(&metricTasksCreatedTotal, 1) }
@@ -28,6 +35,19 @@ func incAnalysisQueued()       { atomic.AddInt64(&metricAnalysisQueuedTotal, 1) 
 func incSSEActive()            { atomic.AddInt64(&metricSSEActiveConnections, 1) }
 func decSSEActive()            { atomic.AddInt64(&metricSSEActiveConnections, -1) }
 
+func incContinuousBlocksCreated(replaced bool) {
+	atomic.AddInt64(&metricContinuousBlocksCreatedTotal, 1)
+	if replaced {
+		atomic.AddInt64(&metricContinuousBlocksReplacedTotal, 1)
+	}
+}
+func incContinuousBlocksRead()        { atomic.AddInt64(&metricContinuousBlocksReadTotal, 1) }
+func incContinuousSourceDeleteRetry() { atomic.AddInt64(&metricContinuousSourceDeleteRetryTotal, 1) }
+func incContinuousCompactionSkip()    { atomic.AddInt64(&metricContinuousCompactionSkipTotal, 1) }
+func incContinuousReclaimedBytes(bytes int64) {
+	atomic.AddInt64(&metricContinuousReclaimedBytesTotal, bytes)
+}
+
 func currentSSEActive() int64 { return atomic.LoadInt64(&metricSSEActiveConnections) }
 
 func resetMetricsForTest() {
@@ -36,6 +56,12 @@ func resetMetricsForTest() {
 	atomic.StoreInt64(&metricArtifactUploadFailedTotal, 0)
 	atomic.StoreInt64(&metricAnalysisQueuedTotal, 0)
 	atomic.StoreInt64(&metricSSEActiveConnections, 0)
+	atomic.StoreInt64(&metricContinuousBlocksCreatedTotal, 0)
+	atomic.StoreInt64(&metricContinuousBlocksReplacedTotal, 0)
+	atomic.StoreInt64(&metricContinuousBlocksReadTotal, 0)
+	atomic.StoreInt64(&metricContinuousSourceDeleteRetryTotal, 0)
+	atomic.StoreInt64(&metricContinuousCompactionSkipTotal, 0)
+	atomic.StoreInt64(&metricContinuousReclaimedBytesTotal, 0)
 }
 
 func (s *APIServer) Metrics(c *gin.Context) {
@@ -50,6 +76,18 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_analysis_queued_total %d\n", atomic.LoadInt64(&metricAnalysisQueuedTotal))
 	writeMetricHeader(&b, "mini_drop_sse_active_connections", "gauge", "Current active SSE connections.")
 	fmt.Fprintf(&b, "mini_drop_sse_active_connections %d\n", currentSSEActive())
+	writeMetricHeader(&b, "mini_drop_continuous_blocks_created_total", "counter", "Continuous profile blocks created by compactor.")
+	fmt.Fprintf(&b, "mini_drop_continuous_blocks_created_total %d\n", atomic.LoadInt64(&metricContinuousBlocksCreatedTotal))
+	writeMetricHeader(&b, "mini_drop_continuous_blocks_replaced_total", "counter", "Continuous profile blocks replaced by a new version (late batch or retention rewrite).")
+	fmt.Fprintf(&b, "mini_drop_continuous_blocks_replaced_total %d\n", atomic.LoadInt64(&metricContinuousBlocksReplacedTotal))
+	writeMetricHeader(&b, "mini_drop_continuous_blocks_read_total", "counter", "Continuous profile block objects decompressed by queries.")
+	fmt.Fprintf(&b, "mini_drop_continuous_blocks_read_total %d\n", atomic.LoadInt64(&metricContinuousBlocksReadTotal))
+	writeMetricHeader(&b, "mini_drop_continuous_source_delete_retry_total", "counter", "Failed source minute-object deletions retried by sweep.")
+	fmt.Fprintf(&b, "mini_drop_continuous_source_delete_retry_total %d\n", atomic.LoadInt64(&metricContinuousSourceDeleteRetryTotal))
+	writeMetricHeader(&b, "mini_drop_continuous_compaction_skip_total", "counter", "Compaction runs skipped (low disk or dependency unavailable).")
+	fmt.Fprintf(&b, "mini_drop_continuous_compaction_skip_total %d\n", atomic.LoadInt64(&metricContinuousCompactionSkipTotal))
+	writeMetricHeader(&b, "mini_drop_continuous_reclaimed_bytes_total", "counter", "Bytes reclaimed by block/source-object garbage collection.")
+	fmt.Fprintf(&b, "mini_drop_continuous_reclaimed_bytes_total %d\n", atomic.LoadInt64(&metricContinuousReclaimedBytesTotal))
 
 	if s != nil && s.DB != nil {
 		s.writeDBMetrics(&b)

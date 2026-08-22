@@ -100,6 +100,10 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 启动存储保留期清理器，避免任务产物和 stopped continuous session 长期堆积。
 	go s.startRetentionCleaner()
 
+	// 阶段三：启动内建持续剖析块存储 compactor（按配置开关；未启用时查询
+	// 继续走旧分钟对象，行为与阶段二完全一致）。
+	go s.startContinuousBlockCompactor()
+
 	// B: 启动时补偿历史已完成但未入分析队列的任务，修复回调缺失期间留下的卡住记录。
 	go func() {
 		time.Sleep(12 * time.Second)

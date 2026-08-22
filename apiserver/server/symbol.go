@@ -15,6 +15,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -255,6 +256,12 @@ func (s *APIServer) CheckKernelSymbol(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	exists, existsErr := s.Storage.ObjectExists(ctx, s.Config.Storage.Bucket, objectKey)
+	if existsErr == nil && !exists {
+		legacyKey := "kernel-symbols/" + req.SHA256 + "/kallsyms"
+		if legacyExists, legacyErr := s.Storage.ObjectExists(ctx, s.Config.Storage.Bucket, legacyKey); legacyErr == nil && legacyExists {
+			objectKey, exists = legacyKey, true
+		}
+	}
 	if existsErr == nil && exists {
 		row = model.KernelSymbolFile{
 			SHA256:        req.SHA256,
@@ -310,9 +317,24 @@ func (s *APIServer) UploadKernelSymbol(c *gin.Context) {
 	}
 
 	limited := http.MaxBytesReader(c.Writer, c.Request.Body, maxKernelSymbolUploadBytes)
-	body, err := io.ReadAll(limited)
+	var source io.Reader = limited
+	if strings.EqualFold(strings.TrimSpace(c.GetHeader("Content-Encoding")), "gzip") {
+		zr, zerr := gzip.NewReader(limited)
+		if zerr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "gzip 内容无效"})
+			return
+		}
+		defer zr.Close()
+		source = zr
+	}
+	// Limit decompressed bytes too: the URL hash is always the raw payload hash.
+	body, err := io.ReadAll(io.LimitReader(source, maxKernelSymbolUploadBytes+1))
 	if err != nil {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "读取上传内容失败: " + err.Error()})
+		return
+	}
+	if int64(len(body)) > maxKernelSymbolUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "解压后文件超过大小上限"})
 		return
 	}
 	if !looksLikeKallsyms(body) {
@@ -327,9 +349,15 @@ func (s *APIServer) UploadKernelSymbol(c *gin.Context) {
 	}
 
 	objectKey := kernelSymbolObjectKey(sum)
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(body); err != nil || zw.Close() != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "压缩上传内容失败"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if err := s.Storage.PutObject(ctx, s.Config.Storage.Bucket, objectKey, bytes.NewReader(body), int64(len(body)), "application/octet-stream"); err != nil {
+	if err := s.putObjectWithEncoding(ctx, objectKey, bytes.NewReader(compressed.Bytes()), int64(compressed.Len()), "application/octet-stream", "gzip"); err != nil {
 		s.Logger.Error("kallsyms 上传失败", zap.String("sha256", sum), zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "上传失败: " + err.Error()})
 		return
@@ -342,7 +370,7 @@ func (s *APIServer) UploadKernelSymbol(c *gin.Context) {
 		KernelRelease: strings.TrimSpace(c.Query("kernel_release")),
 		Hostname:      strings.TrimSpace(c.Query("hostname")),
 		TargetIP:      strings.TrimSpace(c.Query("target_ip")),
-		SizeBytes:     int64(len(body)),
+		SizeBytes:     int64(compressed.Len()),
 		Status:        model.SymbolFileStatusReady,
 		CreatedAt:     now,
 		LastUsedAt:    &now,
@@ -363,18 +391,29 @@ func (s *APIServer) UploadKernelSymbol(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "落库失败: " + err.Error()})
 		return
 	}
-	if err := s.recordKernelSymbolArtifact(tid, objectKey, int64(len(body)), sum); err != nil {
+	if err := s.recordKernelSymbolArtifact(tid, objectKey, int64(compressed.Len()), sum); err != nil {
 		s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", tid), zap.String("sha256", sum), zap.Error(err))
 	}
 	c.JSON(http.StatusOK, gin.H{"sha256": sum, "status": "ready", "object_key": objectKey})
 }
 
 func kernelSymbolObjectKey(sum string) string {
-	return "kernel-symbols/" + sum + "/kallsyms"
+	return "kernel-symbols/" + sum + "/kallsyms.gz"
 }
 
 func isKernelSymbolObjectKey(key string) bool {
-	return strings.HasPrefix(key, "kernel-symbols/") && strings.HasSuffix(key, "/kallsyms")
+	return strings.HasPrefix(key, "kernel-symbols/") && (strings.HasSuffix(key, "/kallsyms") || strings.HasSuffix(key, "/kallsyms.gz"))
+}
+
+type encodingObjectStorage interface {
+	PutObjectWithEncoding(context.Context, string, string, io.Reader, int64, string, string) error
+}
+
+func (s *APIServer) putObjectWithEncoding(ctx context.Context, key string, data io.Reader, size int64, contentType, encoding string) error {
+	if encoded, ok := s.Storage.(encodingObjectStorage); ok {
+		return encoded.PutObjectWithEncoding(ctx, s.Config.Storage.Bucket, key, data, size, contentType, encoding)
+	}
+	return s.Storage.PutObject(ctx, s.Config.Storage.Bucket, key, data, size, contentType)
 }
 
 func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64, sum string) error {
