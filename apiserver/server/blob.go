@@ -33,6 +33,9 @@ import (
 // CAS key
 // ------------------------------------------------------------
 
+// casObjectKeyPrefix CAS 物理 key 前缀；迁移候选判断"blob 是否已迁移"用。
+const casObjectKeyPrefix = "blobs/sha256/"
+
 // blobCASKey 构造内容寻址物理对象 key。
 // 格式：blobs/sha256/<ab>/<logical_sha256>/<format>-v<schema><ext>
 //   - ext：pprof→".pb.gz"（格式自带扩展名）；gzip→".gz"；zstd→".zst"；未压缩→""。

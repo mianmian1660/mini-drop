@@ -47,6 +47,11 @@ func (s *APIServer) startBlobWorkers() {
 	if !s.Config.Blob.BackfillEnabled && !s.Config.Blob.MigrationEnabled && !s.Config.Blob.GCEnabled {
 		return
 	}
+	s.logBlobState("workers started",
+		zap.Bool("backfill_enabled", s.Config.Blob.BackfillEnabled),
+		zap.Bool("migration_enabled", s.Config.Blob.MigrationEnabled),
+		zap.Bool("gc_enabled", s.Config.Blob.GCEnabled),
+		zap.Int("interval_sec", s.Config.Blob.MigrationIntervalSec))
 	interval := time.Duration(s.Config.Blob.MigrationIntervalSec) * time.Second
 	if interval <= 0 {
 		interval = 60 * time.Second
@@ -574,23 +579,26 @@ func blobMigrateReady(blob *model.StorageBlob) bool {
 	if blob == nil {
 		return true
 	}
-	return !strings.HasPrefix(blob.ObjectKey, "blobs/sha256/")
+	return !strings.HasPrefix(blob.ObjectKey, casObjectKeyPrefix)
 }
 
 // migrateNextKallsyms 迁移一个旧未压缩 kallsyms（"kernel-symbols/<sha>/kallsyms"，
-// 不带 .gz 后缀）。已压缩的 .gz 对象由回填覆盖，不重复压缩。
+// 不带 .gz 后缀）。候选在 SQL 层排除已迁移（blob 已是 CAS key）的行；
+// 已压缩的 .gz 对象由回填覆盖，不重复压缩。
 func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 	var row model.KernelSymbolFile
 	err := s.DB.WithContext(ctx).
-		Where("object_key LIKE 'kernel-symbols/%/kallsyms' AND object_key NOT LIKE '%.gz'").
-		Order("created_at ASC").Limit(1).First(&row).Error
+		Joins("LEFT JOIN storage_blobs b ON b.id = kernel_symbol_files.blob_id").
+		Where("kernel_symbol_files.object_key LIKE 'kernel-symbols/%/kallsyms' AND kernel_symbol_files.object_key NOT LIKE '%.gz'").
+		Where("(kernel_symbol_files.blob_id IS NULL OR b.object_key NOT LIKE ?)", casObjectKeyPrefix+"%").
+		Order("kernel_symbol_files.created_at ASC").Limit(1).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	// 已回填且 blob 已是 CAS key → 跳过。
+	// 防御：行级再确认一次（并发迁移场景）。
 	if row.BlobID != nil && *row.BlobID > 0 {
 		var blob model.StorageBlob
 		if err := s.DB.WithContext(ctx).Where("id = ?", *row.BlobID).First(&blob).Error; err == nil && !blobMigrateReady(&blob) {
@@ -618,8 +626,10 @@ func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 	var row model.SymbolFile
 	err := s.DB.WithContext(ctx).
-		Where("object_key LIKE 'symbols/%'").
-		Order("created_at ASC").Limit(1).First(&row).Error
+		Joins("LEFT JOIN storage_blobs b ON b.id = symbol_files.blob_id").
+		Where("symbol_files.object_key LIKE 'symbols/%'").
+		Where("(symbol_files.blob_id IS NULL OR b.object_key NOT LIKE ?)", casObjectKeyPrefix+"%").
+		Order("symbol_files.created_at ASC").Limit(1).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
@@ -652,10 +662,12 @@ func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 func (s *APIServer) migrateNextResult(ctx context.Context) (bool, error) {
 	var a model.Artifact
 	err := s.DB.WithContext(ctx).
+		Joins("LEFT JOIN storage_blobs b ON b.id = artifacts.blob_id").
 		Where("artifacts.kind IN ? AND artifacts.size >= ? AND artifacts.deleted_at IS NULL AND artifacts.status NOT IN ?",
 			[]string{model.ArtifactKindResult, model.ArtifactKindIntermediate},
 			s.Config.Blob.MinCompressBytes,
 			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
+		Where("(artifacts.blob_id IS NULL OR b.object_key NOT LIKE ?)", casObjectKeyPrefix+"%").
 		Order("artifacts.id ASC").Limit(1).First(&a).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
