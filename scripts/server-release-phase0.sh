@@ -13,15 +13,24 @@
 #   8. 只保留当前和上一个 release
 #
 # 用法：
-#   bash server-release-phase0.sh <release_dir> <commit> <archive_sha256> [--dry-run]
+#   bash server-release-phase0.sh <release_dir> <commit> <archive_sha256> [--dry-run] [--allow-low-disk]
+#   --allow-low-disk：用户显式批准在根盘 < 8GiB 时继续构建（默认拒绝）
 # ==============================================================================
 set -euo pipefail
 
-RELEASE_DIR="${1:?usage: server-release-phase0.sh <release_dir> <commit> <sha> [--dry-run]}"
-COMMIT="${2:?missing commit}"
-ARCHIVE_SHA="${3:?missing archive sha256}"
+ARGS=("$@")
+RELEASE_DIR="${ARGS[0]:?usage: server-release-phase0.sh <release_dir> <commit> <sha> [--dry-run] [--allow-low-disk]}"
+COMMIT="${ARGS[1]:?missing commit}"
+ARCHIVE_SHA="${ARGS[2]:?missing archive sha256}"
 DRY_RUN=0
-if [[ "${4:-}" == "--dry-run" ]]; then DRY_RUN=1; fi
+ALLOW_LOW_DISK=0
+for extra in "${ARGS[@]:3}"; do
+  case "${extra}" in
+    --dry-run) DRY_RUN=1 ;;
+    --allow-low-disk) ALLOW_LOW_DISK=1 ;;
+    *) die "未知参数: ${extra}" ;;
+  esac
+done
 
 PROJECT="mini-drop"
 RELEASES_ROOT="/home/ubuntu/mini-drop-releases"
@@ -78,16 +87,20 @@ say "校验 compose 配置（config --quiet）"
 run "${COMPOSE[@]}" config --quiet || die "docker compose config 校验失败，禁止构建与切换"
 
 # ---------------------------------------------------------------------------
-# 2) 构建前磁盘检查：可用 ≥ 8GiB
+# 2) 构建前磁盘检查：默认要求可用 ≥ 8GiB；--allow-low-disk 显式放行
 # ---------------------------------------------------------------------------
 if [[ "$DRY_RUN" == "0" ]]; then
   AVAIL_BYTES="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
   say "构建前根盘可用: $((AVAIL_BYTES / 1024 / 1024 / 1024)) GiB（要求 ≥ 8 GiB）"
   if [[ "${AVAIL_BYTES}" -lt "${MIN_BUILD_FREE_BYTES}" ]]; then
-    die "根盘可用 ${AVAIL_BYTES} bytes < 8GiB，本次服务器构建停止（阶段 0 不通过删除业务数据强行腾空间）"
+    if [[ "${ALLOW_LOW_DISK}" == "1" ]]; then
+      say "⚠️ 用户显式批准（--allow-low-disk）：根盘 ${AVAIL_BYTES} bytes < 8GiB，继续构建；不删除任何业务数据"
+    else
+      die "根盘可用 ${AVAIL_BYTES} bytes < 8GiB，本次服务器构建停止（阶段 0 不通过删除业务数据强行腾空间；确认后可用 --allow-low-disk 放行）"
+    fi
   fi
 else
-  say "[dry-run] 构建前磁盘检查：根盘可用需 ≥ 8 GiB"
+  say "[dry-run] 构建前磁盘检查：根盘可用需 ≥ 8 GiB（--allow-low-disk 可显式放行）"
 fi
 
 # ---------------------------------------------------------------------------

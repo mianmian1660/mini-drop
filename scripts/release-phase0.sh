@@ -14,12 +14,20 @@
 #      rollback tag/快照 → 构建 → 依次切换 → 健康检查 → 更新 current → 清理
 #
 # 用法：
-#   bash scripts/release-phase0.sh [--dry-run]
+#   bash scripts/release-phase0.sh [--dry-run] [--allow-low-disk]
+#   --allow-low-disk：显式批准在服务器根盘 < 8GiB 时继续构建
 # ==============================================================================
 set -euo pipefail
 
 DRY_RUN=0
-if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; fi
+ALLOW_LOW_DISK=0
+for arg in "$@"; do
+  case "${arg}" in
+    --dry-run) DRY_RUN=1 ;;
+    --allow-low-disk) ALLOW_LOW_DISK=1 ;;
+    *) die "未知参数: ${arg}" ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -90,12 +98,13 @@ fi
 # 4) 调用服务器端发布脚本
 # ---------------------------------------------------------------------------
 say "执行服务器端发布"
-DRY_ARG=""
-[[ "$DRY_RUN" == "1" ]] && DRY_ARG="--dry-run"
+EXTRA=""
+[[ "$DRY_RUN" == "1" ]] && EXTRA="${EXTRA} --dry-run"
+[[ "$ALLOW_LOW_DISK" == "1" ]] && EXTRA="${EXTRA} --allow-low-disk"
 if [[ "$DRY_RUN" == "1" ]]; then
-  say "[dry-run] ssh ${REMOTE_HOST} bash /tmp/server-release-phase0.sh ${RELEASE_DIR} ${COMMIT} ${SHA} ${DRY_ARG}"
+  say "[dry-run] ssh ${REMOTE_HOST} bash /tmp/server-release-phase0.sh ${RELEASE_DIR} ${COMMIT} ${SHA}${EXTRA}"
 else
-  ssh "${REMOTE_HOST}" "bash /tmp/server-release-phase0.sh '${RELEASE_DIR}' '${COMMIT}' '${SHA}' ${DRY_ARG}"
+  ssh "${REMOTE_HOST}" "bash /tmp/server-release-phase0.sh '${RELEASE_DIR}' '${COMMIT}' '${SHA}'${EXTRA}"
 fi
 
 say "✅ 本地发布编排完成（commit=${COMMIT}）"
