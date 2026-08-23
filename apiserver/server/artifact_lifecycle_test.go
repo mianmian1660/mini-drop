@@ -132,16 +132,17 @@ func TestLifecycleComputeExpirySuperseded(t *testing.T) {
 	end := now.Add(-2 * time.Hour) // 早于 created → 起点取 created
 	a := mkArtifact("t", model.ArtifactKindResult, "tasks/t/analysis/p/g1/flamegraph.svg", created, model.ArtifactStatusReady)
 	task := &model.HotmethodTask{TID: "t", Status: TaskStatusDone, EndTime: &end}
-	class, exp, _ := s.lifecycleComputeExpiry(&a, task, true)
+	supersededAt := now.Add(-time.Hour)
+	class, exp, _ := s.lifecycleComputeExpiry(&a, task, &supersededAt)
 	if class != model.RetentionClassResultSuperseded {
 		t.Fatalf("class=%s", class)
 	}
 	if exp == nil {
 		t.Fatal("superseded artifact must have expires_at")
 	}
-	want := created.Add(72 * time.Hour)
+	want := supersededAt.Add(72 * time.Hour)
 	if !exp.Truncate(time.Minute).Equal(want.Truncate(time.Minute)) {
-		t.Fatalf("expires_at=%v want ~%v (72h from created)", *exp, want)
+		t.Fatalf("expires_at=%v want ~%v (72h from superseded_at)", *exp, want)
 	}
 }
 
@@ -160,7 +161,7 @@ func TestLifecycleComputeExpiryNonTerminal(t *testing.T) {
 	now := time.Now()
 	a := mkArtifact("t", model.ArtifactKindRaw, "t/perf.data", now.Add(-10*time.Minute), model.ArtifactStatusReady)
 	task := &model.HotmethodTask{TID: "t", Status: TaskStatusRunning}
-	class, exp, nb := s.lifecycleComputeExpiry(&a, task, false)
+	class, exp, nb := s.lifecycleComputeExpiry(&a, task, nil)
 	if class != model.RetentionClassRawLarge {
 		t.Fatalf("class=%s", class)
 	}
@@ -179,7 +180,7 @@ func TestLifecycleComputeExpiryTerminalBackfill(t *testing.T) {
 	end := now.Add(-2 * 24 * time.Hour)
 	a := mkArtifact("t", model.ArtifactKindRaw, "t/perf.data", created, model.ArtifactStatusReady)
 	task := &model.HotmethodTask{TID: "t", Status: TaskStatusDone, EndTime: &end}
-	class, exp, nb := s.lifecycleComputeExpiry(&a, task, false)
+	class, exp, nb := s.lifecycleComputeExpiry(&a, task, nil)
 	if class != model.RetentionClassRawLarge {
 		t.Fatalf("class=%s", class)
 	}
@@ -216,7 +217,7 @@ func TestLifecycleComputeExpiryPolicyShortenProtection(t *testing.T) {
 	task := &model.HotmethodTask{TID: "t", Status: TaskStatusDone, EndTime: &end}
 	// 新策略：result 只有 24h → 到期时间被大幅缩短
 	s.Config.Retention.ResultRetentionHours = 24
-	class, exp, nbOut := s.lifecycleComputeExpiry(&a, task, false)
+	class, exp, nbOut := s.lifecycleComputeExpiry(&a, task, nil)
 	if class != model.RetentionClassResult {
 		t.Fatalf("class=%s", class)
 	}
@@ -238,7 +239,7 @@ func TestLifecycleComputeExpiryManifestPermanent(t *testing.T) {
 	now := time.Now()
 	a := mkArtifact("t", model.ArtifactKindManifest, "t/manifest.json", now.Add(-10*time.Minute), model.ArtifactStatusReady)
 	task := &model.HotmethodTask{TID: "t", Status: TaskStatusDone, EndTime: &now}
-	class, exp, _ := s.lifecycleComputeExpiry(&a, task, false)
+	class, exp, _ := s.lifecycleComputeExpiry(&a, task, nil)
 	if class != model.RetentionClassManifest {
 		t.Fatalf("class=%s", class)
 	}

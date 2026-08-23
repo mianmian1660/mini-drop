@@ -801,7 +801,8 @@ def t_switch_active_initial_late_attempt_kept():
     switched = _switch_active_job_tx(conn, job, "tid")
     assert switched is False
     sql = "\n".join(conn.queries)
-    assert "superseded_at" not in sql
+    assert "superseded_at = NOW()" in sql
+    assert "result_superseded" in sql
     assert "active_analysis_job_id = %s" not in sql
 
 def t_switch_active_initial_newer_attempt_switches():
@@ -1124,6 +1125,78 @@ def t_symbolization_chain_is_wired():
                      if c.startswith("_") and c not in ana_def
                      and c not in ana_imp and not hasattr(builtins, c))
     assert not missing, f"hotmethod_analyzer 调用了未定义的内部函数: {missing}"
+
+
+def t_kallsyms_lookup_ignores_sample_attempt_filter():
+    import os
+    import hotmethod_analyzer as hm
+    from job_context import use
+
+    class Cursor:
+        def __init__(self):
+            self.sql = ""
+            self.params = []
+        def execute(self, sql, params):
+            self.sql, self.params = sql, params
+        def fetchall(self):
+            return [("kernel-symbols/abc/kallsyms.gz",)]
+        def close(self):
+            pass
+    class Conn:
+        def __init__(self):
+            self.last = None
+        def cursor(self):
+            self.last = Cursor()
+            return self.last
+
+    conn = Conn()
+    with use({"attempt_id": 42}):
+        keys = hm._raw_artifact_keys(
+            conn, "tid", suffixes=["kallsyms.gz"], match_attempt=False
+        )
+    assert keys == ["kernel-symbols/abc/kallsyms.gz"]
+    assert "a.attempt_id = %s" not in conn.last.sql
+    assert conn.last.params == ["tid"]
+
+
+def t_timed_out_legacy_thread_keeps_immutable_job_context():
+    import threading
+    import time
+    from analyzer_contract import AnalyzerTemporaryError, InputSpec, LegacyFunctionAnalyzer
+    from artifact_descriptor import current_output_prefix
+    from job_context import use
+
+    started = threading.Event()
+    release = threading.Event()
+    observed = []
+
+    def stale_analyzer(*_args):
+        started.set()
+        release.wait(1)
+        observed.append(current_output_prefix("tid-a"))
+        return {"outputs": []}
+
+    analyzer = LegacyFunctionAnalyzer(
+        name="context-test", pipeline="perf", input_spec=InputSpec("perf.data", ["perf"]),
+        output_specs=[], analyze_func=stale_analyzer, timeout_seconds=0.01,
+    )
+    prepared = {
+        "conn": object(), "storage_cfg": {}, "task": {}, "bucket": "b", "tid": "tid-a",
+        "job_context": {"output_prefix": "tasks/tid-a/analysis/perf/v/g1", "work_dir": "/tmp/a"},
+    }
+    try:
+        analyzer.analyze(prepared)
+        assert False, "legacy analyzer should time out"
+    except AnalyzerTemporaryError:
+        pass
+    assert started.is_set()
+    with use({"output_prefix": "tasks/tid-b/analysis/perf/v/g2", "work_dir": "/tmp/b"}):
+        release.set()
+        for _ in range(100):
+            if observed:
+                break
+            time.sleep(0.005)
+    assert observed == ["tasks/tid-a/analysis/perf/v/g1"]
 
 
 if __name__ == "__main__":

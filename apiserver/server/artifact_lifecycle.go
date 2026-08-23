@@ -199,9 +199,9 @@ func (s *APIServer) notBeforeProtection() time.Duration {
 //     not_before 提升到 now+24h。
 //   - 策略延长：立即按新时长计算，不动 not_before。
 //   - manifest 永不过期：expires_at=nil。
-//   - superseded（阶段 4）：被替换旧代按 created_at 起算 72h，不做 24h 保护
-//     （切换事务已写入精确到期，重算只求一致，不延长清理）。
-func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.HotmethodTask, superseded bool) (class string, expiresAt *time.Time, notBefore *time.Time) {
+//   - superseded（阶段 4）：从 analysis_job.superseded_at 起算 72h，不做 24h
+//     保护（切换事务与 reconciler 使用同一个时间基准）。
+func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.HotmethodTask, supersededAt *time.Time) (class string, expiresAt *time.Time, notBefore *time.Time) {
 	now := time.Now()
 	guard := now.Add(s.notBeforeProtection())
 
@@ -213,7 +213,7 @@ func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.Hotmet
 		taskStatus = task.Status
 		terminal = isTerminalTaskStatus(task.Status)
 	}
-	class = classifyArtifactRetentionFull(a.Kind, a.ObjectKey, taskStatus, superseded)
+	class = classifyArtifactRetentionFull(a.Kind, a.ObjectKey, taskStatus, supersededAt != nil)
 
 	// manifest 永不过期
 	if class == model.RetentionClassManifest && s.Config.Retention.ManifestPermanent {
@@ -225,6 +225,9 @@ func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.Hotmet
 	}
 
 	start := a.CreatedAt
+	if supersededAt != nil {
+		start = *supersededAt
+	}
 	if task != nil && task.EndTime != nil && task.EndTime.After(start) {
 		start = *task.EndTime
 	}
@@ -336,13 +339,13 @@ func (s *APIServer) reconcileLifecycle(ctx context.Context) int64 {
 			}
 			a := &stale[i]
 			task := taskByTID[a.TaskTID]
-			superseded := false
+			var supersededAt *time.Time
 			if a.AnalysisJobID != nil {
 				if job := jobByID[*a.AnalysisJobID]; job != nil && job.SupersededAt != nil {
-					superseded = true
+					supersededAt = job.SupersededAt
 				}
 			}
-			class, exp, nb := s.lifecycleComputeExpiry(a, task, superseded)
+			class, exp, nb := s.lifecycleComputeExpiry(a, task, supersededAt)
 			updates := map[string]interface{}{
 				"retention":                class,
 				"retention_policy_version": version,

@@ -49,6 +49,7 @@ from observability import elapsed_seconds, log_event, now_seconds
 import artifact_descriptor as ad
 import pprof_builder as pprof_builder
 from analyzer_contract import AnalyzerTemporaryError
+from job_context import get as job_context_get
 
 
 # ============================================================
@@ -64,7 +65,9 @@ TASK_TYPE_JAVA_HEAP = 6   # Java 堆 dump
 
 def work_file(tid: str, name: str) -> str:
     """Return a job-private scratch path; legacy callers fall back to /tmp."""
-    root = os.environ.get("ANALYSIS_JOB_WORK_DIR", "").strip()
+    root = str(job_context_get("work_dir", "") or "").strip()
+    if not root:
+        root = os.environ.get("ANALYSIS_JOB_WORK_DIR", "").strip()
     if not root:
         root = os.path.join(os.environ.get("ANALYSIS_WORK_ROOT", "/tmp/mini-drop-analysis"), tid)
     os.makedirs(root, exist_ok=True)
@@ -81,7 +84,9 @@ def env_enabled(name: str) -> bool:
 
 def _analysis_job_id() -> int:
     """当前作业的 AnalysisJob.ID（阶段 4，daemon 设置 ANALYSIS_JOB_ID 环境变量）。"""
-    raw = os.environ.get("ANALYSIS_JOB_ID", "").strip()
+    raw = str(job_context_get("job_id", "") or "").strip()
+    if not raw:
+        raw = os.environ.get("ANALYSIS_JOB_ID", "").strip()
     try:
         return int(raw) if raw else 0
     except ValueError:
@@ -90,7 +95,9 @@ def _analysis_job_id() -> int:
 
 def _analysis_attempt_id() -> int:
     """当前作业输入 RAW 所属 TaskAttempt.ID（阶段 4）。"""
-    raw = os.environ.get("ANALYSIS_ATTEMPT_ID", "").strip()
+    raw = str(job_context_get("attempt_id", "") or "").strip()
+    if not raw:
+        raw = os.environ.get("ANALYSIS_ATTEMPT_ID", "").strip()
     try:
         return int(raw) if raw else 0
     except ValueError:
@@ -99,7 +106,9 @@ def _analysis_attempt_id() -> int:
 
 def _analysis_generation() -> int:
     """当前作业代次（阶段 4）。"""
-    raw = os.environ.get("ANALYSIS_GENERATION", "").strip()
+    raw = str(job_context_get("generation", "") or "").strip()
+    if not raw:
+        raw = os.environ.get("ANALYSIS_GENERATION", "").strip()
     try:
         return int(raw) if raw else 0
     except ValueError:
@@ -426,7 +435,7 @@ def _download_perf_data(storage, bucket: str, tid: str,
     return _download_first_existing(storage, bucket, keys, local_path, "perf.data")
 
 
-def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
+def _raw_artifact_keys(conn, tid: str, suffixes=None, match_attempt: bool = True) -> list:
     """读取任务 RAW artifact 的物理 object_key 列表。
 
     阶段二：blob_id 非空时返回物理 CAS key；否则兼容返回原逻辑 key。
@@ -448,7 +457,7 @@ def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
         )
         params = [tid]
         attempt_id = _analysis_attempt_id()
-        if attempt_id:
+        if attempt_id and match_attempt:
             sql += " AND a.attempt_id = %s"
             params.append(attempt_id)
         sql += " ORDER BY a.created_at DESC, a.id DESC"
@@ -498,7 +507,13 @@ def _download_kallsyms(storage, bucket: str, tid: str,
     优先读取 artifacts 表中记录的 RAW 产物，兼容后续对象 key 调整；如果元数据缺失，
     再回退到早期固定路径 {tid}/kallsyms。
     """
-    keys = _raw_artifact_keys(conn, tid, suffixes=["/kallsyms", ".kallsyms", "kallsyms", "kallsyms.gz"])
+    # kallsyms is a task/shared kernel snapshot and historically has
+    # attempt_id=0. It must not inherit the primary sample RAW attempt filter.
+    keys = _raw_artifact_keys(
+        conn, tid,
+        suffixes=["/kallsyms", ".kallsyms", "kallsyms", "kallsyms.gz"],
+        match_attempt=False,
+    )
     keys.append(f"{tid}/kallsyms")
     if _download_first_existing(storage, bucket, keys, local_path, "kallsyms"):
         # New shared objects use .gz, but key names are not authoritative: old

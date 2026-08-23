@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -75,13 +76,18 @@ func TestNotifyRejectsV2WhenDisabledAndMismatchedKeys(t *testing.T) {
 	if w.Code != 400 {
 		t.Fatalf("mismatched manifest attempt must be rejected, got %d", w.Code)
 	}
+	// 路径内部自洽但数据库 attempt 不存在 → 400，禁止回退完成最新 attempt。
+	w = postNotify(t, s, `{"task_id":"t-v2off","cos_key":"tasks/t-v2off/attempts/999/raw/perf.data"}`)
+	if w.Code != 400 {
+		t.Fatalf("unknown v2 attempt must be rejected, got %d", w.Code)
+	}
 }
 
 func TestEnsureAnalysisQueuedIdempotentPerAttemptMultiGen(t *testing.T) {
 	s := newTestAPIServer(t)
 	s.Config = &config.Config{
 		Storage:    config.StorageConfig{Bucket: "drop-data", PresignExpireSec: 900},
-		SingleShot: config.SingleShotConfig{LayoutV2Enabled: true},
+		SingleShot: config.SingleShotConfig{LayoutV2Enabled: true, GenerationsEnabled: true},
 	}
 	task := mustCreateRunningTask(t, s, "t-multigen")
 	attempt, err := s.startTaskAttempt(&task, model.AttemptTriggerInitial)
@@ -90,10 +96,10 @@ func TestEnsureAnalysisQueuedIdempotentPerAttemptMultiGen(t *testing.T) {
 	}
 	// 第一次通知：v2 路径，attempt 匹配
 	body, _ := json.Marshal(map[string]interface{}{
-		"task_id": "t-multigen",
-		"cos_key": "tasks/t-multigen/attempts/1/raw/perf.data",
-		"attempt_id": 1,
-		"artifact_size": 2048,
+		"task_id":         "t-multigen",
+		"cos_key":         fmt.Sprintf("tasks/t-multigen/attempts/%d/raw/perf.data", attempt.ID),
+		"attempt_id":      attempt.ID,
+		"artifact_size":   2048,
 		"artifact_sha256": "abc",
 	})
 	w := postNotify(t, s, string(body))
@@ -113,7 +119,7 @@ func TestEnsureAnalysisQueuedIdempotentPerAttemptMultiGen(t *testing.T) {
 	if len(jobs) != 1 {
 		t.Fatalf("want 1 job after duplicate notify, got %d", len(jobs))
 	}
-	if jobs[0].Generation != 1 || jobs[0].AttemptID != 1 || jobs[0].Trigger != model.AnalysisJobTriggerInitial {
+	if jobs[0].Generation != 1 || jobs[0].AttemptID != attempt.ID || jobs[0].Trigger != model.AnalysisJobTriggerInitial {
 		t.Fatalf("job fields wrong: gen=%d attempt=%d trigger=%s", jobs[0].Generation, jobs[0].AttemptID, jobs[0].Trigger)
 	}
 	if jobs[0].Pipeline != "perf_flamegraph" {
@@ -123,16 +129,20 @@ func TestEnsureAnalysisQueuedIdempotentPerAttemptMultiGen(t *testing.T) {
 	if err := s.DB.Where("task_tid = ? AND kind = ?", "t-multigen", model.ArtifactKindRaw).Find(&raws).Error; err != nil {
 		t.Fatalf("query raws: %v", err)
 	}
-	if len(raws) != 1 || raws[0].AttemptID != 1 || raws[0].LogicalName != "perf.data" {
+	if len(raws) != 1 || raws[0].AttemptID != attempt.ID || raws[0].LogicalName != "perf.data" {
 		t.Fatalf("raw artifact fields wrong: %+v", raws)
 	}
 
 	// 新 attempt（attempt_id=2）：生成 gen 2
+	attempt2, err := s.startTaskAttempt(&task, model.AttemptTriggerRetry)
+	if err != nil {
+		t.Fatalf("start second attempt: %v", err)
+	}
 	body2, _ := json.Marshal(map[string]interface{}{
-		"task_id": "t-multigen",
-		"cos_key": "tasks/t-multigen/attempts/2/raw/perf.data",
-		"attempt_id": 2,
-		"artifact_size": 4096,
+		"task_id":         "t-multigen",
+		"cos_key":         fmt.Sprintf("tasks/t-multigen/attempts/%d/raw/perf.data", attempt2.ID),
+		"attempt_id":      attempt2.ID,
+		"artifact_size":   4096,
 		"artifact_sha256": "def",
 	})
 	w = postNotify(t, s, string(body2))
@@ -146,8 +156,86 @@ func TestEnsureAnalysisQueuedIdempotentPerAttemptMultiGen(t *testing.T) {
 	if len(jobs) != 2 {
 		t.Fatalf("want 2 jobs, got %d", len(jobs))
 	}
-	if jobs[1].Generation != 2 || jobs[1].AttemptID != 2 {
+	if jobs[1].Generation != 2 || jobs[1].AttemptID != attempt2.ID {
 		t.Fatalf("second job fields wrong: gen=%d attempt=%d", jobs[1].Generation, jobs[1].AttemptID)
+	}
+}
+
+func TestSelectedGenerationFilesAndLegacyKeyAuthorization(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = fakeStorage{}
+	s.Config = &config.Config{Storage: config.StorageConfig{Bucket: "drop-data"}}
+	taskA := model.HotmethodTask{TID: "task-a", Name: "a", Status: TaskStatusDone, UID: "u", CreateTime: nowForTest()}
+	taskB := model.HotmethodTask{TID: "task-b", Name: "b", Status: TaskStatusDone, UID: "u", CreateTime: nowForTest()}
+	if err := s.DB.Create(&taskA).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&taskB).Error; err != nil {
+		t.Fatal(err)
+	}
+	job1 := model.AnalysisJob{TaskTID: taskA.TID, Generation: 1, Pipeline: "perf", Trigger: model.AnalysisJobTriggerInitial, Status: model.AnalysisJobStatusSuccess, CreatedAt: nowForTest(), UpdatedAt: nowForTest()}
+	job2 := model.AnalysisJob{TaskTID: taskA.TID, Generation: 2, Pipeline: "perf", Trigger: model.AnalysisJobTriggerManual, Status: model.AnalysisJobStatusSuccess, CreatedAt: nowForTest(), UpdatedAt: nowForTest()}
+	if err := s.DB.Create(&job1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&job2).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []model.Artifact{
+		{TaskTID: taskA.TID, AnalysisJobID: &job1.ID, Kind: model.ArtifactKindResult, ObjectKey: "tasks/task-a/analysis/perf/v/g1/flamegraph.svg", LogicalName: "flamegraph.svg", Status: model.ArtifactStatusReady, CreatedAt: nowForTest()},
+		{TaskTID: taskA.TID, AnalysisJobID: &job2.ID, Kind: model.ArtifactKindResult, ObjectKey: "tasks/task-a/analysis/perf/v/g2/flamegraph.svg", LogicalName: "flamegraph.svg", Status: model.ArtifactStatusReady, CreatedAt: nowForTest()},
+		{TaskTID: taskB.TID, Kind: model.ArtifactKindRaw, ObjectKey: "tasks/task-b/attempts/1/raw/perf.data", Status: model.ArtifactStatusReady, CreatedAt: nowForTest()},
+	} {
+		if err := s.DB.Create(&a).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, err := s.listTaskFilesForAnalysisJob(taskA.TID, &job2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || !strings.Contains(files[0]["name"].(string), "/g2/") {
+		t.Fatalf("selected generation files=%#v", files)
+	}
+	if !strings.Contains(files[0]["view_url"].(string), fmt.Sprintf("/artifacts/%d/content", files[0]["artifact_id"])) {
+		t.Fatalf("selected file must use artifact content URL: %#v", files[0])
+	}
+	foreignKey := "tasks/task-b/attempts/1/raw/perf.data"
+	if s.cosKeyBelongsToTask(taskA.TID, foreignKey) {
+		t.Fatal("task A must not authorize task B object key")
+	}
+	if !s.cosKeyBelongsToTask(taskB.TID, foreignKey) {
+		t.Fatal("artifact owner task must authorize its object key")
+	}
+}
+
+func TestFailedGenerationRawDoesNotCountAsAvailableResult(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = fakeStorage{}
+	s.Config = &config.Config{Storage: config.StorageConfig{Bucket: "drop-data"}}
+	task := model.HotmethodTask{TID: "t-no-result", Name: "x", Status: TaskStatusDone, UID: "u", CreateTime: nowForTest()}
+	if err := s.DB.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := model.AnalysisJob{TaskTID: task.TID, Generation: 2, Pipeline: "perf", Trigger: model.AnalysisJobTriggerManual, Status: model.AnalysisJobStatusFailed, CreatedAt: nowForTest(), UpdatedAt: nowForTest()}
+	if err := s.DB.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	raw := model.Artifact{TaskTID: task.TID, Kind: model.ArtifactKindRaw, ObjectKey: "t-no-result/perf.data", Status: model.ArtifactStatusReady, CreatedAt: nowForTest()}
+	if err := s.DB.Create(&raw).Error; err != nil {
+		t.Fatal(err)
+	}
+	payload := s.analysisJobsPayload(task.TID)
+	jobs := payload["analysis_jobs"].([]gin.H)
+	if len(jobs) != 1 || jobs[0]["artifacts_available"].(bool) {
+		t.Fatalf("failed generation must not inherit RAW availability: %#v", jobs)
+	}
+	detail, serr := s.taskDetailPayload(task, fmt.Sprint(job.ID))
+	if serr != nil {
+		t.Fatalf("task detail: %v", serr)
+	}
+	if files := detail["files"].([]map[string]interface{}); len(files) != 0 {
+		t.Fatalf("failed selected generation must not fall back to task RAW/older results: %#v", files)
 	}
 }
 

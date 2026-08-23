@@ -19,6 +19,7 @@ from analyzer_contract import AnalyzerError, AnalyzerInputError, AnalyzerTempora
 from analyzer_registry import build_default_registry
 from lease import AnalysisLeaseClient
 from observability import elapsed_seconds, log_event, now_seconds
+from job_context import get as job_context_get, use as use_job_context
 
 
 POLL_INTERVAL = 5
@@ -231,7 +232,7 @@ def record_result_artifacts(conn, tid: str, attempt_id: int, job_id: int,
         elif isinstance(value, str) and ("/" in value):
             keys.append(value)
     if manifest:
-        prefix = os.environ.get("ANALYSIS_OUTPUT_PREFIX", "").strip() or tid
+        prefix = str(job_context_get("output_prefix", "") or "").strip() or tid
         manifest_key = f"{prefix}/manifest.json"
         if manifest_key not in keys:
             keys.append(manifest_key)
@@ -422,6 +423,26 @@ def _switch_active_job_tx(conn, job, tid: str) -> bool:
                   attempt_id=getattr(job, "attempt_id", 0),
                   prev_active=prev_active, trigger=getattr(job, "trigger", "initial"))
     else:
+        # A successful late initial job that loses the active election is also
+        # a superseded generation. Keeping it as a normal 30-day result would
+        # silently defeat the small-disk retention policy.
+        cur.execute(
+            "UPDATE analysis_jobs SET superseded_at = NOW(), updated_at = NOW() "
+            "WHERE id = %s AND superseded_at IS NULL",
+            (job.id,),
+        )
+        cur.execute(
+            """
+            UPDATE artifacts
+            SET retention = 'result_superseded',
+                expires_at = NOW() + (%s || ' hours')::interval,
+                retention_task_state = 'done',
+                updated_at = NOW()
+            WHERE analysis_job_id = %s AND kind IN ('RESULT', 'INTERMEDIATE')
+              AND deleted_at IS NULL AND status = 'ready'
+            """,
+            (SUPERSEDED_RESULT_HOURS, job.id),
+        )
         log_event("analysis_active_kept_late_attempt", task_tid=tid,
                   job_id=job.id, attempt_id=getattr(job, "attempt_id", 0),
                   active_job_id=prev_active)
@@ -498,19 +519,14 @@ def _safe_token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", str(value or ""))
 
 
-def _setup_job_env(job, tid: str, analyzer_version: str):
-    """阶段 4：向分析进程注入当前作业上下文。
+def _build_job_context(job, tid: str, analyzer_version: str, workspace: str):
+    """Build immutable per-job context without mutating process environment.
 
     ANALYSIS_OUTPUT_PREFIX = tasks/{tid}/analysis/{pipeline}/{version}/g{generation}
     （generation>0 且 pipeline 非空时；旧链路回退 {tid} 形态）。
     """
     generation = int(getattr(job, "generation", 0) or 0)
     pipeline = getattr(job, "pipeline", "") or ""
-    os.environ["ANALYSIS_JOB_ID"] = str(getattr(job, "id", 0) or 0)
-    os.environ["ANALYSIS_ATTEMPT_ID"] = str(getattr(job, "attempt_id", 0) or 0)
-    os.environ["ANALYSIS_GENERATION"] = str(generation)
-    os.environ["ANALYSIS_PIPELINE"] = pipeline
-    os.environ["ANALYSIS_ANALYZER_VERSION"] = analyzer_version
     prefix = ""
     if generation > 0 and pipeline:
         prefix = "tasks/{tid}/analysis/{p}/{v}/g{gen}".format(
@@ -519,10 +535,15 @@ def _setup_job_env(job, tid: str, analyzer_version: str):
             v=_safe_token(analyzer_version),
             gen=generation,
         )
-    if prefix:
-        os.environ["ANALYSIS_OUTPUT_PREFIX"] = prefix
-    else:
-        os.environ.pop("ANALYSIS_OUTPUT_PREFIX", None)
+    return {
+        "job_id": int(getattr(job, "id", 0) or 0),
+        "attempt_id": int(getattr(job, "attempt_id", 0) or 0),
+        "generation": generation,
+        "pipeline": pipeline,
+        "analyzer_version": analyzer_version,
+        "output_prefix": prefix or tid,
+        "work_dir": workspace,
+    }
 
 
 def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
@@ -553,8 +574,6 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
     conn = None
     workspace = os.path.join(WORK_ROOT, f"{job.id}-{tid}-{job.attempt}")
     os.makedirs(workspace, exist_ok=True)
-    old_workspace = os.environ.get("ANALYSIS_JOB_WORK_DIR")
-    os.environ["ANALYSIS_JOB_WORK_DIR"] = workspace
     try:
         config = hm.load_config(config_path)
         db_cfg = config["database"]
@@ -567,22 +586,23 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         analyzer = registry.require(task_type)
         analyzer_version = getattr(analyzer, "analyzer_version", ANALYZER_VERSION)
 
-        _setup_job_env(job, tid, analyzer_version)
-        hm.update_analysis_status(conn, tid, 1, "分析中")
-        result = analyzer(
-            conn, storage_cfg, task, bucket, tid, local_dir=local_output_dir, job=job
-        )
-        if result.get("manifest"):
-            manifest_key = _upload_manifest(storage_cfg, bucket, tid, result["manifest"])
-            if manifest_key:
-                result.setdefault("outputs", []).append(manifest_key)
+        immutable_context = _build_job_context(job, tid, analyzer_version, workspace)
+        with use_job_context(immutable_context):
+            hm.update_analysis_status(conn, tid, 1, "分析中")
+            result = analyzer(
+                conn, storage_cfg, task, bucket, tid, local_dir=local_output_dir, job=job
+            )
+            if result.get("manifest"):
+                manifest_key = _upload_manifest(storage_cfg, bucket, tid, result["manifest"])
+                if manifest_key:
+                    result.setdefault("outputs", []).append(manifest_key)
 
-        storage_for_sizes, storage_ok = hm._connect_storage(storage_cfg)
-        if not storage_ok:
-            storage_for_sizes = None
-        finalize_success_tx(conn, lease_client, job, tid, result, analyzer_version,
-                            storage=storage_for_sizes, bucket=bucket)
-        conn.commit()
+            storage_for_sizes, storage_ok = hm._connect_storage(storage_cfg)
+            if not storage_ok:
+                storage_for_sizes = None
+            finalize_success_tx(conn, lease_client, job, tid, result, analyzer_version,
+                                storage=storage_for_sizes, bucket=bucket)
+            conn.commit()
 
         log_event("analysis_succeeded", **common,
                   analysis_duration_seconds=elapsed_seconds(started_at),
@@ -658,10 +678,6 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         # timed-out external worker may leave its directory behind; the next
         # daemon sweep removes it after the two-hour safety window.
         shutil.rmtree(workspace, ignore_errors=True)
-        if old_workspace is None:
-            os.environ.pop("ANALYSIS_JOB_WORK_DIR", None)
-        else:
-            os.environ["ANALYSIS_JOB_WORK_DIR"] = old_workspace
 
 
 def main():

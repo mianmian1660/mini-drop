@@ -277,6 +277,19 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		})
 		return
 	}
+	// A v2 key carries a database attempt ID. String-level path validation is
+	// not enough: reject stale/fabricated IDs instead of finishing a different
+	// latest attempt through the legacy fallback.
+	if isV2AgentKey(strings.TrimSpace(req.CosKey)) {
+		var attemptCount int64
+		if err := s.DB.Model(&model.TaskAttempt{}).
+			Where("id = ? AND task_tid = ?", req.AttemptID, task.TID).
+			Count(&attemptCount).Error; err != nil || attemptCount != 1 {
+			incTaskNotifyFailed()
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "attempt_id 不属于该任务"})
+			return
+		}
+	}
 
 	if strings.TrimSpace(req.ErrorMessage) != "" {
 		incTaskNotifyFailed()
@@ -601,9 +614,13 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, attemptID ui
 
 	if trigger == model.AnalysisJobTriggerInitial {
 		var existing int64
-		if err := tx.Model(&model.AnalysisJob{}).
-			Where("task_tid = ? AND attempt_id = ? AND pipeline = ? AND trigger = ?", tid, attemptID, pipeline, model.AnalysisJobTriggerInitial).
-			Count(&existing).Error; err != nil {
+		existingQuery := tx.Model(&model.AnalysisJob{}).
+			Where("task_tid = ? AND pipeline = ? AND trigger = ?", tid, pipeline, model.AnalysisJobTriggerInitial)
+		generationsEnabled := s.Config != nil && s.Config.SingleShot.GenerationsEnabled
+		if generationsEnabled {
+			existingQuery = existingQuery.Where("attempt_id = ?", attemptID)
+		}
+		if err := existingQuery.Count(&existing).Error; err != nil {
 			return err
 		}
 		if existing > 0 {
@@ -618,6 +635,9 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, attemptID ui
 		return err
 	}
 	generation := maxGen + 1
+	if s.Config == nil || !s.Config.SingleShot.GenerationsEnabled {
+		generation = 1
+	}
 
 	inputArtifactJSON, _ := util.MarshalJSONB(inputArtifactIDs)
 	job := model.AnalysisJob{
@@ -906,14 +926,22 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask, explicitJobID st
 			result["flamegraph_artifact_id"] = flame.ID
 			result["flamegraph_artifact_url"] = fmt.Sprintf("/api/v1/tasks/%s/artifacts/%d/content", task.TID, flame.ID)
 		}
-		if !s.jobHasAnyArtifacts(task.TID, selectedJob.ID) {
+		if !s.jobHasAnyArtifacts(task.TID, selectedJob.ID) &&
+			selectedJob.Generation == 1 && selectedJob.Trigger == model.AnalysisJobTriggerInitial &&
+			selectedJob.Status == model.AnalysisJobStatusSuccess && task.ActiveAnalysisJobID != nil &&
+			*task.ActiveAnalysisJobID == selectedJob.ID {
 			legacyFallback = true
 		}
 	}
+	generationScoped := selectedJob != nil && !legacyFallback
 
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
-		storageFiles, err := s.listTaskFiles(task.TID)
+		var selectedJobID *uint
+		if selectedJob != nil && !legacyFallback {
+			selectedJobID = &selectedJob.ID
+		}
+		storageFiles, err := s.listTaskFilesForAnalysisJob(task.TID, selectedJobID)
 		if err != nil {
 			s.Logger.Warn("列出任务文件失败", zap.String("tid", task.TID), zap.Error(err))
 		} else {
@@ -928,7 +956,7 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask, explicitJobID st
 			}
 		}
 	}
-	if len(files) == 0 {
+	if len(files) == 0 && !generationScoped {
 		files = s.listLocalFiles(task.TID)
 		if len(topFuncs) == 0 {
 			topFuncs = s.fetchLocalTopFunctions(task.TID)
@@ -937,7 +965,7 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask, explicitJobID st
 			bpfData = s.fetchLocalBPFData(task.TID)
 		}
 	}
-	if len(suggestions) == 0 {
+	if len(suggestions) == 0 && !generationScoped {
 		suggestions = s.fetchLocalSuggestions(task.TID)
 	}
 	if len(suggestions) == 0 && selectedJob == nil {
@@ -1714,6 +1742,10 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
+	if !s.cosKeyBelongsToTask(tid, key) {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在")
+		return
+	}
 	if !s.StorageConnected() {
 		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接")
 		return
@@ -1768,6 +1800,10 @@ func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
+	if !s.cosKeyBelongsToTask(tid, key) {
+		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在")
+		return
+	}
 	if !s.StorageConnected() {
 		s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "对象存储未连接")
 		return
@@ -1795,6 +1831,26 @@ func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 	if _, err := io.Copy(c.Writer, reader); err != nil {
 		s.Logger.Warn("代理下载对象存储文件失败", zap.String("key", util.RedactObjectKey(key)), zap.Error(err))
 	}
+}
+
+// cosKeyBelongsToTask keeps the legacy key-based endpoints safe while old
+// clients migrate to Artifact-ID content URLs. Shared/CAS keys are accepted
+// only when an Artifact ledger row explicitly links them to the authorized
+// task; unregistered legacy objects must remain inside that task namespace.
+func (s *APIServer) cosKeyBelongsToTask(tid, key string) bool {
+	tid = strings.TrimSpace(tid)
+	key = strings.TrimSpace(key)
+	if tid == "" || key == "" {
+		return false
+	}
+	var count int64
+	if err := s.DB.Model(&model.Artifact{}).
+		Where("task_tid = ? AND object_key = ? AND deleted_at IS NULL AND status NOT IN ?", tid, key,
+			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
+		Count(&count).Error; err == nil && count > 0 {
+		return true
+	}
+	return strings.HasPrefix(key, tid+"/")
 }
 
 // mimeType 根据文件扩展名返回 MIME 类型
@@ -1846,6 +1902,13 @@ func objectKeyTID(key string) string {
 // 阶段二：产物以 Artifact 账本为准（逻辑名 + blob 物理 key），
 // MinIO 列表只用于补充账本外的历史/孤儿对象（key 直接当物理 key 用）。
 func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) {
+	return s.listTaskFilesForAnalysisJob(tid, nil)
+}
+
+// listTaskFilesForAnalysisJob returns only the selected generation when jobID
+// is non-nil. The complete Artifact ledger is returned separately by the task
+// detail API for the grouped Artifact panel.
+func (s *APIServer) listTaskFilesForAnalysisJob(tid string, jobID *uint) ([]map[string]interface{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -1855,10 +1918,13 @@ func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) 
 
 	// 1) Artifact 账本（含 blob 引用）为准。
 	var artifacts []model.Artifact
-	if err := s.DB.WithContext(ctx).
+	query := s.DB.WithContext(ctx).
 		Where("task_tid = ? AND deleted_at IS NULL AND status NOT IN ?", tid,
-			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
-		Order("id ASC").Find(&artifacts).Error; err != nil {
+			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted})
+	if jobID != nil {
+		query = query.Where("analysis_job_id = ?", *jobID)
+	}
+	if err := query.Order("id ASC").Find(&artifacts).Error; err != nil {
 		return nil, err
 	}
 	blobCache := map[uint]*model.StorageBlob{}
@@ -1898,14 +1964,18 @@ func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) 
 			"retention":     a.Retention,
 			"last_modified": a.CreatedAt,
 		}
-		fileInfo["download_url"] = "/api/v1/cosfiles/download?key=" + url.QueryEscape(name) + "&tid=" + url.QueryEscape(tid)
+		contentURL := fmt.Sprintf("/api/v1/tasks/%s/artifacts/%d/content", url.PathEscape(tid), a.ID)
+		fileInfo["download_url"] = contentURL + "?download=1"
 		if filepath.Ext(name) == ".svg" {
-			fileInfo["view_url"] = "/api/v1/cosfiles/view?key=" + url.QueryEscape(name) + "&tid=" + url.QueryEscape(tid)
+			fileInfo["view_url"] = contentURL
 		}
 		files = append(files, fileInfo)
 	}
 
 	// 2) MinIO 列表补充账本外对象（历史遗留/无元数据文件）。
+	if jobID != nil {
+		return files, nil
+	}
 	prefix := tid + "/"
 	objects, err := s.Storage.ListObjects(ctx, bucket, prefix)
 	if err != nil {

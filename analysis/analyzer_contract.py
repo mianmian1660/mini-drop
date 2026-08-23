@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+from job_context import current as current_job_context, use as use_job_context
+
 
 class AnalyzerError(Exception):
     """Base analyzer error with retry semantics."""
@@ -111,9 +113,9 @@ class BaseAnalyzer:
         return None
 
     def run(self, conn, storage_cfg, task, bucket, tid, local_dir="", job=None) -> dict:
-        import os
         generation = int(getattr(job, "generation", 0) or 0) if job else 0
         attempt_id = int(getattr(job, "attempt_id", 0) or 0) if job else 0
+        inherited_context = current_job_context()
         context = {
             "conn": conn,
             "storage_cfg": storage_cfg,
@@ -128,8 +130,10 @@ class BaseAnalyzer:
             "generation": generation,
             "pipeline": self.pipeline,
             "analyzer_version": self.analyzer_version,
-            "output_prefix": os.environ.get("ANALYSIS_OUTPUT_PREFIX", "").strip() or tid,
+            "output_prefix": inherited_context.get("output_prefix") or tid,
+            "work_dir": inherited_context.get("work_dir", ""),
         }
+        context["job_context"] = dict(inherited_context or context)
         validated = self.validate(context)
         prepared = self.prepare(context, validated)
         result = None
@@ -187,14 +191,18 @@ class LegacyFunctionAnalyzer(BaseAnalyzer):
 
         def _run():
             try:
-                result_box["legacy"] = self._analyze_func(
-                    prepared["conn"],
-                    prepared["storage_cfg"],
-                    prepared["task"],
-                    prepared["bucket"],
-                    prepared["tid"],
-                    prepared.get("local_dir", ""),
-                )
+                # ContextVar values are not inherited by new threads. Install
+                # this job's immutable context explicitly so a timed-out thread
+                # cannot write into a later job's generation/workspace.
+                with use_job_context(prepared.get("job_context", prepared)):
+                    result_box["legacy"] = self._analyze_func(
+                        prepared["conn"],
+                        prepared["storage_cfg"],
+                        prepared["task"],
+                        prepared["bucket"],
+                        prepared["tid"],
+                        prepared.get("local_dir", ""),
+                    )
             except BaseException as exc:  # noqa: BLE001 - 需要把任何异常带回主线程
                 error_box["exc"] = exc
 

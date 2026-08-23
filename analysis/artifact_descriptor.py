@@ -28,6 +28,7 @@ import json
 import os
 
 from pprof_builder import blob_cas_key, gzip_deterministic
+from job_context import get as job_context_get
 
 # 透明 gzip 解码的格式（浏览器资源；pprof 作为文件格式本身保持 .gz）
 _TRANSPARENT_GZIP_FORMATS = {"svg", "folded", "json", "markdown"}
@@ -46,7 +47,9 @@ def current_output_prefix(tid: str) -> str:
     （tasks/{tid}/analysis/{pipeline}/{analyzer_version}/g{generation}）；
     旧链路（未设置）回退到 {tid}，保持历史 key 形态。
     """
-    prefix = os.environ.get("ANALYSIS_OUTPUT_PREFIX", "").strip()
+    prefix = str(job_context_get("output_prefix", "") or "").strip()
+    if not prefix:
+        prefix = os.environ.get("ANALYSIS_OUTPUT_PREFIX", "").strip()
     if prefix:
         return prefix
     return tid or ""

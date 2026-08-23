@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <chrono>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -286,15 +287,17 @@ namespace drop_agent
             ofstream out(manifestPath, ios::trunc);
             if (!out.is_open())
                 return false;
+            const int64_t generatedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
             out << "{";
+            out << "\"schema_version\":2,";
+            out << "\"generated_at_unix_ms\":" << generatedAtMs << ",";
             out << "\"task_id\":\"" << JsonEscape(task.taskid()) << "\",";
             out << "\"attempt_id\":" << task.attempt_id() << ",";
             out << "\"task_kind\":\"" << JsonEscape(task.task_kind()) << "\",";
             out << "\"collector\":\"" << JsonEscape(collector) << "\",";
             out << "\"object_key\":\"" << JsonEscape(rawKey) << "\",";
             out << "\"raw_key\":\"" << JsonEscape(rawKey) << "\",";
-            out << "\"raw_file\":\"" << JsonEscape(rawPath) << "\",";
-            out << "\"local_path\":\"" << JsonEscape(rawPath) << "\",";
             out << "\"content_type\":\"" << JsonEscape(contentType) << "\",";
             out << "\"sample_event\":\"" << JsonEscape(task.sampleargv().event()) << "\",";
             out << "\"result_code\":" << resultCode << ",";

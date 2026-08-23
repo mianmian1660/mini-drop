@@ -14,6 +14,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,8 @@ import (
 	"github.com/mini-drop/apiserver/model"
 	"github.com/mini-drop/apiserver/util"
 )
+
+var errReanalysisInflight = errors.New("analysis job already in flight")
 
 // ------------------------------------------------------------
 // Agent v2 对象路径
@@ -266,6 +269,19 @@ func (s *APIServer) ReanalyzeTask(c *gin.Context) {
 		if err := q.First(&locked).Error; err != nil {
 			return err
 		}
+		// The preflight check provides a fast 409, but only this check is
+		// concurrency-safe: all writers allocate generations under the same
+		// task-row lock.
+		var inflightCount int64
+		if err := tx.Model(&model.AnalysisJob{}).
+			Where("task_tid = ? AND status IN ?", tid,
+				[]string{model.AnalysisJobStatusPending, model.AnalysisJobStatusRunning, model.AnalysisJobStatusRetry}).
+			Count(&inflightCount).Error; err != nil {
+			return err
+		}
+		if inflightCount > 0 {
+			return errReanalysisInflight
+		}
 		var maxGen int
 		if err := tx.Model(&model.AnalysisJob{}).
 			Where("task_tid = ?", tid).
@@ -297,6 +313,17 @@ func (s *APIServer) ReanalyzeTask(c *gin.Context) {
 			map[string]interface{}{"job_id": created.ID, "generation": created.Generation, "attempt_id": attemptID, "pipeline": pipeline})
 	})
 	if err != nil {
+		if errors.Is(err, errReanalysisInflight) {
+			var current model.AnalysisJob
+			s.DB.Where("task_tid = ? AND status IN ?", tid,
+				[]string{model.AnalysisJobStatusPending, model.AnalysisJobStatusRunning, model.AnalysisJobStatusRetry}).
+				Order("id ASC").First(&current)
+			c.JSON(http.StatusConflict, gin.H{
+				"code": http.StatusConflict, "message": "该任务已有进行中的分析作业",
+				"job": analysisJobPublic(current, 0, false, 0),
+			})
+			return
+		}
 		s.Logger.Error("创建重分析作业失败", zap.String("tid", tid), zap.Error(err))
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "创建重分析作业失败")
 		return
@@ -333,9 +360,11 @@ func (s *APIServer) pipelineForTask(task *model.HotmethodTask) string {
 func (s *APIServer) latestAttemptWithReadyRaw(tid string) uint {
 	var attemptID uint
 	err := s.DB.Table("artifacts a").
-		Select("MAX(a.attempt_id)").
+		Select("a.attempt_id").
 		Joins("JOIN task_attempts ta ON ta.id = a.attempt_id").
 		Where("a.task_tid = ? AND a.kind = ? AND a.status = ? AND a.deleted_at IS NULL AND a.attempt_id > 0", tid, model.ArtifactKindRaw, model.ArtifactStatusReady).
+		Order("ta.attempt_seq DESC, ta.id DESC").
+		Limit(1).
 		Scan(&attemptID).Error
 	if err != nil || attemptID == 0 {
 		return 0
@@ -401,18 +430,18 @@ func pipelineAcceptsRaw(pipeline, objectKey string) bool {
 // attemptSeq 为 0 时省略；artifactsAvailable 标记产物是否仍可访问。
 func analysisJobPublic(job model.AnalysisJob, attemptSeq int, artifactsAvailable bool, liveArtifactCount int) gin.H {
 	out := gin.H{
-		"id":              job.ID,
-		"generation":      job.Generation,
-		"attempt_id":      job.AttemptID,
-		"pipeline":        job.Pipeline,
-		"analyzer_version": job.AnalyzerVersion,
-		"status":          job.Status,
-		"trigger":         job.Trigger,
-		"requested_by":    job.RequestedBy,
-		"last_error":      job.LastError,
-		"superseded_at":   job.SupersededAt,
-		"created_at":      job.CreatedAt,
-		"updated_at":      job.UpdatedAt,
+		"id":                  job.ID,
+		"generation":          job.Generation,
+		"attempt_id":          job.AttemptID,
+		"pipeline":            job.Pipeline,
+		"analyzer_version":    job.AnalyzerVersion,
+		"status":              job.Status,
+		"trigger":             job.Trigger,
+		"requested_by":        job.RequestedBy,
+		"last_error":          job.LastError,
+		"superseded_at":       job.SupersededAt,
+		"created_at":          job.CreatedAt,
+		"updated_at":          job.UpdatedAt,
 		"artifacts_available": artifactsAvailable,
 		"live_artifact_count": liveArtifactCount,
 	}
@@ -475,12 +504,14 @@ func (s *APIServer) analysisJobsPayload(tid string) gin.H {
 	out := make([]gin.H, 0, len(jobs))
 	for _, job := range jobs {
 		cnt := liveByJob[job.ID]
-		if cnt == 0 {
+		if cnt == 0 && task.ActiveAnalysisJobID != nil && *task.ActiveAnalysisJobID == job.ID &&
+			job.Generation == 1 && job.Trigger == model.AnalysisJobTriggerInitial && job.Status == model.AnalysisJobStatusSuccess {
 			// 旧任务回填的 active job：产物没有 analysis_job_id，按任务的
 			// legacy（analysis_job_id IS NULL）ready 产物计数，避免误报"已清理"。
 			var legacy int64
 			if err := s.DB.Model(&model.Artifact{}).
-				Where("task_tid = ? AND analysis_job_id IS NULL AND deleted_at IS NULL AND status = ?", tid, model.ArtifactStatusReady).
+				Where("task_tid = ? AND analysis_job_id IS NULL AND kind IN ? AND deleted_at IS NULL AND status = ?", tid,
+					[]string{model.ArtifactKindResult, model.ArtifactKindIntermediate, model.ArtifactKindManifest}, model.ArtifactStatusReady).
 				Count(&legacy).Error; err == nil {
 				cnt = int(legacy)
 			}
@@ -507,20 +538,20 @@ func (s *APIServer) analysisJobsPayload(tid string) gin.H {
 			Scan(&rows).Error; err == nil {
 			for _, r := range rows {
 				candidates = append(candidates, gin.H{
-					"attempt_id":        r.AttemptID,
-					"attempt_seq":       r.Seq,
-					"trigger":           r.Trigger,
-					"created_at":        r.CreatedAt,
-					"raw_available":     r.Cnt > 0,
+					"attempt_id":         r.AttemptID,
+					"attempt_seq":        r.Seq,
+					"trigger":            r.Trigger,
+					"created_at":         r.CreatedAt,
+					"raw_available":      r.Cnt > 0,
 					"raw_artifact_count": r.Cnt,
 				})
 			}
 		}
 	}
 	return gin.H{
-		"active_analysis_job_id":  activeID,
-		"analysis_jobs":           out,
-		"reanalysis_candidates":   candidates,
+		"active_analysis_job_id": activeID,
+		"analysis_jobs":          out,
+		"reanalysis_candidates":  candidates,
 	}
 }
 
