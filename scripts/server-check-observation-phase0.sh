@@ -34,6 +34,16 @@ last="$(grep -E '^[0-9]{4}-' "${LOG}" | tail -1)"
 say "首样本: ${first}"
 say "末样本: ${last}"
 
+# 观察时长门槛：首末样本跨度 ≥ 20 分钟，否则判定不足
+first_epoch="$(echo "${first}" | cut -c1-19 | xargs -I{} date -u -d '{}' +%s 2>/dev/null || echo 0)"
+last_epoch="$(echo "${last}" | cut -c1-19 | xargs -I{} date -u -d '{}' +%s 2>/dev/null || echo 0)"
+span=$(( (last_epoch - first_epoch) / 60 ))
+if [[ "${span}" -lt 20 ]]; then
+  say "❌ 观察时长不足（${span} 分钟 < 20 分钟），无法判定 PASS"
+  exit 1
+fi
+say "观察跨度: ${span} 分钟"
+
 val() { echo "$1" | grep -oE "${2}=[0-9.]+[A-Za-z]*" | head -1 | cut -d= -f2; }
 gbi() { awk -v b="$1" 'BEGIN{printf "%.2f", b/1073741824}'; }
 
