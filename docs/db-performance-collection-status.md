@@ -45,19 +45,51 @@
 
 ---
 
-## 2. 需要验收的故障场景
+## 2. 验收任务清单
 
-链路没通之前,以下场景**一个都还没能真正验证**,是打通链路之后的下一步:
+链路已打通(2026-08-23 09:00,见 3.4),以下 7 个场景全部**待执行**。任务按优先级排序,不是表格原顺序——排序理由和每个任务的前置条件见下方。所有任务默认都要先满足 [4.3 环境层](#43-用户操作注意事项验收复跑必读) 的三条(密码文件重写、磁盘 >2GB、二进制是新版),不再逐条重复。
 
-| 场景 | 注入方式 | 验证的采集能力 | 状态 |
+| # | 任务 | 优先级理由 | 前置条件(除环境层外) | 状态 |
+|---|---|---|---|---|
+| 1 | **锁等待**(双连接互相持锁阻塞) | 唯一一个"刚修完权限、还没在真实竞争下验证过"的场景——3.3 只验证过"无锁时不报错",没验证过"真有锁等待时能不能采到";优先级最高 | 4.3 §7:锁等待要维持 ≥30s(跨过至少一个 10s poll 周期),不能一闪而过 | ✅ 已通过(2026-08-23:waiting=216/blocking=215,minio batch 中 lock_wait wait_seconds 5→15→25s 持续增长,locked_table 正确;3.3 权限修复验证生效) |
+| 2 | **死锁**(双连接交叉加锁) | 和任务 1 同一套连接脚本改一下加锁顺序即可复用,顺手做 | 依赖任务 1 跑通后的脚本 | ⚠️ 部分验证(2026-08-23:InnoDB 确认 LATEST DETECTED DEADLOCK,A 锁行1请求行2 vs B 锁行2请求行1,MySQL 自动回滚;但 lock_wait 链未被采到——死锁 1-2s 内结束,agent 10s poll 周期错过,属已知时序限制:lock_wait 只对持续阻塞>10s 的锁等待有效) |
+| 3 | **QPS 骤降**(导师点名重点场景) | 导师会议记录里唯一点名的场景,四类里最高优先级 | 4.3 §5/§6:sysbench 起量后要跑够久再 `pkill`,`pkill` 后等 90s 再查`db_questions_total` 增量拐点 | ✅ 已通过(2026-08-23:流量跑时 `db_questions_total` +45~49/10s,停流量后骤降为 +9/10s(agent 自身查询残留),增量下降约 80%,拐点清晰) |
+| 4 | **连接风暴**(50 个 `SLEEP(600)` 连接) | 实现最简单,验证 `db_active_connections` 阶段一指标即可 | 无特殊前置,注意连接数别把 MySQL `max_connections` 打爆导致误判成"数据库不可达" | ✅ 已通过(2026-08-23:注入 30 个 SLEEP 后 `Threads_connected=31`,minio batch 中 `db_active_connections=31` 跨窗口持续采集,时间对齐;但无查询接口,仅从 minio 原始数据验证——见 3.6) |
+| 5 | **buffer pool 命中率骤降** | 同上,阶段一标量指标验证 | 需要一张明显大于 buffer pool 的表做全表扫,`orders` 库如果太小要先灌数据 | ✅ 已通过(2026-08-23:灌数据到 order_line 478MB(1258 万行)>> 128MB buffer pool,重启 MySQL 清空缓存后无索引全表扫,`db_innodb_buffer_pool_hit_ratio_bps` 从 9998 骤降到 8859,拐点与扫描对齐。要点:①`information_schema` 表大小统计滞后需 `ANALYZE`;②`FLUSH TABLES` 不清 InnoDB buffer pool 页,必须重启 MySQL 清空缓存才能触发磁盘读) |
+| 6 | **慢查询堆积**(digest) | 3.4 排障过程里已经用等价流量side-effect验证过 digest 能落库,这里是补一次**正式**的验收留证据,预期风险最低 | 4.3 §4:流量必须带默认库,否则复现 3.4 的 SCHEMA_NAME=NULL 老坑 | ✅ 已通过(2026-08-23:1258 万行表全表扫流量,digest 样本 `SELECT COUNT ( * ) FROM order_line WHERE STATUS = ?` call_count 2→3 增量正常,`total_latency_us` 7-10s 清晰暴露慢查询) |
+| 7 | **数据库不可达**(`docker stop fault-mysql`) | 已知盲区,验的是"不崩"不是"采到数据",优先级最低但成本也最低,可以最后顺手做 | 无 | ✅ 已通过(2026-08-23:`docker stop fault-mysql` 后 30s,agent 容器 Up 心跳正常、cpu batch 正常 ACK、三条 db 查询 `failed rc=1` 仅打日志——采集跳过不拖垮主链路) |
+
+**验收标准统一按 4.3 §9/§10**:`profile_windows` 出现对应 `signal_type='db_snapshot'` 窗口且 `window_end>window_start`;排查顺序 Session `degradation_reason` → agent 日志 → minio batch `db_snapshots` 数量。
+
+---
+
+## 2.5 端到端开销对比测试（导师要求 1，2026-08-23 完成 ✅）
+
+**目的**:回答"DBSnapshotSampler 是否挤占主链路(纯 CPU profiling)"。设计为同机双轮对照,唯一变量是 `db_targets`:
+
+| 轮次 | Session 配置 | MySQL 流量 |
+|---|---|---|
+| baseline | 无 `db_targets`(纯 CPU profiling) | 无 |
+| withdb | 带 `db_targets`(CPU + db 采集) | 持续轻量查询(走主键,产生 digest 增量) |
+
+两轮都是 host scope、`signals=["cpu_profile","io_latency","sched_latency"]`、`sample_rate_hz=9`、`aggregation_window_sec=10`、`upload_batch_sec=30`,各跑约 3 分钟。测试脚本:`scripts/db_overhead_compare.sh`。
+
+**结果**:
+
+| 指标 | baseline | withdb | 增量 |
 |---|---|---|---|
-| QPS 骤降(导师点名重点) | sysbench 高 QPS 后 `pkill` | `db_questions_total` 增量能否定位拐点 | 未验证(链路未通) |
-| 连接风暴 | 50 个 `mysql -e "SELECT SLEEP(600)" &` | `db_active_connections` 能否捕获飙升 | 未验证(链路未通) |
-| buffer pool 命中率骤降 | 全表扫描大表 / `FLUSH TABLE` | `db_innodb_buffer_pool_hit_ratio_bps` 从 ~10000 掉到低位 | 未验证(链路未通) |
-| 慢查询堆积(阶段二 digest) | 无索引全表扫描循环 | `db_snapshots kind=digest` 的 `callCount`/`totalLatencyUs` | 未验证(链路未通) |
-| 锁等待(阶段二 lock_wait) | 双连接互相持锁阻塞 | `waiting_pid`/`blocking_pid`/`wait_seconds`/`locked_table` 是否正确成对 | 未验证(链路未通) |
-| 死锁 | 双连接交叉加锁触发 MySQL 自动检测 | 至少捕获死锁前的锁等待链 | 未验证(链路未通) |
-| 数据库不可达(已知盲区) | `docker stop fault-mysql` | 确认采集跳过、不拖垮主链路(不是要采到数据,是要确认不崩) | 未验证(链路未通) |
+| agent CPU 均值(24×4s 采样) | 30.75% | 34.34% | **+3.59pp**(相对 +11.7%) |
+| agent 内存均值 | 115.01 MiB | 122.67 MiB | **+7.66 MiB**(相对 +6.7%) |
+| cpu_profile 窗口数 | 86 | 85 | 持平(均 ~10s/窗口) |
+| cpu 采样 sample_count 均值 | 6 | 8 | 持平 |
+| db_snapshot 窗口 | — | **20 个连续** | 链路全程工作 |
+
+**验证 withdb 阶段 db 采集确实在采**(非空窗口):minio batch 中 digest 样本 `SELECT id,status FROM order_line WHERE id=?` call_count=9/total_latency_us=1666,标量 `db_active_connections=1`、`db_questions_total=269`、`db_innodb_buffer_pool_hit_ratio_bps=9333`;20 个 `db_snapshot` 窗口每 10s 一个、无断点。
+
+**结论**:
+1. **db 采集额外 CPU 开销约 +3.6 个百分点,内存约 +7.7 MiB**。agent 基线 CPU 本身约 30%(perf 采样 + eBPF 主链路),db 采集是其 ~1/8,绝对增量很小。
+2. **不挤占主链路**:cpu_profile 窗口数与 sample_count 两轮持平,证明 db 采集(每 10s 一条连接、三条 SQL)没有影响 CPU 采样质量。
+3. 设计目标达成——DBSnapshotSampler 作为独立采集器,复用 `run_continuous_spool_loop`,对主链路影响可忽略。
 
 ---
 
@@ -122,6 +154,7 @@ for i in $(seq 1 300); do docker exec fault-mysql mysql -uroot -proot orders -N 
 ### 3.5 已知未做的功能缺口(设计上明确推迟,不是 bug)
 
 - PostgreSQL 分支未实现(阶段一、阶段二都只有 MySQL)。
+- **db 标量指标无查询/展示接口(2026-08-23 连接风暴验收发现)**:`db_active_connections`/`db_questions_total`/`db_innodb_buffer_pool_hit_ratio_bps` 被 agent 采集进 `window.metrics`(信号标成 `python_rss`,见 [ContinuousSampler.cpp:1889](../drop/common/ContinuousSampler.cpp:1889)),上传到 minio batch,但 `/api/v1/profile/timeseries`([continuous.go:1774](../apiserver/server/continuous.go:1774))硬编码仅支持 `profile_type=memory&metric=rss_bytes`,前端 `DBSnapshotPanel` 也只展示 digest/lock_wait——**标量指标采了但前端/接口都看不了**,验收只能从 minio batch 原始 JSON 验证。
 - 阶段二"看到数据"和"判断异常"是两回事——现在只是记录事实(digest/锁等待数据),没有任何阈值/基线异常检测逻辑,时间轴预警功能还在方案讨论阶段(见对话中方案 A/B/C),没有代码。
 - 前端建 Session 表单没有 `db_targets` 输入框,会话列表页看不出哪个 Session 配了数据库巡检(见 1.3)。
 - 冷热分层(`ContinuousWindowSummary` 7 天摘要)只覆盖 `cpu_profile`,`db_snapshot` 没有对应的冷层摘要方案。
@@ -136,6 +169,8 @@ for i in $(seq 1 300); do docker exec fault-mysql mysql -uroot -proot orders -N 
 **2026-08-23 凌晨(联调续)**:根因链最终澄清——节流修复本身有效,"修复后问题依旧"的真实原因是 **VM 磁盘 94% 满触发 spool 背压,agent 暂停了全部持续采集**(见 3.1)。清理磁盘后背压解除、db 采集恢复。阶段二 lock_wait 因采集账号缺 MySQL 权限报 `ERROR 1356`,已补齐 `EXECUTE ON sys.*` + `performance_schema` 逐表授权修复(见 3.3)。
 
 **2026-08-23 09:00(链路打通)**:digest 采不到的最终根因 = 测试流量不带默认库导致 `SCHEMA_NAME=NULL`,被 agent 的 `WHERE SCHEMA_NAME IS NOT NULL` 过滤(见 3.4,测试侧修复非代码)。修复后 `profile_windows` 出现 `db_snapshot` 窗口,**数据库采集完整链路打通**。下一步:四类故障注入验收(QPS 骤降/连接风暴/慢查询堆积/锁等待死锁)+ 端到端开销对比测试。
+
+**2026-08-23 14:50(7 场景验收 + 开销对比全部完成)**:四类故障 7 场景验收(见第 2 节表格,锁等待/QPS 骤降/连接风暴/buffer pool 骤降/慢查询堆积/不可达全部 PASS,死锁部分验证属时序限制)。**端到端开销对比测试完成**(见 2.5):db 采集额外开销 CPU +3.6pp、内存 +7.7MiB,不挤占主链路。剩余已知缺口:db 标量指标无查询接口(3.5)、PostgreSQL 分支未实现(3.5)。
 
 ---
 
