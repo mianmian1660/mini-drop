@@ -187,6 +187,14 @@ func (s *APIServer) pqRegisterActiveBlock(ctx context.Context, key pqBlockKey, b
 				return err
 			}
 		}
+		if err := s.pqPersistMigrationReceiptsTx(tx, key, blockID, bucketEnd, members); err != nil {
+			return fmt.Errorf("登记永久 migration receipt 失败: %w", err)
+		}
+		if key.Resolution == model.ContinuousParquetResolutionRaw {
+			if err := s.pqRebuildCoverageSegmentsTx(tx, key.Tenant, key.BucketStart, key.SignalType, blockID, version); err != nil {
+				return fmt.Errorf("重建 coverage segments 失败: %w", err)
+			}
+		}
 		return nil
 	})
 }

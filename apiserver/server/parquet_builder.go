@@ -131,7 +131,24 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 		}
 	case "io_latency", "io_syscall_latency", "sched_latency":
 		for _, histogram := range in.Histograms {
-			for _, bucket := range histogram.Buckets {
+			for bucketIndex, bucket := range histogram.Buckets {
+				eventCount := uint64(0)
+				if bucketIndex == 0 {
+					eventCount = histogram.EventCount
+				}
+				labels := sanitizeContinuousLabels(histogram.Labels)
+				if bucket.Range != "" {
+					if labels == nil {
+						labels = map[string]string{}
+					}
+					labels["_bucket_range"] = bucket.Range
+				}
+				if !in.WindowEnd.IsZero() {
+					if labels == nil {
+						labels = map[string]string{}
+					}
+					labels["_window_end_ms"] = strconv.FormatInt(in.WindowEnd.UnixMilli(), 10)
+				}
 				row := pqHistogramRow{
 					Timestamp:   ts,
 					SessionSID:  sessionSID,
@@ -141,7 +158,7 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 					BucketLow:   bucket.Low,
 					BucketHigh:  bucket.High,
 					Count:       bucket.Count,
-					EventCount:  histogram.EventCount,
+					EventCount:  eventCount,
 					Min:         histogram.Summary.Min,
 					Max:         histogram.Summary.Max,
 					P50:         histogram.Summary.P50,
@@ -149,7 +166,7 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 					P99:         histogram.Summary.P99,
 					Unavailable: histogram.Unavailable,
 					Reason:      histogram.Reason,
-					Labels:      sanitizeContinuousLabels(histogram.Labels),
+					Labels:      labels,
 				}
 				rows.Histogram = append(rows.Histogram, row)
 			}
@@ -383,7 +400,9 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 				case model.ContinuousParquetSignalDB:
 					dbRows = append(dbRows, rows.DB...)
 				}
-				pqAccumulateSignalMembers(members, signal, row.SessionSID, batch.BatchID,
+				// lineage 必须引用数据库 ProfileBatch.BID；payload BatchID 在 v1
+				// block 重试/重写场景可能与当前 DB 行不同。
+				pqAccumulateSignalMembers(members, signal, row.SessionSID, row.BatchBID,
 					rowsForSignal(rows, signal), in.WindowStart, in.WindowEnd)
 				if consumed[signal] == nil {
 					consumed[signal] = map[string]bool{}
@@ -753,6 +772,9 @@ func (s *APIServer) pqRegisterActiveBlockMulti(ctx context.Context, key pqBlockK
 			if err := tx.Create(&members[i]).Error; err != nil {
 				return err
 			}
+		}
+		if err := s.pqPersistMigrationReceiptsTx(tx, key, blockID, bucketEnd, members); err != nil {
+			return fmt.Errorf("登记永久 migration receipt 失败: %w", err)
 		}
 		// 阶段六：raw 块激活时在同一事务内按 (session, signal, hour) 重建
 		// 覆盖区间（幂等替换相交范围；失败整体回滚，块保持 building 由下轮
@@ -1275,8 +1297,13 @@ func downsampleMetricRows(rows []pqMetricRow, targetResolution string) []pqMetri
 	out := make([]pqMetricRow, 0, len(order))
 	for _, k := range order {
 		row := accs[k].row
-		// avg 供查询默认返回
-		row.Value = row.Sum
+		// gauge 查询默认返回该时间桶峰值（RSS 与 v1 的 peak 语义一致）；
+		// counter 返回 reset-aware delta。
+		if row.MetricKind == "counter" {
+			row.Value = row.Delta
+		} else {
+			row.Value = row.Max
+		}
 		out = append(out, row)
 	}
 	return out
@@ -1456,14 +1483,14 @@ func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.Con
 		memberSet[m.SourceRef] = true
 	}
 	// 该小时该信号的源窗口。只要求"封存截止前已存在"的窗口被 lineage 覆盖：
-	//   封存截止 = bucket_start + compaction_delay（默认 10min）。
+	//   封存截止 = bucket_end + compaction_delay（默认 10min）。
 	//   封存后到达的窗口（agent 重试 cpb-retry-* / 时钟漂移）属于迟到窗口，
 	//   由 pqSealedRawHours 触发块重建（superseded 可见），不是本块数据缺失。
 	delaySec := s.Config.ContinuousBlock.CompactionDelaySec
 	if delaySec <= 0 {
 		delaySec = 600
 	}
-	sealCutoff := block.BucketStart.Add(time.Duration(delaySec) * time.Second)
+	sealCutoff := block.BucketEnd.Add(time.Duration(delaySec) * time.Second)
 	types := pqV1SignalTypesFor(block.SignalType)
 	var windows []model.ProfileWindow
 	if err := s.DB.WithContext(ctx).
@@ -1491,16 +1518,25 @@ func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.Con
 		msg := fmt.Sprintf("信号 %s 遗漏 %d 个源窗口: %s", block.SignalType, len(missed), strings.Join(missed[:minInt(len(missed), 5)], ","))
 		// 对账失败 → 标记 failed 并退役该块（superseded，宽限后 sweep 删对象）；
 		// 下一周期 pqSealedRawHours 会重建该分区（含全部已消费 batch 的 member）。
-		_ = s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
-			Where("block_id = ? AND status = ?", block.BlockID, model.ContinuousParquetStatusActive).
-			Updates(map[string]interface{}{
-				"status":           model.ContinuousParquetStatusSuperseded,
-				"superseded_at":    now,
-				"delete_reason":    "reconcile_rebuild",
-				"reconcile_status": model.ContinuousParquetReconcileFailed,
-				"reconciled_at":    now,
-				"reconcile_error":  msg, "updated_at": now,
-			}).Error
+		_ = s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&model.ContinuousParquetBlock{}).
+				Where("block_id = ? AND status = ?", block.BlockID, model.ContinuousParquetStatusActive).
+				Updates(map[string]interface{}{
+					"status":           model.ContinuousParquetStatusSuperseded,
+					"superseded_at":    now,
+					"delete_reason":    "reconcile_rebuild",
+					"reconcile_status": model.ContinuousParquetReconcileFailed,
+					"reconciled_at":    now,
+					"reconcile_error":  msg, "updated_at": now,
+				}).Error; err != nil {
+				return err
+			}
+			return tx.Model(&model.ContinuousMigrationReceipt{}).
+				Where("block_id = ? AND status = ?", block.BlockID, continuousMigrationReceiptPassed).
+				Updates(map[string]interface{}{
+					"status": continuousMigrationReceiptRevoked, "revoke_reason": "reconcile_failed", "updated_at": now,
+				}).Error
+		})
 		s.Logger.Error("v2 shadow 对账不一致（窗口完整性），触发重建",
 			zap.String("signal", block.SignalType), zap.String("block_id", block.BlockID), zap.String("error", msg))
 		return nil
@@ -1551,9 +1587,8 @@ func (s *APIServer) pqReconcileQuarantine(ctx context.Context, limit int) {
 	now := time.Now()
 	var failed []model.ContinuousParquetBlock
 	if err := s.DB.WithContext(ctx).
-		Where("status = ? AND resolution = ? AND reconcile_status = ?",
-			model.ContinuousParquetStatusActive, model.ContinuousParquetResolutionRaw,
-			model.ContinuousParquetReconcileFailed).
+		Where("resolution = ? AND reconcile_status = ?",
+			model.ContinuousParquetResolutionRaw, model.ContinuousParquetReconcileFailed).
 		Order("reconciled_at ASC").Limit(limit).Find(&failed).Error; err != nil {
 		return
 	}
@@ -1563,8 +1598,8 @@ func (s *APIServer) pqReconcileQuarantine(ctx context.Context, limit int) {
 			continue
 		}
 		_ = s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
-			Where("block_id = ? AND status = ? AND reconcile_status = ?",
-				blk.BlockID, model.ContinuousParquetStatusActive, model.ContinuousParquetReconcileFailed).
+			Where("block_id = ? AND reconcile_status = ?",
+				blk.BlockID, model.ContinuousParquetReconcileFailed).
 			Updates(map[string]interface{}{
 				"reconcile_status": model.ContinuousParquetReconcileQuarantined,
 				"updated_at":       now,
@@ -1669,33 +1704,47 @@ func (s *APIServer) pqReclaimStaging(ctx context.Context) {
 	}
 }
 
-// pqBatchCoveredByValidatedRaw batch 的每种实际信号都已被 active、validated、
-// reconciled 的 raw Block lineage 覆盖（阶段六：对账通过才允许清理）。
+// pqBatchCoveredByValidatedRaw batch 的每种实际信号均有永久 passed migration
+// receipt。receipt 不随 raw block 降采样/删除而消失。
 func (s *APIServer) pqBatchCoveredByValidatedRaw(ctx context.Context, batch *model.ProfileBatch) bool {
 	if batch == nil || batch.BID == "" {
 		return false
 	}
-	expected := map[string]bool{}
+	// 以实际 window 为准，不能用 batch.signal_types（它可能声明采集能力，
+	// 但某次 batch 未实际产生该信号）。没有 window 的 batch 不再被查询引用，
+	// 可由 GC 删除；异常 window 的审计记录仍保留在 failure 表。
 	var signalTypes []string
-	_ = json.Unmarshal(batch.SignalTypes, &signalTypes)
+	if err := s.DB.WithContext(ctx).Model(&model.ProfileWindow{}).
+		Where("batch_bid = ?", batch.BID).Distinct("signal_type").Pluck("signal_type", &signalTypes).Error; err != nil {
+		return false
+	}
+	if len(signalTypes) == 0 {
+		var evidence int64
+		_ = s.DB.WithContext(ctx).Model(&model.ContinuousMigrationReceipt{}).
+			Where("source_kind = ? AND source_ref = ? AND status = ?", "batch", batch.BID, continuousMigrationReceiptPassed).
+			Count(&evidence).Error
+		if evidence > 0 {
+			return true
+		}
+		// 隔离流程删除失效 window 后，以同 object_key 的 quarantined 审计
+		// 记录作为无可查询引用的证明。
+		if batch.ObjectKey != "" {
+			_ = s.DB.WithContext(ctx).Model(&model.ContinuousMigrationFailure{}).
+				Where("source_kind = ? AND object_key = ? AND status = ?", "window", batch.ObjectKey,
+					model.ContinuousMigrationFailureQuarantined).
+				Count(&evidence).Error
+		}
+		return evidence > 0
+	}
+	expected := map[string]bool{}
 	for _, signalType := range signalTypes {
 		if signal := pqLedgerSignalForWindow(signalType); signal != "" {
 			expected[signal] = true
 		}
 	}
-	if len(expected) == 0 {
-		expected[model.ContinuousParquetSignalCPU] = true
-	}
 	for signal := range expected {
-		var count int64
-		err := s.DB.WithContext(ctx).Table("continuous_parquet_block_members AS m").
-			Joins("JOIN continuous_parquet_blocks AS b ON b.block_id = m.block_id").
-			Where("m.source_kind = ? AND m.source_ref = ?", "batch", batch.BID).
-			Where("b.signal_type = ? AND b.resolution = ? AND b.status = ? AND b.validation = ? AND b.reconcile_status = ?",
-				signal, model.ContinuousParquetResolutionRaw, model.ContinuousParquetStatusActive,
-				model.ContinuousParquetValidationPassed, model.ContinuousParquetReconcilePassed).
-			Count(&count).Error
-		if err != nil || count == 0 {
+		receipts, err := s.pqPassedMigrationReceipts(ctx, batch.BID, signal)
+		if err != nil || len(receipts) == 0 {
 			return false
 		}
 	}

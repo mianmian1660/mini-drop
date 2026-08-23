@@ -14,11 +14,18 @@ package server
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/mini-drop/apiserver/model"
 )
+
+type phase6DeleteFailureStorage struct{ *continuousMemoryStorage }
+
+func (s *phase6DeleteFailureStorage) DeleteObject(context.Context, string, string) error {
+	return errors.New("injected delete failure")
+}
 
 // TestPQSignalMappingMetrics 信号映射：python_rss window → metrics v2 行。
 func TestPQSignalMappingMetrics(t *testing.T) {
@@ -104,6 +111,45 @@ func TestPQFindBestBlockRequiresReconcile(t *testing.T) {
 	}
 }
 
+func TestPQShadowReconcileUsesHourEndSealCutoff(t *testing.T) {
+	s := pqTestServer(t)
+	ctx := context.Background()
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	block := model.ContinuousParquetBlock{
+		BlockID: "pq-seal-cutoff", Tenant: "default", BucketStart: hour, BucketEnd: hour.Add(time.Hour),
+		SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw,
+		Status: model.ContinuousParquetStatusActive, Validation: model.ContinuousParquetValidationPassed,
+		ReconcileStatus: model.ContinuousParquetReconcilePassed, CreatedAt: hour.Add(2 * time.Hour), UpdatedAt: hour.Add(2 * time.Hour),
+	}
+	if err := s.DB.Create(&block).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&model.ContinuousParquetBlockMember{
+		BlockID: block.BlockID, SourceKind: "batch", SourceRef: "b-early", SessionSID: "s1",
+		StartTime: hour.Add(time.Minute), EndTime: hour.Add(2 * time.Minute), CreatedAt: hour.Add(2 * time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []model.ProfileWindow{
+		{SessionSID: "s1", BatchBID: "b-early", ObjectKey: "k", SignalType: "cpu_profile", WindowStart: hour.Add(time.Minute), WindowEnd: hour.Add(2 * time.Minute), CreatedAt: hour.Add(2 * time.Minute)},
+		// 小时开始 50 分钟后创建，但仍早于 hour_end+delay，必须参与对账。
+		{SessionSID: "s1", BatchBID: "b-late-in-hour", ObjectKey: "k", SignalType: "cpu_profile", WindowStart: hour.Add(50 * time.Minute), WindowEnd: hour.Add(51 * time.Minute), CreatedAt: hour.Add(50 * time.Minute)},
+	} {
+		if err := s.DB.Create(&w).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.pqShadowReconcileBlock(ctx, &block); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Where("block_id = ?", block.BlockID).First(&block).Error; err != nil {
+		t.Fatal(err)
+	}
+	if block.Status != model.ContinuousParquetStatusSuperseded || block.ReconcileStatus != model.ContinuousParquetReconcileFailed {
+		t.Fatalf("late-in-hour missing member must fail reconcile: status=%s reconcile=%s", block.Status, block.ReconcileStatus)
+	}
+}
+
 // TestPQCoverageSegmentMerge coverage segment：间隔 ≤5s 合并，>5s 缺口保留。
 func TestPQCoverageSegmentMerge(t *testing.T) {
 	s := pqTestServer(t)
@@ -126,7 +172,7 @@ func TestPQCoverageSegmentMerge(t *testing.T) {
 	tx.Commit()
 
 	var segments []model.ContinuousCoverageSegment
-	if err := s.DB.Where("session_sid = ? AND signal_type = ?", "s1", model.ContinuousParquetSignalCPU).
+	if err := s.DB.Where("session_sid = ? AND signal_type = ?", "s1", "cpu_profile").
 		Order("segment_start ASC").Find(&segments).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -276,6 +322,9 @@ func TestPQMigrationFailureQuarantine(t *testing.T) {
 	if fresh.Status != model.ContinuousMigrationFailureRetrying || fresh.RetryCount != 0 {
 		t.Fatalf("new failure must start retrying: status=%s retry=%d", fresh.Status, fresh.RetryCount)
 	}
+	if fresh.FirstSeenAt.IsZero() || fresh.FirstSeenAt.Before(time.Now().Add(-time.Minute)) {
+		t.Fatalf("new failure must record first_seen_at: %v", fresh.FirstSeenAt)
+	}
 	// 重复记录累加 retry_count 且不回退 quarantine
 	s.recordContinuousMigrationFailure(ctx, "batch", "b-x", "s1", "continuous/s1/b-x.json", "object_delete", "boom2")
 	if err := s.DB.Where("source_kind = ? AND source_ref = ?", "batch", "b-x").First(&fresh).Error; err != nil {
@@ -283,6 +332,70 @@ func TestPQMigrationFailureQuarantine(t *testing.T) {
 	}
 	if fresh.RetryCount != 1 {
 		t.Fatalf("re-record must bump retry_count: %d", fresh.RetryCount)
+	}
+
+	// 后台实际重试失败也必须累计 retry_count，否则永远无法达到隔离阈值。
+	s.Storage = &phase6DeleteFailureStorage{continuousMemoryStorage: newContinuousMemoryStorage()}
+	fresh.LastSeenAt = time.Now().Add(-15 * time.Minute)
+	fresh.FirstSeenAt = time.Now().Add(-45 * time.Minute)
+	fresh.RetryCount = 1
+	if err := s.DB.Save(&fresh).Error; err != nil {
+		t.Fatal(err)
+	}
+	s.pqProcessMigrationFailures(ctx, 100)
+	if err := s.DB.Where("id = ?", fresh.ID).First(&fresh).Error; err != nil {
+		t.Fatal(err)
+	}
+	if fresh.RetryCount != 2 {
+		t.Fatalf("background retry must bump retry_count: %d", fresh.RetryCount)
+	}
+}
+
+func TestPQMigrationReceiptSurvivesRawTombstone(t *testing.T) {
+	s := pqTestServer(t)
+	ctx := context.Background()
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	batch := model.ProfileBatch{
+		BID: "b-receipt", SessionSID: "s1", StartTime: hour.Add(time.Minute), EndTime: hour.Add(2 * time.Minute),
+		SignalTypes: mustJSONBytes([]string{"cpu_profile"}), CreatedAt: hour,
+	}
+	if err := s.DB.Create(&batch).Error; err != nil {
+		t.Fatal(err)
+	}
+	key := pqBlockKey{Tenant: "default", BucketStart: hour, SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw}
+	if _, err := s.pqCreateBuildingBlock(ctx, key, "pq-receipt", hour.Add(time.Hour), 1); err != nil {
+		t.Fatal(err)
+	}
+	result, err := writeParquetPartGeneric(s, ctx, parquetObjectKeyV2("default", hour, "cpu", "raw", "pq-receipt", 0),
+		[]pqCPURow{{Timestamp: batch.StartTime.UnixMilli(), SessionSID: "s1", Value: 1, ProfileType: "cpu_profile"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []model.ContinuousParquetBlockMember{{
+		SourceKind: "batch", SourceRef: batch.BID, SessionSID: "s1",
+		StartTime: batch.StartTime, EndTime: batch.EndTime, SampleCount: 1, RowCount: 1,
+	}}
+	stats := pqBlockStats{RowCount: 1, SampleTotal: 1, ValueTotal: 1, BytesTotal: result.SizeBytes}
+	if err := s.pqRegisterActiveBlock(ctx, key, "pq-receipt", hour.Add(time.Hour), 1, result, stats, members); err != nil {
+		t.Fatal(err)
+	}
+	var block model.ContinuousParquetBlock
+	if err := s.DB.Where("block_id = ?", "pq-receipt").First(&block).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pqTombstoneBlock(ctx, &block, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.pqBatchCoveredByValidatedRaw(ctx, &batch) {
+		t.Fatal("permanent receipt must remain valid after raw member tombstone")
+	}
+}
+
+func TestPQHourlyRangeIsHalfOpen(t *testing.T) {
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	hours := pqHourlyRange(hour.Add(10*time.Minute), hour.Add(time.Hour))
+	if len(hours) != 1 || !hours[0].Equal(hour) {
+		t.Fatalf("exact-hour end must not add an empty trailing bucket: %v", hours)
 	}
 }
 

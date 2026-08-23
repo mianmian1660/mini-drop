@@ -42,6 +42,7 @@ func (s *APIServer) recordContinuousMigrationFailure(ctx context.Context, source
 		ObjectKey:    objectKey,
 		ErrorType:    errorType,
 		ErrorMessage: errorMessage,
+		FirstSeenAt:  now,
 		LastSeenAt:   now,
 		Status:       model.ContinuousMigrationFailureRetrying,
 		CreatedAt:    now,
@@ -163,6 +164,7 @@ func (s *APIServer) pqRetryMigrationFailure(ctx context.Context, f *model.Contin
 		Where("id = ? AND status = ?", f.ID, model.ContinuousMigrationFailureRetrying).
 		Updates(map[string]interface{}{
 			"status": nextStatus, "error_message": nextError,
+			"retry_count":  gorm.Expr("retry_count + 1"),
 			"last_seen_at": now, "updated_at": now,
 		}).Error
 }
@@ -185,7 +187,7 @@ func (s *APIServer) pqQuarantineMigrationFailure(ctx context.Context, f *model.C
 		return
 	}
 	incContinuousMigrationQuarantine()
-	if f.SourceKind == "window" && f.SourceRef != "" && strings.HasPrefix(f.SourceRef, "win") {
+	if f.SourceKind == "window" && f.SourceRef != "" {
 		// SourceRef 可能是 "window-<id>" 或 "<id>"，兼容两种格式
 		ref := strings.TrimPrefix(f.SourceRef, "window-")
 		var id uint
@@ -218,8 +220,11 @@ func (s *APIServer) pqHasUnresolvedMigrationFailures(ctx context.Context, source
 	}
 	var count int64
 	_ = s.DB.WithContext(ctx).Model(&model.ContinuousMigrationFailure{}).
-		Where("source_kind = ? AND source_ref = ? AND status = ?",
-			sourceKind, sourceRef, model.ContinuousMigrationFailureRetrying).
+		Where("source_kind = ? AND source_ref = ? AND status IN ?",
+			sourceKind, sourceRef, []string{
+				model.ContinuousMigrationFailureRetrying,
+				model.ContinuousMigrationFailureQuarantined,
+			}).
 		Count(&count).Error
 	return count > 0
 }

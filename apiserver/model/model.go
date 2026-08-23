@@ -104,13 +104,13 @@ type HotmethodTask struct {
 	CanceledAt      *time.Time `gorm:"column:canceled_at" json:"canceled_at"`
 	// 存储阶段一：任务级 Artifact 固定（pin）。任务字段是 pin 的唯一当前状态来源：
 	// 任务固定后新产生的 Artifact 自动受保护，无需批量复制 pin 状态。
-	ArtifactsPinned    bool           `gorm:"column:artifacts_pinned;default:false" json:"artifacts_pinned"`
-	ArtifactsPinnedAt  *time.Time     `gorm:"column:artifacts_pinned_at" json:"artifacts_pinned_at"`
-	ArtifactsPinnedBy  string         `gorm:"column:artifacts_pinned_by;size:128" json:"artifacts_pinned_by"`
-	ArtifactsPinReason string         `gorm:"column:artifacts_pin_reason;size:256" json:"artifacts_pin_reason"`
+	ArtifactsPinned    bool       `gorm:"column:artifacts_pinned;default:false" json:"artifacts_pinned"`
+	ArtifactsPinnedAt  *time.Time `gorm:"column:artifacts_pinned_at" json:"artifacts_pinned_at"`
+	ArtifactsPinnedBy  string     `gorm:"column:artifacts_pinned_by;size:128" json:"artifacts_pinned_by"`
+	ArtifactsPinReason string     `gorm:"column:artifacts_pin_reason;size:256" json:"artifacts_pin_reason"`
 	// ActiveAnalysisJobID 当前对用户展示的成功 AnalysisJob（阶段 4：多代结果）。
 	// 为 NULL 时表示无 active job（旧任务继续走 {tid}/... 旧逻辑路径兼容读取）。
-	ActiveAnalysisJobID *uint `gorm:"column:active_analysis_job_id;index:idx_tasks_active_analysis_job" json:"active_analysis_job_id"`
+	ActiveAnalysisJobID *uint          `gorm:"column:active_analysis_job_id;index:idx_tasks_active_analysis_job" json:"active_analysis_job_id"`
 	DeletedAt           gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
 	CanManage           bool           `gorm:"-" json:"can_manage"`
 }
@@ -267,6 +267,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&ContinuousParquetBlock{},
 		&ContinuousParquetBlockFile{},
 		&ContinuousParquetBlockMember{},
+		&ContinuousMigrationReceipt{},
 		&ContinuousCoverageSegment{},
 		&ContinuousMigrationFailure{},
 	)

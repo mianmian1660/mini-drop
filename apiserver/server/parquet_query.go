@@ -27,13 +27,35 @@ import (
 
 // pqHourlyRange 返回 [from, to] 覆盖的 UTC 小时桶列表。
 func pqHourlyRange(from, to time.Time) []time.Time {
+	if !from.Before(to) {
+		return nil
+	}
 	start := from.UTC().Truncate(time.Hour)
-	end := to.UTC().Truncate(time.Hour)
+	// 查询是半开区间 [from,to)，整点 to 不应产生一个空的尾部小时。
+	end := to.UTC().Add(-time.Nanosecond).Truncate(time.Hour)
 	var hours []time.Time
 	for current := start; !current.After(end); current = current.Add(time.Hour) {
 		hours = append(hours, current)
 	}
 	return hours
+}
+
+// pqReadBlockRows 先完整读取一个 block 的所有 part。调用方只在成功后
+// 合并到最终结果，保证任一 part 失败时可以原子地回退整个小时到 v1。
+func pqReadBlockRows[T any](s *APIServer, ctx context.Context, blockID string, fromMS, toMS int64) ([]T, []model.ContinuousParquetBlockFile, error) {
+	files, err := s.pqLoadBlockFiles(ctx, blockID)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows := []T{}
+	for _, file := range files {
+		part, err := readParquetRows[T](s, ctx, file.ObjectKey, fromMS, toMS)
+		if err != nil {
+			return nil, files, err
+		}
+		rows = append(rows, part...)
+	}
+	return rows, files, nil
 }
 
 // pqV2CPUCoverage 查询 [from,to] 的 v2 CPU 覆盖情况。
@@ -109,8 +131,6 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 	if q.ProfileType == "memory" {
 		signalType = "python_memory"
 	}
-	toMS := q.To.UnixMilli()
-
 	var authorizedSIDs []string
 	if err := s.continuousSessionSelection(q).Pluck("sid", &authorizedSIDs).Error; err != nil {
 		return continuousAggregate{}, false, err
@@ -140,7 +160,7 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 		return agg, false, nil
 	}
 	anyData := false
-	for hi, hour := range hours {
+	for _, hour := range hours {
 		hFrom := hour
 		hTo := hour.Add(time.Hour)
 		if hFrom.Before(q.From) {
@@ -152,7 +172,6 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 		if !hFrom.Before(hTo) {
 			continue
 		}
-		isLast := hi == len(hours)-1
 		block, err := s.pqFindBestBlock(ctx, tenant, hour, model.ContinuousParquetSignalCPU)
 		if err != nil {
 			incParquetQueryError()
@@ -171,32 +190,19 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 			}
 			continue
 		}
-		agg.ObjectKeys = append(agg.ObjectKeys, block.BlockID)
-		files, err := s.pqLoadBlockFiles(ctx, block.BlockID)
-		if err != nil {
-			incParquetQueryError()
-			return agg, true, fmt.Errorf("hour %s 加载 block files 失败: %w", hour.UTC().Format(time.RFC3339), err)
-		}
-		readErr := error(nil)
-		for _, file := range files {
-			rows, err := readParquetRows[pqCPURow](s, ctx, file.ObjectKey, hFrom.UnixMilli(), hTo.UnixMilli())
-			if err != nil {
-				readErr = err
-				break
-			}
+		rows, _, readErr := pqReadBlockRows[pqCPURow](s, ctx, block.BlockID, hFrom.UnixMilli(), hTo.UnixMilli())
+		if readErr == nil {
 			for i := range rows {
 				row := &rows[i]
 				if _, ok := authorized[row.SessionSID]; !ok {
 					continue
 				}
-				// 半开区间 [hFrom, hTo)；最后一个小时包含 q.To 这个结束点。
+				// 半开区间 [hFrom, hTo)。
 				if row.Timestamp < hFrom.UnixMilli() {
 					continue
 				}
 				if row.Timestamp >= hTo.UnixMilli() {
-					if !(isLast && row.Timestamp == toMS) {
-						continue
-					}
+					continue
 				}
 				if row.ProfileType != signalType && !(signalType == "cpu_profile" && row.ProfileType == "cpu") {
 					continue
@@ -222,6 +228,7 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 			return agg, true, fmt.Errorf("%w: hour %s parquet 读取失败且 v1 回退不可用: %v",
 				errPartialCoverage, hour.UTC().Format(time.RFC3339), readErr)
 		}
+		agg.ObjectKeys = append(agg.ObjectKeys, block.BlockID)
 		anyData = true
 	}
 	continuousFinalizeSymbolStatus(&agg)

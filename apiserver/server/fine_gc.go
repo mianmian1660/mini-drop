@@ -27,11 +27,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/mini-drop/apiserver/model"
 )
@@ -111,19 +113,20 @@ func (s *APIServer) pqFineGCCandidateBlockReason(ctx context.Context, b *model.P
 	if s.pqHasUnresolvedMigrationFailures(ctx, "batch", b.BID) {
 		return "migration_failure"
 	}
-	// 条件 2：每种实际信号的 active+validated+reconciled raw lineage
+	// 条件 2：每种实际信号的永久 passed migration receipt
 	if !s.pqBatchCoveredByValidatedRaw(ctx, b) {
 		return "no_validated_raw_lineage"
 	}
-	// 条件 3：coverage segments 已提交且区间/样本统计对账通过
+	// 条件 3：receipt 区间覆盖全部 window
 	if ok, reason := s.pqBatchCoverageReconciled(ctx, b); !ok {
 		return reason
 	}
 	return ""
 }
 
-// pqBatchCoverageReconciled 检查 batch 的全部 window 都被 coverage segment
-// 覆盖（区间对账），且 segment 样本总量 ≥ window 样本量（统计对账）。
+// pqBatchCoverageReconciled 检查 batch 的全部 window 都被同信号 passed
+// migration receipt 覆盖。raw 对账成功已经证明源窗口完整性；这里不再用
+// Timeline coverage 的重叠总量近似删除安全性。
 func (s *APIServer) pqBatchCoverageReconciled(ctx context.Context, b *model.ProfileBatch) (bool, string) {
 	var windows []model.ProfileWindow
 	if err := s.DB.WithContext(ctx).Where("batch_bid = ?", b.BID).Find(&windows).Error; err != nil {
@@ -133,17 +136,24 @@ func (s *APIServer) pqBatchCoverageReconciled(ctx context.Context, b *model.Prof
 		// 无 window 引用的 batch：无需覆盖对账，但需要 lineage 已确认（上方已查）
 		return true, ""
 	}
+	bySignal := map[string][]model.ContinuousMigrationReceipt{}
 	for i := range windows {
 		w := &windows[i]
 		signal := pqLedgerSignalForWindow(w.SignalType)
 		if signal == "" {
 			continue
 		}
-		if !s.pqCoverageCovered(ctx, w.SessionSID, signal, w.WindowStart, w.WindowEnd) {
-			return false, "coverage_interval_mismatch"
+		receipts, ok := bySignal[signal]
+		if !ok {
+			var err error
+			receipts, err = s.pqPassedMigrationReceipts(ctx, b.BID, signal)
+			if err != nil {
+				return false, "receipt_query_error"
+			}
+			bySignal[signal] = receipts
 		}
-		if covered := s.pqCoverageSampleTotalFor(ctx, w.SessionSID, signal, w.WindowStart, w.WindowEnd); covered < w.SampleCount {
-			return false, "coverage_sample_mismatch"
+		if !pqReceiptsCoverRange(append([]model.ContinuousMigrationReceipt(nil), receipts...), w.WindowStart, w.WindowEnd) {
+			return false, "receipt_interval_mismatch"
 		}
 	}
 	return true, ""
@@ -153,20 +163,33 @@ func (s *APIServer) pqBatchCoverageReconciled(ctx context.Context, b *model.Prof
 // 提交后删源对象（仅未压缩 staging 删对象；已压缩 batch 的对象属于 v1
 // 块，由 pqReclaimV1Blocks 处理）。
 func (s *APIServer) pqFineGCRemoveBatch(ctx context.Context, b *model.ProfileBatch) {
-	// 行级领取：只允许一个 GC 实例处理该 batch（SKIP LOCKED 由外层查询
-	// 语义 + 状态检查保证；这里再以窗口内复查防并发）
+	// 行级领取：事务内 FOR UPDATE SKIP LOCKED，只有实际删除该行的实例才会
+	// 在提交后删除对象。
+	claimed := false
+	claimedBatch := *b
 	// 1) 事务内清理 window + batch 元数据
 	txErr := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("batch_bid = ?", b.BID).Delete(&model.ProfileWindow{}).Error; err != nil {
+		var locked model.ProfileBatch
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("bid = ?", b.BID).First(&locked).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
 			return err
 		}
-		res := tx.Where("bid = ?", b.BID).Delete(&model.ProfileBatch{})
+		if err := tx.Where("batch_bid = ?", locked.BID).Delete(&model.ProfileWindow{}).Error; err != nil {
+			return err
+		}
+		res := tx.Where("bid = ?", locked.BID).Delete(&model.ProfileBatch{})
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
 			return nil // 已被并发清理
 		}
+		claimed = true
+		claimedBatch = locked
 		return nil
 	})
 	if txErr != nil {
@@ -175,15 +198,18 @@ func (s *APIServer) pqFineGCRemoveBatch(ctx context.Context, b *model.ProfileBat
 			zap.String("bid", b.BID), zap.Error(txErr))
 		return
 	}
+	if !claimed {
+		return
+	}
 	incFineGCDeleted(b.BID)
 	// 2) 提交后删除 staging 对象（block_id 为空才是 staging 对象；已压缩
 	//    batch 的 object_key 指向 v1 块对象，禁止在这里删）
-	if b.BlockID == "" && b.ObjectKey != "" && s.StorageConnected() {
-		if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, b.ObjectKey); err != nil {
-			s.recordContinuousMigrationFailure(ctx, "batch", b.BID, b.SessionSID, b.ObjectKey, "object_delete", err.Error())
+	if claimedBatch.BlockID == "" && claimedBatch.ObjectKey != "" && s.StorageConnected() {
+		if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, claimedBatch.ObjectKey); err != nil {
+			s.recordContinuousMigrationFailure(ctx, "batch", claimedBatch.BID, claimedBatch.SessionSID, claimedBatch.ObjectKey, "object_delete", err.Error())
 			return
 		}
-		incContinuousReclaimedBytes(int64(b.PayloadBytes))
+		incContinuousReclaimedBytes(int64(claimedBatch.PayloadBytes))
 	}
 }
 

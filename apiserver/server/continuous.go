@@ -995,8 +995,12 @@ func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.Cont
 		return nil, nil, nil, err
 	}
 	var segments []model.ContinuousCoverageSegment
+	catalogTo := to
+	if hotCutoff.Before(catalogTo) {
+		catalogTo = hotCutoff
+	}
 	if err := s.DB.WithContext(ctx).
-		Where("session_sid = ? AND segment_start < ? AND segment_end > ?", session.SID, to, from).
+		Where("session_sid = ? AND segment_start < ? AND segment_end > ?", session.SID, catalogTo, from).
 		Order("segment_start ASC").Find(&segments).Error; err != nil {
 		return nil, nil, nil, err
 	}
@@ -1027,6 +1031,9 @@ func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.Cont
 		}
 		if segment.SegmentEnd.After(to) {
 			item["window_end"] = to
+		}
+		if segment.SegmentEnd.After(hotCutoff) {
+			item["window_end"] = hotCutoff
 		}
 		items = append(items, item)
 		merged = append(merged, model.ProfileWindow{
@@ -1137,39 +1144,39 @@ func (s *APIServer) QueryContinuousProfile(c *gin.Context) {
 	}
 	if !found {
 		s.RespondOK(c, gin.H{
-			"query":               profileLabelSelector(q),
-			"nodes":               []ProfileNode{},
-			"items":               []ProfileTopItem{},
-			"total":               0,
-			"unit":                "samples",
-			"empty":               true,
-			"message":             "Native Continuous Profiling 暂无覆盖该时间范围的 10s window",
-			"source":              "mini-drop-native",
-			"profile_source":      "native",
-			"generated_at":        time.Now(),
-			"resolution_seconds":  stats.ResolutionSeconds,
-			"mixed_resolution":    stats.MixedResolution,
-			"storage_source":      stats.StorageSource,
+			"query":                 profileLabelSelector(q),
+			"nodes":                 []ProfileNode{},
+			"items":                 []ProfileTopItem{},
+			"total":                 0,
+			"unit":                  "samples",
+			"empty":                 true,
+			"message":               "Native Continuous Profiling 暂无覆盖该时间范围的 10s window",
+			"source":                "mini-drop-native",
+			"profile_source":        "native",
+			"generated_at":          time.Now(),
+			"resolution_seconds":    stats.ResolutionSeconds,
+			"mixed_resolution":      stats.MixedResolution,
+			"storage_source":        stats.StorageSource,
 			"earliest_available_at": stats.EarliestAvailable,
 		})
 		return
 	}
 	s.RespondOK(c, gin.H{
-		"query":               fg.Query,
-		"nodes":               fg.Nodes,
-		"items":               topn.Items,
-		"total":               fg.Total,
-		"unit":                fg.Unit,
-		"empty":               fg.Empty,
-		"message":             fg.Message,
-		"source":              fg.Source,
-		"profile_source":      fg.ProfileSource,
-		"profile_url":         fg.ProfileURL,
-		"raw_profile_url":     fg.RawProfileURL,
-		"generated_at":        fg.GeneratedAt,
-		"resolution_seconds":  stats.ResolutionSeconds,
-		"mixed_resolution":    stats.MixedResolution,
-		"storage_source":      stats.StorageSource,
+		"query":                 fg.Query,
+		"nodes":                 fg.Nodes,
+		"items":                 topn.Items,
+		"total":                 fg.Total,
+		"unit":                  fg.Unit,
+		"empty":                 fg.Empty,
+		"message":               fg.Message,
+		"source":                fg.Source,
+		"profile_source":        fg.ProfileSource,
+		"profile_url":           fg.ProfileURL,
+		"raw_profile_url":       fg.RawProfileURL,
+		"generated_at":          fg.GeneratedAt,
+		"resolution_seconds":    stats.ResolutionSeconds,
+		"mixed_resolution":      stats.MixedResolution,
+		"storage_source":        stats.StorageSource,
 		"earliest_available_at": stats.EarliestAvailable,
 	})
 }
@@ -2388,14 +2395,14 @@ func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
 	if !found {
 		stats := s.pqQueryStatsFor(c.Request.Context(), q)
 		s.RespondOK(c, gin.H{
-			"query":        profileLabelSelector(q),
-			"signal_type":  signalType,
-			"empty":        true,
-			"message":      "Native Continuous eBPF 暂无覆盖该时间范围的 histogram window",
-			"source":       "mini-drop-native",
-			"generated_at": time.Now(),
-			"buckets":      []ContinuousHistogramBucket{},
-			"trend":        []gin.H{},
+			"query":          profileLabelSelector(q),
+			"signal_type":    signalType,
+			"empty":          true,
+			"message":        "Native Continuous eBPF 暂无覆盖该时间范围的 histogram window",
+			"source":         "mini-drop-native",
+			"generated_at":   time.Now(),
+			"buckets":        []ContinuousHistogramBucket{},
+			"trend":          []gin.H{},
 			"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
 			"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
 		})
@@ -2556,14 +2563,14 @@ func (s *APIServer) QueryContinuousDBSnapshot(c *gin.Context) {
 	if !found {
 		stats := s.pqQueryStatsFor(c.Request.Context(), q)
 		s.RespondOK(c, gin.H{
-			"query":        profileLabelSelector(q),
-			"signal_type":  "db_snapshot",
-			"empty":        true,
-			"message":      "该时间范围暂无数据库快照数据",
-			"source":       "mini-drop-native",
-			"generated_at": time.Now(),
-			"digests":      []gin.H{},
-			"lock_waits":   []gin.H{},
+			"query":          profileLabelSelector(q),
+			"signal_type":    "db_snapshot",
+			"empty":          true,
+			"message":        "该时间范围暂无数据库快照数据",
+			"source":         "mini-drop-native",
+			"generated_at":   time.Now(),
+			"digests":        []gin.H{},
+			"lock_waits":     []gin.H{},
 			"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
 			"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
 		})

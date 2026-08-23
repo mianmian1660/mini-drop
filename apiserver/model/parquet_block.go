@@ -153,6 +153,32 @@ type ContinuousParquetBlockMember struct {
 
 func (ContinuousParquetBlockMember) TableName() string { return "continuous_parquet_block_members" }
 
+// ContinuousMigrationReceipt 是不会随 raw Block 生命周期删除的迁移凭证。
+// 每行表示一个 source batch 的某个信号已完整写入并通过对账的 raw Block。
+// Block member 用于物理块 lineage；receipt 用于细粒度元数据 GC 的长期证明。
+type ContinuousMigrationReceipt struct {
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	Tenant       string    `gorm:"column:tenant;size:64;default:default" json:"tenant"`
+	SourceKind   string    `gorm:"column:source_kind;size:16;uniqueIndex:uq_cmr_source_block,priority:1" json:"source_kind"`
+	SourceRef    string    `gorm:"column:source_ref;size:128;uniqueIndex:uq_cmr_source_block,priority:2;index" json:"source_ref"`
+	SessionSID   string    `gorm:"column:session_sid;size:64;index" json:"session_sid"`
+	SignalType   string    `gorm:"column:signal_type;size:32;index" json:"signal_type"`
+	BlockID      string    `gorm:"column:block_id;size:64;uniqueIndex:uq_cmr_source_block,priority:3;index" json:"block_id"`
+	BucketStart  time.Time `gorm:"column:bucket_start" json:"bucket_start"`
+	BucketEnd    time.Time `gorm:"column:bucket_end" json:"bucket_end"`
+	StartTime    time.Time `gorm:"column:start_time" json:"start_time"`
+	EndTime      time.Time `gorm:"column:end_time" json:"end_time"`
+	SampleCount  uint64    `gorm:"column:sample_count" json:"sample_count"`
+	ValueTotal   uint64    `gorm:"column:value_total" json:"value_total"`
+	RowCount     int64     `gorm:"column:row_count" json:"row_count"`
+	Status       string    `gorm:"column:status;size:16;default:passed;index" json:"status"`
+	RevokeReason string    `gorm:"column:revoke_reason;type:text" json:"revoke_reason"`
+	CreatedAt    time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
+func (ContinuousMigrationReceipt) TableName() string { return "continuous_migration_receipts" }
+
 // ============================================================
 // 阶段六：细粒度目录模型
 // ============================================================
@@ -181,13 +207,13 @@ const (
 type ContinuousCoverageSegment struct {
 	ID uint `gorm:"primaryKey" json:"id"`
 	// Tenant 单租户固定 default。
-	Tenant string `gorm:"column:tenant;size:64;default:default" json:"tenant"`
+	Tenant string `gorm:"column:tenant;size:64;default:default;uniqueIndex:uq_ccs_segment,priority:1" json:"tenant"`
 	// SessionSID + SignalType + SegmentStart + SegmentEnd 构成唯一键
 	// （同一区间不允许重复 segment）。
-	SessionSID   string    `gorm:"column:session_sid;size:64;uniqueIndex:uq_ccs_segment,priority:1" json:"session_sid"`
-	SignalType   string    `gorm:"column:signal_type;size:32;uniqueIndex:uq_ccs_segment,priority:2" json:"signal_type"`
-	SegmentStart time.Time `gorm:"column:segment_start;uniqueIndex:uq_ccs_segment,priority:3" json:"segment_start"`
-	SegmentEnd   time.Time `gorm:"column:segment_end;uniqueIndex:uq_ccs_segment,priority:4" json:"segment_end"`
+	SessionSID   string    `gorm:"column:session_sid;size:64;uniqueIndex:uq_ccs_segment,priority:2" json:"session_sid"`
+	SignalType   string    `gorm:"column:signal_type;size:32;uniqueIndex:uq_ccs_segment,priority:3" json:"signal_type"`
+	SegmentStart time.Time `gorm:"column:segment_start;uniqueIndex:uq_ccs_segment,priority:4" json:"segment_start"`
+	SegmentEnd   time.Time `gorm:"column:segment_end;uniqueIndex:uq_ccs_segment,priority:5" json:"segment_end"`
 	// SampleCount 段内样本总数（区间/样本统计对账依据）。
 	SampleCount uint64 `gorm:"column:sample_count" json:"sample_count"`
 	// SourceBlock 生成该段的 raw Block ID（可追溯审计）。

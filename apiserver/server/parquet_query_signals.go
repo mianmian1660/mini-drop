@@ -170,24 +170,21 @@ func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, 
 			}
 			continue
 		}
-		files, err := s.pqLoadBlockFiles(ctx, block.BlockID)
-		if err != nil {
-			incParquetQueryError()
-			return nil, true, fmt.Errorf("hour %s 加载 block files 失败: %w", hour.UTC().Format(time.RFC3339), err)
-		}
-		readErr := error(nil)
-		for _, file := range files {
-			rows, err := readParquetRows[pqMetricRow](s, ctx, file.ObjectKey, hFrom.UnixMilli(), hTo.UnixMilli())
-			if err != nil {
-				readErr = err
-				break
-			}
+		rows, _, readErr := pqReadBlockRows[pqMetricRow](s, ctx, block.BlockID, hFrom.UnixMilli(), hTo.UnixMilli())
+		if readErr == nil {
 			for i := range rows {
 				row := &rows[i]
 				if _, ok := authorized[row.SessionSID]; !ok {
 					continue
 				}
 				if row.Metric != metricName || row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
+					continue
+				}
+				sample := ContinuousStackSample{
+					PID: int(row.PID), Comm: row.Comm, Exe: row.Exe, Runtime: row.Runtime,
+					Labels: pqLabelsInterface(row.Labels),
+				}
+				if !continuousSampleMatches(sample, pqLabelsInterface(row.Labels), q.Filters) {
 					continue
 				}
 				addPoint(row.PID, row.ProcessStartMs, row.Comm, row.Exe, row.Runtime, time.UnixMilli(row.Timestamp), row.Value)
@@ -310,22 +307,8 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 			}
 			continue
 		}
-		if !seenBlock[block.BlockID] {
-			seenBlock[block.BlockID] = true
-			objectKeys = append(objectKeys, block.BlockID)
-		}
-		files, err := s.pqLoadBlockFiles(ctx, block.BlockID)
-		if err != nil {
-			incParquetQueryError()
-			return nil, true, err
-		}
-		readErr := error(nil)
-		for _, file := range files {
-			rows, err := readParquetRows[pqHistogramRow](s, ctx, file.ObjectKey, hFrom.UnixMilli(), hTo.UnixMilli())
-			if err != nil {
-				readErr = err
-				break
-			}
+		rows, _, readErr := pqReadBlockRows[pqHistogramRow](s, ctx, block.BlockID, hFrom.UnixMilli(), hTo.UnixMilli())
+		if readErr == nil {
 			for i := range rows {
 				row := &rows[i]
 				if _, ok := authorized[row.SessionSID]; !ok {
@@ -340,7 +323,6 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 				if row.Unavailable && unavailableReason == "" {
 					unavailableReason = row.Reason
 				}
-				totalEvents = addContinuousCount(totalEvents, row.EventCount)
 				key := row.BucketLowRange() + "|" + strconv.FormatFloat(row.BucketLow, 'f', -1, 64) + "|" + strconv.FormatFloat(row.BucketHigh, 'f', -1, 64)
 				item := merged[key]
 				if item == nil {
@@ -349,6 +331,7 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 				}
 				item.Count = addContinuousCount(item.Count, row.Count)
 			}
+			totalEvents = addContinuousCount(totalEvents, pqHistogramEventTotal(rows, signalType, hFrom, hTo, authorized))
 		}
 		if readErr != nil {
 			incParquetQueryError()
@@ -361,8 +344,11 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 			return nil, true, fmt.Errorf("%w: hour %s histogram 读取失败且 v1 回退不可用: %v",
 				errPartialCoverage, hour.UTC().Format(time.RFC3339), readErr)
 		}
-		// v2 趋势点：按 (timestamp, event_count, p50/p95/p99) 聚合
-		trend = append(trend, s.pqHistogramTrendFromFile(ctx, q, signalType, files, hFrom, hTo, authorized)...)
+		if !seenBlock[block.BlockID] {
+			seenBlock[block.BlockID] = true
+			objectKeys = append(objectKeys, block.BlockID)
+		}
+		trend = append(trend, pqHistogramTrendFromRows(rows, signalType, block.Resolution, hFrom, hTo, authorized)...)
 	}
 
 	buckets := make([]ContinuousHistogramBucket, 0, len(merged))
@@ -412,6 +398,39 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 	}, true, nil
 }
 
+// pqHistogramEventTotal 兼容新旧 Parquet：旧文件在每个 bucket 重复
+// event_count，新文件只在第一桶写入。按 histogram identity 取 max 后求和。
+func pqHistogramEventTotal(rows []pqHistogramRow, signalType string, hFrom, hTo time.Time,
+	authorized map[string]struct{}) uint64 {
+	events := map[string]uint64{}
+	for i := range rows {
+		row := &rows[i]
+		if _, ok := authorized[row.SessionSID]; !ok || row.SignalType != signalType ||
+			row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
+			continue
+		}
+		key := row.SessionSID + "|" + strconv.FormatInt(row.Timestamp, 10) + "|" + row.SignalType + "|" + row.Backend + "|" + pqHistogramIdentityLabelKey(row.Labels)
+		if row.EventCount > events[key] {
+			events[key] = row.EventCount
+		}
+	}
+	var total uint64
+	for _, count := range events {
+		total = addContinuousCount(total, count)
+	}
+	return total
+}
+
+func pqHistogramIdentityLabelKey(labels map[string]string) string {
+	clone := make(map[string]string, len(labels))
+	for key, value := range labels {
+		if !strings.HasPrefix(key, "_") {
+			clone[key] = value
+		}
+	}
+	return pqSortedLabelKey(clone)
+}
+
 // mergeV1Histogram 把 v1 子范围 histogram 结果并入混合累加器。
 func (s *APIServer) mergeV1Histogram(ctx context.Context, q ProfileQuery, signalType string,
 	merged map[string]*pqBucketAgg, trend *[]gin.H, backends map[string]bool,
@@ -448,11 +467,11 @@ func (s *APIServer) mergeV1Histogram(ctx context.Context, q ProfileQuery, signal
 	return true, nil
 }
 
-// pqHistogramTrendFromFile 从 v2 histogram 行构建趋势点（按窗口聚合 p50/p95/p99）。
-func (s *APIServer) pqHistogramTrendFromFile(ctx context.Context, q ProfileQuery, signalType string,
-	files []model.ContinuousParquetBlockFile, hFrom, hTo time.Time, authorized map[string]struct{}) []gin.H {
+// pqHistogramTrendFromRows 从已经完整读取的 v2 行构建趋势点。
+func pqHistogramTrendFromRows(rows []pqHistogramRow, signalType, resolution string,
+	hFrom, hTo time.Time, authorized map[string]struct{}) []gin.H {
 	type trendAcc struct {
-		eventCount    uint64
+		events        map[string]uint64
 		p50, p95, p99 float64
 		countWeight   uint64
 		unavailable   bool
@@ -460,34 +479,31 @@ func (s *APIServer) pqHistogramTrendFromFile(ctx context.Context, q ProfileQuery
 		backend       string
 	}
 	acc := map[int64]*trendAcc{}
-	for _, file := range files {
-		rows, err := readParquetRows[pqHistogramRow](s, ctx, file.ObjectKey, hFrom.UnixMilli(), hTo.UnixMilli())
-		if err != nil {
+	for i := range rows {
+		row := &rows[i]
+		if _, ok := authorized[row.SessionSID]; !ok || row.SignalType != signalType ||
+			row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
 			continue
 		}
-		for i := range rows {
-			row := &rows[i]
-			if _, ok := authorized[row.SessionSID]; !ok || row.SignalType != signalType {
-				continue
-			}
-			bucket := row.Timestamp / 60000 * 60000
-			item := acc[bucket]
-			if item == nil {
-				item = &trendAcc{backend: row.Backend, unavailable: row.Unavailable, reason: row.Reason}
-				acc[bucket] = item
-			}
-			if row.EventCount > item.eventCount {
-				item.eventCount = row.EventCount
-			}
-			if row.Count > 0 {
-				item.p50 += row.P50 * float64(row.Count)
-				item.p95 += row.P95 * float64(row.Count)
-				item.p99 += row.P99 * float64(row.Count)
-				item.countWeight += row.Count
-			}
-			if row.Unavailable {
-				item.unavailable = true
-			}
+		// raw 保持原窗口时间；5m/1h 的 Timestamp 本身已经对齐目标桶。
+		bucket := row.Timestamp
+		item := acc[bucket]
+		if item == nil {
+			item = &trendAcc{events: map[string]uint64{}, backend: row.Backend, unavailable: row.Unavailable, reason: row.Reason}
+			acc[bucket] = item
+		}
+		eventKey := row.SessionSID + "|" + strconv.FormatInt(row.Timestamp, 10) + "|" + row.Backend + "|" + pqHistogramIdentityLabelKey(row.Labels)
+		if row.EventCount > item.events[eventKey] {
+			item.events[eventKey] = row.EventCount
+		}
+		if row.Count > 0 {
+			item.p50 += row.P50 * float64(row.Count)
+			item.p95 += row.P95 * float64(row.Count)
+			item.p99 += row.P99 * float64(row.Count)
+			item.countWeight += row.Count
+		}
+		if row.Unavailable {
+			item.unavailable = true
 		}
 	}
 	keys := make([]int64, 0, len(acc))
@@ -498,16 +514,36 @@ func (s *APIServer) pqHistogramTrendFromFile(ctx context.Context, q ProfileQuery
 	out := make([]gin.H, 0, len(keys))
 	for _, k := range keys {
 		item := acc[k]
+		var eventCount uint64
+		for _, count := range item.events {
+			eventCount = addContinuousCount(eventCount, count)
+		}
 		p50, p95, p99 := item.p50, item.p95, item.p99
 		if item.countWeight > 0 {
 			p50 /= float64(item.countWeight)
 			p95 /= float64(item.countWeight)
 			p99 /= float64(item.countWeight)
 		}
+		windowEnd := time.UnixMilli(k).Add(time.Minute)
+		if resolution != model.ContinuousParquetResolutionRaw {
+			if seconds := pqSignalResolutionSeconds(resolution); seconds > 0 {
+				windowEnd = time.UnixMilli(k).Add(time.Duration(seconds) * time.Second)
+			}
+		} else {
+			for i := range rows {
+				if rows[i].Timestamp != k {
+					continue
+				}
+				if endMS, err := strconv.ParseInt(rows[i].Labels["_window_end_ms"], 10, 64); err == nil && endMS > k {
+					windowEnd = time.UnixMilli(endMS)
+					break
+				}
+			}
+		}
 		out = append(out, gin.H{
 			"window_start": time.UnixMilli(k),
-			"window_end":   time.UnixMilli(k + 60000),
-			"event_count":  item.eventCount,
+			"window_end":   windowEnd,
+			"event_count":  eventCount,
 			"p50":          p50,
 			"p95":          p95,
 			"p99":          p99,
@@ -521,6 +557,9 @@ func (s *APIServer) pqHistogramTrendFromFile(ctx context.Context, q ProfileQuery
 
 // BucketLowRange 兼容 v1 bucket.Range 字段（低边界字符串）。
 func (r *pqHistogramRow) BucketLowRange() string {
+	if value := r.Labels["_bucket_range"]; value != "" {
+		return value
+	}
 	return strconv.FormatFloat(r.BucketLow, 'f', -1, 64)
 }
 
@@ -578,22 +617,8 @@ func (s *APIServer) pqQueryDBMixed(ctx context.Context, q ProfileQuery) (gin.H, 
 			}
 			continue
 		}
-		if !seenBlock[block.BlockID] {
-			seenBlock[block.BlockID] = true
-			objectKeys = append(objectKeys, block.BlockID)
-		}
-		files, err := s.pqLoadBlockFiles(ctx, block.BlockID)
-		if err != nil {
-			incParquetQueryError()
-			return nil, true, err
-		}
-		readErr := error(nil)
-		for _, file := range files {
-			rows, err := readParquetRows[pqDBRow](s, ctx, file.ObjectKey, hFrom.UnixMilli(), hTo.UnixMilli())
-			if err != nil {
-				readErr = err
-				break
-			}
+		rows, _, readErr := pqReadBlockRows[pqDBRow](s, ctx, block.BlockID, hFrom.UnixMilli(), hTo.UnixMilli())
+		if readErr == nil {
 			for i := range rows {
 				row := &rows[i]
 				if _, ok := authorized[row.SessionSID]; !ok {
@@ -641,16 +666,25 @@ func (s *APIServer) pqQueryDBMixed(ctx context.Context, q ProfileQuery) (gin.H, 
 			return nil, true, fmt.Errorf("%w: hour %s db 读取失败且 v1 回退不可用: %v",
 				errPartialCoverage, hour.UTC().Format(time.RFC3339), readErr)
 		}
+		if !seenBlock[block.BlockID] {
+			seenBlock[block.BlockID] = true
+			objectKeys = append(objectKeys, block.BlockID)
+		}
 	}
 
 	digestList := make([]gin.H, 0, len(digests))
 	for _, item := range digests {
+		avgLatencyUs := uint64(0)
+		if item.CallCount > 0 {
+			avgLatencyUs = item.TotalLatencyUs / item.CallCount
+		}
 		digestList = append(digestList, gin.H{
 			"instance_label":   item.InstanceLabel,
 			"schema_name":      item.SchemaName,
 			"digest_text":      item.DigestText,
 			"call_count":       item.CallCount,
 			"total_latency_us": item.TotalLatencyUs,
+			"avg_latency_us":   avgLatencyUs,
 			"rows_examined":    item.RowsExamined,
 		})
 	}
@@ -662,6 +696,14 @@ func (s *APIServer) pqQueryDBMixed(ctx context.Context, q ProfileQuery) (gin.H, 
 			d, _ := digestList[j]["call_count"].(uint64)
 			return c > d
 		}
+		return a > b
+	})
+	if len(digestList) > continuousSummaryTopLimit {
+		digestList = digestList[:continuousSummaryTopLimit]
+	}
+	sort.Slice(lockWaits, func(i, j int) bool {
+		a, _ := lockWaits[i]["wait_seconds"].(uint64)
+		b, _ := lockWaits[j]["wait_seconds"].(uint64)
 		return a > b
 	})
 	stats := s.pqStorageSourceForSignal(ctx, q, model.ContinuousParquetSignalDB)

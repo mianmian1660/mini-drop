@@ -66,6 +66,10 @@ func (s *APIServer) startParquetWorkers() {
 		zap.String("mode", mode),
 		zap.Int("block_interval_sec", s.Config.ContinuousParquet.BlockIntervalSec),
 	)
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	s.pqRebuildActiveCoverageCatalog(startupCtx, s.Config.ContinuousParquet.Tenant)
+	s.runParquetCycle(startupCtx, mode)
+	startupCancel()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -167,7 +171,10 @@ func (s *APIServer) pqSealedRawHours(ctx context.Context, tenant string, now tim
 	if !scanFrom.IsZero() {
 		query = query.Where("window_start >= ?", scanFrom)
 	}
-	query = query.Group("bucket").Order("bucket DESC").Limit(limit)
+	// 不能在排除已覆盖小时之前 LIMIT：否则最新 N 小时一旦全部 covered，
+	// 更早的 backfill 缺口会永久饥饿。先扫描配置范围内的 distinct hour，
+	// 再在下方对真正 needsBuild 的小时限流。
+	query = query.Group("bucket").Order("bucket DESC")
 	if s.DB.Dialector.Name() == "postgres" {
 		var rows []struct{ Bucket time.Time }
 		if err := query.Scan(&rows).Error; err != nil {
@@ -191,6 +198,11 @@ func (s *APIServer) pqSealedRawHours(ctx context.Context, tenant string, now tim
 	}
 	out := make([]time.Time, 0, len(bucketTimes))
 	for _, hour := range bucketTimes {
+		// 只有整个小时结束并经过 compaction delay 才能封存；不能因为当前
+		// 小时里某个窗口早于 now-delay 就提前构建不完整块。
+		if hour.Add(time.Hour).After(sealedCutoff) {
+			continue
+		}
 		var windows []model.ProfileWindow
 		if err := s.DB.WithContext(ctx).
 			Select("signal_type, created_at").
@@ -212,6 +224,9 @@ func (s *APIServer) pqSealedRawHours(ctx context.Context, tenant string, now tim
 		}
 		if needsBuild {
 			out = append(out, hour)
+			if len(out) >= limit {
+				break
+			}
 		}
 	}
 	return out

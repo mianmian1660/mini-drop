@@ -5,7 +5,7 @@
 //   - 连续或间隔不超过 5 秒的 window 合并为一个 segment，真实缺口原样保留；
 //   - segment 独立于 raw Block 生命周期，保留 30 天
 //     （CONTINUOUS_COVERAGE_RETENTION_HOURS），raw 降采样后精确缺口不丢失；
-//   - Timeline 与细粒度 GC 依赖 segment 判断"区间/样本统计对账"。
+//   - segment 只服务 Timeline；细粒度 GC 使用永久 migration receipt。
 // ============================================================
 
 package server
@@ -24,40 +24,47 @@ import (
 const pqCoverageMergeTolerance = 5 * time.Second
 
 // pqRebuildCoverageSegmentsTx 在激活事务内重建某 (hour, signal) 的覆盖区间。
-// 为了保持跨小时连续性，重建范围取 [hour-1h, hour+1h)，替换与该范围相交的
-// 旧 segment；相邻小时激活会再次重建并幂等收敛。
+// segment 严格限制在当前小时，并保留原始 signal subtype；它只用于 Timeline，
+// 不再作为 GC 删除证明。
 func (s *APIServer) pqRebuildCoverageSegmentsTx(tx *gorm.DB, tenant string, hourStart time.Time, signalType string, sourceBlock string, sourceVersion int) error {
 	types := pqV1SignalTypesFor(signalType)
 	if len(types) == 0 {
 		return nil
 	}
 	now := time.Now()
-	from := hourStart.Add(-time.Hour)
-	to := hourStart.Add(2 * time.Hour)
+	from := hourStart
+	to := hourStart.Add(time.Hour)
 
 	var windows []model.ProfileWindow
-	if err := tx.Where("window_start >= ? AND window_start < ? AND signal_type IN ?", from, to, types).
+	if err := tx.Where("window_start < ? AND window_end > ? AND signal_type IN ?", to, from, types).
 		Order("session_sid ASC, window_start ASC").Find(&windows).Error; err != nil {
 		return err
 	}
-	bySession := map[string][]model.ProfileWindow{}
+	bySeries := map[string][]model.ProfileWindow{}
 	for _, w := range windows {
 		if w.SessionSID == "" || w.WindowStart.IsZero() || w.WindowEnd.IsZero() || !w.WindowStart.Before(w.WindowEnd) {
 			continue
 		}
-		bySession[w.SessionSID] = append(bySession[w.SessionSID], w)
+		if w.WindowStart.Before(from) {
+			w.WindowStart = from
+		}
+		if w.WindowEnd.After(to) {
+			w.WindowEnd = to
+		}
+		key := w.SessionSID + "\x00" + w.SignalType
+		bySeries[key] = append(bySeries[key], w)
 	}
 
-	// 替换与该范围相交的旧 segment（保持跨小时连续）
-	for sid := range bySession {
-		if err := tx.Where("session_sid = ? AND signal_type = ? AND segment_start < ? AND segment_end > ?",
-			sid, signalType, to, from).Delete(&model.ContinuousCoverageSegment{}).Error; err != nil {
-			return err
-		}
+	// 无论本轮是否仍有 session，都清掉该 canonical signal 当前小时的旧段，
+	// 防止迟到重写后已消失的 session 留下陈旧 coverage。
+	deleteTypes := append(append([]string{}, types...), signalType)
+	if err := tx.Where("tenant = ? AND signal_type IN ? AND segment_start >= ? AND segment_start < ?",
+		tenant, deleteTypes, from, to).Delete(&model.ContinuousCoverageSegment{}).Error; err != nil {
+		return err
 	}
 
 	// 合并 window → segment
-	for sid, ws := range bySession {
+	for _, ws := range bySeries {
 		var segs []model.ContinuousCoverageSegment
 		for _, w := range ws {
 			last := len(segs) - 1
@@ -70,8 +77,8 @@ func (s *APIServer) pqRebuildCoverageSegmentsTx(tx *gorm.DB, tenant string, hour
 			}
 			segs = append(segs, model.ContinuousCoverageSegment{
 				Tenant:        tenant,
-				SessionSID:    sid,
-				SignalType:    signalType,
+				SessionSID:    w.SessionSID,
+				SignalType:    w.SignalType,
 				SegmentStart:  w.WindowStart,
 				SegmentEnd:    w.WindowEnd,
 				SampleCount:   w.SampleCount,
@@ -91,12 +98,37 @@ func (s *APIServer) pqRebuildCoverageSegmentsTx(tx *gorm.DB, tenant string, hour
 	return nil
 }
 
+// pqRebuildActiveCoverageCatalog 在新版本启动时从 active raw block 重建派生的
+// Timeline catalog。receipt/Parquet 数据不受影响。
+func (s *APIServer) pqRebuildActiveCoverageCatalog(ctx context.Context, tenant string) {
+	var blocks []model.ContinuousParquetBlock
+	if err := s.DB.WithContext(ctx).
+		Where("tenant = ? AND resolution = ? AND status = ? AND validation = ? AND reconcile_status = ?",
+			tenant, model.ContinuousParquetResolutionRaw, model.ContinuousParquetStatusActive,
+			model.ContinuousParquetValidationPassed, model.ContinuousParquetReconcilePassed).
+		Order("bucket_start ASC").Find(&blocks).Error; err != nil {
+		return
+	}
+	for i := range blocks {
+		block := &blocks[i]
+		if err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			return s.pqRebuildCoverageSegmentsTx(tx, tenant, block.BucketStart, block.SignalType, block.BlockID, block.Version)
+		}); err != nil {
+			s.Logger.Warn("启动时重建 coverage catalog 失败", zap.String("block_id", block.BlockID), zap.Error(err))
+		}
+	}
+}
+
 // pqCoverageSegmentsFor 读取某 (session, signal, [from,to)) 的覆盖区间。
 func (s *APIServer) pqCoverageSegmentsFor(ctx context.Context, sessionSID, signalType string, from, to time.Time) ([]model.ContinuousCoverageSegment, error) {
 	var segments []model.ContinuousCoverageSegment
+	types := pqV1SignalTypesFor(signalType)
+	if len(types) == 0 {
+		types = []string{signalType}
+	}
 	err := s.DB.WithContext(ctx).
-		Where("session_sid = ? AND signal_type = ? AND segment_start < ? AND segment_end > ?",
-			sessionSID, signalType, to, from).
+		Where("session_sid = ? AND signal_type IN ? AND segment_start < ? AND segment_end > ?",
+			sessionSID, types, to, from).
 		Order("segment_start ASC").Find(&segments).Error
 	return segments, err
 }
@@ -132,9 +164,13 @@ func (s *APIServer) pqCoverageCovered(ctx context.Context, sessionSID, signalTyp
 // （统计对账：GC 用 segment 样本量核对被清理 window 的样本量）。
 func (s *APIServer) pqCoverageSampleTotalFor(ctx context.Context, sessionSID, signalType string, from, to time.Time) uint64 {
 	var total uint64
+	types := pqV1SignalTypesFor(signalType)
+	if len(types) == 0 {
+		types = []string{signalType}
+	}
 	_ = s.DB.WithContext(ctx).Model(&model.ContinuousCoverageSegment{}).
-		Where("session_sid = ? AND signal_type = ? AND segment_start < ? AND segment_end > ?",
-			sessionSID, signalType, to, from).
+		Where("session_sid = ? AND signal_type IN ? AND segment_start < ? AND segment_end > ?",
+			sessionSID, types, to, from).
 		Select("COALESCE(SUM(sample_count),0)").Scan(&total).Error
 	return total
 }
