@@ -49,9 +49,9 @@ type StorageDiskSnapshot struct {
 }
 
 const (
-	storageMinFreeBytesDefault      uint64 = 1 << 30
-	storageWarningFreeBytesDefault  uint64 = 8 << 30
-	storageCriticalFreeBytesDefault uint64 = 4 << 30
+	storageMinFreeBytesDefault      uint64 = 512 << 20
+	storageWarningFreeBytesDefault  uint64 = 2 << 30
+	storageCriticalFreeBytesDefault uint64 = 1 << 30
 )
 
 // readStorageDiskSnapshot 是可被单元测试替换的 statfs 读取函数。

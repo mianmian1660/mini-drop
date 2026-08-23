@@ -109,6 +109,9 @@ func (s *APIServer) runParquetCycle(ctx context.Context, mode string) {
 	// 5) 阶段六：细粒度 GC（off|observe|enforce）
 	s.pqRunFineRowGC(ctx)
 
+	// 5b) 阶段六：migration receipt 回收（无界增长防护）
+	s.pqRunMigrationReceiptGC(ctx)
+
 	// 6) 阶段六：迁移失败重试/隔离 + coverage 过期回收
 	s.pqProcessMigrationFailures(ctx, 100)
 	s.pqReclaimExpiredCoverage(ctx, 500)

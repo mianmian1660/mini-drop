@@ -241,7 +241,7 @@ type ContinuousParquetConfig struct {
 	// ForecastWindowHours 每小时采集量预测窗口（用于 required_free 公式），默认 2。
 	ForecastWindowHours int `mapstructure:"forecast_window_hours"`
 	// RecoverHysteresisBytes 空间恢复到 required_free + 该值且连续两次
-	// 60s 检查通过后才自动恢复采集，默认 512 MiB。
+	// 60s 检查通过后才自动恢复采集，默认 128 MiB。
 	RecoverHysteresisBytes int64 `mapstructure:"recover_hysteresis_bytes"`
 	// RecoveryChecks 连续通过次数，默认 2。
 	RecoveryChecks int `mapstructure:"recovery_checks"`
@@ -265,6 +265,11 @@ type ContinuousParquetConfig struct {
 	// 30 分钟后标记 quarantined，默认 3。
 	// 环境变量 CONTINUOUS_MIGRATION_FAILURE_RETRY_LIMIT。
 	MigrationFailureRetryLimit int `mapstructure:"migration_failure_retry_limit"`
+	// MigrationReceiptRetentionHours migration receipt 保留时长（小时），默认
+	// 72。超过该时长的 batch receipt，若对应 profile_batches.bid 已不存在，则
+	// 在 Parquet 维护周期内被回收（passed/revoked 均可回收），防止无界增长。
+	// 环境变量 CONTINUOUS_MIGRATION_RECEIPT_RETENTION_HOURS。
+	MigrationReceiptRetentionHours int `mapstructure:"migration_receipt_retention_hours"`
 }
 
 // LogConfig 日志配置
@@ -384,8 +389,9 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("continuous_parquet.min_free_reserve", int64(512<<20))
 	v.SetDefault("continuous_parquet.required_free_extra_bytes", int64(0))
 	v.SetDefault("continuous_parquet.forecast_window_hours", 2)
-	v.SetDefault("continuous_parquet.recover_hysteresis_bytes", int64(512<<20))
+	v.SetDefault("continuous_parquet.recover_hysteresis_bytes", int64(128<<20))
 	v.SetDefault("continuous_parquet.recovery_checks", 2)
+	v.SetDefault("continuous_parquet.migration_receipt_retention_hours", 72)
 	v.SetDefault("blob.backfill_enabled", false)
 	v.SetDefault("blob.migration_enabled", false)
 	v.SetDefault("blob.gc_enabled", false)
@@ -397,9 +403,9 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("blob.migrate_elf", true)
 	v.SetDefault("blob.migrate_results", true)
 	v.SetDefault("storage_disk.path", "/tmp")
-	v.SetDefault("storage_disk.warning_free_bytes", uint64(8<<30))
-	v.SetDefault("storage_disk.critical_free_bytes", uint64(4<<30))
-	v.SetDefault("storage_disk.min_free_bytes", uint64(1<<30))
+	v.SetDefault("storage_disk.warning_free_bytes", uint64(2<<30))
+	v.SetDefault("storage_disk.critical_free_bytes", uint64(1<<30))
+	v.SetDefault("storage_disk.min_free_bytes", uint64(512<<20))
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")
 	v.SetDefault("log.output", "stdout")
@@ -583,6 +589,9 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envMigRetry := os.Getenv("CONTINUOUS_MIGRATION_FAILURE_RETRY_LIMIT"); envMigRetry != "" {
 		v.Set("continuous_parquet.migration_failure_retry_limit", envMigRetry)
+	}
+	if envReceiptRet := os.Getenv("CONTINUOUS_MIGRATION_RECEIPT_RETENTION_HOURS"); envReceiptRet != "" {
+		v.Set("continuous_parquet.migration_receipt_retention_hours", envReceiptRet)
 	}
 	if envBlobBackfill := os.Getenv("BLOB_BACKFILL_ENABLED"); envBlobBackfill != "" {
 		v.Set("blob.backfill_enabled", parseBoolEnv(envBlobBackfill))
@@ -847,13 +856,13 @@ func (cfg *Config) Validate() error {
 		cfg.StorageDisk.Path = "/tmp"
 	}
 	if cfg.StorageDisk.WarningFreeBytes == 0 {
-		cfg.StorageDisk.WarningFreeBytes = 8 << 30
+		cfg.StorageDisk.WarningFreeBytes = 2 << 30
 	}
 	if cfg.StorageDisk.CriticalFreeBytes == 0 {
-		cfg.StorageDisk.CriticalFreeBytes = 4 << 30
+		cfg.StorageDisk.CriticalFreeBytes = 1 << 30
 	}
 	if cfg.StorageDisk.MinFreeBytes == 0 {
-		cfg.StorageDisk.MinFreeBytes = 1 << 30
+		cfg.StorageDisk.MinFreeBytes = 512 << 20
 	}
 	// 阈值链必须严格递减且为正；违反时直接拒绝启动，避免等级判定失真。
 	if cfg.StorageDisk.WarningFreeBytes <= cfg.StorageDisk.CriticalFreeBytes ||
