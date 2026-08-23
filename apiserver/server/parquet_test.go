@@ -597,18 +597,30 @@ func TestPQShadowMismatchNeverBecomesActive(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	// 对象不存在 → loadContinuousBatches 失败 → 构建失败（fail-closed）
-	if built, err := s.pqBuildRawHour(ctx, "default", hour); err == nil || built {
-		t.Fatalf("missing source object must fail the hour build: built=%v err=%v", built, err)
+	// 对象不存在 → 登记 migration failure 并跳过（不阻塞），不产生 active 块
+	if built, err := s.pqBuildRawHour(ctx, "default", hour); err != nil || built {
+		t.Fatalf("missing source object must be recorded, not fail or build: built=%v err=%v", built, err)
 	}
 	key := pqBlockKey{Tenant: "default", BucketStart: hour, SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw}
 	if active, findErr := s.pqFindActiveBlock(ctx, key); findErr != nil || active != nil {
 		t.Fatalf("failed hour build must not activate any block: active=%+v err=%v", active, findErr)
 	}
+	var migCount int64
+	if err := s.DB.Model(&model.ContinuousMigrationFailure{}).
+		Where("source_kind = ? AND error_type = ?", "window", "missing_object").Count(&migCount).Error; err != nil || migCount == 0 {
+		t.Fatalf("missing object must be recorded as migration failure: count=%d err=%v", migCount, err)
+	}
 
-	// 窗口完整性：对象存在但窗口未被消费 → 构建失败
+	// 窗口完整性：payload 存在但窗口未被消费（无失败记录）→ 构建失败
+	objKey2 := "continuous/s1/b2.json"
+	if err := s.DB.Create(&model.ProfileWindow{
+		SessionSID: "s1", BatchBID: "b2", WindowStart: hour.Add(3 * time.Minute), WindowEnd: hour.Add(4 * time.Minute),
+		ObjectKey: objKey2, SignalType: "cpu_profile", SampleCount: 1, CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	mem := s.Storage.(*continuousMemoryStorage)
-	if err := mem.PutObject(ctx, "drop-data", objKey, strings.NewReader(`{"session_sid":"s1","batch_id":"b1","windows":[]}`), 0, "application/json"); err != nil {
+	if err := mem.PutObject(ctx, "drop-data", objKey2, strings.NewReader(`{"session_sid":"s1","batch_id":"b2","windows":[]}`), 0, "application/json"); err != nil {
 		t.Fatal(err)
 	}
 	if built, err := s.pqBuildRawHour(ctx, "default", hour); err == nil || built {

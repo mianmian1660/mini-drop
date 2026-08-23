@@ -330,7 +330,13 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 	for _, objectKey := range objectOrder {
 		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
-			return false, fmt.Errorf("v2 builder: 加载源对象 %s 失败: %w", objectKey, err)
+			// 阶段六：对象缺失/不可读 → 登记 migration failure 并跳过该对象，
+			// 不阻塞整小时（其余对象照常构建）。覆盖/lineage 会反映真实缺口。
+			for _, row := range byObject[objectKey] {
+				s.recordContinuousMigrationFailure(ctx, "window", "window-"+strconv.FormatUint(uint64(row.ID), 10),
+					row.SessionSID, objectKey, "missing_object", err.Error())
+			}
+			continue
 		}
 		batchByID := continuousBatchIndex(batches)
 		// 阶段六修正：按 (batch, signal) 去重而非按 batch——同一 batch 的
@@ -348,11 +354,13 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 				continue
 			}
 			seenSignal[groupKey] = true
-			batch, rowKey, ok := continuousResolveBatch(row, batches, batchByID)
+			batch, _, ok := continuousResolveBatch(row, batches, batchByID)
 			if !ok {
-				return false, fmt.Errorf("v2 builder: 无法解析源窗口 id=%d batch=%s", row.ID, row.BatchBID)
+				// batch 不在 payload（被重写移除/丢失）→ 登记失败并跳过该窗口
+				s.recordContinuousMigrationFailure(ctx, "window", "window-"+strconv.FormatUint(uint64(row.ID), 10),
+					row.SessionSID, objectKey, "source_mismatch", "batch 不在 payload")
+				continue
 			}
-			_ = rowKey
 			sessionSet[row.SessionSID] = true
 			if batch == nil {
 				continue
@@ -389,6 +397,9 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 	// 消费进对应信号的 raw 块。漏消费（batch 缺失/解析跳过）→ 块失败（fail-closed），
 	// 绝不静默丢失。样本总量不做跨语义比较（v1 sample_count 与 v2 行计数口径
 	// 不同：空 samples 回退 agent 计数/metrics 只数 rss/histogram 数 EventCount）。
+	// 已登记 migration failure 的窗口（missing_object/source_mismatch）视为审计
+	// 缺口，不参与完整性判据。
+	failedWindows := s.pqFailedWindowSet(ctx)
 	for _, signal := range []string{
 		model.ContinuousParquetSignalCPU,
 		model.ContinuousParquetSignalMetrics,
@@ -408,6 +419,9 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 				}
 			}
 			if mapped == "" {
+				continue
+			}
+			if failedWindows["window-"+strconv.FormatUint(uint64(w.ID), 10)] {
 				continue
 			}
 			key := w.SessionSID + "|" + strconv.FormatInt(w.WindowStart.UnixMilli(), 10)
@@ -1460,9 +1474,13 @@ func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.Con
 		return err
 	}
 	var missed []string
+	failedWindows := s.pqFailedWindowSet(ctx)
 	for _, w := range windows {
 		if w.ObjectKey == "" {
 			continue
+		}
+		if failedWindows["window-"+strconv.FormatUint(uint64(w.ID), 10)] {
+			continue // 已登记缺失/不匹配的审计缺口
 		}
 		if !memberSet[w.BatchBID] {
 			missed = append(missed, fmt.Sprintf("win=%d batch=%s", w.ID, w.BatchBID))
@@ -1471,14 +1489,19 @@ func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.Con
 	if len(missed) > 0 {
 		incParquetShadowFailure()
 		msg := fmt.Sprintf("信号 %s 遗漏 %d 个源窗口: %s", block.SignalType, len(missed), strings.Join(missed[:minInt(len(missed), 5)], ","))
+		// 对账失败 → 标记 failed 并退役该块（superseded，宽限后 sweep 删对象）；
+		// 下一周期 pqSealedRawHours 会重建该分区（含全部已消费 batch 的 member）。
 		_ = s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
 			Where("block_id = ? AND status = ?", block.BlockID, model.ContinuousParquetStatusActive).
 			Updates(map[string]interface{}{
+				"status":           model.ContinuousParquetStatusSuperseded,
+				"superseded_at":    now,
+				"delete_reason":    "reconcile_rebuild",
 				"reconcile_status": model.ContinuousParquetReconcileFailed,
 				"reconciled_at":    now,
 				"reconcile_error":  msg, "updated_at": now,
 			}).Error
-		s.Logger.Error("v2 shadow 对账不一致（窗口完整性）",
+		s.Logger.Error("v2 shadow 对账不一致（窗口完整性），触发重建",
 			zap.String("signal", block.SignalType), zap.String("block_id", block.BlockID), zap.String("error", msg))
 		return nil
 	}
@@ -1500,6 +1523,23 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// pqFailedWindowSet 返回已登记 migration failure 的 window ref 集合
+// （source_kind='window' 且未 resolved/purged）。完整性对账排除这些审计缺口。
+func (s *APIServer) pqFailedWindowSet(ctx context.Context) map[string]bool {
+	out := map[string]bool{}
+	var refs []string
+	if err := s.DB.WithContext(ctx).Model(&model.ContinuousMigrationFailure{}).
+		Where("source_kind = ? AND status IN ?", "window",
+			[]string{model.ContinuousMigrationFailureRetrying, model.ContinuousMigrationFailureQuarantined}).
+		Pluck("source_ref", &refs).Error; err != nil {
+		return out
+	}
+	for _, ref := range refs {
+		out[ref] = true
+	}
+	return out
 }
 
 // pqReconcileQuarantine 把连续多次对账失败（且跨越至少 30 分钟）的 raw 块
