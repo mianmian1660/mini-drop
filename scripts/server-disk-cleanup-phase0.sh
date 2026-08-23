@@ -57,7 +57,7 @@ report() {
 # 镜像是否被任何容器引用
 # ---------------------------------------------------------------------------
 container_refs() { # container_refs <image> → 引用容器数
-  docker ps -aq --filter "ancestor=$1" 2>/dev/null | grep -c .
+  docker ps -aq --filter "ancestor=$1" 2>/dev/null | wc -l | tr -d ' '
 }
 
 # 运行中/已打 rollback 标签的镜像 ID 集合（这些绝不允许删）

@@ -91,3 +91,6 @@ skills-lock.json
 .workbuddy/memory/2026-08-19.md
 .workbuddy/memory/2026-08-20.md
 .workbuddy/memory/2026-08-22.md
+
+# WorkBuddy 项目本地状态（记忆/工具数据，不随产品仓库分发）
+.workbuddy/
