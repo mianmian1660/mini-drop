@@ -47,6 +47,9 @@ type APIServer struct {
 
 	// 存储压力后台检测状态（阶段 0：磁盘止血）
 	storageState storageMonitorState
+
+	// 阶段五：容量前置门禁（required_free + Continuous 配额 + 恢复滞后）。
+	parquetDisk *parquetDiskState
 }
 
 // New 创建一个新的 APIServer 实例
@@ -114,6 +117,10 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 阶段三：启动内建持续剖析块存储 compactor（按配置开关；未启用时查询
 	// 继续走旧分钟对象，行为与阶段二完全一致）。
 	go s.startContinuousBlockCompactor()
+
+	// 阶段五：启动 Continuous Parquet v2 worker（按 CONTINUOUS_PARQUET_MODE；
+	// off 时不启动，查询完全走 v1）。
+	go s.startParquetWorkers()
 
 	// 阶段 0：启动存储压力后台检测（每 60 秒一次快照 + 指标 + 结构化日志）。
 	go s.startStorageMonitor()

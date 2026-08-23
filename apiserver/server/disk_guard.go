@@ -127,6 +127,8 @@ func (s *APIServer) currentStorageSnapshot() StorageDiskSnapshot {
 
 // canStartCollection 保留采集入口的硬保护：只有 emergency/unknown 才拒收，
 // warning/critical 放行。拒收时按来源计数（mini_drop_collection_rejected_low_disk_total）。
+// 阶段五在 emergency/unknown 之上叠加 required_free 动态门槛：
+// available < required_free 时同样拒收（new/retry/scheduled/continuous）。
 func (s *APIServer) canStartCollection(source string) (bool, string, StorageDiskSnapshot) {
 	snap := s.currentStorageSnapshot()
 	if snap.Level == StoragePressureEmergency || snap.Level == StoragePressureUnknown {
@@ -140,6 +142,11 @@ func (s *APIServer) canStartCollection(source string) (bool, string, StorageDisk
 			message = fmt.Sprintf("采集被拒绝：无法检查采集磁盘 %s 的状态（statfs 失败），已暂停新采集", snap.Path)
 		}
 		return false, message, snap
+	}
+	// 阶段五：required_free 动态门槛（低于门槛拒绝，防止 compaction/新采集
+	// 挤占保护线；恢复由 60s 检测状态机控制）。
+	if ok, reason, _ := s.collectionCapacityOK(source); !ok {
+		return false, reason, snap
 	}
 	return true, "", snap
 }

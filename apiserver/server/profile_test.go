@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -876,6 +877,22 @@ func (m *continuousMemoryStorage) GetObject(_ context.Context, _, key string) (i
 		return nil, fmt.Errorf("missing object %s", key)
 	}
 	return io.NopCloser(strings.NewReader(body)), nil
+}
+
+func (m *continuousMemoryStorage) GetObjectRange(_ context.Context, _, key string, offset, length int64) (io.ReadCloser, error) {
+	body, ok := m.objects[key]
+	if !ok {
+		return nil, fmt.Errorf("missing object %s", key)
+	}
+	data := []byte(body)
+	if offset >= int64(len(data)) {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	end := offset + length
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	return io.NopCloser(bytes.NewReader(data[offset:end])), nil
 }
 
 func (m *continuousMemoryStorage) PresignedGetURL(context.Context, string, string, time.Duration) (string, error) {

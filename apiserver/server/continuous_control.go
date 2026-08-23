@@ -368,5 +368,18 @@ func (s *APIServer) ReconcileContinuousSessions(c *gin.Context) {
 	var authoritativeState model.ContinuousAgentState
 	_ = s.DB.Where("target_ip = ?", req.TargetIP).First(&authoritativeState).Error
 	revision := authoritativeState.Revision
-	s.RespondOK(c, gin.H{"assignments": assignments, "revision": revision, "server_time": now})
+	// 阶段五：容量暂停时通过心跳把 server_storage_pressure 推给 Agent，
+	// Agent 停止产生新窗口（已产生窗口继续上报/ACK）。
+	halted := s.capacityHalted()
+	pressure := gin.H{"halted": halted}
+	if halted {
+		snap := s.currentStorageSnapshot()
+		pressure["required_free_bytes"] = s.diskV2().lastRequiredFree
+		pressure["available_bytes"] = snap.AvailableBytes
+		pressure["reason"] = "server_storage_pressure"
+	}
+	s.RespondOK(c, gin.H{
+		"assignments": assignments, "revision": revision, "server_time": now,
+		"server_pressure": pressure,
+	})
 }

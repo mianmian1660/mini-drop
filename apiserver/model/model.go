@@ -264,5 +264,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&StorageBlob{},
 		&StorageObjectGC{},
 		&StorageMigrationFailure{},
+		&ContinuousParquetBlock{},
+		&ContinuousParquetBlockFile{},
+		&ContinuousParquetBlockMember{},
 	)
 }

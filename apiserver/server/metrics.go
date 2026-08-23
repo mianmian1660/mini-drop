@@ -66,6 +66,9 @@ var (
 	metricBlobByStatus            = map[string]int64{}
 	metricBlobByStatusBytesMu     sync.Mutex
 	metricBlobByStatusBytes       = map[string]int64{}
+	// 阶段五：Parquet v2 指标
+	metricParquetBuildSkipTotal       int64 // counter：v2 块构建跳过（低磁盘/配额）
+	metricParquetMetricUnknownKindTotal int64 // counter：未登记 metric 类型告警
 )
 
 // 按来源计数的低磁盘拒收计数（label: source）。
@@ -79,6 +82,20 @@ var (
 	metricMaintenanceSkipMu sync.Mutex
 	metricMaintenanceSkip   = map[string]int64{}
 )
+
+// 阶段五：shadow 对账失败计数与指标辅助。
+var (
+	parquetShadowFailures atomic.Int64
+)
+
+func incParquetBuildSkip(reason string) {
+	atomic.AddInt64(&metricParquetBuildSkipTotal, 1)
+	incMaintenanceSkip("parquet_build")
+}
+func incParquetMetricUnknownKind(metric string) {
+	atomic.AddInt64(&metricParquetMetricUnknownKindTotal, 1)
+}
+func incParquetShadowFailure() { parquetShadowFailures.Add(1) }
 
 func incTasksCreated()         { atomic.AddInt64(&metricTasksCreatedTotal, 1) }
 func incTaskNotifyFailed()     { atomic.AddInt64(&metricTaskNotifyFailedTotal, 1) }
@@ -348,6 +365,12 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_continuous_compaction_skip_total %d\n", atomic.LoadInt64(&metricContinuousCompactionSkipTotal))
 	writeMetricHeader(&b, "mini_drop_continuous_reclaimed_bytes_total", "counter", "Bytes reclaimed by block/source-object garbage collection.")
 	fmt.Fprintf(&b, "mini_drop_continuous_reclaimed_bytes_total %d\n", atomic.LoadInt64(&metricContinuousReclaimedBytesTotal))
+	writeMetricHeader(&b, "mini_drop_parquet_build_skip_total", "counter", "Parquet v2 block builds skipped (low disk or quota exceeded).")
+	fmt.Fprintf(&b, "mini_drop_parquet_build_skip_total %d\n", atomic.LoadInt64(&metricParquetBuildSkipTotal))
+	writeMetricHeader(&b, "mini_drop_parquet_metric_unknown_kind_total", "counter", "Unknown metric kinds treated as gauge (alert for counter misclassification).")
+	fmt.Fprintf(&b, "mini_drop_parquet_metric_unknown_kind_total %d\n", atomic.LoadInt64(&metricParquetMetricUnknownKindTotal))
+	writeMetricHeader(&b, "mini_drop_parquet_shadow_failures_total", "counter", "Parquet v2 shadow reconciliation failures (v1 remains query source).")
+	fmt.Fprintf(&b, "mini_drop_parquet_shadow_failures_total %d\n", parquetShadowFailures.Load())
 	writeMetricHeader(&b, "mini_drop_storage_total_bytes", "gauge", "Total bytes of the monitored storage filesystem.")
 	fmt.Fprintf(&b, "mini_drop_storage_total_bytes %d\n", atomic.LoadInt64(&metricStorageTotalBytes))
 	writeMetricHeader(&b, "mini_drop_storage_available_bytes", "gauge", "Available bytes of the monitored storage filesystem.")

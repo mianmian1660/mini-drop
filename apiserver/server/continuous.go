@@ -137,6 +137,9 @@ type ContinuousStackSample struct {
 	Backend        string                 `json:"backend"`
 	Runtime        string                 `json:"runtime"`
 	Labels         map[string]interface{} `json:"labels"`
+	// Frames 阶段五结构化栈（Agent 兼容期同时发送 stack+frames；v2-only
+	// 且回滚窗口结束后仅发送 frames）。apiserver 优先使用 frames。
+	Frames []ContinuousStackFrame `json:"frames,omitempty"`
 }
 
 type ContinuousProfileIngest struct {
@@ -699,6 +702,14 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误: "+err.Error())
 		return
 	}
+	// 阶段五：容量暂停时拒绝 batch 采集（GC/删除继续；Agent 侧此时应已
+	// 进入 waiting/server_storage_pressure，这里是双保险）。
+	if s.capacityHalted() {
+		incCollectionRejectedLowDisk(CollectionSourceContinuous)
+		s.RespondHTTPError(c, http.StatusInsufficientStorage, ErrCodeStorageLowDisk,
+			"服务器存储压力：Continuous 采集已暂停（server_storage_pressure），请稍后重试")
+		return
+	}
 	if !req.StartTime.Before(req.EndTime) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "batch 时间范围不合法")
 		return
@@ -1036,6 +1047,7 @@ func (s *APIServer) QueryContinuousProfile(c *gin.Context) {
 	if !ok {
 		return
 	}
+	stats := s.pqQueryStatsFor(c.Request.Context(), q)
 	fg, found, err := s.queryNativeContinuousFlamegraph(c.Request.Context(), q)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
@@ -1048,32 +1060,40 @@ func (s *APIServer) QueryContinuousProfile(c *gin.Context) {
 	}
 	if !found {
 		s.RespondOK(c, gin.H{
-			"query":          profileLabelSelector(q),
-			"nodes":          []ProfileNode{},
-			"items":          []ProfileTopItem{},
-			"total":          0,
-			"unit":           "samples",
-			"empty":          true,
-			"message":        "Native Continuous Profiling 暂无覆盖该时间范围的 10s window",
-			"source":         "mini-drop-native",
-			"profile_source": "native",
-			"generated_at":   time.Now(),
+			"query":               profileLabelSelector(q),
+			"nodes":               []ProfileNode{},
+			"items":               []ProfileTopItem{},
+			"total":               0,
+			"unit":                "samples",
+			"empty":               true,
+			"message":             "Native Continuous Profiling 暂无覆盖该时间范围的 10s window",
+			"source":              "mini-drop-native",
+			"profile_source":      "native",
+			"generated_at":        time.Now(),
+			"resolution_seconds":  stats.ResolutionSeconds,
+			"mixed_resolution":    stats.MixedResolution,
+			"storage_source":      stats.StorageSource,
+			"earliest_available_at": stats.EarliestAvailable,
 		})
 		return
 	}
 	s.RespondOK(c, gin.H{
-		"query":           fg.Query,
-		"nodes":           fg.Nodes,
-		"items":           topn.Items,
-		"total":           fg.Total,
-		"unit":            fg.Unit,
-		"empty":           fg.Empty,
-		"message":         fg.Message,
-		"source":          fg.Source,
-		"profile_source":  fg.ProfileSource,
-		"profile_url":     fg.ProfileURL,
-		"raw_profile_url": fg.RawProfileURL,
-		"generated_at":    fg.GeneratedAt,
+		"query":               fg.Query,
+		"nodes":               fg.Nodes,
+		"items":               topn.Items,
+		"total":               fg.Total,
+		"unit":                fg.Unit,
+		"empty":               fg.Empty,
+		"message":             fg.Message,
+		"source":              fg.Source,
+		"profile_source":      fg.ProfileSource,
+		"profile_url":         fg.ProfileURL,
+		"raw_profile_url":     fg.RawProfileURL,
+		"generated_at":        fg.GeneratedAt,
+		"resolution_seconds":  stats.ResolutionSeconds,
+		"mixed_resolution":    stats.MixedResolution,
+		"storage_source":      stats.StorageSource,
+		"earliest_available_at": stats.EarliestAvailable,
 	})
 }
 
@@ -1215,6 +1235,7 @@ func (s *APIServer) cleanupContinuousRetention(ctx context.Context, session mode
 }
 
 func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q ProfileQuery) (ProfileFlamegraph, bool, error) {
+	stats := s.pqQueryStatsFor(ctx, q)
 	agg, found, err := s.queryNativeContinuousAggregate(ctx, q)
 	if err != nil {
 		return ProfileFlamegraph{}, found, err
@@ -1258,6 +1279,10 @@ func (s *APIServer) queryNativeContinuousFlamegraph(ctx context.Context, q Profi
 		RawProfileURL:      s.continuousRawProfileURL(ctx, agg.ObjectKeys),
 		Query:              profileLabelSelector(q),
 		SymbolStatus:       agg.SymbolStatus,
+		ResolutionSeconds:  stats.ResolutionSeconds,
+		MixedResolution:    stats.MixedResolution,
+		StorageSource:      stats.StorageSource,
+		EarliestAvailable:  stats.EarliestAvailable,
 		SymbolDiagnostics:  continuousSymbolDiagnostics(agg),
 		RuntimeDiagnostics: continuousRuntimeDiagnostics(agg),
 		Truncated:          truncated,
@@ -1899,6 +1924,17 @@ func downsampleRSSPoints(points []ProfileTimeseriesPoint, limit int) []ProfileTi
 }
 
 func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q ProfileQuery) (continuousAggregate, bool, error) {
+	// 阶段五：prefer/enforce 模式优先 v2（覆盖完整时走纯 v2，缺口整段回退 v1）。
+	if pqModeQueryV2(s.pqModeOf()) {
+		v2Agg, v2Found, err := s.pqQueryAggregateV2(ctx, q)
+		if err != nil {
+			return continuousAggregate{}, false, err
+		}
+		if v2Found {
+			return v2Agg, true, nil
+		}
+		// 无 v2 覆盖 → 回退 v1
+	}
 	var windows []model.ProfileWindow
 	sessionQuery := s.continuousSessionSelection(q)
 	signalType := "cpu_profile"

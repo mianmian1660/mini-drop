@@ -315,6 +315,12 @@ func (s *APIServer) runContinuousBlockCompaction(ctx context.Context) {
 	if s.DB == nil || !cfg.Enabled {
 		return
 	}
+	// 阶段五 enforce：停止生成 v1 小时块（分钟 JSON 仅作 staging，
+	// 由 v2 raw 构建消费）；既有 v1 保留 24h 回滚窗口后分批删除。
+	if pqMode(s.Config.ContinuousParquet.Mode) == "enforce" {
+		s.recordContinuousBlockSkip("v2_enforce", "")
+		return
+	}
 	if !s.StorageConnected() {
 		s.recordContinuousBlockSkip("storage_disconnected", "")
 		return

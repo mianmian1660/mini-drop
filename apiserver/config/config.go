@@ -15,20 +15,21 @@ import (
 
 // Config 是全局配置结构体，包含所有运行时配置
 type Config struct {
-	Server          ServerConfig          `mapstructure:"server"`
-	Database        DatabaseConfig        `mapstructure:"database"`
-	GRPC            GRPCConfig            `mapstructure:"grpc"`
-	Storage         StorageConfig         `mapstructure:"storage"`
-	Retention       RetentionConfig       `mapstructure:"retention"`
-	ContinuousBlock ContinuousBlockConfig `mapstructure:"continuous_block"`
-	Blob            BlobConfig            `mapstructure:"blob"`
-	StorageDisk     StorageDiskConfig     `mapstructure:"storage_disk"`
-	Log             LogConfig             `mapstructure:"log"`
-	Security        SecurityConfig        `mapstructure:"security"`
-	Observability   ObservabilityConfig   `mapstructure:"observability"`
-	Profile         ProfileConfig         `mapstructure:"profile"`
-	AgentDiscovery  AgentDiscoveryConfig  `mapstructure:"agent_discovery"`
-	SingleShot      SingleShotConfig      `mapstructure:"single_shot"`
+	Server           ServerConfig             `mapstructure:"server"`
+	Database         DatabaseConfig           `mapstructure:"database"`
+	GRPC             GRPCConfig               `mapstructure:"grpc"`
+	Storage          StorageConfig            `mapstructure:"storage"`
+	Retention        RetentionConfig          `mapstructure:"retention"`
+	ContinuousBlock  ContinuousBlockConfig    `mapstructure:"continuous_block"`
+	ContinuousParquet ContinuousParquetConfig `mapstructure:"continuous_parquet"`
+	Blob             BlobConfig               `mapstructure:"blob"`
+	StorageDisk      StorageDiskConfig        `mapstructure:"storage_disk"`
+	Log              LogConfig                `mapstructure:"log"`
+	Security         SecurityConfig           `mapstructure:"security"`
+	Observability    ObservabilityConfig      `mapstructure:"observability"`
+	Profile          ProfileConfig            `mapstructure:"profile"`
+	AgentDiscovery   AgentDiscoveryConfig     `mapstructure:"agent_discovery"`
+	SingleShot       SingleShotConfig         `mapstructure:"single_shot"`
 }
 
 // SingleShotConfig 阶段 4：单次采样最终存储模型的发布开关。
@@ -179,6 +180,73 @@ type ContinuousBlockConfig struct {
 	CompactionIntervalSec int `mapstructure:"compaction_interval_sec"`
 }
 
+// ContinuousParquetConfig 控制阶段五的 Continuous Parquet Block v2。
+// 保留阶段三 gzip JSON Block v1 作为兼容基线与回退源；v2 是独立链路
+// （continuous/v2/...），写入 Parquet 文件并登记到目录账本
+// （continuous_parquet_blocks / block_files / block_members）。
+//
+// Mode 取值（CONTINUOUS_PARQUET_MODE，默认 off）：
+//   - off：不写入 v2，不启动 v2 compactor；查询完全走 v1。Parquet reader
+//     仍然可用（迁移重放/兼容读取），additive migration 正常应用。
+//   - shadow：v2 双写 + 每完成小时自动对账；v1 仍是唯一查询源。
+//   - prefer：按 coverage map 优先 v2，缺口回退 v1，继续双写。
+//   - enforce：停止生成 v1 小时块（分钟 JSON 仅作 staging）；既有 v1
+//     保留 24h 回滚窗口后按 200 对象/批分批删除。
+//
+// 对象布局固定为：
+//
+//	continuous/v2/tenant=default/date=YYYY-MM-DD/hour=HH/
+//	  signal=cpu|metrics|histogram|db/resolution=raw|5m|1h/{block-id}-{part}.parquet
+//
+// raw/5m/1h 默认保留 24h/7d/30d；Continuous 硬配额 4 GiB（目标水位 3.6 GiB），
+// staging、v1 fallback 与 v2 共用同一配额池。
+type ContinuousParquetConfig struct {
+	// Mode 运行模式：off | shadow | prefer | enforce。
+	Mode string `mapstructure:"mode"`
+	// Tenant 单租户固定为 default（当前系统只支持单租户）。
+	Tenant string `mapstructure:"tenant"`
+	// RawRetentionHours / Res5mRetentionHours / Res1hRetentionHours：
+	// raw/5m/1h 分区保留时长（小时），默认 24 / 168 / 720。
+	RawRetentionHours  int `mapstructure:"raw_retention_hours"`
+	Res5mRetentionHours int `mapstructure:"res5m_retention_hours"`
+	Res1hRetentionHours int `mapstructure:"res1h_retention_hours"`
+	// QuotaBytes Continuous 全部存储（staging + v1 fallback + v2）硬配额，
+	// 默认 4 GiB（CONTINUOUS_QUOTA_BYTES）。
+	QuotaBytes int64 `mapstructure:"quota_bytes"`
+	// QuotaTargetBytes 目标水位，默认 3.6 GiB（CONTINUOUS_QUOTA_TARGET_BYTES）。
+	QuotaTargetBytes int64 `mapstructure:"quota_target_bytes"`
+	// StagingMinutesRetention 分钟 JSON staging（未压缩 batch）最长保留时长
+	// （分钟），默认 120（约 2 小时，v2 raw 块生成后即可清理）。
+	StagingMinutesRetention int `mapstructure:"staging_minutes_retention"`
+	// RowGroupTargetBytes 单 row group 目标大小（字节），默认 16 MiB。
+	RowGroupTargetBytes int64 `mapstructure:"row_group_target_bytes"`
+	// MaxPartBytes 单 Parquet 文件目标上限（字节），默认 128 MiB；超出时
+	// 同一 logical block 拆分为多个 part。
+	MaxPartBytes int64 `mapstructure:"max_part_bytes"`
+	// ShadowBackfillHours shadow 模式启动时回填最近 N 个完整小时，默认 1。
+	ShadowBackfillHours int `mapstructure:"shadow_backfill_hours"`
+	// ReconcileIntervalSec 每小时对账/补偿 worker 扫描周期（秒），默认 300。
+	ReconcileIntervalSec int `mapstructure:"reconcile_interval_sec"`
+	// BlockIntervalSec v2 block 生成扫描周期（秒），默认 300。
+	BlockIntervalSec int `mapstructure:"block_interval_sec"`
+	// V1RollbackWindowHours enforce 删除 v1 前的回滚窗口（小时），默认 24。
+	V1RollbackWindowHours int `mapstructure:"v1_rollback_window_hours"`
+	// V1DeleteBatch 删除 v1 块/对象每批数量，默认 200。
+	V1DeleteBatch int `mapstructure:"v1_delete_batch"`
+	// MinFreeReserve 除 min_free_bytes 外为 v2 构建/迁移保留的额外空间
+	// （字节），默认 512 MiB（CONTINUOUS_PARQUET_MIN_FREE_RESERVE）。
+	MinFreeReserve int64 `mapstructure:"min_free_reserve"`
+	// RequiredFreeExtraBytes 在 required_free 公式中额外保留的空间，默认 0。
+	RequiredFreeExtraBytes int64 `mapstructure:"required_free_extra_bytes"`
+	// ForecastWindowHours 每小时采集量预测窗口（用于 required_free 公式），默认 2。
+	ForecastWindowHours int `mapstructure:"forecast_window_hours"`
+	// RecoverHysteresisBytes 空间恢复到 required_free + 该值且连续两次
+	// 60s 检查通过后才自动恢复采集，默认 512 MiB。
+	RecoverHysteresisBytes int64 `mapstructure:"recover_hysteresis_bytes"`
+	// RecoveryChecks 连续通过次数，默认 2。
+	RecoveryChecks int `mapstructure:"recovery_checks"`
+}
+
 // LogConfig 日志配置
 type LogConfig struct {
 	Level  string `mapstructure:"level"`
@@ -278,6 +346,26 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("continuous_block.window_sec", 3600)
 	v.SetDefault("continuous_block.compaction_delay_sec", 600)
 	v.SetDefault("continuous_block.compaction_interval_sec", 300)
+	v.SetDefault("continuous_parquet.mode", "off")
+	v.SetDefault("continuous_parquet.tenant", "default")
+	v.SetDefault("continuous_parquet.raw_retention_hours", 24)
+	v.SetDefault("continuous_parquet.res5m_retention_hours", 168)
+	v.SetDefault("continuous_parquet.res1h_retention_hours", 720)
+	v.SetDefault("continuous_parquet.quota_bytes", int64(4<<30))
+	v.SetDefault("continuous_parquet.quota_target_bytes", int64(3600*1024*1024))
+	v.SetDefault("continuous_parquet.staging_minutes_retention", 120)
+	v.SetDefault("continuous_parquet.row_group_target_bytes", int64(16<<20))
+	v.SetDefault("continuous_parquet.max_part_bytes", int64(128<<20))
+	v.SetDefault("continuous_parquet.shadow_backfill_hours", 1)
+	v.SetDefault("continuous_parquet.reconcile_interval_sec", 300)
+	v.SetDefault("continuous_parquet.block_interval_sec", 300)
+	v.SetDefault("continuous_parquet.v1_rollback_window_hours", 24)
+	v.SetDefault("continuous_parquet.v1_delete_batch", 200)
+	v.SetDefault("continuous_parquet.min_free_reserve", int64(512<<20))
+	v.SetDefault("continuous_parquet.required_free_extra_bytes", int64(0))
+	v.SetDefault("continuous_parquet.forecast_window_hours", 2)
+	v.SetDefault("continuous_parquet.recover_hysteresis_bytes", int64(512<<20))
+	v.SetDefault("continuous_parquet.recovery_checks", 2)
 	v.SetDefault("blob.backfill_enabled", false)
 	v.SetDefault("blob.migration_enabled", false)
 	v.SetDefault("blob.gc_enabled", false)
@@ -400,6 +488,66 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envBlockInterval := os.Getenv("CONTINUOUS_BLOCK_COMPACTION_INTERVAL_SEC"); envBlockInterval != "" {
 		v.Set("continuous_block.compaction_interval_sec", envBlockInterval)
+	}
+	if envPQMode := os.Getenv("CONTINUOUS_PARQUET_MODE"); envPQMode != "" {
+		v.Set("continuous_parquet.mode", envPQMode)
+	}
+	if envPQTenant := os.Getenv("CONTINUOUS_PARQUET_TENANT"); envPQTenant != "" {
+		v.Set("continuous_parquet.tenant", envPQTenant)
+	}
+	if envPQRaw := os.Getenv("CONTINUOUS_PARQUET_RAW_RETENTION_HOURS"); envPQRaw != "" {
+		v.Set("continuous_parquet.raw_retention_hours", envPQRaw)
+	}
+	if envPQ5m := os.Getenv("CONTINUOUS_PARQUET_5M_RETENTION_HOURS"); envPQ5m != "" {
+		v.Set("continuous_parquet.res5m_retention_hours", envPQ5m)
+	}
+	if envPQ1h := os.Getenv("CONTINUOUS_PARQUET_1H_RETENTION_HOURS"); envPQ1h != "" {
+		v.Set("continuous_parquet.res1h_retention_hours", envPQ1h)
+	}
+	if envPQQuota := os.Getenv("CONTINUOUS_QUOTA_BYTES"); envPQQuota != "" {
+		v.Set("continuous_parquet.quota_bytes", envPQQuota)
+	}
+	if envPQQuotaTarget := os.Getenv("CONTINUOUS_QUOTA_TARGET_BYTES"); envPQQuotaTarget != "" {
+		v.Set("continuous_parquet.quota_target_bytes", envPQQuotaTarget)
+	}
+	if envPQStaging := os.Getenv("CONTINUOUS_STAGING_MINUTES_RETENTION"); envPQStaging != "" {
+		v.Set("continuous_parquet.staging_minutes_retention", envPQStaging)
+	}
+	if envPQRG := os.Getenv("CONTINUOUS_PARQUET_ROW_GROUP_TARGET_BYTES"); envPQRG != "" {
+		v.Set("continuous_parquet.row_group_target_bytes", envPQRG)
+	}
+	if envPQPart := os.Getenv("CONTINUOUS_PARQUET_MAX_PART_BYTES"); envPQPart != "" {
+		v.Set("continuous_parquet.max_part_bytes", envPQPart)
+	}
+	if envPQBackfill := os.Getenv("CONTINUOUS_PARQUET_SHADOW_BACKFILL_HOURS"); envPQBackfill != "" {
+		v.Set("continuous_parquet.shadow_backfill_hours", envPQBackfill)
+	}
+	if envPQReconcile := os.Getenv("CONTINUOUS_PARQUET_RECONCILE_INTERVAL_SEC"); envPQReconcile != "" {
+		v.Set("continuous_parquet.reconcile_interval_sec", envPQReconcile)
+	}
+	if envPQInterval := os.Getenv("CONTINUOUS_PARQUET_BLOCK_INTERVAL_SEC"); envPQInterval != "" {
+		v.Set("continuous_parquet.block_interval_sec", envPQInterval)
+	}
+	if envPQRollback := os.Getenv("CONTINUOUS_PARQUET_V1_ROLLBACK_WINDOW_HOURS"); envPQRollback != "" {
+		v.Set("continuous_parquet.v1_rollback_window_hours", envPQRollback)
+	}
+	if envPQV1Del := os.Getenv("CONTINUOUS_PARQUET_V1_DELETE_BATCH"); envPQV1Del != "" {
+		v.Set("continuous_parquet.v1_delete_batch", envPQV1Del)
+	}
+	if envPQReserve := os.Getenv("CONTINUOUS_PARQUET_MIN_FREE_RESERVE"); envPQReserve != "" {
+		v.Set("continuous_parquet.min_free_reserve", envPQReserve)
+	}
+	if envPQExtra := os.Getenv("CONTINUOUS_PARQUET_REQUIRED_FREE_EXTRA_BYTES"); envPQExtra != "" {
+		v.Set("continuous_parquet.required_free_extra_bytes", envPQExtra)
+	}
+	if envPQForecast := os.Getenv("CONTINUOUS_PARQUET_FORECAST_WINDOW_HOURS"); envPQForecast != "" {
+		v.Set("continuous_parquet.forecast_window_hours", envPQForecast)
+	}
+	if envPQRecover := os.Getenv("CONTINUOUS_PARQUET_RECOVER_HYSTERESIS_BYTES"); envPQRecover != "" {
+		v.Set("continuous_parquet.recover_hysteresis_bytes", envPQRecover)
+	}
+	if envPQChecks := os.Getenv("CONTINUOUS_PARQUET_RECOVERY_CHECKS"); envPQChecks != "" {
+		v.Set("continuous_parquet.recovery_checks", envPQChecks)
 	}
 	if envBlobBackfill := os.Getenv("BLOB_BACKFILL_ENABLED"); envBlobBackfill != "" {
 		v.Set("blob.backfill_enabled", parseBoolEnv(envBlobBackfill))

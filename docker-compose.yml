@@ -86,7 +86,7 @@ services:
       minio:
         condition: service_healthy
     entrypoint: >
-      /bin/sh -c " mc alias set myminio http://minio:9000 drop dropdrop; mc mb --ignore-existing myminio/drop-data; mc anonymous set public myminio/drop-data; echo 'MinIO init: bucket=drop-data, policy=public'; "
+      /bin/sh -c " mc alias set myminio http://minio:9000 drop dropdrop; mc mb --ignore-existing myminio/drop-data; mc anonymous set public myminio/drop-data; mc anonymous set private myminio/drop-data/continuous/v2/; echo 'MinIO init: bucket=drop-data, policy=public (continuous/v2 anonymous read denied)'; "
 
   # ========================================================
   # drop_server — C++ 调度中心
@@ -264,6 +264,28 @@ services:
       CONTINUOUS_BLOCK_WINDOW_SEC: "${CONTINUOUS_BLOCK_WINDOW_SEC:-3600}"
       CONTINUOUS_BLOCK_COMPACTION_DELAY_SEC: "${CONTINUOUS_BLOCK_COMPACTION_DELAY_SEC:-600}"
       CONTINUOUS_BLOCK_COMPACTION_INTERVAL_SEC: "${CONTINUOUS_BLOCK_COMPACTION_INTERVAL_SEC:-300}"
+      # 阶段五：Continuous Parquet Block v2
+      # 保留 v1 作为兼容基线与回退源；mode=off|shadow|prefer|enforce（默认 off）。
+      # off：不写 v2、查询全走 v1；shadow：v2 双写+v1 查询；prefer：v2 优先
+      # 缺口回退 v1；enforce：停 v1 小时块、24h 回滚窗口后分批删 v1。
+      CONTINUOUS_PARQUET_MODE: "${CONTINUOUS_PARQUET_MODE:-off}"
+      CONTINUOUS_PARQUET_TENANT: "${CONTINUOUS_PARQUET_TENANT:-default}"
+      CONTINUOUS_PARQUET_RAW_RETENTION_HOURS: "${CONTINUOUS_PARQUET_RAW_RETENTION_HOURS:-24}"
+      CONTINUOUS_PARQUET_5M_RETENTION_HOURS: "${CONTINUOUS_PARQUET_5M_RETENTION_HOURS:-168}"
+      CONTINUOUS_PARQUET_1H_RETENTION_HOURS: "${CONTINUOUS_PARQUET_1H_RETENTION_HOURS:-720}"
+      CONTINUOUS_QUOTA_BYTES: "${CONTINUOUS_QUOTA_BYTES:-4294967296}"
+      CONTINUOUS_QUOTA_TARGET_BYTES: "${CONTINUOUS_QUOTA_TARGET_BYTES:-3774873600}"
+      CONTINUOUS_STAGING_MINUTES_RETENTION: "${CONTINUOUS_STAGING_MINUTES_RETENTION:-120}"
+      CONTINUOUS_PARQUET_ROW_GROUP_TARGET_BYTES: "${CONTINUOUS_PARQUET_ROW_GROUP_TARGET_BYTES:-16777216}"
+      CONTINUOUS_PARQUET_MAX_PART_BYTES: "${CONTINUOUS_PARQUET_MAX_PART_BYTES:-134217728}"
+      CONTINUOUS_PARQUET_SHADOW_BACKFILL_HOURS: "${CONTINUOUS_PARQUET_SHADOW_BACKFILL_HOURS:-1}"
+      CONTINUOUS_PARQUET_RECONCILE_INTERVAL_SEC: "${CONTINUOUS_PARQUET_RECONCILE_INTERVAL_SEC:-300}"
+      CONTINUOUS_PARQUET_BLOCK_INTERVAL_SEC: "${CONTINUOUS_PARQUET_BLOCK_INTERVAL_SEC:-300}"
+      CONTINUOUS_PARQUET_V1_ROLLBACK_WINDOW_HOURS: "${CONTINUOUS_PARQUET_V1_ROLLBACK_WINDOW_HOURS:-24}"
+      CONTINUOUS_PARQUET_V1_DELETE_BATCH: "${CONTINUOUS_PARQUET_V1_DELETE_BATCH:-200}"
+      CONTINUOUS_PARQUET_MIN_FREE_RESERVE: "${CONTINUOUS_PARQUET_MIN_FREE_RESERVE:-536870912}"
+      CONTINUOUS_PARQUET_RECOVER_HYSTERESIS_BYTES: "${CONTINUOUS_PARQUET_RECOVER_HYSTERESIS_BYTES:-536870912}"
+      CONTINUOUS_PARQUET_RECOVERY_CHECKS: "${CONTINUOUS_PARQUET_RECOVERY_CHECKS:-2}"
     extra_hosts:
       - "localhost:host-gateway" # 让容器内也能通过 localhost 访问宿主机上的 MinIO 端口
     depends_on:

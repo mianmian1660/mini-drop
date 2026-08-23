@@ -37,6 +37,11 @@ type Storage interface {
 	// GetObject 下载文件
 	GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, error)
 
+	// GetObjectRange 下载文件指定字节范围 [offset, offset+length)。
+	// 阶段五 Parquet 列裁剪/row group 选择只读取所需范围，不允许全量下载。
+	// 超出对象末尾时返回 io.EOF 语义错误（与 io.ReaderAt 约定一致）。
+	GetObjectRange(ctx context.Context, bucket, key string, offset, length int64) (io.ReadCloser, error)
+
 	// PresignedGetURL 生成预签名下载 URL（有效期秒数）
 	PresignedGetURL(ctx context.Context, bucket, key string, expires time.Duration) (string, error)
 

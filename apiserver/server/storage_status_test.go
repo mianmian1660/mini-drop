@@ -143,7 +143,10 @@ func TestStorageStatfsFailureFailsClosed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// warning/critical 不拒收，emergency/unknown 才拒收
+// 拒收边界（阶段 0 + 阶段五）：emergency/unknown 拒收；低于 required_free
+// 动态门槛（阶段五）也拒收；达到/超过 required_free 且非 emergency/unknown
+// 才放行。warning 级别（高于 required_free）放行，critical 级别（低于
+// required_free）拒收。
 // ---------------------------------------------------------------------------
 
 func TestCollectionOnlyRejectedOnEmergencyOrUnknown(t *testing.T) {
@@ -152,17 +155,17 @@ func TestCollectionOnlyRejectedOnEmergencyOrUnknown(t *testing.T) {
 		avail   uint64
 		wantRej bool
 	}{
-		{"warning", 5 * giB, false},
-		{"critical", 2 * giB, false},
-		{"emergency", 512 * 1024 * 1024, true},
+		// required_free = max(critical=4GiB, min+reserve=1.5GiB) = 4GiB
+		{"warning_above_required", 8 * giB, false},      // > required_free
+		{"critical_below_required", 2 * giB, true},      // < required_free（阶段五新增拒收）
+		{"emergency", 512 * 1024 * 1024, true},          // < min_free
+		{"normal", 20 * giB, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resetMetricsForTest()
 			setDiskFree(t, 40*giB, tc.avail, 40*giB-tc.avail, nil)
 			s := newTestAPIServer(t)
-			s.Config = &config.Config{StorageDisk: config.StorageDiskConfig{
-				Path: "/tmp", WarningFreeBytes: 8 * giB, CriticalFreeBytes: 4 * giB, MinFreeBytes: 1 * giB,
-			}}
+			s.Config = pqTestConfig()
 			ok, _, _ := s.canStartCollection(CollectionSourceOneShot)
 			if ok == tc.wantRej {
 				t.Fatalf("rejected = %v, want %v (avail=%d)", !ok, tc.wantRej, tc.avail)

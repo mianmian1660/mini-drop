@@ -45,6 +45,18 @@ func (m *retentionMemoryStorage) GetObject(_ context.Context, _, key string) (io
 	return io.NopCloser(bytes.NewReader(m.objects[key])), nil
 }
 
+func (m *retentionMemoryStorage) GetObjectRange(_ context.Context, _, key string, offset, length int64) (io.ReadCloser, error) {
+	data := m.objects[key]
+	if int64(len(data)) <= offset {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	end := offset + length
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	return io.NopCloser(bytes.NewReader(data[offset:end])), nil
+}
+
 func (m *retentionMemoryStorage) PresignedGetURL(context.Context, string, string, time.Duration) (string, error) {
 	return "http://example.test/signed", nil
 }

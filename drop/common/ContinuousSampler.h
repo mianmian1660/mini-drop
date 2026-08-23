@@ -74,6 +74,29 @@ struct ContinuousSamplerConfig
 // a shared engine starts; callers use this for capability reporting only.
 bool CoreContinuousSamplerAvailable();
 
+// 阶段五：服务器存储压力（server_storage_pressure）全局开关。由
+// ContinuousSessionManager 从心跳响应的 server_pressure.halted 解析后设置；
+// 采样器在 spool_has_collection_capacity 处读取——压力期间停止产生新窗口，
+// 已有 spool 继续按重试/ACK 流程排空。
+void SetContinuousServerPressure(bool halted);
+bool ContinuousServerPressureHalted();
+
+// 阶段五：结构化栈帧。perf 解析保留 IP、symbol、DSO，并从 mmap/build-id
+// 计算 file-relative normalized_offset；py-spy/memray/bpftrace 能获取的
+// 字段如实填写；无法获取的字段为 NULL/0，不推测。
+struct ContinuousStackFrame
+{
+    std::string function;       // 符号名（无符号时为空）
+    std::string raw;            // 原始帧串（perf script 原样）
+    std::string file;           // 源文件（可解析时）
+    int32_t line = 0;           // 源文件行号（0 = 未知）
+    uint64_t address = 0;       // 指令地址（IP；0 = 未知）
+    std::string mappingFile;    // 所属 DSO（"" = 未知）
+    std::string buildId;        // ELF build-id（16 进制；"" = 未知）
+    uint64_t normalizedOffset = 0; // 相对 mapping 基址偏移（0 = 未知）
+    bool resolved = false;      // 是否解析出符号
+};
+
 struct ContinuousSampleWindow
 {
     int64_t windowStartUnixMs = 0;

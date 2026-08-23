@@ -152,6 +152,11 @@ type ProfileFlamegraph struct {
 	// 采样摘要（火焰图场景下摘要没有调用树，实际不会有 Nodes，只用来
 	// 承载 Message 提示前端引导去看 TopN）。
 	Degraded bool `json:"degraded,omitempty"`
+	// 阶段五：v2 兼容字段（mode=prefer/enforce 时填充）。
+	ResolutionSeconds  int        `json:"resolution_seconds,omitempty"`
+	MixedResolution    bool       `json:"mixed_resolution,omitempty"`
+	StorageSource      string     `json:"storage_source,omitempty"`
+	EarliestAvailable  *time.Time `json:"earliest_available_at,omitempty"`
 }
 
 type ProfileTopItem struct {

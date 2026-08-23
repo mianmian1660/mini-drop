@@ -12,6 +12,7 @@
 package server
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -45,6 +46,11 @@ func (s *APIServer) startStorageMonitor() {
 func (s *APIServer) checkStoragePressure() {
 	snap := s.currentStorageSnapshot()
 	updateStorageMetrics(snap)
+
+	// 阶段五：容量门禁恢复滞后状态机（60s 一次，连续通过后才自动恢复）。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = s.tickRecoveryState(ctx, snap)
+	cancel()
 
 	s.storageState.mu.Lock()
 	defer s.storageState.mu.Unlock()
@@ -94,11 +100,20 @@ func (s *APIServer) logStorageLevel(snap StorageDiskSnapshot, changed bool) {
 // StorageStatus 返回最新磁盘快照 + Artifact 生命周期统计 + Blob 统计。
 // GET /api/v1/storage/status（鉴权分组内）
 func (s *APIServer) StorageStatus(c *gin.Context) {
+	ctx := c.Request.Context()
 	snap := s.currentStorageSnapshot()
 	// 每次请求实时刷新统计（量级可控：聚合 SQL）。
-	s.collectLifecycleStats(c.Request.Context())
+	s.collectLifecycleStats(ctx)
 	lifecycle := s.lifecycleStatsSnapshot()
-	blob := s.collectBlobStats(c.Request.Context())
+	blob := s.collectBlobStats(ctx)
+
+	// 阶段五：容量门禁 + Continuous 配额 + v2 覆盖
+	requiredFree := s.requiredFreeBytes(ctx)
+	forecast := s.forecastIngestBytes(ctx, s.Config.ContinuousParquet.ForecastWindowHours)
+	quota := s.continuousQuotaSnapshot(ctx)
+	coverage := s.pqCoverageSnapshot(ctx)
+	mode := s.pqModeOf()
+
 	s.RespondOK(c, gin.H{
 		"path":                 snap.Path,
 		"total_bytes":          snap.TotalBytes,
@@ -109,6 +124,23 @@ func (s *APIServer) StorageStatus(c *gin.Context) {
 		"new_collection_allowed": snap.CollectionAllowed,
 		"maintenance_allowed":  blob.MaintenanceAllowed,
 		"checked_at":           snap.CheckedAt,
+		// 阶段五：容量门禁
+		"required_free_bytes":       requiredFree,
+		"forecast_ingest_bytes_2h":  forecast,
+		"capacity_halted":           s.capacityHalted(),
+		"continuous_quota_bytes":    quota.QuotaBytes,
+		"continuous_quota_target_bytes": quota.TargetBytes,
+		"continuous_quota_used_bytes":   quota.UsedBytes,
+		"continuous_staging_bytes":  quota.StagingBytes,
+		"continuous_v1_block_bytes": quota.V1BlockBytes,
+		"continuous_v2_block_bytes": quota.V2BlockBytes,
+		"parquet_mode":              mode,
+		"parquet_blocks_by_resolution": coverage.ByResolution,
+		"parquet_active_blocks":     coverage.ActiveBlocks,
+		"parquet_shadow_failures":   coverage.ShadowFailures,
+		"parquet_validation_backlog": coverage.ValidationBacklog,
+		"v1_fallback_bytes":         quota.V1BlockBytes,
+		"earliest_available_at":     coverage.EarliestActiveAt,
 		"lifecycle_mode":       lifecycle.Mode,
 		"policy_version":       lifecycle.PolicyVersion,
 		"reconcile_backlog":    lifecycle.ReconcileBacklog,

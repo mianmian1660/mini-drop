@@ -301,8 +301,14 @@ static uint64_t spool_free_bytes(const ContinuousSamplerConfig &cfg)
     return static_cast<uint64_t>(fs.f_bavail) * static_cast<uint64_t>(fs.f_frsize);
 }
 
+// 阶段五：服务器存储压力全局标志（ContinuousSessionManager 心跳解析设置）。
+static std::atomic<bool> g_continuousServerPressureHalted{false};
+
 static bool spool_has_collection_capacity(const ContinuousSamplerConfig &cfg)
 {
+    // 服务器存储压力：停止产生新窗口（Agent 进入 waiting/server_storage_pressure）。
+    if (ContinuousServerPressureHalted())
+        return false;
     return spool_usage_bytes(cfg) < cfg.spoolMaxBytes &&
            spool_free_bytes(cfg) >= cfg.spoolMinFreeBytes;
 }
@@ -371,6 +377,7 @@ static bool looks_like_bpftrace_error(const std::string &text)
 struct AggregatedSample
 {
     std::vector<std::string> stack;
+    std::vector<drop::ContinuousStackFrame> frames; // 阶段五：结构化栈（与 stack 并行，可能为空）
     std::string comm;
     int pid = 0;
     int64_t processStartMs = 0;
@@ -504,6 +511,15 @@ static bool env_enabled_default(const char *name, bool fallback)
         return static_cast<char>(std::tolower(c));
     });
     return text == "1" || text == "true" || text == "yes" || text == "on";
+}
+
+// 阶段五：frames-only 模式（DROP_CONTINUOUS_FRAMES_ONLY=1）。
+// shadow/prefer 阶段同时发送 stack+frames；进入 v2-only 且回滚窗口结束后
+// 仅发送 frames（服务端按 frames 生成展示名称）。默认关闭保持兼容。
+static bool frames_only_mode()
+{
+    static const bool enabled = env_enabled_default("DROP_CONTINUOUS_FRAMES_ONLY", false);
+    return enabled;
 }
 
 static int env_positive_int(const char *name, int fallback)
@@ -755,6 +771,165 @@ static std::string parse_frame_name(const std::string &raw, int pid)
     return name;
 }
 
+// ------------------------------------------------------------
+// 阶段五：perf script 行 → 结构化栈帧
+// ------------------------------------------------------------
+// perf script 每帧行的典型格式：
+//   "        7f1234abcdef symbol_name (/usr/lib/libc.so.6)"
+//   "        7f1234 [unknown] (/usr/lib/libc.so.6)"
+// 解析 IP/symbol/DSO，并从 /proc/pid/maps 的 mmap 信息计算 file-relative
+// normalized_offset；build-id 从 ELF 读取（有缓存）。取不到的字段如实留空
+// /0，不推测。
+// ------------------------------------------------------------
+
+// proc_maps_containing 在 /proc/pid/maps 中查找包含 address 且路径为 dsoPath
+// 的映射，返回映射 vaddr 基址与文件偏移（用于 file-relative offset）。
+static bool proc_maps_containing(int pid,
+                                 const std::string &dsoPath,
+                                 uint64_t address,
+                                 uint64_t *base,
+                                 uint64_t *fileOffset)
+{
+    if (pid <= 0 || dsoPath.empty() || address == 0)
+        return false;
+    std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
+    std::ifstream maps(mapsPath);
+    if (!maps.is_open())
+        return false;
+    std::string line;
+    while (std::getline(maps, line))
+    {
+        std::istringstream iss(line);
+        std::string range;
+        iss >> range;
+        size_t dash = range.find('-');
+        if (dash == std::string::npos)
+            continue;
+        uint64_t lo = std::strtoull(range.substr(0, dash).c_str(), nullptr, 16);
+        uint64_t hi = std::strtoull(range.substr(dash + 1).c_str(), nullptr, 16);
+        std::string perms;
+        iss >> perms;
+        std::string offsetHex;
+        iss >> offsetHex;
+        uint64_t offset = std::strtoull(offsetHex.c_str(), nullptr, 16);
+        // dev inode
+        std::string dev, inode;
+        iss >> dev >> inode;
+        std::string path;
+        std::getline(iss, path);
+        path = drop::trim(path);
+        if (path.empty())
+            continue;
+        // 匹配路径本身或 basename（perf 输出可能是相对名）
+        bool match = (path == dsoPath);
+        if (!match)
+        {
+            size_t slash = path.rfind('/');
+            std::string baseName = slash == std::string::npos ? path : path.substr(slash + 1);
+            size_t dslash = dsoPath.rfind('/');
+            std::string dsoBase = dslash == std::string::npos ? dsoPath : dsoPath.substr(dslash + 1);
+            match = (baseName == dsoBase);
+        }
+        if (!match)
+            continue;
+        if (address >= lo && address < hi)
+        {
+            if (base)
+                *base = lo;
+            if (fileOffset)
+                *fileOffset = offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+static drop::ContinuousStackFrame parse_perf_frame(const std::string &raw, int pid)
+{
+    drop::ContinuousStackFrame frame;
+    frame.raw = drop::trim(raw);
+    if (frame.raw.empty())
+        return frame;
+    std::istringstream iss(frame.raw);
+    std::string first;
+    iss >> first;
+    std::string rest;
+    std::getline(iss, rest);
+    // IP：perf script 输出形如 "7a93e5545ca8"（无 0x 前缀）或 "0x7a93..."，
+    // 只按"全十六进制"判定，避免把符号名误当地址。
+    if (!first.empty())
+    {
+        bool allHex = true;
+        for (char ch : first)
+        {
+            if (!std::isxdigit(static_cast<unsigned char>(ch)))
+            {
+                allHex = false;
+                break;
+            }
+        }
+        if (allHex && first.size() >= 3)
+            frame.address = std::strtoull(first.c_str(), nullptr, 16);
+    }
+    // symbol 与 dso（perf 输出 "symbol (dso)"）
+    std::string name = drop::trim(rest);
+    size_t paren = name.find(" (");
+    if (paren != std::string::npos)
+    {
+        size_t close = name.rfind(')');
+        if (close != std::string::npos && close > paren + 2)
+            frame.mappingFile = name.substr(paren + 2, close - paren - 2);
+        name = drop::trim(name.substr(0, paren));
+    }
+    if (!name.empty() && name != "[unknown]")
+    {
+        frame.function = name;
+        frame.resolved = true;
+    }
+    // normalized_offset：mmap 信息（file-relative = address - vaddr + file_offset）
+    if (frame.address != 0 && !frame.mappingFile.empty())
+    {
+        uint64_t base = 0, fileOffset = 0;
+        if (proc_maps_containing(pid, frame.mappingFile, frame.address, &base, &fileOffset))
+        {
+            if (frame.address >= base)
+                frame.normalizedOffset = frame.address - base + fileOffset;
+        }
+        // build-id（ELF 读取，缓存友好）
+        std::string buildId;
+        if (drop::elf_gnu_build_id(frame.mappingFile, &buildId))
+            frame.buildId = buildId;
+    }
+    return frame;
+}
+
+// frames_to_json 序列化结构化栈（阶段五）。
+static std::string frames_to_json(const std::vector<drop::ContinuousStackFrame> &frames)
+{
+    if (frames.empty())
+        return "";
+    std::string out = "\"frames\":[";
+    for (size_t i = 0; i < frames.size(); ++i)
+    {
+        const auto &frame = frames[i];
+        if (i)
+            out += ",";
+        out += "{";
+        out += "\"function\":\"" + json_escape(frame.function) + "\",";
+        out += "\"raw\":\"" + json_escape(frame.raw) + "\",";
+        out += "\"file\":\"" + json_escape(frame.file) + "\",";
+        out += "\"line\":" + std::to_string(frame.line) + ",";
+        out += "\"address\":" + std::to_string(frame.address) + ",";
+        out += "\"mapping_file\":\"" + json_escape(frame.mappingFile) + "\",";
+        out += "\"build_id\":\"" + json_escape(frame.buildId) + "\",";
+        out += "\"normalized_offset\":" + std::to_string(frame.normalizedOffset) + ",";
+        out += std::string("\"resolved\":") + (frame.resolved ? "true" : "false");
+        out += "}";
+    }
+    out += "]";
+    return out;
+}
+
 static bool parse_sample_header(const std::string &line,
                                 std::string *comm,
                                 int *pid,
@@ -815,6 +990,7 @@ static void add_sample(std::map<std::string, AggregatedSample> *out,
                        const std::string &comm,
                        int pid,
                        const std::vector<std::string> &rawStack,
+                       const std::vector<drop::ContinuousStackFrame> &rawFrames,
                        const std::string &stackScope = "",
                        const std::string &backend = "")
 {
@@ -826,6 +1002,8 @@ static void add_sample(std::map<std::string, AggregatedSample> *out,
     pid = process_tgid(pid);
     std::vector<std::string> stack = rawStack;
     std::reverse(stack.begin(), stack.end());
+    std::vector<drop::ContinuousStackFrame> frames = rawFrames;
+    std::reverse(frames.begin(), frames.end());
     std::string exe = read_exe(pid);
     std::string key = comm + "|" + std::to_string(pid) + "|" + exe;
     for (const auto &frame : stack)
@@ -837,6 +1015,7 @@ static void add_sample(std::map<std::string, AggregatedSample> *out,
         sample.pid = pid;
         sample.exe = exe;
         sample.stack = stack;
+        sample.frames = frames;
         sample.stackScope = stackScope;
         sample.backend = backend;
     }
@@ -852,11 +1031,13 @@ static PerfScriptParseResult parse_perf_script_result(const std::string &script)
     std::string currentComm;
     int currentPid = 0;
     std::vector<std::string> currentStack;
+    std::vector<drop::ContinuousStackFrame> currentFrames;
     auto flush = [&]() {
-        add_sample(&byKey, currentComm, currentPid, currentStack);
+        add_sample(&byKey, currentComm, currentPid, currentStack, currentFrames);
         currentComm.clear();
         currentPid = 0;
         currentStack.clear();
+        currentFrames.clear();
     };
     while (std::getline(iss, line))
     {
@@ -894,6 +1075,11 @@ static PerfScriptParseResult parse_perf_script_result(const std::string &script)
             std::string frame = parse_frame_name(line, currentPid);
             if (!frame.empty())
                 currentStack.push_back(frame);
+            // 阶段五：结构化帧与旧字符串栈并行（frames-only 模式由
+            // 服务端按 frames 生成展示名称，这里始终发送两份保持兼容）。
+            drop::ContinuousStackFrame structured = parse_perf_frame(line, currentPid);
+            if (!structured.raw.empty())
+                currentFrames.push_back(structured);
         }
     }
     flush();
@@ -2017,6 +2203,12 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             body += "\"count\":" + std::to_string(sample.count) + ",";
             body += "\"stack_scope\":\"" + json_escape(sample.stackScope) + "\",";
             body += "\"backend\":\"" + json_escape(sample.backend) + "\",";
+            {
+                std::string framesJson = frames_to_json(sample.frames);
+                if (!framesJson.empty())
+                    body += framesJson + ",";
+                if (!frames_only_mode() || framesJson.empty())
+                {
             body += "\"stack\":[";
             for (size_t fi = 0; fi < sample.stack.size(); ++fi)
             {
@@ -2025,6 +2217,10 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
                 body += "\"" + json_escape(sample.stack[fi]) + "\"";
             }
             body += "]}";
+                }
+            }
+            body = body.substr(0, body.size() - 1); // 去掉结尾逗号
+            body += "}";
         }
         body += "],";
         body += "\"profiles\":[";
@@ -2054,6 +2250,12 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
                 body += "\"count\":" + std::to_string(sample.count) + ",";
                 body += "\"stack_scope\":\"" + json_escape(profile.stackScope) + "\",";
                 body += "\"backend\":\"" + json_escape(profile.backend) + "\",";
+                {
+                    std::string framesJson = frames_to_json(sample.frames);
+                    if (!framesJson.empty())
+                        body += framesJson + ",";
+                    if (!frames_only_mode() || framesJson.empty())
+                    {
                 body += "\"stack\":[";
                 for (size_t fi = 0; fi < sample.stack.size(); ++fi)
                 {
@@ -2062,6 +2264,10 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
                     body += "\"" + json_escape(sample.stack[fi]) + "\"";
                 }
                 body += "]}";
+                    }
+                }
+                body = body.substr(0, body.size() - 1);
+                body += "}";
             }
             body += "]}";
         }
@@ -2923,6 +3129,16 @@ static void queue_core_histograms(std::vector<WindowPayload> *windows,
 }
 
 } // namespace (anonymous)
+
+// 阶段五：服务器存储压力全局开关（公开 API，见 ContinuousSampler.h）。
+void SetContinuousServerPressure(bool halted)
+{
+    g_continuousServerPressureHalted.store(halted);
+}
+bool ContinuousServerPressureHalted()
+{
+    return g_continuousServerPressureHalted.load();
+}
 
 bool ContinuousSessionHasPendingSpool(const ContinuousSamplerConfig &config)
 {

@@ -8,7 +8,8 @@
 # ---------- 阶段1：编译 ----------
 # FROM：以哪个镜像为基础。这里用装了 Go 1.19 的精简 Linux
 # AS builder：起个名字叫 builder，后面可以引用
-FROM golang:1.19-alpine AS builder
+# 阶段五：Go 1.22 (parquet-go v0.24.0 requires go >= 1.22)
+FROM golang:1.22-alpine AS builder
 ENV GOPROXY=https://goproxy.cn,direct
 # 注：这里原来有一行替换 apk 源的 sed，实际是死代码——本阶段(builder)从没
 # 执行过 apk add，真正用到 apk 的是下面阶段2(FROM alpine:3.18)，两个阶段

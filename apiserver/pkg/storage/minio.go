@@ -103,6 +103,24 @@ func (m *MinIOStorage) GetObject(ctx context.Context, bucket, key string) (io.Re
 	return obj, nil
 }
 
+// GetObjectRange 下载文件指定字节范围 [offset, offset+length)。
+// 使用 MinIO/S3 的 Range 语义；offset 为负或 length<=0 视为参数错误。
+// 返回的 reader 读取到该范围末尾时返回 io.EOF。
+func (m *MinIOStorage) GetObjectRange(ctx context.Context, bucket, key string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("非法 range 参数 offset=%d length=%d", offset, length)
+	}
+	opts := minio.GetObjectOptions{}
+	if err := opts.SetRange(offset, offset+length-1); err != nil {
+		return nil, fmt.Errorf("设置 range %d-%d 失败: %w", offset, offset+length-1, err)
+	}
+	obj, err := m.client.GetObject(ctx, bucket, key, opts)
+	if err != nil {
+		return nil, fmt.Errorf("下载文件范围失败: %w", err)
+	}
+	return obj, nil
+}
+
 // PresignedGetURL 生成预签名下载 URL（bucket 已设为公开读取时返回直接 URL）
 func (m *MinIOStorage) PresignedGetURL(ctx context.Context, bucket, key string, expires time.Duration) (string, error) {
 	// Bucket 已在 docker-compose 启动时设为 public-read，直接返回 URL

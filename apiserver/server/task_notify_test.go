@@ -54,6 +54,9 @@ func (fakeStorage) PutObject(context.Context, string, string, io.Reader, int64, 
 func (fakeStorage) GetObject(context.Context, string, string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("ok")), nil
 }
+func (fakeStorage) GetObjectRange(context.Context, string, string, int64, int64) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("ok")), nil
+}
 func (fakeStorage) PresignedGetURL(context.Context, string, string, time.Duration) (string, error) {
 	return "http://example.test/signed", nil
 }

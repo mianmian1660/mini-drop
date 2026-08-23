@@ -350,9 +350,19 @@ std::string ContinuousSessionManager::BuildReconcileBody(const std::vector<drop:
         for (const auto &target : runtime.targets)
             active.push_back({{"pid", target.pid}, {"process_start_ms", target.processStartMs},
                               {"comm", target.comm}, {"exe", target.exe}, {"rss_bytes", process_rss_bytes(target.pid)}});
-        body["sessions"].push_back({{"sid", entry.first}, {"observed_state", runtime.observedState},
+        std::string observedState = runtime.observedState;
+        std::string degradationReason = runtime.degradationReason;
+        // 阶段五：服务器存储压力时上报 waiting/server_storage_pressure
+        // （不覆盖用户主动 stop，desired_state 仍由服务端裁决）。
+        if (drop::ContinuousServerPressureHalted() &&
+            (observedState == "running" || observedState == "pending" || observedState == "degraded"))
+        {
+            observedState = "waiting";
+            degradationReason = "server_storage_pressure";
+        }
+        body["sessions"].push_back({{"sid", entry.first}, {"observed_state", observedState},
                                      {"active_processes", active}, {"continuity_mode", runtime.effectiveContinuityMode},
-                                     {"degradation_reason", runtime.degradationReason},
+                                     {"degradation_reason", degradationReason},
                                      {"last_error", runtime.lastError}});
     }
     for (const auto &entry : stoppedReports_)
@@ -410,6 +420,12 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
             return false;
         const json &data = root.at("data");
         *revision = data.value("revision", static_cast<uint64_t>(0));
+        // 阶段五：服务器存储压力 → 全局暂停新窗口产生。
+        if (data.contains("server_pressure"))
+        {
+            const json &pressure = data.at("server_pressure");
+            drop::SetContinuousServerPressure(pressure.value("halted", false));
+        }
         assignments->clear();
         for (const auto &item : data.value("assignments", json::array()))
         {
