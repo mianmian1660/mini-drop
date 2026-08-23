@@ -59,6 +59,7 @@ var (
 	metricBlobGCDeleted           int64 // counter：GC 删除对象数
 	metricBlobGCDeletedBytes      int64 // counter：GC 回收字节
 	metricBlobGCFailures          int64 // counter：GC 删除失败次数
+	metricBlobOrphanReconciled    int64 // counter：孤儿回填 blob 墓碑化数
 	metricMaintenanceSkipTotal    int64 // counter：maintenance 跳过（低磁盘/unknown）
 	metricBlobByStatusMu          sync.Mutex
 	metricBlobByStatus            = map[string]int64{}
@@ -192,6 +193,8 @@ func incBlobGCDeletedBytes(n int64) {
 }
 func incBlobGCFailures() { atomic.AddInt64(&metricBlobGCFailures, 1) }
 
+func incBlobOrphanReconciled() { atomic.AddInt64(&metricBlobOrphanReconciled, 1) }
+
 // incMaintenanceSkip 累加 maintenance 跳过计数（compactor / 格式迁移）。
 // 与采集拒收口径分离：maintenance 跳过不是"采集拒绝"。
 func incMaintenanceSkip(kind string) {
@@ -299,6 +302,7 @@ func resetMetricsForTest() {
 	atomic.StoreInt64(&metricBlobGCDeleted, 0)
 	atomic.StoreInt64(&metricBlobGCDeletedBytes, 0)
 	atomic.StoreInt64(&metricBlobGCFailures, 0)
+	atomic.StoreInt64(&metricBlobOrphanReconciled, 0)
 	atomic.StoreInt64(&metricMaintenanceSkipTotal, 0)
 	metricArtifactsByStatusMu.Lock()
 	metricArtifactsByStatus = map[string]int64{}
@@ -442,6 +446,8 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_blob_gc_deleted_bytes_total %d\n", atomic.LoadInt64(&metricBlobGCDeletedBytes))
 	writeMetricHeader(&b, "mini_drop_blob_gc_failures_total", "counter", "Delayed GC deletion failures.")
 	fmt.Fprintf(&b, "mini_drop_blob_gc_failures_total %d\n", atomic.LoadInt64(&metricBlobGCFailures))
+	writeMetricHeader(&b, "mini_drop_blob_orphan_reconciled_total", "counter", "Orphan backfill blobs tombstoned after migration.")
+	fmt.Fprintf(&b, "mini_drop_blob_orphan_reconciled_total %d\n", atomic.LoadInt64(&metricBlobOrphanReconciled))
 	writeMetricHeader(&b, "mini_drop_maintenance_skip_total", "counter", "Maintenance operations skipped (low disk / unknown), by kind.")
 	kinds := make([]string, 0, len(metricMaintenanceSkip))
 	metricMaintenanceSkipMu.Lock()

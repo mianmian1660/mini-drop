@@ -241,7 +241,7 @@ func (s *APIServer) CheckKernelSymbol(c *gin.Context) {
 			"last_used_at": &now,
 			"target_ip":    firstNonEmpty(req.TargetIP, row.TargetIP),
 		}).Error
-		if err := s.recordKernelSymbolArtifact(req.TID, row.ObjectKey, row.SizeBytes, req.SHA256); err != nil {
+		if err := s.recordKernelSymbolArtifact(req.TID, row.ObjectKey, row.SizeBytes, req.SHA256, row.BlobID); err != nil {
 			s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", req.TID), zap.String("sha256", req.SHA256), zap.Error(err))
 		}
 		c.JSON(http.StatusOK, gin.H{"upload_required": false, "object_key": row.ObjectKey})
@@ -289,7 +289,7 @@ func (s *APIServer) CheckKernelSymbol(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "落库失败: " + err.Error()})
 			return
 		}
-		if err := s.recordKernelSymbolArtifact(req.TID, objectKey, req.SizeBytes, req.SHA256); err != nil {
+		if err := s.recordKernelSymbolArtifact(req.TID, objectKey, req.SizeBytes, req.SHA256, nil); err != nil {
 			s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", req.TID), zap.String("sha256", req.SHA256), zap.Error(err))
 		}
 		c.JSON(http.StatusOK, gin.H{"upload_required": false, "object_key": objectKey})
@@ -391,7 +391,7 @@ func (s *APIServer) UploadKernelSymbol(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "落库失败: " + err.Error()})
 		return
 	}
-	if err := s.recordKernelSymbolArtifact(tid, objectKey, int64(compressed.Len()), sum); err != nil {
+	if err := s.recordKernelSymbolArtifact(tid, objectKey, int64(compressed.Len()), sum, nil); err != nil {
 		s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", tid), zap.String("sha256", sum), zap.Error(err))
 	}
 	c.JSON(http.StatusOK, gin.H{"sha256": sum, "status": "ready", "object_key": objectKey})
@@ -416,7 +416,10 @@ func (s *APIServer) putObjectWithEncoding(ctx context.Context, key string, data 
 	return s.Storage.PutObject(ctx, s.Config.Storage.Bucket, key, data, size, contentType)
 }
 
-func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64, sum string) error {
+// recordKernelSymbolArtifact 登记 kallsyms artifact 引用。
+// 阶段二：blobID 非空时把 artifact 直接关联到已迁移的 CAS blob
+// （避免新引用指向旧 key 造成孤儿 blob、阻塞 GC）。
+func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64, sum string, blobID *uint) error {
 	if tid == "" || objectKey == "" {
 		return nil
 	}
@@ -430,6 +433,7 @@ func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64
 		Retention:   "raw",
 		ContentType: "application/octet-stream",
 		Status:      model.ArtifactStatusReady,
+		BlobID:      blobID,
 		CreatedAt:   time.Now(),
 	}
 	return s.DB.Clauses(clause.OnConflict{
@@ -441,6 +445,7 @@ func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64
 			"retention":    artifact.Retention,
 			"content_type": artifact.ContentType,
 			"status":       artifact.Status,
+			"blob_id":      artifact.BlobID,
 		}),
 	}).Create(&artifact).Error
 }

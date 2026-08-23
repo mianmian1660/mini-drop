@@ -90,6 +90,14 @@ func (s *APIServer) runBlobCycle(ctx context.Context) {
 			s.logBlobWarn("backfill failed", zap.Error(err))
 		}
 	}
+	// 对账：迁移切换引用后，指向旧 key 的回填 blob 若已无引用则墓碑化并入 GC 队列。
+	// 不依赖迁移开关（Release B 起始终运行），也修复迁移早期未入队的孤儿旧对象。
+	if s.Config.Blob.BackfillEnabled || s.Config.Blob.MigrationEnabled {
+		if err := s.reconcileOrphanBackfillBlobs(ctx); err != nil {
+			s.setBlobError("orphan reconcile: " + err.Error())
+			s.logBlobWarn("orphan reconcile failed", zap.Error(err))
+		}
+	}
 	if s.Config.Blob.GCEnabled {
 		if err := s.runGCOnce(ctx); err != nil {
 			s.setBlobError("gc: " + err.Error())
@@ -98,6 +106,52 @@ func (s *APIServer) runBlobCycle(ctx context.Context) {
 	}
 	s.setBlobError("")
 	s.refreshBlobMetrics(ctx)
+}
+
+// reconcileOrphanBackfillBlobs 处理"指向旧物理 key 且已无引用"的孤儿 Blob：
+//   - 墓碑化 Blob 行（deleted_at/status=deleted，delete_reason=migration）。
+//   - 旧 key 入 GC 队列（幂等），让 GC 能删掉旧对象。
+// 幂等：Blob 已墓碑/已有引用则跳过。
+func (s *APIServer) reconcileOrphanBackfillBlobs(ctx context.Context) error {
+	if s == nil || s.DB == nil {
+		return nil
+	}
+	var blobs []model.StorageBlob
+	if err := s.DB.WithContext(ctx).
+		Where("object_key NOT LIKE ? AND status = ? AND deleted_at IS NULL",
+			casObjectKeyPrefix+"%", model.BlobStatusReady).
+		Limit(200).Find(&blobs).Error; err != nil {
+		return err
+	}
+	for i := range blobs {
+		if ctx.Err() != nil {
+			break
+		}
+		b := &blobs[i]
+		refs, err := s.countBlobRefs(ctx, b.ID)
+		if err != nil {
+			continue
+		}
+		if refs > 0 {
+			continue
+		}
+		now := time.Now()
+		res := s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
+			Where("id = ? AND status = ? AND deleted_at IS NULL", b.ID, model.BlobStatusReady).
+			Updates(map[string]interface{}{
+				"status": model.BlobStatusDeleted, "deleted_at": &now,
+				"delete_reason": model.GCMigrationReason, "updated_at": now,
+			})
+		if res.Error != nil || res.RowsAffected != 1 {
+			continue
+		}
+		s.enqueueGC(ctx, b.ObjectKey, model.GCMigrationReason)
+		incBlobOrphanReconciled()
+		s.logBlobState("orphan backfill blob tombstoned",
+			zap.Uint("blob_id", b.ID),
+			zap.String("object_key", redactBlobKey(b.ObjectKey)))
+	}
+	return nil
 }
 
 // ------------------------------------------------------------
