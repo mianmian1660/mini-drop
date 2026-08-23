@@ -28,6 +28,8 @@ type SymbolFile struct {
 	Status     int        `gorm:"column:status;default:0;index" json:"status"`
 	CreatedAt  time.Time  `gorm:"column:created_at" json:"created_at"`
 	LastUsedAt *time.Time `gorm:"column:last_used_at" json:"last_used_at"`
+	// BlobID 指向 storage_blobs（阶段二）；NULL 表示尚未回填（兼容原 object_key）。
+	BlobID *uint `gorm:"column:blob_id;index:idx_symbol_files_blob_id" json:"blob_id"`
 }
 
 // KernelSymbolFile — sha256 索引的 /proc/kallsyms 快照账本。
@@ -43,6 +45,8 @@ type KernelSymbolFile struct {
 	Status        int        `gorm:"column:status;default:0;index" json:"status"`
 	CreatedAt     time.Time  `gorm:"column:created_at" json:"created_at"`
 	LastUsedAt    *time.Time `gorm:"column:last_used_at" json:"last_used_at"`
+	// BlobID 指向 storage_blobs（阶段二）；NULL 表示尚未回填（兼容原 object_key）。
+	BlobID *uint `gorm:"column:blob_id;index:idx_kernel_symbol_files_blob_id" json:"blob_id"`
 }
 
 // TaskBuildID — 某个任务需要哪些 build-id（tid, build_id 复合主键）

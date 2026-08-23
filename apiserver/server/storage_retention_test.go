@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -67,6 +68,14 @@ func (m *retentionMemoryStorage) DeleteObject(_ context.Context, _, key string) 
 func (m *retentionMemoryStorage) ObjectExists(_ context.Context, _, key string) (bool, error) {
 	_, ok := m.objects[key]
 	return ok, nil
+}
+
+func (m *retentionMemoryStorage) StatObject(_ context.Context, _, key string) (int64, error) {
+	data, ok := m.objects[key]
+	if !ok {
+		return 0, fmt.Errorf("对象不存在: %s", key)
+	}
+	return int64(len(data)), nil
 }
 
 func testKallsymsBody() []byte {

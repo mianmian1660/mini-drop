@@ -391,6 +391,7 @@ func (s *APIServer) runArtifactLifecycleCycle(ctx context.Context) {
 	}
 	s.processDeletingRetries(ctx)
 	s.processExpiredCandidates(ctx)
+	s.processBlobDeletingRetries(ctx)
 	s.refreshLifecycleMetrics(ctx)
 }
 
@@ -580,6 +581,11 @@ func (s *APIServer) processClaimedDeletion(ctx context.Context, a *model.Artifac
 	if a == nil {
 		return
 	}
+	// 阶段二：有 Blob 引用 → 走 Blob 生命周期（最后引用才删物理对象）。
+	if a.BlobID != nil && *a.BlobID > 0 {
+		s.processClaimedBlobDeletion(ctx, a, reason)
+		return
+	}
 	// 共享 kallsyms：有其它活跃引用时只释放本行；最后一个引用必须先成功
 	// 删除共享对象与 ledger，再写墓碑。任何失败都保留 deleting 供后续重试。
 	if isKernelSymbolObjectKey(a.ObjectKey) {
@@ -595,6 +601,185 @@ func (s *APIServer) processClaimedDeletion(ctx context.Context, a *model.Artifac
 		return
 	}
 	s.completeArtifactDeletion(ctx, a, reason)
+}
+
+// processClaimedBlobDeletion 阶段二 Blob 生命周期删除：
+//  1. 先落 artifact 墓碑（减少引用）。
+//  2. 若 Blob 仍有其它有效引用 → 结束（对象保留）。
+//  3. 无引用 → CAS 领取 Blob（ready→deleting）→ 删物理对象 →
+//     墓碑 Blob + 清理 ledger 行（kernel_symbol_files/symbol_files）。
+// 删除失败保留 Blob deleting 状态按退避重试（processBlobDeletingRetries）。
+func (s *APIServer) processClaimedBlobDeletion(ctx context.Context, a *model.Artifact, reason string) {
+	if a == nil || a.BlobID == nil {
+		return
+	}
+	var blob model.StorageBlob
+	if err := s.DB.WithContext(ctx).Where("id = ?", *a.BlobID).First(&blob).Error; err != nil {
+		// Blob 行丢失（异常）：回退到 legacy 直接删逻辑 key，避免对象泄漏。
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			s.logBlobWarn("blob row missing, fallback to legacy delete",
+				zap.Uint("artifact_id", a.ID),
+				zap.String("object_key", redactBlobKey(a.ObjectKey)))
+			if s.StorageConnected() {
+				if delErr := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, a.ObjectKey); delErr != nil {
+					s.failArtifactDeletion(ctx, a, delErr)
+					return
+				}
+			}
+			s.completeArtifactDeletion(ctx, a, reason)
+			return
+		}
+		s.failArtifactDeletion(ctx, a, err)
+		return
+	}
+	if blob.IsDeleted() {
+		// 物理对象已删：直接落 artifact 墓碑。
+		s.completeArtifactDeletion(ctx, a, reason)
+		return
+	}
+	// 1) 先落 artifact 墓碑。
+	s.completeArtifactDeletion(ctx, a, reason)
+	// 2) 统计其它有效引用。
+	refs, err := s.countBlobRefs(ctx, blob.ID)
+	if err != nil {
+		s.failBlobDeletion(ctx, &blob, err)
+		return
+	}
+	if refs > 0 {
+		return // 对象仍被引用，保留
+	}
+	// 3) CAS 领取 Blob 删除（避免并发最后引用竞态）。
+	if !s.claimBlobDeletionCAS(ctx, blob.ID) {
+		return // 其它 cleaner 已领取，负责删对象
+	}
+	if !s.StorageConnected() {
+		s.failBlobDeletion(ctx, &blob, errors.New("object storage is disconnected"))
+		return
+	}
+	if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, blob.ObjectKey); err != nil {
+		s.failBlobDeletion(ctx, &blob, err)
+		return
+	}
+	// 删除成功：墓碑 Blob + 清理 ledger 行。
+	s.tombstoneBlob(ctx, &blob, reason)
+	_ = s.DB.WithContext(ctx).Where("blob_id = ?", blob.ID).Delete(&model.KernelSymbolFile{}).Error
+	_ = s.DB.WithContext(ctx).Where("blob_id = ?", blob.ID).Delete(&model.SymbolFile{}).Error
+	incArtifactCleanupDeleted(reason)
+	incArtifactCleanupDeletedBytes(a.Size)
+	s.logBlobState("blob object deleted (last reference)",
+		zap.Uint("blob_id", blob.ID),
+		zap.String("object_key", redactBlobKey(blob.ObjectKey)),
+		zap.Int64("stored_size", blob.StoredSize),
+		zap.String("reason", reason))
+}
+
+// claimBlobDeletionCAS 行级 CAS 领取 Blob 删除：只有 ready 且未删的行会成功。
+func (s *APIServer) claimBlobDeletionCAS(ctx context.Context, blobID uint) bool {
+	if s == nil || s.DB == nil {
+		return false
+	}
+	res := s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
+		Where("id = ? AND status = ? AND deleted_at IS NULL", blobID, model.BlobStatusReady).
+		Updates(map[string]interface{}{
+			"status":                 model.BlobStatusDeleting,
+			"next_delete_attempt_at": nil,
+			"last_delete_error":      "",
+			"updated_at":             time.Now(),
+		})
+	return res.Error == nil && res.RowsAffected == 1
+}
+
+// tombstoneBlob 删除成功：写 Blob 墓碑（行永久保留审计）。
+func (s *APIServer) tombstoneBlob(ctx context.Context, blob *model.StorageBlob, reason string) {
+	if blob == nil {
+		return
+	}
+	now := time.Now()
+	_ = s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
+		Where("id = ? AND status = ?", blob.ID, model.BlobStatusDeleting).
+		Updates(map[string]interface{}{
+			"status":                 model.BlobStatusDeleted,
+			"deleted_at":             &now,
+			"delete_reason":          firstNonEmpty(reason, model.DeleteReasonExpired),
+			"next_delete_attempt_at": nil,
+			"last_delete_error":      "",
+			"updated_at":             now,
+		})
+}
+
+// failBlobDeletion 删除失败：保留 deleting，按退避重试。
+func (s *APIServer) failBlobDeletion(ctx context.Context, blob *model.StorageBlob, delErr error) {
+	if blob == nil {
+		return
+	}
+	now := time.Now()
+	attempts := blob.DeleteAttempts + 1
+	next := now.Add(deleteBackoff(attempts))
+	_ = s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
+		Where("id = ? AND status = ?", blob.ID, model.BlobStatusDeleting).
+		Updates(map[string]interface{}{
+			"delete_attempts":        attempts,
+			"last_delete_error":      truncateString(delErr.Error(), 1024),
+			"next_delete_attempt_at": &next,
+			"updated_at":             now,
+		})
+	incBlobGCFailures()
+	s.setBlobError(delErr.Error())
+	s.logBlobWarn("blob object delete failed, will retry",
+		zap.Uint("blob_id", blob.ID),
+		zap.String("object_key", redactBlobKey(blob.ObjectKey)),
+		zap.Int("attempt", attempts),
+		zap.String("next_attempt", next.Format(time.RFC3339)),
+		zap.Error(delErr))
+}
+
+// processBlobDeletingRetries 处理到期的 deleting Blob 重试（生命周期循环内）。
+func (s *APIServer) processBlobDeletingRetries(ctx context.Context) {
+	if s == nil || s.DB == nil {
+		return
+	}
+	now := time.Now()
+	var blobs []model.StorageBlob
+	if err := s.DB.WithContext(ctx).
+		Where("status = ? AND deleted_at IS NULL AND (next_delete_attempt_at IS NULL OR next_delete_attempt_at <= ?)", model.BlobStatusDeleting, now).
+		Order("id ASC").Limit(s.retentionBatchLimit()).Find(&blobs).Error; err != nil {
+		s.logBlobWarn("blob deleting retry query failed", zap.Error(err))
+		return
+	}
+	for i := range blobs {
+		if ctx.Err() != nil {
+			break
+		}
+		blob := &blobs[i]
+		// 重试前复查引用：若期间又出现新引用（如 revive），取消删除。
+		refs, err := s.countBlobRefs(ctx, blob.ID)
+		if err != nil {
+			continue
+		}
+		if refs > 0 {
+			// 恢复 ready（对象还在，继续供新引用使用）。
+			_ = s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
+				Where("id = ? AND status = ?", blob.ID, model.BlobStatusDeleting).
+				Updates(map[string]interface{}{
+					"status":             model.BlobStatusReady,
+					"delete_attempts":    0,
+					"last_delete_error":  "",
+					"updated_at":         time.Now(),
+				})
+			continue
+		}
+		if !s.StorageConnected() {
+			s.failBlobDeletion(ctx, blob, errors.New("object storage is disconnected"))
+			continue
+		}
+		if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, blob.ObjectKey); err != nil {
+			s.failBlobDeletion(ctx, blob, err)
+			continue
+		}
+		s.tombstoneBlob(ctx, blob, firstNonEmpty(blob.DeleteReason, model.DeleteReasonExpired))
+		_ = s.DB.WithContext(ctx).Where("blob_id = ?", blob.ID).Delete(&model.KernelSymbolFile{}).Error
+		_ = s.DB.WithContext(ctx).Where("blob_id = ?", blob.ID).Delete(&model.SymbolFile{}).Error
+	}
 }
 
 func (s *APIServer) processClaimedKernelSymbolDeletion(ctx context.Context, a *model.Artifact, reason string) {

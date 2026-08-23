@@ -21,6 +21,7 @@ type Config struct {
 	Storage         StorageConfig         `mapstructure:"storage"`
 	Retention       RetentionConfig       `mapstructure:"retention"`
 	ContinuousBlock ContinuousBlockConfig `mapstructure:"continuous_block"`
+	Blob            BlobConfig            `mapstructure:"blob"`
 	StorageDisk     StorageDiskConfig     `mapstructure:"storage_disk"`
 	Log             LogConfig             `mapstructure:"log"`
 	Security        SecurityConfig        `mapstructure:"security"`
@@ -116,6 +117,32 @@ type RetentionConfig struct {
 	DiagnosticHours   int `mapstructure:"diagnostic_hours"`
 	// ManifestPermanent 为 true 时 manifest 类永不过期（默认 true）。
 	ManifestPermanent bool `mapstructure:"manifest_permanent"`
+}
+
+// BlobConfig 控制阶段二物理 Blob 存储。
+// 扩展发布顺序（Release A → B → C）：先只部署兼容 Reader（所有开关关闭），
+// 再开回填与压缩迁移，最后 24h 宽限期过后开旧对象 GC。
+type BlobConfig struct {
+	// BackfillEnabled 开启全量元数据回填：按有效引用 distinct object_key 创建
+	// storage_blobs 并回填三张表的 blob_id。历史对象不搬迁、不重新计算内容哈希。
+	BackfillEnabled bool `mapstructure:"backfill_enabled"`
+	// MigrationEnabled 开启共享符号压缩迁移（kallsyms/ELF/SVG/folded ≥4KiB 文本）。
+	MigrationEnabled bool `mapstructure:"migration_enabled"`
+	// GCEnabled 开启 storage_object_gc 延迟删除（必须在兼容 Reader 上线且
+	// 旧对象保留满宽限期后才允许打开）。
+	GCEnabled bool `mapstructure:"gc_enabled"`
+	// MinCompressBytes 迁移/新写入压缩阈值：大于等于该字节数的文本结果才压缩，默认 4096。
+	MinCompressBytes int64 `mapstructure:"min_compress_bytes"`
+	// GCSafeGraceHours 迁移入队到允许删除的宽限期（小时），默认 24。
+	GCSafeGraceHours int `mapstructure:"gc_safe_grace_hours"`
+	// MigrationBatch 每轮迁移/回填的最大对象数，默认 50。
+	MigrationBatch int `mapstructure:"migration_batch"`
+	// MigrationIntervalSec 迁移 worker 扫描周期（秒），默认 60。
+	MigrationIntervalSec int `mapstructure:"migration_interval_sec"`
+	// 迁移对象类型开关（MigrationEnabled=true 时按这些子开关分阶段执行）。
+	MigrateKallsyms bool `mapstructure:"migrate_kallsyms"`
+	MigrateELF      bool `mapstructure:"migrate_elf"`
+	MigrateResults  bool `mapstructure:"migrate_results"`
 }
 
 // ContinuousBlockConfig 控制阶段三的持续采集块存储（compactor）：
@@ -233,6 +260,16 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("continuous_block.window_sec", 3600)
 	v.SetDefault("continuous_block.compaction_delay_sec", 600)
 	v.SetDefault("continuous_block.compaction_interval_sec", 300)
+	v.SetDefault("blob.backfill_enabled", false)
+	v.SetDefault("blob.migration_enabled", false)
+	v.SetDefault("blob.gc_enabled", false)
+	v.SetDefault("blob.min_compress_bytes", 4096)
+	v.SetDefault("blob.gc_safe_grace_hours", 24)
+	v.SetDefault("blob.migration_batch", 50)
+	v.SetDefault("blob.migration_interval_sec", 60)
+	v.SetDefault("blob.migrate_kallsyms", true)
+	v.SetDefault("blob.migrate_elf", true)
+	v.SetDefault("blob.migrate_results", true)
 	v.SetDefault("storage_disk.path", "/tmp")
 	v.SetDefault("storage_disk.warning_free_bytes", uint64(8<<30))
 	v.SetDefault("storage_disk.critical_free_bytes", uint64(4<<30))
@@ -330,6 +367,36 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envBlockInterval := os.Getenv("CONTINUOUS_BLOCK_COMPACTION_INTERVAL_SEC"); envBlockInterval != "" {
 		v.Set("continuous_block.compaction_interval_sec", envBlockInterval)
+	}
+	if envBlobBackfill := os.Getenv("BLOB_BACKFILL_ENABLED"); envBlobBackfill != "" {
+		v.Set("blob.backfill_enabled", parseBoolEnv(envBlobBackfill))
+	}
+	if envBlobMigration := os.Getenv("BLOB_MIGRATION_ENABLED"); envBlobMigration != "" {
+		v.Set("blob.migration_enabled", parseBoolEnv(envBlobMigration))
+	}
+	if envBlobGC := os.Getenv("BLOB_GC_ENABLED"); envBlobGC != "" {
+		v.Set("blob.gc_enabled", parseBoolEnv(envBlobGC))
+	}
+	if envBlobMinCompress := os.Getenv("BLOB_MIN_COMPRESS_BYTES"); envBlobMinCompress != "" {
+		v.Set("blob.min_compress_bytes", envBlobMinCompress)
+	}
+	if envBlobGrace := os.Getenv("BLOB_GC_SAFE_GRACE_HOURS"); envBlobGrace != "" {
+		v.Set("blob.gc_safe_grace_hours", envBlobGrace)
+	}
+	if envBlobBatch := os.Getenv("BLOB_MIGRATION_BATCH"); envBlobBatch != "" {
+		v.Set("blob.migration_batch", envBlobBatch)
+	}
+	if envBlobInterval := os.Getenv("BLOB_MIGRATION_INTERVAL_SEC"); envBlobInterval != "" {
+		v.Set("blob.migration_interval_sec", envBlobInterval)
+	}
+	if envMigrateKallsyms := os.Getenv("BLOB_MIGRATE_KALLSYMS"); envMigrateKallsyms != "" {
+		v.Set("blob.migrate_kallsyms", parseBoolEnv(envMigrateKallsyms))
+	}
+	if envMigrateELF := os.Getenv("BLOB_MIGRATE_ELF"); envMigrateELF != "" {
+		v.Set("blob.migrate_elf", parseBoolEnv(envMigrateELF))
+	}
+	if envMigrateResults := os.Getenv("BLOB_MIGRATE_RESULTS"); envMigrateResults != "" {
+		v.Set("blob.migrate_results", parseBoolEnv(envMigrateResults))
 	}
 	if envCleanupInterval := os.Getenv("RETENTION_CLEANUP_INTERVAL_SEC"); envCleanupInterval != "" {
 		v.Set("retention.cleanup_interval_sec", envCleanupInterval)
@@ -454,6 +521,18 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.ContinuousBlock.CompactionIntervalSec <= 0 {
 		cfg.ContinuousBlock.CompactionIntervalSec = 300
+	}
+	if cfg.Blob.MinCompressBytes <= 0 {
+		cfg.Blob.MinCompressBytes = 4096
+	}
+	if cfg.Blob.GCSafeGraceHours <= 0 {
+		cfg.Blob.GCSafeGraceHours = 24
+	}
+	if cfg.Blob.MigrationBatch <= 0 {
+		cfg.Blob.MigrationBatch = 50
+	}
+	if cfg.Blob.MigrationIntervalSec <= 0 {
+		cfg.Blob.MigrationIntervalSec = 60
 	}
 	if cfg.Retention.BatchLimit <= 0 {
 		cfg.Retention.BatchLimit = 200

@@ -903,6 +903,14 @@ func (m *continuousMemoryStorage) ObjectExists(_ context.Context, _, key string)
 	return ok, nil
 }
 
+func (m *continuousMemoryStorage) StatObject(_ context.Context, _, key string) (int64, error) {
+	body, ok := m.objects[key]
+	if !ok {
+		return 0, fmt.Errorf("对象不存在: %s", key)
+	}
+	return int64(len(body)), nil
+}
+
 func TestProfileQueryUsesSessionRetentionWindow(t *testing.T) {
 	s := newTestAPIServer(t)
 	now := time.Now().UTC()

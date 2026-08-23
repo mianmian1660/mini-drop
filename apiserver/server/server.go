@@ -108,6 +108,9 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 存储阶段一：Artifact 生命周期循环（策略重算 + observe/enforce 清理状态机）。
 	go s.startArtifactLifecycleCleaner()
 
+	// 存储阶段二：物理 Blob 后台 worker（回填 / 压缩迁移 / 延迟 GC，按配置开关）。
+	go s.startBlobWorkers()
+
 	// 阶段三：启动内建持续剖析块存储 compactor（按配置开关；未启用时查询
 	// 继续走旧分钟对象，行为与阶段二完全一致）。
 	go s.startContinuousBlockCompactor()

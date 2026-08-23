@@ -76,6 +76,15 @@ type Artifact struct {
 	Status      string    `gorm:"column:status;size:32;default:ready;index:idx_artifacts_ready_expiry,priority:1;index:idx_artifacts_deleting_retry,priority:1" json:"status"`
 	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
 
+	// ---- 存储阶段二：物理 Blob 引用 ----
+	// BlobID 指向 storage_blobs；NULL 表示尚未回填（兼容读取原 object_key）。
+	// Artifact.ObjectKey 始终是逻辑名称（如 "tid/flamegraph.svg"），不暴露 CAS 物理路径。
+	BlobID *uint `gorm:"column:blob_id;index:idx_artifacts_blob_id" json:"blob_id"`
+	// Format 内容格式（pprof/kallsyms/svg/...，NULL 表示未知或未分类）。
+	Format string `gorm:"column:format;size:32" json:"format"`
+	// SchemaVersion 内容 schema 版本（如 pprof 为 "1"）。
+	SchemaVersion string `gorm:"column:schema_version;size:32" json:"schema_version"`
+
 	// ---- 存储阶段一：生命周期字段 ----
 	// ExpiresAt 有效到期时间；非终态任务的 Artifact 为 NULL（暂不计算到期）。
 	ExpiresAt *time.Time `gorm:"column:expires_at;index:idx_artifacts_ready_expiry,priority:2" json:"expires_at"`

@@ -164,6 +164,19 @@ func (m *MinIOStorage) ObjectExists(ctx context.Context, bucket, key string) (bo
 	return true, nil
 }
 
+// StatObject 返回对象大小（字节）。对象不存在时返回错误（同 ObjectExists 判定）。
+func (m *MinIOStorage) StatObject(ctx context.Context, bucket, key string) (int64, error) {
+	info, err := m.client.StatObject(ctx, bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		errResp := minio.ToErrorResponse(err)
+		if errResp.Code == "NoSuchKey" {
+			return 0, fmt.Errorf("对象不存在: %s", key)
+		}
+		return 0, fmt.Errorf("StatObject %s 失败: %w", key, err)
+	}
+	return info.Size, nil
+}
+
 // Endpoint 返回 MinIO 地址（用于日志）
 func (m *MinIOStorage) Endpoint() string {
 	return m.endpoint

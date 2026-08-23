@@ -64,6 +64,9 @@ func (fakeStorage) DeleteObject(context.Context, string, string) error { return 
 func (fakeStorage) ObjectExists(context.Context, string, string) (bool, error) {
 	return true, nil
 }
+func (fakeStorage) StatObject(context.Context, string, string) (int64, error) {
+	return 0, nil
+}
 
 type fakeControlClient struct {
 	cancelReq *pb_control.CancelTaskRequest
