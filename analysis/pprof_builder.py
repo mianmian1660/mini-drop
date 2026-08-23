@@ -71,12 +71,12 @@ def _string_field(field: int, value: str) -> bytes:
 # perf script 解析 → 规范样本模型
 # ----------------------------------------------------------
 
-# perf script 头行兼容多种版本输出：
+# perf script 头行兼容多种版本输出（pid/tid 可能是 "123 456" 或 "123/456"，[cpu] 可选）：
 #   comm pid tid [cpu] time: event: <frame>      (旧格式)
 #   comm pid/tid [cpu] time: event: <frame>      (pid/tid 合并)
 #   comm pid/tid time: event:                    (无 [cpu] 字段，帧在下一行)
 _HEADER_RE = re.compile(
-    r"^(\S+)\s+(\S+)(?:\s+\[\d+\])?\s+([\d.]+):\s+([^:]+):(?:\s*(.*))?$"
+    r"^(\S+)\s+(\d+(?:/\d+)?|\d+\s+\d+)(?:\s+\[\d+\])?\s+([\d.]+):\s+([^:]+):(?:\s*(.*))?$"
 )
 # 帧：ip sym (dso) 或 ip sym 或 [unknown] 形式
 _FRAME_RE = re.compile(
@@ -142,11 +142,14 @@ def parse_perf_script(output: str) -> dict:
 
 
 def _parse_pid_tid(pidtid: str):
-    """解析 pid/tid 字段："123/456" → (123,456)；"123" → (123,123)。"""
+    """解析 pid/tid 字段："123/456" → (123,456)；"123 456" → (123,456)；"123" → (123,123)。"""
     try:
         if "/" in pidtid:
             p, t = pidtid.split("/", 1)
             return int(p), int(t)
+        parts = pidtid.split()
+        if len(parts) >= 2:
+            return int(parts[0]), int(parts[1])
         v = int(pidtid)
         return v, v
     except (TypeError, ValueError):
