@@ -69,6 +69,31 @@ var (
 	// 阶段五：Parquet v2 指标
 	metricParquetBuildSkipTotal       int64 // counter：v2 块构建跳过（低磁盘/配额）
 	metricParquetMetricUnknownKindTotal int64 // counter：未登记 metric 类型告警
+	// 阶段六：细粒度 GC / 迁移失败 / 查询指标
+	metricFineGCCandidatesTotal  int64 // counter：细粒度 GC 候选 batch 数
+	metricFineGCDeletedTotal     int64 // counter：细粒度 GC 已清理 batch 数
+	metricFineGCFailuresTotal    int64 // counter：细粒度 GC 失败次数
+	metricMigrationFailureTotal  int64 // counter：迁移失败记录新增数
+	metricMigrationQuarantineTotal int64 // counter：隔离数
+	metricParquetV1FallbackTotal int64 // counter：v1 fallback 次数
+	metricParquetQueryErrorsTotal int64 // counter：Parquet 查询错误次数
+	metricParquetQueryLatencyMs  int64 // gauge：最近一次 Parquet 查询耗时（ms）
+	// 按原因计数的细粒度 GC 阻塞（label: reason）
+	metricFineGCBlockedMu sync.Mutex
+	metricFineGCBlocked   = map[string]int64{}
+	// 按错误类型计数的迁移失败（label: error_type）
+	metricMigrationFailureByTypeMu sync.Mutex
+	metricMigrationFailureByType   = map[string]int64{}
+	// 阶段六：热表/对账/覆盖率 gauge（由 pqRefreshPhase6Metrics 刷新）
+	metricHotWindowCount       int64 // gauge：热 window 数（< 2h）
+	metricHotBatchCount        int64 // gauge：热 batch 数
+	metricHotWindowOldestMs    int64 // gauge：最老热 window 时间戳（ms）
+	metricHotBatchOldestMs     int64 // gauge：最老热 batch 时间戳（ms）
+	metricOrphanWindowCount    int64 // gauge：orphan window 数
+	metricCoverageSegments     int64 // gauge：coverage segment 数
+	metricReconcileFailed      int64 // gauge：对账失败 raw 块数
+	metricReconcileQuarantined int64 // gauge：对账隔离 raw 块数
+	metricFineGCEnforceCandidates int64 // gauge：enforce 可清理候选数（observe 统计）
 )
 
 // 按来源计数的低磁盘拒收计数（label: source）。
@@ -96,6 +121,32 @@ func incParquetMetricUnknownKind(metric string) {
 	atomic.AddInt64(&metricParquetMetricUnknownKindTotal, 1)
 }
 func incParquetShadowFailure() { parquetShadowFailures.Add(1) }
+
+// 阶段六指标辅助。
+func incFineGCCandidate(bid string)  { atomic.AddInt64(&metricFineGCCandidatesTotal, 1) }
+func incFineGCDeleted(bid string)    { atomic.AddInt64(&metricFineGCDeletedTotal, 1) }
+func incFineGCFailure(reason, bid string) {
+	atomic.AddInt64(&metricFineGCFailuresTotal, 1)
+}
+func incFineGCBlocked(reason, bid string) {
+	metricFineGCBlockedMu.Lock()
+	metricFineGCBlocked[reason]++
+	metricFineGCBlockedMu.Unlock()
+}
+func incContinuousMigrationFailure(errorType string) {
+	atomic.AddInt64(&metricMigrationFailureTotal, 1)
+	metricMigrationFailureByTypeMu.Lock()
+	metricMigrationFailureByType[errorType]++
+	metricMigrationFailureByTypeMu.Unlock()
+}
+func incContinuousMigrationQuarantine() { atomic.AddInt64(&metricMigrationQuarantineTotal, 1) }
+func incParquetV1Fallback()             { atomic.AddInt64(&metricParquetV1FallbackTotal, 1) }
+func incParquetQueryError()             { atomic.AddInt64(&metricParquetQueryErrorsTotal, 1) }
+func observeParquetQueryLatency(ms int64) {
+	if ms >= 0 {
+		atomic.StoreInt64(&metricParquetQueryLatencyMs, ms)
+	}
+}
 
 func incTasksCreated()         { atomic.AddInt64(&metricTasksCreatedTotal, 1) }
 func incTaskNotifyFailed()     { atomic.AddInt64(&metricTaskNotifyFailedTotal, 1) }
@@ -371,6 +422,71 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_parquet_metric_unknown_kind_total %d\n", atomic.LoadInt64(&metricParquetMetricUnknownKindTotal))
 	writeMetricHeader(&b, "mini_drop_parquet_shadow_failures_total", "counter", "Parquet v2 shadow reconciliation failures (v1 remains query source).")
 	fmt.Fprintf(&b, "mini_drop_parquet_shadow_failures_total %d\n", parquetShadowFailures.Load())
+	// 阶段六：细粒度 GC / 迁移失败 / 查询指标
+	writeMetricHeader(&b, "mini_drop_fine_gc_candidates_total", "counter", "Fine-grained GC candidate batches observed.")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_candidates_total %d\n", atomic.LoadInt64(&metricFineGCCandidatesTotal))
+	writeMetricHeader(&b, "mini_drop_fine_gc_deleted_total", "counter", "Fine-grained GC batches cleaned.")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_deleted_total %d\n", atomic.LoadInt64(&metricFineGCDeletedTotal))
+	writeMetricHeader(&b, "mini_drop_fine_gc_failures_total", "counter", "Fine-grained GC failures.")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_failures_total %d\n", atomic.LoadInt64(&metricFineGCFailuresTotal))
+	writeMetricHeader(&b, "mini_drop_fine_gc_blocked_total", "counter", "Fine-grained GC candidates blocked, by reason.")
+	blockedReasons := make([]string, 0, len(metricFineGCBlocked))
+	metricFineGCBlockedMu.Lock()
+	for reason := range metricFineGCBlocked {
+		blockedReasons = append(blockedReasons, reason)
+	}
+	metricFineGCBlockedMu.Unlock()
+	sort.Strings(blockedReasons)
+	for _, reason := range blockedReasons {
+		count := func() int64 {
+			metricFineGCBlockedMu.Lock()
+			defer metricFineGCBlockedMu.Unlock()
+			return metricFineGCBlocked[reason]
+		}()
+		fmt.Fprintf(&b, "mini_drop_fine_gc_blocked_total{reason=%q} %d\n", prometheusLabel(reason), count)
+	}
+	writeMetricHeader(&b, "mini_drop_migration_failure_total", "counter", "Continuous migration failure records created, by error type.")
+	failureTypes := make([]string, 0, len(metricMigrationFailureByType))
+	metricMigrationFailureByTypeMu.Lock()
+	for errorType := range metricMigrationFailureByType {
+		failureTypes = append(failureTypes, errorType)
+	}
+	metricMigrationFailureByTypeMu.Unlock()
+	sort.Strings(failureTypes)
+	for _, errorType := range failureTypes {
+		count := func() int64 {
+			metricMigrationFailureByTypeMu.Lock()
+			defer metricMigrationFailureByTypeMu.Unlock()
+			return metricMigrationFailureByType[errorType]
+		}()
+		fmt.Fprintf(&b, "mini_drop_migration_failure_total{error_type=%q} %d\n", prometheusLabel(errorType), count)
+	}
+	writeMetricHeader(&b, "mini_drop_migration_quarantine_total", "counter", "Continuous migration failures quarantined.")
+	fmt.Fprintf(&b, "mini_drop_migration_quarantine_total %d\n", atomic.LoadInt64(&metricMigrationQuarantineTotal))
+	writeMetricHeader(&b, "mini_drop_parquet_v1_fallback_total", "counter", "Query hours falling back to v1 storage (missing/blocked parquet coverage).")
+	fmt.Fprintf(&b, "mini_drop_parquet_v1_fallback_total %d\n", atomic.LoadInt64(&metricParquetV1FallbackTotal))
+	writeMetricHeader(&b, "mini_drop_parquet_query_errors_total", "counter", "Parquet query errors (read/decode/dependency).")
+	fmt.Fprintf(&b, "mini_drop_parquet_query_errors_total %d\n", atomic.LoadInt64(&metricParquetQueryErrorsTotal))
+	writeMetricHeader(&b, "mini_drop_parquet_query_latency_ms", "gauge", "Last parquet query latency in milliseconds.")
+	fmt.Fprintf(&b, "mini_drop_parquet_query_latency_ms %d\n", atomic.LoadInt64(&metricParquetQueryLatencyMs))
+	writeMetricHeader(&b, "mini_drop_fine_gc_hot_windows", "gauge", "Hot profile window count (within hot metadata retention).")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_hot_windows %d\n", atomic.LoadInt64(&metricHotWindowCount))
+	writeMetricHeader(&b, "mini_drop_fine_gc_hot_batches", "gauge", "Hot profile batch count (within hot metadata retention).")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_hot_batches %d\n", atomic.LoadInt64(&metricHotBatchCount))
+	writeMetricHeader(&b, "mini_drop_fine_gc_hot_window_oldest_ms", "gauge", "Oldest hot window start time (unix ms).")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_hot_window_oldest_ms %d\n", atomic.LoadInt64(&metricHotWindowOldestMs))
+	writeMetricHeader(&b, "mini_drop_fine_gc_hot_batch_oldest_ms", "gauge", "Oldest hot batch start time (unix ms).")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_hot_batch_oldest_ms %d\n", atomic.LoadInt64(&metricHotBatchOldestMs))
+	writeMetricHeader(&b, "mini_drop_fine_gc_orphan_windows", "gauge", "Orphan profile windows (missing batch reference).")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_orphan_windows %d\n", atomic.LoadInt64(&metricOrphanWindowCount))
+	writeMetricHeader(&b, "mini_drop_fine_gc_coverage_segments", "gauge", "Coverage segment count.")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_coverage_segments %d\n", atomic.LoadInt64(&metricCoverageSegments))
+	writeMetricHeader(&b, "mini_drop_fine_gc_reconcile_failed", "gauge", "Raw parquet blocks with failed reconcile status.")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_reconcile_failed %d\n", atomic.LoadInt64(&metricReconcileFailed))
+	writeMetricHeader(&b, "mini_drop_fine_gc_reconcile_quarantined", "gauge", "Raw parquet blocks quarantined from reconcile failures.")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_reconcile_quarantined %d\n", atomic.LoadInt64(&metricReconcileQuarantined))
+	writeMetricHeader(&b, "mini_drop_fine_gc_enforce_candidates", "gauge", "Fine-grained GC candidates eligible for enforce cleanup.")
+	fmt.Fprintf(&b, "mini_drop_fine_gc_enforce_candidates %d\n", atomic.LoadInt64(&metricFineGCEnforceCandidates))
 	writeMetricHeader(&b, "mini_drop_storage_total_bytes", "gauge", "Total bytes of the monitored storage filesystem.")
 	fmt.Fprintf(&b, "mini_drop_storage_total_bytes %d\n", atomic.LoadInt64(&metricStorageTotalBytes))
 	writeMetricHeader(&b, "mini_drop_storage_available_bytes", "gauge", "Available bytes of the monitored storage filesystem.")

@@ -245,6 +245,26 @@ type ContinuousParquetConfig struct {
 	RecoverHysteresisBytes int64 `mapstructure:"recover_hysteresis_bytes"`
 	// RecoveryChecks 连续通过次数，默认 2。
 	RecoveryChecks int `mapstructure:"recovery_checks"`
+	// FineRowGCMode 阶段六细粒度行 GC 模式：off | observe | enforce，默认 off。
+	//   - off：不统计不清理（阶段六未开启时的默认行为）。
+	//   - observe：只统计候选与阻塞原因，不删除。
+	//   - enforce：对小事务/固定批次清理 window/batch 元数据与 staging 对象。
+	// 环境变量 CONTINUOUS_FINE_ROW_GC_MODE。
+	FineRowGCMode string `mapstructure:"fine_row_gc_mode"`
+	// HotMetadataRetentionMinutes 热 window/batch 元数据保留时长（分钟），
+	// 默认 120（2 小时）。早于此时间的 window/batch 才允许被细粒度 GC 清理。
+	// 环境变量 CONTINUOUS_HOT_METADATA_RETENTION_MINUTES。
+	HotMetadataRetentionMinutes int `mapstructure:"hot_metadata_retention_minutes"`
+	// FineRowGCBatch 每轮细粒度 GC 最多处理的行数，默认 1000。
+	// 环境变量 CONTINUOUS_FINE_ROW_GC_BATCH。
+	FineRowGCBatch int `mapstructure:"fine_row_gc_batch"`
+	// CoverageRetentionHours coverage segment 保留时长（小时），默认 720（30 天）。
+	// 环境变量 CONTINUOUS_COVERAGE_RETENTION_HOURS。
+	CoverageRetentionHours int `mapstructure:"coverage_retention_hours"`
+	// MigrationFailureRetryLimit 迁移失败重试上限：连续达到该次数且跨越至少
+	// 30 分钟后标记 quarantined，默认 3。
+	// 环境变量 CONTINUOUS_MIGRATION_FAILURE_RETRY_LIMIT。
+	MigrationFailureRetryLimit int `mapstructure:"migration_failure_retry_limit"`
 }
 
 // LogConfig 日志配置
@@ -549,6 +569,21 @@ func Load(configPath string) (*Config, error) {
 	if envPQChecks := os.Getenv("CONTINUOUS_PARQUET_RECOVERY_CHECKS"); envPQChecks != "" {
 		v.Set("continuous_parquet.recovery_checks", envPQChecks)
 	}
+	if envFineGCMode := os.Getenv("CONTINUOUS_FINE_ROW_GC_MODE"); envFineGCMode != "" {
+		v.Set("continuous_parquet.fine_row_gc_mode", envFineGCMode)
+	}
+	if envHotRet := os.Getenv("CONTINUOUS_HOT_METADATA_RETENTION_MINUTES"); envHotRet != "" {
+		v.Set("continuous_parquet.hot_metadata_retention_minutes", envHotRet)
+	}
+	if envGCBatch := os.Getenv("CONTINUOUS_FINE_ROW_GC_BATCH"); envGCBatch != "" {
+		v.Set("continuous_parquet.fine_row_gc_batch", envGCBatch)
+	}
+	if envCovRet := os.Getenv("CONTINUOUS_COVERAGE_RETENTION_HOURS"); envCovRet != "" {
+		v.Set("continuous_parquet.coverage_retention_hours", envCovRet)
+	}
+	if envMigRetry := os.Getenv("CONTINUOUS_MIGRATION_FAILURE_RETRY_LIMIT"); envMigRetry != "" {
+		v.Set("continuous_parquet.migration_failure_retry_limit", envMigRetry)
+	}
 	if envBlobBackfill := os.Getenv("BLOB_BACKFILL_ENABLED"); envBlobBackfill != "" {
 		v.Set("blob.backfill_enabled", parseBoolEnv(envBlobBackfill))
 	}
@@ -770,6 +805,28 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.ContinuousParquet.RecoveryChecks <= 0 {
 		cfg.ContinuousParquet.RecoveryChecks = 2
+	}
+	if mode := strings.ToLower(strings.TrimSpace(cfg.ContinuousParquet.FineRowGCMode)); mode == "" {
+		cfg.ContinuousParquet.FineRowGCMode = "off"
+	} else {
+		switch mode {
+		case "off", "observe", "enforce":
+			cfg.ContinuousParquet.FineRowGCMode = mode
+		default:
+			cfg.ContinuousParquet.FineRowGCMode = "off"
+		}
+	}
+	if cfg.ContinuousParquet.HotMetadataRetentionMinutes <= 0 {
+		cfg.ContinuousParquet.HotMetadataRetentionMinutes = 120
+	}
+	if cfg.ContinuousParquet.FineRowGCBatch <= 0 {
+		cfg.ContinuousParquet.FineRowGCBatch = 1000
+	}
+	if cfg.ContinuousParquet.CoverageRetentionHours <= 0 {
+		cfg.ContinuousParquet.CoverageRetentionHours = 720
+	}
+	if cfg.ContinuousParquet.MigrationFailureRetryLimit <= 0 {
+		cfg.ContinuousParquet.MigrationFailureRetryLimit = 3
 	}
 	if cfg.Blob.MinCompressBytes <= 0 {
 		cfg.Blob.MinCompressBytes = 4096

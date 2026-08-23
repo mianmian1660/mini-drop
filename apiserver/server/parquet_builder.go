@@ -101,7 +101,7 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 			}
 			rows.CPU = append(rows.CPU, row)
 		}
-	case "metrics":
+	case "metrics", "python_rss":
 		for _, metric := range in.Metrics {
 			kind, registered := pqMetricKindFor(metric.Metric)
 			if !registered {
@@ -319,7 +319,9 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 	var metricRows []pqMetricRow
 	var histRows []pqHistogramRow
 	var dbRows []pqDBRow
-	members := map[string]map[string]bool{} // signal → batch bid set
+	// 阶段六：per-signal lineage。members[signal][batchBID] 只登记该信号
+	// 实际消费的 batch；禁止共享全部 batch member。
+	members := map[string]map[string]*pqSignalMemberAcc{}
 	sessionSet := map[string]bool{}
 	processSet := map[string]bool{}
 
@@ -352,30 +354,35 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 				metricRows = append(metricRows, rows.Metrics...)
 				histRows = append(histRows, rows.Histogram...)
 				dbRows = append(dbRows, rows.DB...)
+				pqAccumulateSignalMembers(members, model.ContinuousParquetSignalCPU, row.SessionSID, batch.BatchID,
+					rows.CPU, in.WindowStart, in.WindowEnd)
+				pqAccumulateSignalMembers(members, model.ContinuousParquetSignalMetrics, row.SessionSID, batch.BatchID,
+					rows.Metrics, in.WindowStart, in.WindowEnd)
+				pqAccumulateSignalMembers(members, model.ContinuousParquetSignalHistogram, row.SessionSID, batch.BatchID,
+					rows.Histogram, in.WindowStart, in.WindowEnd)
+				pqAccumulateSignalMembers(members, model.ContinuousParquetSignalDB, row.SessionSID, batch.BatchID,
+					rows.DB, in.WindowStart, in.WindowEnd)
 				for _, sample := range rows.CPU {
 					processSet[strconv.Itoa(int(sample.PID))+"|"+strconv.FormatInt(sample.ProcessStartMs, 10)] = true
 				}
 			}
-			if members[batch.BatchID] == nil {
-				members[batch.BatchID] = map[string]bool{}
-			}
-			members[batch.BatchID]["batch"] = true
 		}
 	}
 
 	// 按信号拆 part 写入
 	builtAny := false
 	signalRows := []struct {
-		signal string
-		cpu    []pqCPURow
-		metric []pqMetricRow
-		hist   []pqHistogramRow
-		db     []pqDBRow
+		signal  string
+		cpu     []pqCPURow
+		metric  []pqMetricRow
+		hist    []pqHistogramRow
+		db      []pqDBRow
+		members []model.ContinuousParquetBlockMember
 	}{
-		{signal: model.ContinuousParquetSignalCPU, cpu: cpuRows},
-		{signal: model.ContinuousParquetSignalMetrics, metric: metricRows},
-		{signal: model.ContinuousParquetSignalHistogram, hist: histRows},
-		{signal: model.ContinuousParquetSignalDB, db: dbRows},
+		{signal: model.ContinuousParquetSignalCPU, cpu: cpuRows, members: pqMemberRowsFor(members[model.ContinuousParquetSignalCPU])},
+		{signal: model.ContinuousParquetSignalMetrics, metric: metricRows, members: pqMemberRowsFor(members[model.ContinuousParquetSignalMetrics])},
+		{signal: model.ContinuousParquetSignalHistogram, hist: histRows, members: pqMemberRowsFor(members[model.ContinuousParquetSignalHistogram])},
+		{signal: model.ContinuousParquetSignalDB, db: dbRows, members: pqMemberRowsFor(members[model.ContinuousParquetSignalDB])},
 	}
 	for _, group := range signalRows {
 		total := len(group.cpu) + len(group.metric) + len(group.hist) + len(group.db)
@@ -385,7 +392,7 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 		ok, err := s.pqWriteSignalBlock(ctx, tenant, hourStart, hourEnd,
 			group.signal, model.ContinuousParquetResolutionRaw, "",
 			group.cpu, group.metric, group.hist, group.db,
-			sessionSet, processSet, members)
+			sessionSet, processSet, group.members)
 		if err != nil {
 			s.Logger.Warn("v2 builder: raw 块构建失败",
 				zap.String("signal", group.signal), zap.Time("hour", hourStart), zap.Error(err))
@@ -396,12 +403,108 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 	return builtAny, nil
 }
 
+// pqSignalMemberAcc 单个 batch 对某信号块的贡献统计（阶段六 member 富化）。
+type pqSignalMemberAcc struct {
+	SessionSID  string
+	StartTime   time.Time
+	EndTime     time.Time
+	SampleCount uint64
+	ValueTotal  uint64
+	RowCount    int64
+}
+
+// pqAccumulateSignalMembers 把一组信号行累加进 per-signal member 统计。
+func pqAccumulateSignalMembers(acc map[string]map[string]*pqSignalMemberAcc, signal, sessionSID, bid string,
+	rows interface{}, start, end time.Time) {
+	total := 0
+	var sampleCount, valueTotal uint64
+	switch typed := rows.(type) {
+	case []pqCPURow:
+		total = len(typed)
+		for i := range typed {
+			sampleCount = addContinuousCount(sampleCount, typed[i].Value)
+			valueTotal = addContinuousCount(valueTotal, typed[i].Value)
+		}
+	case []pqMetricRow:
+		total = len(typed)
+		for i := range typed {
+			sampleCount = addContinuousCount(sampleCount, typed[i].Count)
+			valueTotal = addContinuousCount(valueTotal, typed[i].Value)
+		}
+	case []pqHistogramRow:
+		total = len(typed)
+		for i := range typed {
+			sampleCount = addContinuousCount(sampleCount, typed[i].Count)
+			valueTotal = addContinuousCount(valueTotal, typed[i].Count)
+		}
+	case []pqDBRow:
+		total = len(typed)
+		for i := range typed {
+			count := typed[i].CallCount
+			if count == 0 {
+				count = typed[i].OccurrenceCount
+			}
+			sampleCount = addContinuousCount(sampleCount, count)
+			valueTotal = addContinuousCount(valueTotal, count)
+		}
+	default:
+		return
+	}
+	if total == 0 || bid == "" {
+		return
+	}
+	if acc[signal] == nil {
+		acc[signal] = map[string]*pqSignalMemberAcc{}
+	}
+	item := acc[signal][bid]
+	if item == nil {
+		item = &pqSignalMemberAcc{SessionSID: sessionSID, StartTime: start, EndTime: end}
+		acc[signal][bid] = item
+	}
+	if start.Before(item.StartTime) {
+		item.StartTime = start
+	}
+	if end.After(item.EndTime) {
+		item.EndTime = end
+	}
+	item.SampleCount = addContinuousCount(item.SampleCount, sampleCount)
+	item.ValueTotal = addContinuousCount(item.ValueTotal, valueTotal)
+	item.RowCount += int64(total)
+}
+
+// pqMemberRowsFor 把 per-signal member 统计转成账本行（稳定顺序）。
+func pqMemberRowsFor(acc map[string]*pqSignalMemberAcc) []model.ContinuousParquetBlockMember {
+	if len(acc) == 0 {
+		return nil
+	}
+	bids := make([]string, 0, len(acc))
+	for bid := range acc {
+		bids = append(bids, bid)
+	}
+	sort.Strings(bids)
+	out := make([]model.ContinuousParquetBlockMember, 0, len(bids))
+	for _, bid := range bids {
+		item := acc[bid]
+		out = append(out, model.ContinuousParquetBlockMember{
+			SourceKind:  "batch",
+			SourceRef:   bid,
+			SessionSID:  item.SessionSID,
+			StartTime:   item.StartTime,
+			EndTime:     item.EndTime,
+			SampleCount: item.SampleCount,
+			ValueTotal:  item.ValueTotal,
+			RowCount:    item.RowCount,
+		})
+	}
+	return out
+}
+
 // pqWriteSignalBlock 构建并登记单个 (signal, resolution) 块。
-// sourceMembers：raw 为 batch 集合；降采样为来源块集合。
+// members：raw 为 batch lineage（per-signal）；降采样为来源块 lineage。
 func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourStart, hourEnd time.Time,
 	signalType, resolution, sourceBlockID string,
 	cpuRows []pqCPURow, metricRows []pqMetricRow, histRows []pqHistogramRow, dbRows []pqDBRow,
-	sessionSet map[string]bool, processSet map[string]bool, sourceMembers map[string]map[string]bool) (bool, error) {
+	sessionSet map[string]bool, processSet map[string]bool, members []model.ContinuousParquetBlockMember) (bool, error) {
 
 	key := pqBlockKey{Tenant: tenant, BucketStart: hourStart, SignalType: signalType, Resolution: resolution}
 
@@ -413,7 +516,6 @@ func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourS
 	}
 	defer release()
 
-	now := time.Now()
 	blockID := pqNewBlockID()
 
 	// 版本 = 旧 active 版本 + 1（无旧块则 1）
@@ -434,7 +536,7 @@ func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourS
 		}
 	}
 
-	results, stats, memberRows, err := s.pqWriteAndVerifyParts(ctx, tenant, hourStart, hourEnd,
+	results, stats, err := s.pqWriteAndVerifyParts(ctx, tenant, hourStart, hourEnd,
 		signalType, resolution, blockID, cpuRows, metricRows, histRows, dbRows)
 	if err != nil {
 		_ = s.pqMarkBlockFailed(ctx, blockID, "build_failed")
@@ -447,18 +549,26 @@ func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourS
 			signalType, stats.RowCount, expected.RowCount, stats.SampleTotal, expected.SampleTotal,
 			stats.ValueTotal, expected.ValueTotal)
 	}
-	if (s.pqModeOf() == "shadow" || s.pqModeOf() == "prefer") &&
-		resolution == model.ContinuousParquetResolutionRaw && signalType == model.ContinuousParquetSignalCPU {
-		sourceSamples, sourceErr := s.pqRawCPUWindowSampleTotal(ctx, key.BucketStart)
-		if sourceErr != nil || sourceSamples != stats.SampleTotal {
-			_ = s.pqMarkBlockFailed(ctx, blockID, "shadow_source_mismatch")
-			if sourceErr != nil {
-				return false, fmt.Errorf("v2 shadow 源统计失败: %w", sourceErr)
-			}
+	// 阶段六：raw 块按信号独立做源数据对账（v1 window 样本总量 vs v2）。
+	// shadow/prefer/enforce 全部执行——只有对账通过的块才能进查询与细粒度
+	// 清理候选。5m/1h 由来源 raw 链保证（登记时继承 reconcile 状态）。
+	reconcileOK := true
+	reconcileErr := ""
+	if resolution == model.ContinuousParquetResolutionRaw && pqModeEnabled(s.pqModeOf()) {
+		sourceSamples, sourceErr := s.pqRawSignalSourceSampleTotal(ctx, key.BucketStart, signalType)
+		if sourceErr != nil {
+			_ = s.pqMarkBlockFailed(ctx, blockID, "shadow_source_error")
+			return false, fmt.Errorf("v2 shadow 源统计失败 signal=%s: %w", signalType, sourceErr)
+		}
+		if sourceSamples != stats.SampleTotal {
 			incParquetShadowFailure()
-			return false, fmt.Errorf("v2 shadow 源样本不一致: v1=%d v2=%d", sourceSamples, stats.SampleTotal)
+			reconcileOK = false
+			reconcileErr = fmt.Sprintf("v1=%d v2=%d", sourceSamples, stats.SampleTotal)
+			_ = s.pqMarkBlockFailed(ctx, blockID, "shadow_source_mismatch")
+			return false, fmt.Errorf("v2 shadow 源样本不一致 signal=%s %s", signalType, reconcileErr)
 		}
 	}
+	_ = reconcileOK
 
 	// 汇总统计（多 part 聚合）
 	for _, result := range results {
@@ -466,19 +576,21 @@ func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourS
 	}
 	stats.SessionCount = len(sessionSet)
 	stats.ProcessCount = len(processSet)
-	if len(memberRows) == 0 {
-		for bid, kinds := range sourceMembers {
-			for kind := range kinds {
-				memberRows = append(memberRows, model.ContinuousParquetBlockMember{
-					SourceKind: kind, SourceRef: bid, StartTime: hourStart, EndTime: hourEnd,
-					CreatedAt: now,
-				})
+
+	// 登记 active（单事务：退役旧 active → 插入新 active → files → members）。
+	// reconcile_status：raw 已在此处通过源对账 → passed；5m/1h 继承来源块状态
+	// （来源链未对账通过则不能进查询/GC）。
+	reconcileStatus := model.ContinuousParquetReconcilePassed
+	if resolution != model.ContinuousParquetResolutionRaw && sourceBlockID != "" {
+		var src model.ContinuousParquetBlock
+		if err := s.DB.WithContext(ctx).Where("block_id = ?", sourceBlockID).First(&src).Error; err == nil {
+			reconcileStatus = src.ReconcileStatus
+			if reconcileStatus == "" {
+				reconcileStatus = model.ContinuousParquetReconcilePending
 			}
 		}
 	}
-
-	// 登记 active（单事务：退役旧 active → 插入新 active → files → members）
-	if err := s.pqRegisterActiveBlockMulti(ctx, key, blockID, hourEnd, version, results, stats, memberRows); err != nil {
+	if err := s.pqRegisterActiveBlockMulti(ctx, key, blockID, hourEnd, version, results, stats, members, reconcileStatus); err != nil {
 		_ = s.pqMarkBlockFailed(ctx, blockID, "register_failed")
 		// 登记失败不删对象（由 sweep 按 block_id 前缀回收）
 		return false, err
@@ -493,10 +605,14 @@ func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourS
 }
 
 // pqRegisterActiveBlockMulti 多 part 版登记（扩展单 part 版）：把 building
-// 行更新为 active，并登记全部 part 文件与 members。
+// 行更新为 active，并登记全部 part 文件与 members。reconcileStatus 写入
+// reconcile_status（raw 对账通过为 passed；降采样继承来源链）。
 func (s *APIServer) pqRegisterActiveBlockMulti(ctx context.Context, key pqBlockKey, blockID string, bucketEnd time.Time,
-	version int, results []parquetWriteResult, stats pqBlockStats, members []model.ContinuousParquetBlockMember) error {
+	version int, results []parquetWriteResult, stats pqBlockStats, members []model.ContinuousParquetBlockMember, reconcileStatus string) error {
 	now := time.Now()
+	if reconcileStatus == "" {
+		reconcileStatus = model.ContinuousParquetReconcilePassed
+	}
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var oldBlock model.ContinuousParquetBlock
 		oldFound := false
@@ -529,6 +645,9 @@ func (s *APIServer) pqRegisterActiveBlockMulti(ctx context.Context, key pqBlockK
 			"bucket_end":           bucketEnd,
 			"status":               model.ContinuousParquetStatusActive,
 			"validation":           model.ContinuousParquetValidationPassed,
+			"reconcile_status":     reconcileStatus,
+			"reconciled_at":        now,
+			"reconcile_error":      "",
 			"member_count":         len(members),
 			"row_count":            stats.RowCount,
 			"value_total":          stats.ValueTotal,
@@ -570,6 +689,14 @@ func (s *APIServer) pqRegisterActiveBlockMulti(ctx context.Context, key pqBlockK
 				return err
 			}
 		}
+		// 阶段六：raw 块激活时在同一事务内按 (session, signal, hour) 重建
+		// 覆盖区间（幂等替换相交范围；失败整体回滚，块保持 building 由下轮
+		// 重试）。降采样块不重建（segment 独立于 raw Block 生命周期）。
+		if key.Resolution == model.ContinuousParquetResolutionRaw {
+			if err := s.pqRebuildCoverageSegmentsTx(tx, key.Tenant, key.BucketStart, key.SignalType, blockID, version); err != nil {
+				return fmt.Errorf("重建 coverage segments 失败: %w", err)
+			}
+		}
 		return nil
 	})
 }
@@ -584,10 +711,10 @@ func pqMergeBoundaries(results []parquetWriteResult) []pqRowGroupBoundary {
 }
 
 // pqWriteAndVerifyParts 按 max_part_bytes 拆 part 写入并校验。
-// 返回 (results, 汇总统计, 空)。
+// 返回 (results, 汇总统计, 错误)。
 func (s *APIServer) pqWriteAndVerifyParts(ctx context.Context, tenant string, hourStart, hourEnd time.Time,
 	signalType, resolution, blockID string,
-	cpuRows []pqCPURow, metricRows []pqMetricRow, histRows []pqHistogramRow, dbRows []pqDBRow) ([]parquetWriteResult, pqBlockStats, []model.ContinuousParquetBlockMember, error) {
+	cpuRows []pqCPURow, metricRows []pqMetricRow, histRows []pqHistogramRow, dbRows []pqDBRow) ([]parquetWriteResult, pqBlockStats, error) {
 	cfg := s.Config.ContinuousParquet
 	maxPartBytes := cfg.MaxPartBytes
 	if maxPartBytes <= 0 {
@@ -677,7 +804,7 @@ func (s *APIServer) pqWriteAndVerifyParts(ctx context.Context, tenant string, ho
 				continue
 			}
 			if err := writePart(cpuRows[start : start+size]); err != nil {
-				return nil, stats, nil, err
+				return nil, stats, err
 			}
 			start += size
 		}
@@ -693,7 +820,7 @@ func (s *APIServer) pqWriteAndVerifyParts(ctx context.Context, tenant string, ho
 				continue
 			}
 			if err := writePart(metricRows[start : start+size]); err != nil {
-				return nil, stats, nil, err
+				return nil, stats, err
 			}
 			start += size
 		}
@@ -708,7 +835,7 @@ func (s *APIServer) pqWriteAndVerifyParts(ctx context.Context, tenant string, ho
 				continue
 			}
 			if err := writePart(histRows[start : start+size]); err != nil {
-				return nil, stats, nil, err
+				return nil, stats, err
 			}
 			start += size
 		}
@@ -723,7 +850,7 @@ func (s *APIServer) pqWriteAndVerifyParts(ctx context.Context, tenant string, ho
 				continue
 			}
 			if err := writePart(dbRows[start : start+size]); err != nil {
-				return nil, stats, nil, err
+				return nil, stats, err
 			}
 			start += size
 		}
@@ -737,7 +864,7 @@ func (s *APIServer) pqWriteAndVerifyParts(ctx context.Context, tenant string, ho
 		}
 	}
 
-	return results, stats, nil, nil
+	return results, stats, nil
 }
 
 // pqStatsForSignalRows 从 v1 解码后的源行独立计算登记统计。写入器返回的
@@ -917,7 +1044,11 @@ func (s *APIServer) pqBuildDownsample(ctx context.Context, tenant string, hourSt
 			processSet[strconv.Itoa(int(row.PID))+"|"+strconv.FormatInt(row.ProcessStartMs, 10)] = true
 		}
 
-		sourceMembers := map[string]map[string]bool{source.BlockID: {"block": true}}
+		sourceMembers := []model.ContinuousParquetBlockMember{{
+			SourceKind: "block", SourceRef: source.BlockID,
+			SessionSID: "", StartTime: source.BucketStart, EndTime: source.BucketEnd,
+			SampleCount: source.SampleTotal, ValueTotal: source.ValueTotal, RowCount: source.RowCount,
+		}}
 		ok, err := s.pqWriteSignalBlock(ctx, tenant, hourStart, source.BucketEnd,
 			signalType, targetResolution, source.BlockID,
 			outCPU, outMetric, outHist, outDB, sessionSet, processSet, sourceMembers)
@@ -1209,38 +1340,110 @@ func downsampleDBRows(rows []pqDBRow, targetResolution string) []pqDBRow {
 	return out
 }
 
-// pqShadowReconcile 对 raw CPU 块与 v1 ProfileWindow 的样本总量做周期性
-// 独立对账。其它信号已在激活前按解码源行与 Parquet footer 做严格核对。
-func (s *APIServer) pqShadowReconcile(ctx context.Context, key pqBlockKey, blockID string, stats pqBlockStats) {
-	if key.Resolution != model.ContinuousParquetResolutionRaw || key.SignalType != model.ContinuousParquetSignalCPU {
-		return
+// pqV1SignalTypesFor 返回某 v2 信号对应的 v1 window signal_type 集合。
+func pqV1SignalTypesFor(signalType string) []string {
+	switch signalType {
+	case model.ContinuousParquetSignalCPU:
+		return []string{"cpu_profile", "cpu", "python_memory", "memory"}
+	case model.ContinuousParquetSignalMetrics:
+		return []string{"metrics", "python_rss"}
+	case model.ContinuousParquetSignalHistogram:
+		return []string{"io_latency", "io_syscall_latency", "sched_latency"}
+	case model.ContinuousParquetSignalDB:
+		return []string{"db", "db_snapshot"}
+	default:
+		return nil
 	}
-	sourceSampleTotal, err := s.pqRawCPUWindowSampleTotal(ctx, key.BucketStart)
-	if err != nil {
-		s.Logger.Warn("v2 shadow 对账: 源统计失败", zap.Error(err))
-		return
-	}
-	if stats.SampleTotal != sourceSampleTotal {
-		incParquetShadowFailure()
-		s.Logger.Error("v2 shadow 对账不一致",
-			zap.String("signal", key.SignalType), zap.String("resolution", key.Resolution),
-			zap.String("block_id", blockID),
-			zap.Uint64("v2_samples", stats.SampleTotal),
-			zap.Uint64("v1_samples", sourceSampleTotal))
-		return
-	}
-	s.Logger.Info("v2 shadow 对账通过",
-		zap.String("signal", key.SignalType), zap.String("resolution", key.Resolution),
-		zap.String("block_id", blockID), zap.Uint64("samples", stats.SampleTotal))
 }
 
-func (s *APIServer) pqRawCPUWindowSampleTotal(ctx context.Context, bucketStart time.Time) (uint64, error) {
+// pqRawSignalSourceSampleTotal 按信号独立统计某小时 v1 window 样本总量
+// （与 v2 块的 SampleTotal 口径对齐：CPU=样本计数、metrics=点数、
+// histogram=桶计数和、DB=digest/事件计数和）。
+func (s *APIServer) pqRawSignalSourceSampleTotal(ctx context.Context, bucketStart time.Time, signalType string) (uint64, error) {
+	types := pqV1SignalTypesFor(signalType)
+	if len(types) == 0 {
+		return 0, fmt.Errorf("未知 v2 信号类型: %s", signalType)
+	}
 	var total uint64
 	err := s.DB.WithContext(ctx).Model(&model.ProfileWindow{}).
-		Where("window_start >= ? AND window_start < ? AND signal_type IN ?", bucketStart, bucketStart.Add(time.Hour),
-			[]string{"cpu_profile", "cpu", "python_memory", "memory"}).
+		Where("window_start >= ? AND window_start < ? AND signal_type IN ?", bucketStart, bucketStart.Add(time.Hour), types).
 		Select("COALESCE(SUM(sample_count),0)").Scan(&total).Error
 	return total, err
+}
+
+// pqShadowReconcileBlock 按信号对 raw 块与 v1 ProfileWindow 样本总量做
+// 周期性独立对账（阶段六：每种信号各自对账）。结果写入 reconcile_status：
+//   - 一致 → passed + reconciled_at
+//   - 不一致 → failed + reconcile_error（连续失败由 pqReconcileQuarantine 升级）
+func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.ContinuousParquetBlock) error {
+	if block == nil || block.Resolution != model.ContinuousParquetResolutionRaw {
+		return nil
+	}
+	sourceSampleTotal, err := s.pqRawSignalSourceSampleTotal(ctx, block.BucketStart, block.SignalType)
+	if err != nil {
+		s.Logger.Warn("v2 shadow 对账: 源统计失败",
+			zap.String("signal", block.SignalType), zap.String("block_id", block.BlockID), zap.Error(err))
+		return err
+	}
+	now := time.Now()
+	if block.SampleTotal != sourceSampleTotal {
+		incParquetShadowFailure()
+		msg := fmt.Sprintf("v1=%d v2=%d", sourceSampleTotal, block.SampleTotal)
+		_ = s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
+			Where("block_id = ? AND status = ?", block.BlockID, model.ContinuousParquetStatusActive).
+			Updates(map[string]interface{}{
+				"reconcile_status": model.ContinuousParquetReconcileFailed,
+				"reconciled_at":    now,
+				"reconcile_error":  msg, "updated_at": now,
+			}).Error
+		s.Logger.Error("v2 shadow 对账不一致",
+			zap.String("signal", block.SignalType), zap.String("resolution", block.Resolution),
+			zap.String("block_id", block.BlockID), zap.String("error", msg))
+		return nil
+	}
+	if err := s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
+		Where("block_id = ? AND status = ?", block.BlockID, model.ContinuousParquetStatusActive).
+		Updates(map[string]interface{}{
+			"reconcile_status": model.ContinuousParquetReconcilePassed,
+			"reconciled_at":    now,
+			"reconcile_error":  "", "updated_at": now,
+		}).Error; err != nil {
+		return err
+	}
+	s.Logger.Info("v2 shadow 对账通过",
+		zap.String("signal", block.SignalType), zap.String("resolution", block.Resolution),
+		zap.String("block_id", block.BlockID), zap.Uint64("samples", block.SampleTotal))
+	return nil
+}
+
+// pqReconcileQuarantine 把连续多次对账失败（且跨越至少 30 分钟）的 raw 块
+// 标记为 quarantined，fail-closed：查询与细粒度 GC 均不接受。
+func (s *APIServer) pqReconcileQuarantine(ctx context.Context, limit int) {
+	if limit <= 0 {
+		limit = 50
+	}
+	now := time.Now()
+	var failed []model.ContinuousParquetBlock
+	if err := s.DB.WithContext(ctx).
+		Where("status = ? AND resolution = ? AND reconcile_status = ?",
+			model.ContinuousParquetStatusActive, model.ContinuousParquetResolutionRaw,
+			model.ContinuousParquetReconcileFailed).
+		Order("reconciled_at ASC").Limit(limit).Find(&failed).Error; err != nil {
+		return
+	}
+	for i := range failed {
+		blk := &failed[i]
+		if blk.ReconciledAt == nil || now.Sub(*blk.ReconciledAt) < 30*time.Minute {
+			continue
+		}
+		_ = s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
+			Where("block_id = ? AND status = ? AND reconcile_status = ?",
+				blk.BlockID, model.ContinuousParquetStatusActive, model.ContinuousParquetReconcileFailed).
+			Updates(map[string]interface{}{
+				"reconcile_status": model.ContinuousParquetReconcileQuarantined,
+				"updated_at":       now,
+			}).Error
+	}
 }
 
 // pqReclaimForQuota 配额回收：先清 superseded/staging，再按最老 1h 回收。
@@ -1262,7 +1465,13 @@ func (s *APIServer) pqReclaimForQuota(ctx context.Context) {
 	s.pqReclaimOldest1hToTarget(ctx, 100)
 }
 
-// pqReclaimStaging 清理超过 staging 保留期的未压缩 batch 对象。
+// pqReclaimStaging 清理超过 staging 保留期的未压缩 batch 元数据与源对象。
+// 清理顺序（阶段六修正，修复"先删 batch 遗留 orphan window"问题）：
+//
+//	覆盖确认 → window/batch 同事务清理 → 提交后才删除源对象。
+//
+// 对象删除失败进入 continuous_migration_failures 可重试状态，不阻塞元数据清理，
+// 且绝不允许"对象已删但 DB 仍保留 active 查询引用"。
 func (s *APIServer) pqReclaimStaging(ctx context.Context) {
 	// off/shadow/prefer 仍可能整段回退 v1；删除分钟对象会让 ProfileWindow
 	// 指向不存在的源。只有 enforce 且 lineage 完整时才允许回收。
@@ -1294,30 +1503,48 @@ func (s *APIServer) pqReclaimStaging(ctx context.Context) {
 			continue
 		}
 		covered := true
-		var reclaimed int64
 		ids := make([]uint, 0, len(refs))
+		bids := make([]string, 0, len(refs))
 		for j := range refs {
 			if !refs[j].CreatedAt.Before(cutoff) || !s.pqBatchCoveredByValidatedRaw(ctx, &refs[j]) {
 				covered = false
 				break
 			}
 			ids = append(ids, refs[j].ID)
-			reclaimed += int64(refs[j].PayloadBytes)
+			bids = append(bids, refs[j].BID)
 		}
 		if !covered {
 			continue
 		}
-		if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, b.ObjectKey); err != nil {
+		var reclaimed int64
+		for j := range refs {
+			reclaimed += int64(refs[j].PayloadBytes)
+		}
+		// 1) 事务内清理 window + batch 元数据（CASCADE 外键下删 batch 即级联
+		//    window；显式先删 window 兼容 NOT VALID 过渡期，绝不遗留 orphan）。
+		txErr := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if len(bids) > 0 {
+				if err := tx.Where("batch_bid IN ?", bids).Delete(&model.ProfileWindow{}).Error; err != nil {
+					return err
+				}
+			}
+			return tx.Where("id IN ?", ids).Delete(&model.ProfileBatch{}).Error
+		})
+		if txErr != nil {
+			s.Logger.Warn("v2 staging 元数据清理失败（对象保持不动）", zap.String("object_key", b.ObjectKey), zap.Error(txErr))
 			continue
 		}
-		if err := s.DB.WithContext(ctx).Where("id IN ?", ids).Delete(&model.ProfileBatch{}).Error; err != nil {
-			s.Logger.Error("v2 staging 对象已删但元数据清理失败", zap.String("object_key", b.ObjectKey), zap.Error(err))
+		// 2) 提交后删除源对象；失败进入可重试异常记录。
+		if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, b.ObjectKey); err != nil {
+			s.recordContinuousMigrationFailure(ctx, "batch", bids[0], b.SessionSID, b.ObjectKey, "object_delete", err.Error())
 			continue
 		}
 		incContinuousReclaimedBytes(reclaimed)
 	}
 }
 
+// pqBatchCoveredByValidatedRaw batch 的每种实际信号都已被 active、validated、
+// reconciled 的 raw Block lineage 覆盖（阶段六：对账通过才允许清理）。
 func (s *APIServer) pqBatchCoveredByValidatedRaw(ctx context.Context, batch *model.ProfileBatch) bool {
 	if batch == nil || batch.BID == "" {
 		return false
@@ -1338,9 +1565,9 @@ func (s *APIServer) pqBatchCoveredByValidatedRaw(ctx context.Context, batch *mod
 		err := s.DB.WithContext(ctx).Table("continuous_parquet_block_members AS m").
 			Joins("JOIN continuous_parquet_blocks AS b ON b.block_id = m.block_id").
 			Where("m.source_kind = ? AND m.source_ref = ?", "batch", batch.BID).
-			Where("b.signal_type = ? AND b.resolution = ? AND b.status = ? AND b.validation = ?",
+			Where("b.signal_type = ? AND b.resolution = ? AND b.status = ? AND b.validation = ? AND b.reconcile_status = ?",
 				signal, model.ContinuousParquetResolutionRaw, model.ContinuousParquetStatusActive,
-				model.ContinuousParquetValidationPassed).
+				model.ContinuousParquetValidationPassed, model.ContinuousParquetReconcilePassed).
 			Count(&count).Error
 		if err != nil || count == 0 {
 			return false

@@ -102,20 +102,43 @@ func (s *APIServer) runParquetCycle(ctx context.Context, mode string) {
 		s.pqReclaimV1Blocks(ctx)
 	}
 
-	// 5) 配额回收
+	// 5) 阶段六：细粒度 GC（off|observe|enforce）
+	s.pqRunFineRowGC(ctx)
+
+	// 6) 阶段六：迁移失败重试/隔离 + coverage 过期回收
+	s.pqProcessMigrationFailures(ctx, 100)
+	s.pqReclaimExpiredCoverage(ctx, 500)
+
+	// 7) 配额回收
 	s.pqEnforceQuota(ctx)
 
-	// 6) sweep 回收对象
+	// 8) sweep 回收对象
 	s.pqSweepCleanup(ctx, 200)
+
+	// 9) 阶段六：热表/对账/覆盖率指标刷新
+	s.pqRefreshPhase6Metrics(ctx)
 }
 
-// pqSealedHours 返回需要首次构建或因迟到窗口/部分信号失败而重写的小时。
+// pqSealedRawHours 返回需要首次构建或因迟到窗口/部分信号失败而重写的小时。
+// shadow 模式额外遵守 CONTINUOUS_PARQUET_SHADOW_BACKFILL_HOURS：只回填
+// 最近 N 个完整小时（线上首次 48h），避免一次性把全部历史都扫进来。
 func (s *APIServer) pqSealedRawHours(ctx context.Context, tenant string, now time.Time, limit int) []time.Time {
 	delay := time.Duration(s.Config.ContinuousBlock.CompactionDelaySec) * time.Second
 	if delay <= 0 {
 		delay = 600 * time.Second
 	}
 	sealedCutoff := now.Add(-delay)
+
+	// shadow：回填窗口 = max(sealedCutoff, now - backfillHours)。prefer/enforce
+	// 不设上限（正常增量构建）。
+	scanFrom := time.Time{}
+	if s.pqModeOf() == "shadow" {
+		backfill := time.Duration(s.Config.ContinuousParquet.ShadowBackfillHours) * time.Hour
+		if backfill <= 0 {
+			backfill = 1 * time.Hour
+		}
+		scanFrom = now.Add(-backfill)
+	}
 
 	// active 必须按 bucket+signal 追踪，不能只要任意信号成功就把整个小时
 	// 标成 covered。CreatedAt 用于发现 active 之后才到达的迟到窗口。
@@ -135,13 +158,16 @@ func (s *APIServer) pqSealedRawHours(ctx context.Context, tenant string, now tim
 		active[block.BucketStart.Unix()][block.SignalType] = block.CreatedAt
 	}
 
-	// 有窗口数据但尚无 raw 块的小时
+	// 有窗口数据但尚无 raw 块的小时（shadow 限定回填范围）
 	trunc := pqHourTruncExpr(s.DB.Dialector.Name(), "window_start")
 	bucketTimes := make([]time.Time, 0, limit)
 	query := s.DB.WithContext(ctx).Model(&model.ProfileWindow{}).
 		Select(fmt.Sprintf("%s AS bucket", trunc)).
-		Where("window_start < ?", sealedCutoff).
-		Group("bucket").Order("bucket DESC").Limit(limit)
+		Where("window_start < ?", sealedCutoff)
+	if !scanFrom.IsZero() {
+		query = query.Where("window_start >= ?", scanFrom)
+	}
+	query = query.Group("bucket").Order("bucket DESC").Limit(limit)
 	if s.DB.Dialector.Name() == "postgres" {
 		var rows []struct{ Bucket time.Time }
 		if err := query.Scan(&rows).Error; err != nil {
@@ -195,7 +221,7 @@ func pqLedgerSignalForWindow(signalType string) string {
 	switch signalType {
 	case "cpu_profile", "cpu", "python_memory", "memory":
 		return model.ContinuousParquetSignalCPU
-	case "metrics":
+	case "metrics", "python_rss":
 		return model.ContinuousParquetSignalMetrics
 	case "io_latency", "io_syscall_latency", "sched_latency":
 		return model.ContinuousParquetSignalHistogram
@@ -306,31 +332,26 @@ func (s *APIServer) pqDeleteLayerAfterGrace(ctx context.Context, source *model.C
 	}
 }
 
-// pqReconcileHours shadow/prefer 每小时对账：对已 active 的 raw 块
-// 校验统计（v1 vs v2）。失败计数入指标。
+// pqReconcileHours shadow/prefer 每小时对账：对已 active 的 raw 块按信号
+// 独立校验统计（v1 vs v2）。失败计数入指标并写 reconcile_status。
 func (s *APIServer) pqReconcileHours(ctx context.Context) {
 	var blocks []model.ContinuousParquetBlock
 	if err := s.DB.WithContext(ctx).
-		Where("status = ? AND validation = ? AND resolution = ? AND signal_type = ?",
+		Where("status = ? AND validation = ? AND resolution = ? AND reconcile_status <> ?",
 			model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed,
-			model.ContinuousParquetResolutionRaw, model.ContinuousParquetSignalCPU).
-		Order("bucket_start DESC").Limit(100).Find(&blocks).Error; err != nil {
+			model.ContinuousParquetResolutionRaw, model.ContinuousParquetReconcileQuarantined).
+		Order("bucket_start DESC").Limit(200).Find(&blocks).Error; err != nil {
 		return
 	}
 	for i := range blocks {
 		block := &blocks[i]
-		key := pqBlockKey{
-			Tenant: block.Tenant, BucketStart: block.BucketStart,
-			SignalType: block.SignalType, Resolution: block.Resolution,
+		if err := s.pqShadowReconcileBlock(ctx, block); err != nil {
+			s.Logger.Warn("v2 shadow 对账失败（保留待重试）",
+				zap.String("block_id", block.BlockID), zap.String("signal", block.SignalType), zap.Error(err))
 		}
-		stats := pqBlockStats{
-			RowCount: block.RowCount, ValueTotal: block.ValueTotal,
-			SampleTotal: block.SampleTotal, SessionCount: block.SessionCount,
-			ProcessCount: block.ProcessCount, BytesTotal: block.BytesTotal,
-			FirstRowTime: block.FirstRowTime, LastRowTime: block.LastRowTime,
-		}
-		s.pqShadowReconcile(ctx, key, block.BlockID, stats)
 	}
+	// 连续失败升级 quarantine（fail-closed）
+	s.pqReconcileQuarantine(ctx, 50)
 }
 
 // pqEnforceQuota 配额回收：超过硬配额先回收 staging/superseded，再最老 1h。
@@ -377,8 +398,14 @@ func (s *APIServer) pqV1BlockCoveredByValidatedRaw(ctx context.Context, blockID 
 		return false
 	}
 	var batches []model.ProfileBatch
-	if err := s.DB.WithContext(ctx).Where("block_id = ?", blockID).Find(&batches).Error; err != nil || len(batches) == 0 {
+	if err := s.DB.WithContext(ctx).Where("block_id = ?", blockID).Find(&batches).Error; err != nil {
 		return false
+	}
+	// 块内 batch 行已被细粒度 GC 清理（或本为空块）→ 无 active 查询引用，
+	// 对已过回滚窗口的块安全删除（阶段六：不允许对象已删但保留 active 引用，
+	// 反过来也不允许元数据已清而对象永留）。
+	if len(batches) == 0 {
+		return true
 	}
 	for i := range batches {
 		if !s.pqBatchCoveredByValidatedRaw(ctx, &batches[i]) {
@@ -442,12 +469,14 @@ func (s *APIServer) pqEarliestAvailableAt(ctx context.Context) *time.Time {
 	return snap.EarliestActiveAt
 }
 
-// pqCoverageForHour 判断某小时是否有 active v2 块（prefer 查询用）。
+// pqCoverageForHour 判断某小时是否有 active、validated、reconciled 的 v2 块
+// （prefer/enforce 查询与细粒度 GC 门禁用）。
 func (s *APIServer) pqCoverageForHour(ctx context.Context, tenant string, hourStart time.Time, signalType string) bool {
 	var count int64
 	if err := s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
-		Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND status = ? AND validation = ?",
-			tenant, hourStart, signalType, model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed).
+		Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND status = ? AND validation = ? AND reconcile_status = ?",
+			tenant, hourStart, signalType, model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed,
+			model.ContinuousParquetReconcilePassed).
 		Count(&count).Error; err != nil {
 		return false
 	}
@@ -455,13 +484,15 @@ func (s *APIServer) pqCoverageForHour(ctx context.Context, tenant string, hourSt
 }
 
 // pqFindBestBlock 按 raw→5m→1h 优先级找某小时的 active 块。
+// 只返回 validation=passed AND reconcile_status=passed 的块（fail-closed）。
 func (s *APIServer) pqFindBestBlock(ctx context.Context, tenant string, hourStart time.Time, signalType string) (*model.ContinuousParquetBlock, error) {
 	for _, resolution := range model.ContinuousParquetResolutions {
 		var block model.ContinuousParquetBlock
 		err := s.DB.WithContext(ctx).
-			Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND resolution = ? AND status = ? AND validation = ?",
+			Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND resolution = ? AND status = ? AND validation = ? AND reconcile_status = ?",
 				tenant, hourStart, signalType, resolution,
-				model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed).
+				model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed,
+				model.ContinuousParquetReconcilePassed).
 			First(&block).Error
 		if err == nil {
 			return &block, nil

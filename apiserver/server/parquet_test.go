@@ -448,7 +448,8 @@ func TestPQStagingReclaimRequiresEnforceAndValidatedLineage(t *testing.T) {
 		BlockID: "pq-covered", Tenant: "default", BucketStart: batch.StartTime.UTC().Truncate(time.Hour),
 		BucketEnd: batch.StartTime.UTC().Truncate(time.Hour).Add(time.Hour), SignalType: model.ContinuousParquetSignalCPU,
 		Resolution: model.ContinuousParquetResolutionRaw, Status: model.ContinuousParquetStatusActive,
-		Validation: model.ContinuousParquetValidationPassed, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		Validation: model.ContinuousParquetValidationPassed, ReconcileStatus: model.ContinuousParquetReconcilePassed,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if err := s.DB.Create(&block).Error; err != nil {
 		t.Fatal(err)
@@ -586,7 +587,11 @@ func TestPQShadowMismatchNeverBecomesActive(t *testing.T) {
 		model.ContinuousParquetSignalCPU, model.ContinuousParquetResolutionRaw, "",
 		[]pqCPURow{{Timestamp: hour.Add(time.Minute).UnixMilli(), SessionSID: "s1", Value: 2, ProfileType: "cpu_profile"}},
 		nil, nil, nil, map[string]bool{"s1": true}, nil,
-		map[string]map[string]bool{"b1": {"batch": true}})
+		[]model.ContinuousParquetBlockMember{{
+			SourceKind: "batch", SourceRef: "b1", SessionSID: "s1",
+			StartTime: hour.Add(time.Minute), EndTime: hour.Add(2 * time.Minute),
+			SampleCount: 2, ValueTotal: 2, RowCount: 1,
+		}})
 	if err == nil {
 		t.Fatal("shadow source mismatch must fail the block")
 	}
@@ -627,7 +632,7 @@ func TestPQQueryRequiresFullCoverageAndAuthorizedSession(t *testing.T) {
 	}
 	q := ProfileQuery{SessionSID: "s-owned", Host: "10.0.0.1", OwnerUIDs: []string{"owner"},
 		From: hour, To: hour.Add(30 * time.Minute), ProfileType: "cpu"}
-	agg, found, err := s.pqQueryAggregateV2(ctx, q)
+	agg, found, err := s.pqQueryAggregateMixed(ctx, q)
 	if err != nil || !found {
 		t.Fatalf("authorized v2 query failed: found=%v err=%v", found, err)
 	}
@@ -635,9 +640,15 @@ func TestPQQueryRequiresFullCoverageAndAuthorizedSession(t *testing.T) {
 		t.Fatalf("cross-session data leaked into aggregate: total=%v", agg.Total)
 	}
 
+	// 阶段六：跨出覆盖小时 → 该小时回退 v1（无数据则不计入），covered 小时
+	// 仍走 v2，不再整段回退；结果不得包含未授权 session 数据。
 	q.To = hour.Add(time.Hour + 30*time.Minute)
-	if _, found, err := s.pqQueryAggregateV2(ctx, q); err != nil || found {
-		t.Fatalf("partial coverage must fall back entirely: found=%v err=%v", found, err)
+	agg2, found, err := s.pqQueryAggregateMixed(ctx, q)
+	if err != nil || !found {
+		t.Fatalf("mixed partial-coverage query must return covered data: found=%v err=%v", found, err)
+	}
+	if agg2.Total != 2 {
+		t.Fatalf("mixed query must not leak unauthorized or uncovered data: total=%v", agg2.Total)
 	}
 }
 
