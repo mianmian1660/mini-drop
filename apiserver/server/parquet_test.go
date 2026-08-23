@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -574,30 +575,44 @@ func TestPQWriterDoesNotDeadlockWhenUploadFailsWithoutReading(t *testing.T) {
 }
 
 func TestPQShadowMismatchNeverBecomesActive(t *testing.T) {
+	// 阶段六：raw 块激活前按信号做窗口完整性对账（fail-closed）——任何
+	// 可解析源窗口未被消费，整小时构建失败，绝不产生 active 块。
 	s := pqTestServer(t)
+	setDiskFree(t, 100<<30, 80<<30, 20<<30, nil)
 	s.Config.ContinuousParquet.Mode = "shadow"
+	ctx := context.Background()
 	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	objKey := "continuous/s1/b-missing.json"
+
+	// 源窗口存在（batch 指向的对象在 MinIO 缺失）→ 构建必须失败
 	if err := s.DB.Create(&model.ProfileWindow{
 		SessionSID: "s1", BatchBID: "b1", WindowStart: hour.Add(time.Minute), WindowEnd: hour.Add(2 * time.Minute),
-		ObjectKey: "source", SignalType: "cpu_profile", SampleCount: 9, CreatedAt: time.Now(),
+		ObjectKey: objKey, SignalType: "cpu_profile", SampleCount: 2, CreatedAt: time.Now(),
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.pqWriteSignalBlock(context.Background(), "default", hour, hour.Add(time.Hour),
-		model.ContinuousParquetSignalCPU, model.ContinuousParquetResolutionRaw, "",
-		[]pqCPURow{{Timestamp: hour.Add(time.Minute).UnixMilli(), SessionSID: "s1", Value: 2, ProfileType: "cpu_profile"}},
-		nil, nil, nil, map[string]bool{"s1": true}, nil,
-		[]model.ContinuousParquetBlockMember{{
-			SourceKind: "batch", SourceRef: "b1", SessionSID: "s1",
-			StartTime: hour.Add(time.Minute), EndTime: hour.Add(2 * time.Minute),
-			SampleCount: 2, ValueTotal: 2, RowCount: 1,
-		}})
-	if err == nil {
-		t.Fatal("shadow source mismatch must fail the block")
+	if err := s.DB.Create(&model.ProfileBatch{
+		BID: "b1", SessionSID: "s1", ObjectKey: objKey, StartTime: hour.Add(time.Minute), EndTime: hour.Add(2 * time.Minute),
+		SignalTypes: mustJSONBytes([]string{"cpu_profile"}), Status: "ready", CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 对象不存在 → loadContinuousBatches 失败 → 构建失败（fail-closed）
+	if built, err := s.pqBuildRawHour(ctx, "default", hour); err == nil || built {
+		t.Fatalf("missing source object must fail the hour build: built=%v err=%v", built, err)
 	}
 	key := pqBlockKey{Tenant: "default", BucketStart: hour, SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw}
-	if active, findErr := s.pqFindActiveBlock(context.Background(), key); findErr != nil || active != nil {
-		t.Fatalf("mismatched shadow block became active: active=%+v err=%v", active, findErr)
+	if active, findErr := s.pqFindActiveBlock(ctx, key); findErr != nil || active != nil {
+		t.Fatalf("failed hour build must not activate any block: active=%+v err=%v", active, findErr)
+	}
+
+	// 窗口完整性：对象存在但窗口未被消费 → 构建失败
+	mem := s.Storage.(*continuousMemoryStorage)
+	if err := mem.PutObject(ctx, "drop-data", objKey, strings.NewReader(`{"session_sid":"s1","batch_id":"b1","windows":[]}`), 0, "application/json"); err != nil {
+		t.Fatal(err)
+	}
+	if built, err := s.pqBuildRawHour(ctx, "default", hour); err == nil || built {
+		t.Fatalf("unconsumed window must fail the hour build: built=%v err=%v", built, err)
 	}
 }
 
