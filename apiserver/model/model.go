@@ -258,5 +258,6 @@ func AutoMigrate(db *gorm.DB) error {
 		&TaskBuildID{},
 		&StorageBlob{},
 		&StorageObjectGC{},
+		&StorageMigrationFailure{},
 	)
 }

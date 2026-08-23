@@ -271,8 +271,35 @@ def build_manifest(
     analyzer_name: str,
     analyzer_version: str,
     input_artifacts: List[dict],
-    outputs: List[str],
+    outputs: List[object],
 ) -> dict:
+    output_artifacts = []
+    for output in outputs:
+        if isinstance(output, dict) and output.get("object_key"):
+            key = str(output["object_key"])
+            output_artifacts.append({
+                "object_key": key,
+                "name": key.rsplit("/", 1)[-1],
+                "kind": output.get("kind") or (
+                    "RESULT" if key.endswith((".svg", ".json", ".md", ".html"))
+                    else "INTERMEDIATE"
+                ),
+                "content_type": output.get("content_type") or _content_type(key),
+                "format": output.get("format") or "",
+                "schema_version": output.get("schema_version") or "",
+                "compression": output.get("compression") or "",
+                "logical_sha256": output.get("logical_sha256") or "",
+                "stored_sha256": output.get("stored_sha256") or "",
+                "logical_size": int(output.get("logical_size") or 0),
+                "stored_size": int(output.get("stored_size") or 0),
+            })
+        elif isinstance(output, str):
+            output_artifacts.append({
+                "object_key": output,
+                "name": output.rsplit("/", 1)[-1],
+                "kind": "RESULT" if output.endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE",
+                "content_type": _content_type(output),
+            })
     return {
         "task_id": task_id,
         "job_id": job_id,
@@ -281,16 +308,7 @@ def build_manifest(
         "analyzer_version": analyzer_version,
         "generated_at_unix": int(time.time()),
         "input_artifacts": input_artifacts,
-        "output_artifacts": [
-            {
-                "object_key": output,
-                "name": str(output).rsplit("/", 1)[-1],
-                "kind": "RESULT" if str(output).endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE",
-                "content_type": _content_type(str(output)),
-            }
-            for output in outputs
-            if isinstance(output, str)
-        ],
+        "output_artifacts": output_artifacts,
     }
 
 

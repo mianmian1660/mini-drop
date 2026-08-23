@@ -48,6 +48,7 @@ from attribution import run_attribution
 from observability import elapsed_seconds, log_event, now_seconds
 import artifact_descriptor as ad
 import pprof_builder as pprof_builder
+from analyzer_contract import AnalyzerTemporaryError
 
 
 # ============================================================
@@ -182,7 +183,7 @@ def get_task(conn, tid: str) -> dict:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             "SELECT tid, name, type, profiler_type, target_ip, "
-            "request_params, status, analysis_status "
+            "request_params, status, analysis_status, create_time, end_time "
             "FROM hotmethod_tasks WHERE tid = %s AND deleted_at IS NULL",
             (tid,)
         )
@@ -652,6 +653,21 @@ def _build_cpu_pprof(script_output, folded_text, local_perf, task, tid) -> dict:
                   mode=mode, error=check.get("error") or "")
         if not check["ok"]:
             raise RuntimeError("pprof 校验失败: " + check["error"])
+        folded_samples = 0
+        for line in (folded_text or "").splitlines():
+            parts = line.rsplit(None, 1)
+            if len(parts) == 2:
+                try:
+                    folded_samples += int(parts[1])
+                except ValueError:
+                    pass
+        if folded_samples <= 0:
+            raise RuntimeError("folded 样本总数为零")
+        if check.get("total_samples") != folded_samples:
+            raise RuntimeError(
+                "pprof/folded 样本数不一致: pprof=%s folded=%s" %
+                (check.get("total_samples"), folded_samples)
+            )
         # pprof 内容本身就是 .pb.gz 文件格式：compression="" 不再二次压缩。
         return ad.build_descriptor(tid, "cpu.pprof.pb.gz", raw_gz,
                                    kind="RAW", fmt="pprof",
@@ -664,6 +680,18 @@ def _build_cpu_pprof(script_output, folded_text, local_perf, task, tid) -> dict:
             from analyzer_contract import AnalyzerError
             raise AnalyzerError(f"pprof 生成失败: {exc}") from exc
         return None
+
+
+def _upload_cpu_pprof(storage_ok, storage, bucket, descriptor, tid) -> bool:
+    """上传 portable profile；enforce 模式把缺失产物视为可重试失败。"""
+    if storage_ok and ad.upload_descriptor(storage, bucket, descriptor):
+        return True
+    mode = os.environ.get("PORTABLE_PROFILE_MODE", "observe").strip().lower()
+    print(f"[analysis] pprof 上传失败（mode={mode}）", file=sys.stderr)
+    log_event("pprof_upload_failed", task_tid=tid, mode=mode)
+    if mode == "enforce":
+        raise AnalyzerTemporaryError("pprof 上传失败")
+    return False
 
 
 def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
@@ -817,14 +845,10 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
 
     # cpu.pprof.pb.gz：RAW/pprof/v1，raw_portable（7 天）
     if pprof_descriptor is not None:
-        if storage_ok and ad.upload_descriptor(storage, bucket, pprof_descriptor):
+        if _upload_cpu_pprof(storage_ok, storage, bucket, pprof_descriptor, tid):
             outputs.append(pprof_descriptor)
             presigned_urls["cpu.pprof.pb.gz"] = _get_presigned_url(
                 storage, bucket, pprof_descriptor["blob_key"])
-        else:
-            print(f"[analysis] pprof 上传失败（observe 模式下不影响分析结果）",
-                  file=sys.stderr)
-            log_event("pprof_upload_failed", task_tid=tid)
 
     # --- 7. 规则建议引擎：匹配热点函数 → 生成优化建议 ---
     suggestions_result = {}

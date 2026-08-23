@@ -69,7 +69,7 @@ type StorageBlob struct {
 	// StoredSize 实际存储字节数（压缩后）。
 	StoredSize int64 `gorm:"column:stored_size;not null;default:0" json:"stored_size"`
 	// LogicalSize 解压后的内容大小；历史对象无法确知时等于 stored_size。
-	LogicalSize int64 `gorm:"column:logical_size;not null;default:0" json:"logical_size"`
+	LogicalSize int64  `gorm:"column:logical_size;not null;default:0" json:"logical_size"`
 	Format      string `gorm:"column:format;size:32;uniqueIndex:uidx_storage_blobs_content,priority:2" json:"format"`
 	// SchemaVersion 内容 schema 版本（如 pprof v1）。
 	SchemaVersion string `gorm:"column:schema_version;size:32" json:"schema_version"`
@@ -101,9 +101,9 @@ func (b *StorageBlob) IsDeleted() bool {
 
 // StorageObjectGC 原因
 const (
-	GCMigrationReason       = "migration"
-	GCLastReferenceReason   = "last_reference"
-	GCOverrideReason        = "override"
+	GCMigrationReason     = "migration"
+	GCLastReferenceReason = "last_reference"
+	GCOverrideReason      = "override"
 )
 
 // StorageObjectGC — 迁移后旧物理 key 的延迟 GC 队列。
@@ -129,3 +129,16 @@ type StorageObjectGC struct {
 // TableName 固定为 storage_object_gc（与 012 迁移 SQL 一致；
 // GORM 默认复数会生成 storage_object_gcs 造成双表）。
 func (StorageObjectGC) TableName() string { return "storage_object_gc" }
+
+// StorageMigrationFailure 记录单个旧对象的迁移失败与退避时间。
+// 独立建表而不污染 StorageBlob.status：旧对象在迁移失败期间仍然是可读的 ready Blob。
+type StorageMigrationFailure struct {
+	ObjectKey     string     `gorm:"column:object_key;primaryKey;size:512" json:"object_key"`
+	Attempts      int        `gorm:"column:attempts;not null;default:0" json:"attempts"`
+	NextAttemptAt *time.Time `gorm:"column:next_attempt_at;index" json:"next_attempt_at"`
+	LastError     string     `gorm:"column:last_error;size:1024" json:"last_error"`
+	CreatedAt     time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+func (StorageMigrationFailure) TableName() string { return "storage_migration_failures" }

@@ -1,13 +1,13 @@
 package server
 
 import (
-	"errors"
-	"io"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -24,13 +24,13 @@ func blobTestServer(t *testing.T) *APIServer {
 	s.Config = &config.Config{
 		Storage: config.StorageConfig{Bucket: "drop-data", PresignExpireSec: 900},
 		Blob: config.BlobConfig{
-			MinCompressBytes:  4096,
-			GCSafeGraceHours:  24,
-			MigrationBatch:    50,
+			MinCompressBytes:     4096,
+			GCSafeGraceHours:     24,
+			MigrationBatch:       50,
 			MigrationIntervalSec: 60,
-			MigrateKallsyms:   true,
-			MigrateELF:        true,
-			MigrateResults:    true,
+			MigrateKallsyms:      true,
+			MigrateELF:           true,
+			MigrateResults:       true,
 		},
 		Retention: config.RetentionConfig{
 			Enabled: true, LifecycleMode: "enforce", NotBeforeProtectionHours: 24,
@@ -413,6 +413,214 @@ func TestBlobMigrationCompressesAndSwitchesRefs(t *testing.T) {
 	if _, ok := mem.objects["kernel-symbols/abc/kallsyms"]; !ok {
 		t.Fatal("legacy object deleted before grace period")
 	}
+	// 迁移引用已经带 blob_id；对账墓碑化旧 backfill blob 后，宽限期结束必须
+	// 真正删除旧 key，不能因为逻辑 object_key 保留而永久 deferred。
+	if err := s.reconcileOrphanBackfillBlobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Minute)
+	if err := s.DB.Model(&model.StorageObjectGC{}).
+		Where("object_key = ?", "kernel-symbols/abc/kallsyms").
+		Updates(map[string]interface{}{"not_before": &past, "next_delete_attempt_at": nil}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runGCOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mem.objects["kernel-symbols/abc/kallsyms"]; ok {
+		t.Fatal("legacy object must be deleted after grace period")
+	}
+}
+
+func TestKernelLedgerDoesNotPinLastCASReference(t *testing.T) {
+	s := blobTestServer(t)
+	mem := s.Storage.(*retentionMemoryStorage)
+	now := time.Now()
+	blob := model.StorageBlob{
+		ObjectKey: "blobs/sha256/ab/kernel/kallsyms-v1.gz", StoredSize: 10,
+		Format: model.BlobFormatKallsyms, Compression: model.CompressionGzip,
+		Status: model.BlobStatusReady, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.DB.Create(&blob).Error; err != nil {
+		t.Fatal(err)
+	}
+	mem.objects[blob.ObjectKey] = []byte("compressed")
+	sha := strings.Repeat("d", 64)
+	if err := s.DB.Create(&model.KernelSymbolFile{
+		SHA256: sha, ObjectKey: "kernel-symbols/" + sha + "/kallsyms",
+		Status: model.SymbolFileStatusReady, BlobID: &blob.ID, CreatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	a := model.Artifact{
+		TaskTID: "t-kernel-cas", Kind: model.ArtifactKindRaw,
+		ObjectKey: "kernel-symbols/" + sha + "/kallsyms", BlobID: &blob.ID,
+		Status: model.ArtifactStatusReady, CreatedAt: now,
+	}
+	if err := s.DB.Create(&a).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !s.claimArtifactForDeletion(context.Background(), &a, false) {
+		t.Fatal("claim artifact")
+	}
+	s.processClaimedDeletion(context.Background(), &a, model.DeleteReasonExpired)
+	var final model.StorageBlob
+	if err := s.DB.First(&final, blob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != model.BlobStatusDeleted || final.DeletedAt == nil {
+		t.Fatalf("kernel CAS blob was pinned by ledger: %+v", final)
+	}
+	var ledgers int64
+	s.DB.Model(&model.KernelSymbolFile{}).Where("blob_id = ?", blob.ID).Count(&ledgers)
+	if ledgers != 0 {
+		t.Fatalf("kernel ledger count=%d want 0", ledgers)
+	}
+}
+
+func TestKernelArtifactCannotReferenceDeletingBlob(t *testing.T) {
+	s := blobTestServer(t)
+	now := time.Now()
+	blob := model.StorageBlob{
+		ObjectKey: "blobs/sha256/ab/deleting/kallsyms-v1.gz",
+		Format:    model.BlobFormatKallsyms, Compression: model.CompressionGzip,
+		Status: model.BlobStatusDeleting, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.DB.Create(&blob).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordKernelSymbolArtifact("t-new", "kernel-symbols/x/kallsyms", 10, "x", &blob.ID); err == nil {
+		t.Fatal("deleting blob must reject a new artifact reference")
+	}
+	var refs int64
+	s.DB.Model(&model.Artifact{}).Where("blob_id = ?", blob.ID).Count(&refs)
+	if refs != 0 {
+		t.Fatalf("new refs=%d want 0", refs)
+	}
+}
+
+func TestKernelArtifactTombstoneCannotBeRevived(t *testing.T) {
+	s := blobTestServer(t)
+	now := time.Now()
+	deletedAt := now.Add(-time.Minute)
+	key := "kernel-symbols/x/kallsyms"
+	tombstone := model.Artifact{
+		TaskTID: "t-tombstone", Kind: model.ArtifactKindRaw, ObjectKey: key,
+		Status: model.ArtifactStatusDeleted, DeletedAt: &deletedAt, CreatedAt: now,
+	}
+	if err := s.DB.Create(&tombstone).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordKernelSymbolArtifact(tombstone.TaskTID, key, 10, "x", nil); err == nil {
+		t.Fatal("kernel artifact tombstone must reject revival")
+	}
+	var final model.Artifact
+	if err := s.DB.First(&final, tombstone.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != model.ArtifactStatusDeleted || final.DeletedAt == nil {
+		t.Fatalf("tombstone revived: %+v", final)
+	}
+}
+
+func TestOrphanCASBlobReconcilesAfterSafeGrace(t *testing.T) {
+	s := blobTestServer(t)
+	mem := s.Storage.(*retentionMemoryStorage)
+	s.Config.Blob.GCSafeGraceHours = 1
+	now := time.Now()
+	blob := model.StorageBlob{
+		ObjectKey: "blobs/sha256/ab/orphan/svg-v1.gz", StoredSize: 12,
+		Format: model.BlobFormatSVG, Compression: model.CompressionGzip,
+		Status: model.BlobStatusReady, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now,
+	}
+	if err := s.DB.Create(&blob).Error; err != nil {
+		t.Fatal(err)
+	}
+	mem.objects[blob.ObjectKey] = []byte("orphan-bytes")
+	if err := s.reconcileOrphanCASBlobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var final model.StorageBlob
+	if err := s.DB.First(&final, blob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != model.BlobStatusDeleted || final.DeletedAt == nil {
+		t.Fatalf("orphan CAS blob not tombstoned: %+v", final)
+	}
+	if _, ok := mem.objects[blob.ObjectKey]; ok {
+		t.Fatal("orphan CAS object still exists")
+	}
+}
+
+func TestMigrationFailureQuarantinesOnlyBadObject(t *testing.T) {
+	s := blobTestServer(t)
+	mem := s.Storage.(*retentionMemoryStorage)
+	s.Config.Blob.MigrationBatch = 3
+	now := time.Now()
+	badKey := "kernel-symbols/bad/kallsyms"
+	goodKey := "kernel-symbols/good/kallsyms"
+	if err := s.DB.Create(&model.KernelSymbolFile{
+		SHA256: "bad", ObjectKey: badKey, Status: model.SymbolFileStatusReady, CreatedAt: now.Add(-time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&model.KernelSymbolFile{
+		SHA256: "good", ObjectKey: goodKey, Status: model.SymbolFileStatusReady, CreatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	mem.objects[goodKey] = []byte("ffffffff81000000 T good\n")
+	s.Storage = &failOneGetStorage{retentionMemoryStorage: mem, failedKey: badKey}
+	if err := s.runMigrationOnce(context.Background()); err == nil {
+		t.Fatal("batch should report the quarantined object error")
+	}
+	var failure model.StorageMigrationFailure
+	if err := s.DB.Where("object_key = ?", badKey).First(&failure).Error; err != nil {
+		t.Fatalf("missing failure state: %v", err)
+	}
+	var good model.KernelSymbolFile
+	if err := s.DB.Where("sha256 = ?", "good").First(&good).Error; err != nil {
+		t.Fatal(err)
+	}
+	if good.BlobID == nil {
+		t.Fatal("good object behind bad candidate was not migrated")
+	}
+	var migrated model.StorageBlob
+	if err := s.DB.First(&migrated, *good.BlobID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(migrated.ObjectKey, casObjectKeyPrefix) {
+		t.Fatalf("good object physical key=%s", migrated.ObjectKey)
+	}
+}
+
+func TestUnsupportedResultDoesNotBlockSupportedCandidate(t *testing.T) {
+	s := blobTestServer(t)
+	mem := s.Storage.(*retentionMemoryStorage)
+	now := time.Now()
+	perfKey := "t/perf.data"
+	svgKey := "t/flamegraph.svg"
+	mem.objects[perfKey] = bytes.Repeat([]byte("p"), 5000)
+	mem.objects[svgKey] = bytes.Repeat([]byte("s"), 5000)
+	if err := s.DB.Create(&model.Artifact{TaskTID: "t", Kind: model.ArtifactKindIntermediate,
+		ObjectKey: perfKey, Size: 5000, Status: model.ArtifactStatusReady, CreatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&model.Artifact{TaskTID: "t", Kind: model.ArtifactKindResult,
+		ObjectKey: svgKey, Size: 5000, Status: model.ArtifactStatusReady, CreatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	done, err := s.migrateNextResult(context.Background())
+	if err != nil || !done {
+		t.Fatalf("supported result behind perf.data done=%v err=%v", done, err)
+	}
+	var svg model.Artifact
+	if err := s.DB.Where("object_key = ?", svgKey).First(&svg).Error; err != nil {
+		t.Fatal(err)
+	}
+	if svg.BlobID == nil {
+		t.Fatal("svg was not migrated")
+	}
 }
 
 func TestBlobMigrationFailureKeepsOldRefs(t *testing.T) {
@@ -460,6 +668,18 @@ type failingGetStorage struct {
 
 func (f *failingGetStorage) GetObject(ctx context.Context, _, _ string) (io.ReadCloser, error) {
 	return nil, errors.New("simulated read failure")
+}
+
+type failOneGetStorage struct {
+	*retentionMemoryStorage
+	failedKey string
+}
+
+func (f *failOneGetStorage) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+	if key == f.failedKey {
+		return nil, errors.New("simulated object corruption")
+	}
+	return f.retentionMemoryStorage.GetObject(ctx, bucket, key)
 }
 
 // ------------------------------------------------------------

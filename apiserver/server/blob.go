@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 
 	"github.com/mini-drop/apiserver/model"
 	"github.com/mini-drop/apiserver/util"
@@ -39,6 +40,7 @@ const casObjectKeyPrefix = "blobs/sha256/"
 // blobCASKey 构造内容寻址物理对象 key。
 // 格式：blobs/sha256/<ab>/<logical_sha256>/<format>-v<schema><ext>
 //   - ext：pprof→".pb.gz"（格式自带扩展名）；gzip→".gz"；zstd→".zst"；未压缩→""。
+//
 // 该格式与 analysis/artifact_descriptor.py 的 blob_cas_key 保持一致（跨端契约）。
 func blobCASKey(logicalSHA256, format, schemaVersion, compression string) string {
 	if len(logicalSHA256) < 2 {
@@ -203,27 +205,33 @@ func (r resolvedBlob) String() string {
 
 // countBlobRefs 统计一个 Blob 的全部有效引用：
 //   - artifacts：blob_id 指向且未删除（deleting/deleted 不算有效引用）
-//   - symbol_files / kernel_symbol_files：blob_id 指向
+//   - symbol_files：全局 build-id 符号库自身拥有 Blob
+//
+// KernelSymbolFile 只是任务 Artifact 的去重索引，不是独立所有者；否则最后一个
+// kallsyms Artifact 删除时会形成“ledger 引用阻止删除、删除后才清 ledger”的循环。
 func (s *APIServer) countBlobRefs(ctx context.Context, blobID uint) (int64, error) {
-	if s == nil || s.DB == nil || blobID == 0 {
+	if s == nil || s.DB == nil {
+		return 0, nil
+	}
+	return countBlobRefsDB(s.DB.WithContext(ctx), blobID)
+}
+
+func countBlobRefsDB(q *gorm.DB, blobID uint) (int64, error) {
+	if q == nil || blobID == 0 {
 		return 0, nil
 	}
 	var total int64
-	q := s.DB.WithContext(ctx)
 	if err := q.Model(&model.Artifact{}).
 		Where("blob_id = ? AND deleted_at IS NULL AND status NOT IN ?", blobID,
 			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
 		Count(&total).Error; err != nil {
 		return 0, err
 	}
-	var n2, n3 int64
+	var n2 int64
 	if err := q.Model(&model.SymbolFile{}).Where("blob_id = ?", blobID).Count(&n2).Error; err != nil {
 		return 0, err
 	}
-	if err := q.Model(&model.KernelSymbolFile{}).Where("blob_id = ?", blobID).Count(&n3).Error; err != nil {
-		return 0, err
-	}
-	return total + n2 + n3, nil
+	return total + n2, nil
 }
 
 // ------------------------------------------------------------
@@ -232,19 +240,19 @@ func (s *APIServer) countBlobRefs(ctx context.Context, blobID uint) (int64, erro
 
 type blobStats struct {
 	// BlobCount/BlobPhysicalBytes/BlobLogicalBytes 只统计 ready 的物理 blob。
-	BlobCount          int64             `json:"blob_count"`
-	BlobPhysicalBytes  int64             `json:"blob_physical_bytes"`
-	BlobLogicalBytes   int64             `json:"blob_logical_bytes"`
-	BlobDedupBytes     int64             `json:"deduplicated_bytes"`
-	ByStatusCount      map[string]int64  `json:"blob_by_status_count"`
-	ByStatusBytes      map[string]int64  `json:"blob_by_status_bytes"`
-	Backlog            int64             `json:"migration_backlog"`
-	BackfillBacklog    int64             `json:"backfill_backlog"`
-	FailedObjects      int64             `json:"migration_failures"`
-	ReclaimedBytes     int64             `json:"migration_reclaimed_bytes"`
-	LastRunAt          *time.Time        `json:"migration_last_run_at"`
-	LastError          string            `json:"migration_last_error"`
-	MaintenanceAllowed bool              `json:"maintenance_allowed"`
+	BlobCount          int64            `json:"blob_count"`
+	BlobPhysicalBytes  int64            `json:"blob_physical_bytes"`
+	BlobLogicalBytes   int64            `json:"blob_logical_bytes"`
+	BlobDedupBytes     int64            `json:"deduplicated_bytes"`
+	ByStatusCount      map[string]int64 `json:"blob_by_status_count"`
+	ByStatusBytes      map[string]int64 `json:"blob_by_status_bytes"`
+	Backlog            int64            `json:"migration_backlog"`
+	BackfillBacklog    int64            `json:"backfill_backlog"`
+	FailedObjects      int64            `json:"migration_failures"`
+	ReclaimedBytes     int64            `json:"migration_reclaimed_bytes"`
+	LastRunAt          *time.Time       `json:"migration_last_run_at"`
+	LastError          string           `json:"migration_last_error"`
+	MaintenanceAllowed bool             `json:"maintenance_allowed"`
 }
 
 type blobRuntimeState struct {

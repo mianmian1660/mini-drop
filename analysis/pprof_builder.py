@@ -76,7 +76,7 @@ def _string_field(field: int, value: str) -> bytes:
 #   comm pid/tid [cpu] time: event: <frame>      (pid/tid 合并)
 #   comm pid/tid time: event:                    (无 [cpu] 字段，帧在下一行)
 _HEADER_RE = re.compile(
-    r"^(\S+)\s+(\d+(?:/\d+)?|\d+\s+\d+)(?:\s+\[\d+\])?\s+([\d.]+):\s+([^:]+):(?:\s*(.*))?$"
+    r"^(.+?)\s+(\d+(?:/\d+)?|\d+\s+\d+)(?:\s+\[\d+\])?\s+([\d.]+):\s+([^:]+):(?:\s*(.*))?$"
 )
 # 帧：ip sym (dso) 或 ip sym 或 [unknown] 形式
 _FRAME_RE = re.compile(
@@ -419,7 +419,7 @@ def validate_pprof_proto(raw_gz: bytes) -> dict:
     返回: {"ok": bool, "samples": int, "locations": int, "mappings": int,
            "functions": int, "error": str}
     """
-    result = {"ok": False, "samples": 0, "locations": 0,
+    result = {"ok": False, "samples": 0, "total_samples": 0, "locations": 0,
               "mappings": 0, "functions": 0, "error": ""}
     try:
         from google.protobuf import descriptor_pool
@@ -436,11 +436,36 @@ def validate_pprof_proto(raw_gz: bytes) -> dict:
         data = gzip.decompress(raw_gz)
         profile = msg_cls()
         profile.ParseFromString(data)
-        result["ok"] = True
         result["samples"] = len(profile.sample)
         result["locations"] = len(profile.location)
         result["mappings"] = len(profile.mapping)
         result["functions"] = len(profile.function)
+        if not profile.sample:
+            raise ValueError("profile has no samples")
+        if not profile.sample_type:
+            raise ValueError("profile has no sample types")
+        mapping_ids = {item.id for item in profile.mapping}
+        function_ids = {item.id for item in profile.function}
+        location_ids = {item.id for item in profile.location}
+        if 0 in mapping_ids or 0 in function_ids or 0 in location_ids:
+            raise ValueError("profile contains zero-valued IDs")
+        for location in profile.location:
+            if location.mapping_id and location.mapping_id not in mapping_ids:
+                raise ValueError("location references missing mapping")
+            for line in location.line:
+                if line.function_id not in function_ids:
+                    raise ValueError("location references missing function")
+        total_samples = 0
+        for sample in profile.sample:
+            if len(sample.value) != len(profile.sample_type):
+                raise ValueError("sample value count does not match sample_type")
+            if any(location_id not in location_ids for location_id in sample.location_id):
+                raise ValueError("sample references missing location")
+            total_samples += sample.value[0]
+        if total_samples <= 0:
+            raise ValueError("profile total sample count is zero")
+        result["total_samples"] = total_samples
+        result["ok"] = True
     except Exception as exc:  # noqa: BLE001
         result["error"] = "%s: %s" % (type(exc).__name__, exc)
     return result

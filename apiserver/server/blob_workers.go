@@ -99,6 +99,10 @@ func (s *APIServer) runBlobCycle(ctx context.Context) {
 		}
 	}
 	if s.Config.Blob.GCEnabled {
+		if err := s.reconcileOrphanCASBlobs(ctx); err != nil {
+			s.setBlobError("cas orphan reconcile: " + err.Error())
+			s.logBlobWarn("cas orphan reconcile failed", zap.Error(err))
+		}
 		if err := s.runGCOnce(ctx); err != nil {
 			s.setBlobError("gc: " + err.Error())
 			s.logBlobWarn("gc failed", zap.Error(err))
@@ -108,9 +112,48 @@ func (s *APIServer) runBlobCycle(ctx context.Context) {
 	s.refreshBlobMetrics(ctx)
 }
 
+// reconcileOrphanCASBlobs 回收已登记但没有逻辑引用的 CAS Blob。覆盖分析上传后
+// 数据库事务失败、Artifact 被墓碑拒绝、重试覆盖到新内容等孤儿场景。
+// 使用与旧对象 GC 相同的安全宽限期，避免把仍处于上传→登记窗口的对象误判为孤儿。
+func (s *APIServer) reconcileOrphanCASBlobs(ctx context.Context) error {
+	grace := time.Duration(s.Config.Blob.GCSafeGraceHours) * time.Hour
+	if grace <= 0 {
+		grace = 24 * time.Hour
+	}
+	cutoff := time.Now().Add(-grace)
+	var blobs []model.StorageBlob
+	if err := s.DB.WithContext(ctx).
+		Where("object_key LIKE ? AND status = ? AND deleted_at IS NULL AND created_at <= ?",
+			casObjectKeyPrefix+"%", model.BlobStatusReady, cutoff).
+		Order("id ASC").Limit(200).Find(&blobs).Error; err != nil {
+		return err
+	}
+	for i := range blobs {
+		blob, claimed, err := s.claimUnreferencedBlobDeletion(ctx, blobs[i].ID)
+		if err != nil {
+			continue
+		}
+		if !claimed {
+			continue
+		}
+		if !s.StorageConnected() {
+			s.failBlobDeletion(ctx, &blob, errors.New("object storage is disconnected"))
+			continue
+		}
+		if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, blob.ObjectKey); err != nil {
+			s.failBlobDeletion(ctx, &blob, err)
+			continue
+		}
+		s.tombstoneBlob(ctx, &blob, model.GCLastReferenceReason)
+		_ = s.DB.WithContext(ctx).Where("blob_id = ?", blob.ID).Delete(&model.KernelSymbolFile{}).Error
+	}
+	return nil
+}
+
 // reconcileOrphanBackfillBlobs 处理"指向旧物理 key 且已无引用"的孤儿 Blob：
 //   - 墓碑化 Blob 行（deleted_at/status=deleted，delete_reason=migration）。
 //   - 旧 key 入 GC 队列（幂等），让 GC 能删掉旧对象。
+//
 // 幂等：Blob 已墓碑/已有引用则跳过。
 func (s *APIServer) reconcileOrphanBackfillBlobs(ctx context.Context) error {
 	if s == nil || s.DB == nil {
@@ -382,6 +425,7 @@ func (s *APIServer) runMigrationOnce(ctx context.Context) error {
 		budget = 10
 	}
 	processed := 0
+	var lastErr error
 	for processed < budget {
 		if ctx.Err() != nil {
 			break
@@ -392,7 +436,9 @@ func (s *APIServer) runMigrationOnce(ctx context.Context) error {
 		if s.Config.Blob.MigrateKallsyms {
 			done, err = s.migrateNextKallsyms(ctx)
 			if err != nil {
-				return err
+				lastErr = err
+				processed++
+				continue
 			}
 			if done {
 				processed++
@@ -403,7 +449,9 @@ func (s *APIServer) runMigrationOnce(ctx context.Context) error {
 		if s.Config.Blob.MigrateELF {
 			done, err = s.migrateNextELF(ctx)
 			if err != nil {
-				return err
+				lastErr = err
+				processed++
+				continue
 			}
 			if done {
 				processed++
@@ -414,7 +462,9 @@ func (s *APIServer) runMigrationOnce(ctx context.Context) error {
 		if s.Config.Blob.MigrateResults {
 			done, err = s.migrateNextResult(ctx)
 			if err != nil {
-				return err
+				lastErr = err
+				processed++
+				continue
 			}
 			if done {
 				processed++
@@ -423,7 +473,7 @@ func (s *APIServer) runMigrationOnce(ctx context.Context) error {
 		}
 		break // 无候选
 	}
-	return nil
+	return lastErr
 }
 
 // migrationCommon 迁移公共流程：读取旧对象 → gzip 影子写入 CAS key →
@@ -459,7 +509,18 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 	if err := s.DB.WithContext(ctx).
 		Where("logical_sha256 = ? AND format = ? AND compression = ?", logicalHash, in.Format, model.CompressionGzip).
 		First(&existing).Error; err == nil && existing.DeletedAt == nil {
-		return existing.ID, 0, s.switchMigrationRefs(ctx, in.OldKey, existing.ID, in, existing.StoredSHA256)
+		if existing.Status != model.BlobStatusReady {
+			return 0, 0, fmt.Errorf("deduplicated blob %d is %s", existing.ID, existing.Status)
+		}
+		if err := s.verifyBlob(ctx, existing.ObjectKey, logicalHash, logicalSize); err != nil {
+			return 0, 0, fmt.Errorf("verify deduplicated blob: %w", err)
+		}
+		if err := s.switchMigrationRefs(ctx, in.OldKey, existing.ID, in, existing.StoredSHA256); err != nil {
+			return 0, 0, err
+		}
+		s.enqueueGC(ctx, in.OldKey, model.GCMigrationReason)
+		s.clearMigrationFailure(ctx, in.OldKey)
+		return existing.ID, 0, nil
 	}
 
 	// 3) 影子上传：gzip(mtime=0) 写 CAS key，同时算存储哈希与大小。
@@ -506,6 +567,7 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 	}
 	// 6) 旧 key 入 GC 队列（24h 宽限）。
 	s.enqueueGC(ctx, in.OldKey, model.GCMigrationReason)
+	s.clearMigrationFailure(ctx, in.OldKey)
 	reclaimed := logicalSize - storedSize
 	if reclaimed < 0 {
 		reclaimed = 0
@@ -523,12 +585,55 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 	return blobID, reclaimed, nil
 }
 
+func (s *APIServer) migrationFailureDueScope(db *gorm.DB, keyColumn string) *gorm.DB {
+	now := time.Now()
+	join := "LEFT JOIN storage_migration_failures mf ON mf.object_key = " + keyColumn
+	return db.Joins(join).Where("(mf.object_key IS NULL OR mf.next_attempt_at IS NULL OR mf.next_attempt_at <= ?)", now)
+}
+
+func (s *APIServer) recordMigrationFailure(ctx context.Context, key string, migrationErr error) error {
+	if key == "" || migrationErr == nil {
+		return nil
+	}
+	var previous model.StorageMigrationFailure
+	_ = s.DB.WithContext(ctx).Where("object_key = ?", key).First(&previous).Error
+	attempts := previous.Attempts + 1
+	now := time.Now()
+	next := now.Add(deleteBackoff(attempts))
+	row := model.StorageMigrationFailure{
+		ObjectKey: key, Attempts: attempts, NextAttemptAt: &next,
+		LastError: truncateString(migrationErr.Error(), 1024), CreatedAt: now, UpdatedAt: now,
+	}
+	if !previous.CreatedAt.IsZero() {
+		row.CreatedAt = previous.CreatedAt
+	}
+	return s.DB.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "object_key"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"attempts": attempts, "next_attempt_at": &next,
+			"last_error": row.LastError, "updated_at": now,
+		}),
+	}).Create(&row).Error
+}
+
+func (s *APIServer) clearMigrationFailure(ctx context.Context, key string) {
+	_ = s.DB.WithContext(ctx).Where("object_key = ?", key).Delete(&model.StorageMigrationFailure{}).Error
+}
+
 // upsertBlobByContent 按内容唯一键 (logical_sha256, format, compression) upsert。
 // PostgreSQL：部分唯一索引带 WHERE 谓词，ON CONFLICT 必须显式带同样谓词
 // 才能匹配索引（用 raw SQL）；SQLite（单测）：GORM 创建的是全量唯一索引，
 // 用 GORM OnConflict 即可。两者都会把墓碑行复活（deleted_at=NULL, status=ready）。
 func upsertBlobByContent(tx *gorm.DB, row *model.StorageBlob, logicalHash, format string) error {
 	now := row.UpdatedAt
+	var current model.StorageBlob
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("logical_sha256 = ? AND format = ? AND compression = ?", logicalHash, format, model.CompressionGzip).
+		First(&current).Error; err == nil && current.Status == model.BlobStatusDeleting {
+		return fmt.Errorf("blob %d is being deleted", current.ID)
+	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
 	if tx.Dialector.Name() == "postgres" {
 		if err := tx.Exec(`
 			INSERT INTO storage_blobs
@@ -551,21 +656,25 @@ func upsertBlobByContent(tx *gorm.DB, row *model.StorageBlob, logicalHash, forma
 				delete_attempts = 0,
 				verified_at = EXCLUDED.verified_at,
 				deleted_at = NULL,
-				updated_at = NOW()`,
+				updated_at = NOW()
+			WHERE storage_blobs.status <> 'deleting'`,
 			row.ObjectKey, row.LogicalSHA256, row.StoredSHA256, row.StoredSize, row.LogicalSize,
 			row.Format, row.SchemaVersion, row.Compression, row.ContentEncoding, row.ContentType,
 			row.Status, row.DeleteReason, row.DeleteAttempts, row.NextDeleteAttemptAt, row.LastDeleteError,
 			row.VerifiedAt, row.DeletedAt, row.CreatedAt, row.UpdatedAt).Error; err != nil {
 			return err
 		}
-		var id uint
+		var selected model.StorageBlob
 		if err := tx.Raw(`
-			SELECT id FROM storage_blobs
+			SELECT id, status FROM storage_blobs
 			WHERE logical_sha256 = ? AND format = ? AND compression = ?
-			LIMIT 1`, logicalHash, format, model.CompressionGzip).Scan(&id).Error; err != nil {
+			LIMIT 1`, logicalHash, format, model.CompressionGzip).Scan(&selected).Error; err != nil {
 			return err
 		}
-		row.ID = id
+		if selected.Status == model.BlobStatusDeleting {
+			return fmt.Errorf("blob %d is being deleted", selected.ID)
+		}
+		row.ID = selected.ID
 		return nil
 	}
 	if err := tx.Clauses(clause.OnConflict{
@@ -604,6 +713,12 @@ func (s *APIServer) switchMigrationRefs(ctx context.Context, oldKey string, blob
 // storedSHA256 非空时同步 artifacts.sha256 为实际存储字节哈希
 // （"Artifact.sha256 校验实际存储字节；规范内容哈希只放 Blob"）。
 func (s *APIServer) switchMigrationRefsTx(tx *gorm.DB, oldKey string, blobID uint, in migrationCommonInput, storedSHA256 string) error {
+	var blob model.StorageBlob
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND status = ? AND deleted_at IS NULL", blobID, model.BlobStatusReady).
+		First(&blob).Error; err != nil {
+		return fmt.Errorf("migration target blob is not ready: %w", err)
+	}
 	now := time.Now()
 	if in.SwitchArtifacts {
 		updates := map[string]interface{}{"blob_id": blobID, "updated_at": now}
@@ -649,8 +764,10 @@ func blobMigrateReady(blob *model.StorageBlob) bool {
 // 已压缩的 .gz 对象由回填覆盖，不重复压缩。
 func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 	var row model.KernelSymbolFile
-	err := s.DB.WithContext(ctx).
+	query := s.migrationFailureDueScope(s.DB.WithContext(ctx), "kernel_symbol_files.object_key")
+	err := query.
 		Joins("LEFT JOIN storage_blobs b ON b.id = kernel_symbol_files.blob_id").
+		Where("kernel_symbol_files.status = ?", model.SymbolFileStatusReady).
 		Where("kernel_symbol_files.object_key LIKE 'kernel-symbols/%/kallsyms' AND kernel_symbol_files.object_key NOT LIKE '%.gz'").
 		Where("(kernel_symbol_files.blob_id IS NULL OR b.object_key NOT LIKE ?)", casObjectKeyPrefix+"%").
 		Order("kernel_symbol_files.created_at ASC").Limit(1).First(&row).Error
@@ -679,6 +796,9 @@ func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 		incBlobMigrationFailures()
 		s.logBlobWarn("kallsyms migration failed",
 			zap.String("object_key", redactBlobKey(row.ObjectKey)), zap.Error(err))
+		if stateErr := s.recordMigrationFailure(ctx, row.ObjectKey, err); stateErr != nil {
+			return true, fmt.Errorf("%v; record migration failure: %w", err, stateErr)
+		}
 		return true, err
 	}
 	return true, nil
@@ -687,9 +807,10 @@ func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 // migrateNextELF 迁移一个用户态 ELF 符号（"symbols/<build_id>"）。
 func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 	var row model.SymbolFile
-	err := s.DB.WithContext(ctx).
+	query := s.migrationFailureDueScope(s.DB.WithContext(ctx), "symbol_files.object_key")
+	err := query.
 		Joins("LEFT JOIN storage_blobs b ON b.id = symbol_files.blob_id").
-		Where("symbol_files.object_key LIKE 'symbols/%'").
+		Where("symbol_files.status = ? AND symbol_files.object_key LIKE 'symbols/%'", model.SymbolFileStatusReady).
 		Where("(symbol_files.blob_id IS NULL OR b.object_key NOT LIKE ?)", casObjectKeyPrefix+"%").
 		Order("symbol_files.created_at ASC").Limit(1).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -705,9 +826,9 @@ func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 		}
 	}
 	_, _, err = s.migrationCommon(ctx, migrationCommonInput{
-		OldKey:            row.ObjectKey,
-		Format:            model.BlobFormatELF,
-		ContentType:       "application/octet-stream",
+		OldKey:             row.ObjectKey,
+		Format:             model.BlobFormatELF,
+		ContentType:        "application/octet-stream",
 		SwitchSymbolLedger: true,
 	})
 	if err != nil {
@@ -715,6 +836,9 @@ func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 		incBlobMigrationFailures()
 		s.logBlobWarn("elf migration failed",
 			zap.String("object_key", redactBlobKey(row.ObjectKey)), zap.Error(err))
+		if stateErr := s.recordMigrationFailure(ctx, row.ObjectKey, err); stateErr != nil {
+			return true, fmt.Errorf("%v; record migration failure: %w", err, stateErr)
+		}
 		return true, err
 	}
 	return true, nil
@@ -723,13 +847,15 @@ func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 // migrateNextResult 迁移一个历史文本结果（SVG/folded/JSON/Markdown ≥4KiB）。
 func (s *APIServer) migrateNextResult(ctx context.Context) (bool, error) {
 	var a model.Artifact
-	err := s.DB.WithContext(ctx).
+	query := s.migrationFailureDueScope(s.DB.WithContext(ctx), "artifacts.object_key")
+	err := query.
 		Joins("LEFT JOIN storage_blobs b ON b.id = artifacts.blob_id").
 		Where("artifacts.kind IN ? AND artifacts.size >= ? AND artifacts.deleted_at IS NULL AND artifacts.status NOT IN ?",
 			[]string{model.ArtifactKindResult, model.ArtifactKindIntermediate},
 			s.Config.Blob.MinCompressBytes,
 			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
 		Where("(artifacts.blob_id IS NULL OR b.object_key NOT LIKE ?)", casObjectKeyPrefix+"%").
+		Where("(LOWER(artifacts.object_key) LIKE '%.svg' OR LOWER(artifacts.object_key) LIKE '%folded.txt' OR LOWER(artifacts.object_key) LIKE '%.collapsed' OR LOWER(artifacts.object_key) LIKE '%.json' OR LOWER(artifacts.object_key) LIKE '%.md')").
 		Order("artifacts.id ASC").Limit(1).First(&a).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
@@ -748,12 +874,7 @@ func (s *APIServer) migrateNextResult(ctx context.Context) (bool, error) {
 	switch format {
 	case model.BlobFormatSVG, model.BlobFormatFolded, model.BlobFormatJSON, model.BlobFormatMarkdown:
 	default:
-		// 不可迁移格式：标记 blob（占位）避免反复扫描。
-		now := time.Now()
-		_ = s.DB.WithContext(ctx).Model(&model.Artifact{}).
-			Where("id = ?", a.ID).
-			Updates(map[string]interface{}{"format": format, "updated_at": now}).Error
-		return false, nil
+		return false, nil // SQL 已过滤；保留防御分支
 	}
 	contentType := mimeType(a.ObjectKey)
 	_, _, err = s.migrationCommon(ctx, migrationCommonInput{
@@ -767,6 +888,9 @@ func (s *APIServer) migrateNextResult(ctx context.Context) (bool, error) {
 		incBlobMigrationFailures()
 		s.logBlobWarn("result migration failed",
 			zap.String("object_key", redactBlobKey(a.ObjectKey)), zap.Error(err))
+		if stateErr := s.recordMigrationFailure(ctx, a.ObjectKey, err); stateErr != nil {
+			return true, fmt.Errorf("%v; record migration failure: %w", err, stateErr)
+		}
 		return true, err
 	}
 	return true, nil
@@ -960,26 +1084,28 @@ func (s *APIServer) runGCOnce(ctx context.Context) error {
 // legacyKeyRefs 统计仍有引用解析到旧物理 key 的行数：
 // blob_id IS NULL 的 artifacts/symbol_files/kernel_symbol_files + 未删除的 blob 行。
 func (s *APIServer) legacyKeyRefs(ctx context.Context, key string) (int64, error) {
-	var total int64
-	for _, m := range []interface{}{
-		&model.Artifact{}, &model.SymbolFile{}, &model.KernelSymbolFile{},
-	} {
-		q := s.DB.WithContext(ctx).Model(m).Where("object_key = ?", key)
-		switch m.(type) {
-		case *model.Artifact:
-			q = q.Where("deleted_at IS NULL AND status NOT IN ?", []string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted})
-		}
-		var n int64
-		if err := q.Count(&n).Error; err != nil {
-			return 0, err
-		}
-		total += n
+	var artifacts, symbols, kernelSymbols int64
+	if err := s.DB.WithContext(ctx).Model(&model.Artifact{}).
+		Where("object_key = ? AND blob_id IS NULL AND deleted_at IS NULL AND status NOT IN ?", key,
+			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
+		Count(&artifacts).Error; err != nil {
+		return 0, err
+	}
+	if err := s.DB.WithContext(ctx).Model(&model.SymbolFile{}).
+		Where("object_key = ? AND (blob_id IS NULL OR blob_id = 0)", key).
+		Count(&symbols).Error; err != nil {
+		return 0, err
+	}
+	if err := s.DB.WithContext(ctx).Model(&model.KernelSymbolFile{}).
+		Where("object_key = ? AND (blob_id IS NULL OR blob_id = 0)", key).
+		Count(&kernelSymbols).Error; err != nil {
+		return 0, err
 	}
 	var blobRefs int64
 	_ = s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
 		Where("object_key = ? AND deleted_at IS NULL", key).
 		Count(&blobRefs).Error
-	return total + blobRefs, nil
+	return artifacts + symbols + kernelSymbols + blobRefs, nil
 }
 
 // failGCDeletion 删除失败退避（1m→5m→30m→2h→6h）。

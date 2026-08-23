@@ -608,6 +608,7 @@ func (s *APIServer) processClaimedDeletion(ctx context.Context, a *model.Artifac
 //  2. 若 Blob 仍有其它有效引用 → 结束（对象保留）。
 //  3. 无引用 → CAS 领取 Blob（ready→deleting）→ 删物理对象 →
 //     墓碑 Blob + 清理 ledger 行（kernel_symbol_files/symbol_files）。
+//
 // 删除失败保留 Blob deleting 状态按退避重试（processBlobDeletingRetries）。
 func (s *APIServer) processClaimedBlobDeletion(ctx context.Context, a *model.Artifact, reason string) {
 	if a == nil || a.BlobID == nil {
@@ -639,19 +640,17 @@ func (s *APIServer) processClaimedBlobDeletion(ctx context.Context, a *model.Art
 	}
 	// 1) 先落 artifact 墓碑。
 	s.completeArtifactDeletion(ctx, a, reason)
-	// 2) 统计其它有效引用。
-	refs, err := s.countBlobRefs(ctx, blob.ID)
+	// 2/3) 在同一事务内锁住 Blob、复查引用并领取删除。写入方也会锁同一行，
+	// 因而不能在“引用计数为零”和 ready→deleting 之间插入新引用。
+	claimedBlob, claimed, err := s.claimUnreferencedBlobDeletion(ctx, blob.ID)
 	if err != nil {
-		s.failBlobDeletion(ctx, &blob, err)
-		return
+		s.logBlobWarn("claim unreferenced blob failed", zap.Uint("blob_id", blob.ID), zap.Error(err))
+		return // artifact 已墓碑；孤儿 Blob 对账会在宽限期后继续收敛
 	}
-	if refs > 0 {
-		return // 对象仍被引用，保留
+	if !claimed {
+		return // 仍有引用，或其它 cleaner 已领取
 	}
-	// 3) CAS 领取 Blob 删除（避免并发最后引用竞态）。
-	if !s.claimBlobDeletionCAS(ctx, blob.ID) {
-		return // 其它 cleaner 已领取，负责删对象
-	}
+	blob = claimedBlob
 	if !s.StorageConnected() {
 		s.failBlobDeletion(ctx, &blob, errors.New("object storage is disconnected"))
 		return
@@ -673,20 +672,42 @@ func (s *APIServer) processClaimedBlobDeletion(ctx context.Context, a *model.Art
 		zap.String("reason", reason))
 }
 
-// claimBlobDeletionCAS 行级 CAS 领取 Blob 删除：只有 ready 且未删的行会成功。
-func (s *APIServer) claimBlobDeletionCAS(ctx context.Context, blobID uint) bool {
-	if s == nil || s.DB == nil {
-		return false
-	}
-	res := s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
-		Where("id = ? AND status = ? AND deleted_at IS NULL", blobID, model.BlobStatusReady).
-		Updates(map[string]interface{}{
-			"status":                 model.BlobStatusDeleting,
-			"next_delete_attempt_at": nil,
-			"last_delete_error":      "",
-			"updated_at":             time.Now(),
-		})
-	return res.Error == nil && res.RowsAffected == 1
+// claimUnreferencedBlobDeletion 把“锁 Blob → 统计引用 → 领取删除”放在一个事务里。
+// PostgreSQL 的 FOR UPDATE 与分析端登记引用使用相同的行锁协议。
+func (s *APIServer) claimUnreferencedBlobDeletion(ctx context.Context, blobID uint) (model.StorageBlob, bool, error) {
+	var blob model.StorageBlob
+	claimed := false
+	err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND status = ? AND deleted_at IS NULL", blobID, model.BlobStatusReady).
+			First(&blob).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		refs, err := countBlobRefsDB(tx, blob.ID)
+		if err != nil {
+			return err
+		}
+		if refs > 0 {
+			return nil
+		}
+		res := tx.Model(&model.StorageBlob{}).
+			Where("id = ? AND status = ? AND deleted_at IS NULL", blob.ID, model.BlobStatusReady).
+			Updates(map[string]interface{}{
+				"status":                 model.BlobStatusDeleting,
+				"next_delete_attempt_at": nil,
+				"last_delete_error":      "",
+				"updated_at":             time.Now(),
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		claimed = res.RowsAffected == 1
+		return nil
+	})
+	return blob, claimed, err
 }
 
 // tombstoneBlob 删除成功：写 Blob 墓碑（行永久保留审计）。
@@ -761,10 +782,10 @@ func (s *APIServer) processBlobDeletingRetries(ctx context.Context) {
 			_ = s.DB.WithContext(ctx).Model(&model.StorageBlob{}).
 				Where("id = ? AND status = ?", blob.ID, model.BlobStatusDeleting).
 				Updates(map[string]interface{}{
-					"status":             model.BlobStatusReady,
-					"delete_attempts":    0,
-					"last_delete_error":  "",
-					"updated_at":         time.Now(),
+					"status":            model.BlobStatusReady,
+					"delete_attempts":   0,
+					"last_delete_error": "",
+					"updated_at":        time.Now(),
 				})
 			continue
 		}

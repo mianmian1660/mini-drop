@@ -46,6 +46,15 @@ def test_parse_perf_script_counts_samples():
     assert s["frames"][0] == (0x7F8C12345678, "main", "/usr/bin/python3")
 
 
+def test_parse_perf_script_comm_with_spaces():
+    output = "worker pool 123/456 [001] 10.25: cpu-clock: 7f main (/bin/app)\n"
+    model = pb.parse_perf_script(output)
+    assert len(model["samples"]) == 1
+    assert model["samples"][0]["comm"] == "worker pool"
+    assert model["samples"][0]["pid"] == 123
+    assert model["samples"][0]["tid"] == 456
+
+
 def test_pprof_roundtrip_references_valid():
     model = pb.parse_perf_script(SAMPLE_SCRIPT)
     raw = pb.build_pprof(model, period_ns=52631579,
@@ -55,6 +64,7 @@ def test_pprof_roundtrip_references_valid():
     check = pb.validate_pprof_proto(gz)
     assert check["ok"], check["error"]
     assert check["samples"] == 2  # main;foo;bar 聚合为 1 条 ×2，main;baz 1 条
+    assert check["total_samples"] == 3
     Profile = _profile()
     p = Profile()
     p.ParseFromString(gzip.decompress(gz))
@@ -177,6 +187,13 @@ def test_folded_to_model():
     assert m["samples"][0]["frames"][0][1] == "main"
 
 
+def test_empty_pprof_is_rejected():
+    empty = pb.pprof_gz({"samples": []}, period_ns=10000000)
+    check = pb.validate_pprof_proto(empty)
+    assert not check["ok"]
+    assert "no samples" in check["error"]
+
+
 if __name__ == "__main__":
     failures = 0
     for k, v in sorted(list(globals().items())):
@@ -187,5 +204,6 @@ if __name__ == "__main__":
             except Exception as e:
                 failures += 1
                 print(f"  ❌ {k}: {e}")
-    print(f"结果: 通过 {8 - failures}, 失败 {failures}, 总计 8")
+    total = sum(1 for k, v in globals().items() if k.startswith("test_") and callable(v))
+    print(f"结果: 通过 {total - failures}, 失败 {failures}, 总计 {total}")
     sys.exit(1 if failures else 0)

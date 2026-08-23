@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 
-from analyzer_contract import AnalyzerError, AnalyzerInputError
+from analyzer_contract import AnalyzerError, AnalyzerInputError, AnalyzerTemporaryError
 from analyzer_registry import build_default_registry
 from lease import AnalysisLeaseClient
 from observability import elapsed_seconds, log_event, now_seconds
@@ -47,8 +47,9 @@ def cleanup_stale_workspaces():
 def _upsert_blob_row(conn, descriptor: dict) -> int:
     """按内容唯一键 (logical_sha256, format, compression) upsert storage_blobs。
 
-    内容寻址去重：同内容复用同一 blob；墓碑（deleted）行被复活（内容不可变，
-    重新上传同 key 对象是幂等的）。返回 blob_id。
+    内容寻址去重：同内容复用同一 blob。登记方与 cleaner 共用行锁协议：
+    deleting Blob 不允许新增引用，等待分析任务重试；deleted/failed Blob 只有在
+    本次 CAS 上传完成后才复活。返回 blob_id。
     """
     cur = conn.cursor()
     cur.execute(
@@ -59,17 +60,7 @@ def _upsert_blob_row(conn, descriptor: dict) -> int:
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ready', NOW(), NOW())
         ON CONFLICT (logical_sha256, format, compression)
           WHERE logical_sha256 IS NOT NULL
-        DO UPDATE SET object_key = EXCLUDED.object_key,
-            stored_sha256 = EXCLUDED.stored_sha256,
-            stored_size = EXCLUDED.stored_size,
-            logical_size = EXCLUDED.logical_size,
-            content_encoding = EXCLUDED.content_encoding,
-            content_type = EXCLUDED.content_type,
-            status = 'ready',
-            deleted_at = NULL,
-            delete_reason = NULL,
-            delete_attempts = 0,
-            updated_at = NOW()
+        DO NOTHING
         RETURNING id
         """,
         (
@@ -86,7 +77,45 @@ def _upsert_blob_row(conn, descriptor: dict) -> int:
         ),
     )
     row = cur.fetchone()
-    return row[0] if row else 0
+    if row:
+        return row[0]
+
+    cur.execute(
+        """
+        SELECT id, status
+        FROM storage_blobs
+        WHERE logical_sha256 = %s AND format = %s AND compression = %s
+        FOR UPDATE
+        """,
+        (descriptor.get("logical_sha256"), descriptor.get("format"),
+         descriptor.get("compression")),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise AnalyzerTemporaryError("CAS Blob 并发登记失败，请重试")
+    blob_id, status = row[0], row[1]
+    if status in ("deleting", "uploading"):
+        raise AnalyzerTemporaryError("CAS Blob 正在变更状态，请重试")
+    if status != "ready":
+        cur.execute(
+            """
+            UPDATE storage_blobs
+            SET object_key = %s, stored_sha256 = %s, stored_size = %s,
+                logical_size = %s, schema_version = %s,
+                content_encoding = %s, content_type = %s,
+                status = 'ready', deleted_at = NULL, delete_reason = NULL,
+                delete_attempts = 0, next_delete_attempt_at = NULL,
+                last_delete_error = '', updated_at = NOW()
+            WHERE id = %s AND status <> 'deleting'
+            """,
+            (descriptor["blob_key"], descriptor.get("stored_sha256"),
+             descriptor.get("stored_size", 0), descriptor.get("logical_size", 0),
+             descriptor.get("schema_version"), descriptor.get("content_encoding"),
+             descriptor.get("content_type"), blob_id),
+        )
+        if getattr(cur, "rowcount", 1) != 1:
+            raise AnalyzerTemporaryError("CAS Blob 状态发生变化，请重试")
+    return blob_id
 
 
 def _insert_artifact_from_descriptor(conn, tid: str, attempt_id: int,
@@ -198,15 +227,11 @@ def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None
         if aid:
             artifact_ids.append(aid)
         else:
-            # 唯一键命中 deleted tombstone：拒绝复活，删除已上传的物理对象。
-            try:
-                if storage is not None and bucket:
-                    storage.delete_object(bucket, descriptor["blob_key"])
-                    log_event("artifact_tombstone_upload_removed", task_tid=tid,
-                              object_key=descriptor["object_key"])
-            except Exception as exc:
-                log_event("artifact_tombstone_upload_remove_failed", task_tid=tid,
-                          object_key=descriptor["object_key"], error=str(exc))
+            # 唯一键命中 deleted tombstone：只拒绝逻辑引用。blob_key 是共享 CAS
+            # 对象，绝不能在未检查其它引用时直接删除；服务端孤儿对账会在安全
+            # 宽限期后回收真正的零引用 Blob。
+            log_event("artifact_tombstone_blob_unreferenced", task_tid=tid,
+                      object_key=descriptor["object_key"], blob_key=descriptor["blob_key"])
     for key in keys:
         aid = _insert_artifact_from_key(conn, tid, attempt_id, key, storage, bucket)
         if aid:

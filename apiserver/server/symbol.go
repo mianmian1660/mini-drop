@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"regexp"
@@ -243,6 +244,8 @@ func (s *APIServer) CheckKernelSymbol(c *gin.Context) {
 		}).Error
 		if err := s.recordKernelSymbolArtifact(req.TID, row.ObjectKey, row.SizeBytes, req.SHA256, row.BlobID); err != nil {
 			s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", req.TID), zap.String("sha256", req.SHA256), zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "kallsyms 对象正在回收，请重试"})
+			return
 		}
 		c.JSON(http.StatusOK, gin.H{"upload_required": false, "object_key": row.ObjectKey})
 		return
@@ -436,18 +439,38 @@ func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64
 		BlobID:      blobID,
 		CreatedAt:   time.Now(),
 	}
-	return s.DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "task_tid"}, {Name: "kind"}, {Name: "object_key"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"size":         artifact.Size,
-			"sha256":       artifact.SHA256,
-			"hash":         artifact.Hash,
-			"retention":    artifact.Retention,
-			"content_type": artifact.ContentType,
-			"status":       artifact.Status,
-			"blob_id":      artifact.BlobID,
-		}),
-	}).Create(&artifact).Error
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		if blobID != nil && *blobID > 0 {
+			var blob model.StorageBlob
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND status = ? AND deleted_at IS NULL", *blobID, model.BlobStatusReady).
+				First(&blob).Error; err != nil {
+				return err
+			}
+		}
+		res := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "task_tid"}, {Name: "kind"}, {Name: "object_key"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"size":         artifact.Size,
+				"sha256":       artifact.SHA256,
+				"hash":         artifact.Hash,
+				"retention":    artifact.Retention,
+				"content_type": artifact.ContentType,
+				"status":       artifact.Status,
+				"blob_id":      artifact.BlobID,
+			}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Eq{Column: clause.Column{Table: "artifacts", Name: "deleted_at"}, Value: nil},
+			}},
+		}).Create(&artifact)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return errors.New("kallsyms artifact tombstone cannot be revived")
+		}
+		return nil
+	})
 }
 
 func looksLikeKallsyms(body []byte) bool {
