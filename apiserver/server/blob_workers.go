@@ -459,7 +459,7 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 	if err := s.DB.WithContext(ctx).
 		Where("logical_sha256 = ? AND format = ? AND compression = ?", logicalHash, in.Format, model.CompressionGzip).
 		First(&existing).Error; err == nil && existing.DeletedAt == nil {
-		return existing.ID, 0, s.switchMigrationRefs(ctx, in.OldKey, existing.ID, in)
+		return existing.ID, 0, s.switchMigrationRefs(ctx, in.OldKey, existing.ID, in, existing.StoredSHA256)
 	}
 
 	// 3) 影子上传：gzip(mtime=0) 写 CAS key，同时算存储哈希与大小。
@@ -499,7 +499,7 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 			return err
 		}
 		blobID = row.ID
-		return s.switchMigrationRefsTx(tx, in.OldKey, blobID, in)
+		return s.switchMigrationRefsTx(tx, in.OldKey, blobID, in, storedHash)
 	})
 	if err != nil {
 		return 0, 0, err
@@ -594,19 +594,27 @@ func upsertBlobByContent(tx *gorm.DB, row *model.StorageBlob, logicalHash, forma
 }
 
 // switchMigrationRefs 事务外切引用（复用已有 blob 的并发场景）。
-func (s *APIServer) switchMigrationRefs(ctx context.Context, oldKey string, blobID uint, in migrationCommonInput) error {
+func (s *APIServer) switchMigrationRefs(ctx context.Context, oldKey string, blobID uint, in migrationCommonInput, storedSHA256 string) error {
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return s.switchMigrationRefsTx(tx, oldKey, blobID, in)
+		return s.switchMigrationRefsTx(tx, oldKey, blobID, in, storedSHA256)
 	})
 }
 
-func (s *APIServer) switchMigrationRefsTx(tx *gorm.DB, oldKey string, blobID uint, in migrationCommonInput) error {
+// switchMigrationRefsTx 切换引用到新 blob。
+// storedSHA256 非空时同步 artifacts.sha256 为实际存储字节哈希
+// （"Artifact.sha256 校验实际存储字节；规范内容哈希只放 Blob"）。
+func (s *APIServer) switchMigrationRefsTx(tx *gorm.DB, oldKey string, blobID uint, in migrationCommonInput, storedSHA256 string) error {
 	now := time.Now()
 	if in.SwitchArtifacts {
+		updates := map[string]interface{}{"blob_id": blobID, "updated_at": now}
+		if storedSHA256 != "" {
+			updates["sha256"] = storedSHA256
+			updates["hash"] = "sha256:" + storedSHA256
+		}
 		if err := tx.Model(&model.Artifact{}).
 			Where("object_key = ? AND deleted_at IS NULL AND status NOT IN ?", oldKey,
 				[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
-			Updates(map[string]interface{}{"blob_id": blobID, "updated_at": now}).Error; err != nil {
+			Updates(updates).Error; err != nil {
 			return err
 		}
 	}
@@ -793,7 +801,7 @@ func (s *APIServer) streamGzipUpload(ctx context.Context, srcKey, dstKey, conten
 	doneCh := make(chan error, 1)
 	go func() {
 		hasher := sha256.New()
-		zw, gzErr := gzip.NewWriterLevel(pw, gzip.BestCompression)
+		zw, gzErr := gzip.NewWriterLevel(io.MultiWriter(pw, hasher), gzip.BestCompression)
 		if gzErr != nil {
 			pw.CloseWithError(gzErr)
 			doneCh <- gzErr
@@ -801,9 +809,9 @@ func (s *APIServer) streamGzipUpload(ctx context.Context, srcKey, dstKey, conten
 		}
 		zw.Header.ModTime = time.Unix(0, 0) // mtime=0，确定性输出
 		zw.Header.OS = 0
-		mw := io.MultiWriter(zw, hasher)
-		_, copyErr := io.Copy(mw, rc)
+		_, copyErr := io.Copy(zw, rc)
 		closeErr := zw.Close()
+		// hasher 只覆盖 gzip 输出字节（MultiWriter(pw, hasher)），即实际存储字节。
 		hashCh <- hex.EncodeToString(hasher.Sum(nil))
 		if copyErr != nil {
 			pw.CloseWithError(copyErr)
