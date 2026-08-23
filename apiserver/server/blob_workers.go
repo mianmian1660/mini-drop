@@ -684,6 +684,10 @@ func (s *APIServer) streamGzipUpload(ctx context.Context, srcKey, dstKey, conten
 		doneCh <- nil
 	}()
 	putErr := s.Storage.PutObject(ctx, s.Config.Storage.Bucket, dstKey, pr, -1, contentType)
+	if putErr != nil {
+		// 关闭写端，让压缩 goroutine 立即退出，避免管道阻塞挂死 worker。
+		_ = pw.CloseWithError(putErr)
+	}
 	storedHash := <-hashCh
 	copyErr := <-doneCh
 	if putErr != nil {
