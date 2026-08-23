@@ -1439,11 +1439,13 @@ func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.Con
 	for _, m := range members {
 		memberSet[m.SourceRef] = true
 	}
-	// 该小时该信号的源窗口
+	// 该小时该信号的源窗口（只检查构建时已存在的窗口：构建后到达的迟到
+	// 窗口由 pqSealedRawHours 触发块重建，不是本块的数据缺失）。
 	types := pqV1SignalTypesFor(block.SignalType)
 	var windows []model.ProfileWindow
 	if err := s.DB.WithContext(ctx).
-		Where("window_start >= ? AND window_start < ? AND signal_type IN ?", block.BucketStart, block.BucketStart.Add(time.Hour), types).
+		Where("window_start >= ? AND window_start < ? AND signal_type IN ? AND created_at <= ?",
+			block.BucketStart, block.BucketStart.Add(time.Hour), types, block.CreatedAt).
 		Select("id, session_sid, batch_bid, object_key, window_start").
 		Find(&windows).Error; err != nil {
 		return err
