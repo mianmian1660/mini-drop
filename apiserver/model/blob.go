@@ -62,7 +62,8 @@ type StorageBlob struct {
 	ID        uint   `gorm:"primaryKey" json:"id"`
 	ObjectKey string `gorm:"column:object_key;size:512;uniqueIndex:uidx_storage_blobs_object_key" json:"object_key"`
 	// LogicalSHA256 未压缩规范内容的哈希；历史对象为 NULL（不重新计算）。
-	LogicalSHA256 string `gorm:"column:logical_sha256;size:64;uniqueIndex:uidx_storage_blobs_content,priority:1" json:"logical_sha256"`
+	// 用 *string：NULL 不参与内容寻址唯一索引（与 SQL 部分索引语义一致）。
+	LogicalSHA256 *string `gorm:"column:logical_sha256;size:64;uniqueIndex:uidx_storage_blobs_content,priority:1" json:"logical_sha256"`
 	// StoredSHA256 MinIO 中实际字节的哈希。
 	StoredSHA256 string `gorm:"column:stored_sha256;size:64" json:"stored_sha256"`
 	// StoredSize 实际存储字节数（压缩后）。

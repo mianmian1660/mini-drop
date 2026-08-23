@@ -370,7 +370,7 @@ func TestBlobMigrationCompressesAndSwitchesRefs(t *testing.T) {
 	if migrated.Compression != model.CompressionGzip {
 		t.Fatalf("compression = %s", migrated.Compression)
 	}
-	if migrated.LogicalSHA256 != sha256hex(legacyKallsyms) {
+	if migrated.LogicalSHA256 == nil || *migrated.LogicalSHA256 != sha256hex(legacyKallsyms) {
 		t.Fatal("logical sha mismatch")
 	}
 	// 回读校验：对象是 gzip，解压后等于原文

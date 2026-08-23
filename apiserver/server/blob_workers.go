@@ -255,9 +255,10 @@ func (s *APIServer) ensureBackfillBlob(ctx context.Context, key string, size int
 		Compression:     compression,
 		ContentType:     mimeType(key),
 		ContentEncoding: transparentContentEncoding(format, compression),
-		Status:          model.BlobStatusReady,
-		CreatedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
+		// LogicalSHA256 保持 nil（NULL）：历史对象不参与内容寻址唯一索引。
+		Status:    model.BlobStatusReady,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 	if err := s.DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "object_key"}},
@@ -404,7 +405,7 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 	err = s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		row := model.StorageBlob{
 			ObjectKey:       casKey,
-			LogicalSHA256:   logicalHash,
+			LogicalSHA256:   &logicalHash,
 			StoredSHA256:    storedHash,
 			StoredSize:      storedSize,
 			LogicalSize:     logicalSize,
@@ -418,27 +419,8 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		}
-		if err := tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "logical_sha256"}, {Name: "format"}, {Name: "compression"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"object_key":       row.ObjectKey,
-				"stored_sha256":    row.StoredSHA256,
-				"stored_size":      row.StoredSize,
-				"logical_size":     row.LogicalSize,
-				"content_encoding": row.ContentEncoding,
-				"content_type":     row.ContentType,
-				"status":           row.Status,
-				"verified_at":      row.VerifiedAt,
-				"deleted_at":       nil,
-				"updated_at":       now,
-			}),
-		}).Create(&row).Error; err != nil {
+		if err := upsertBlobByContent(tx, &row, logicalHash, in.Format); err != nil {
 			return err
-		}
-		if row.ID == 0 {
-			if err := tx.Where("logical_sha256 = ? AND format = ? AND compression = ?", logicalHash, in.Format, model.CompressionGzip).First(&row).Error; err != nil {
-				return err
-			}
 		}
 		blobID = row.ID
 		return s.switchMigrationRefsTx(tx, in.OldKey, blobID, in)
@@ -463,6 +445,76 @@ func (s *APIServer) migrationCommon(ctx context.Context, in migrationCommonInput
 		zap.Int64("stored_size", storedSize),
 		zap.Int64("reclaimed", reclaimed))
 	return blobID, reclaimed, nil
+}
+
+// upsertBlobByContent 按内容唯一键 (logical_sha256, format, compression) upsert。
+// PostgreSQL：部分唯一索引带 WHERE 谓词，ON CONFLICT 必须显式带同样谓词
+// 才能匹配索引（用 raw SQL）；SQLite（单测）：GORM 创建的是全量唯一索引，
+// 用 GORM OnConflict 即可。两者都会把墓碑行复活（deleted_at=NULL, status=ready）。
+func upsertBlobByContent(tx *gorm.DB, row *model.StorageBlob, logicalHash, format string) error {
+	now := row.UpdatedAt
+	if tx.Dialector.Name() == "postgres" {
+		if err := tx.Exec(`
+			INSERT INTO storage_blobs
+				(object_key, logical_sha256, stored_sha256, stored_size, logical_size,
+				 format, schema_version, compression, content_encoding, content_type,
+				 status, delete_reason, delete_attempts, next_delete_attempt_at,
+				 last_delete_error, verified_at, deleted_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?, NULL, ?, ?)
+			ON CONFLICT (logical_sha256, format, compression)
+			  WHERE logical_sha256 IS NOT NULL
+			DO UPDATE SET
+				object_key = EXCLUDED.object_key,
+				stored_sha256 = EXCLUDED.stored_sha256,
+				stored_size = EXCLUDED.stored_size,
+				logical_size = EXCLUDED.logical_size,
+				content_encoding = EXCLUDED.content_encoding,
+				content_type = EXCLUDED.content_type,
+				status = 'ready',
+				delete_reason = NULL,
+				delete_attempts = 0,
+				verified_at = EXCLUDED.verified_at,
+				deleted_at = NULL,
+				updated_at = NOW()`,
+			row.ObjectKey, row.LogicalSHA256, row.StoredSHA256, row.StoredSize, row.LogicalSize,
+			row.Format, row.SchemaVersion, row.Compression, row.ContentEncoding, row.ContentType,
+			row.Status, row.DeleteReason, row.DeleteAttempts, row.LastDeleteError, row.VerifiedAt,
+			row.CreatedAt, row.UpdatedAt).Error; err != nil {
+			return err
+		}
+		var id uint
+		if err := tx.Raw(`
+			SELECT id FROM storage_blobs
+			WHERE logical_sha256 = ? AND format = ? AND compression = ?
+			LIMIT 1`, logicalHash, format, model.CompressionGzip).Scan(&id).Error; err != nil {
+			return err
+		}
+		row.ID = id
+		return nil
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "logical_sha256"}, {Name: "format"}, {Name: "compression"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"object_key":       row.ObjectKey,
+			"stored_sha256":    row.StoredSHA256,
+			"stored_size":      row.StoredSize,
+			"logical_size":     row.LogicalSize,
+			"content_encoding": row.ContentEncoding,
+			"content_type":     row.ContentType,
+			"status":           model.BlobStatusReady,
+			"verified_at":      row.VerifiedAt,
+			"deleted_at":       nil,
+			"updated_at":       now,
+		}),
+	}).Create(row).Error; err != nil {
+		return err
+	}
+	if row.ID == 0 {
+		if err := tx.Where("logical_sha256 = ? AND format = ? AND compression = ?", logicalHash, format, model.CompressionGzip).First(row).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // switchMigrationRefs 事务外切引用（复用已有 blob 的并发场景）。
