@@ -150,19 +150,24 @@ func (s *APIServer) CheckContinuousSessionSymbols(c *gin.Context) {
 	buildIDs := map[string]bool{}
 	kallsyms := ""
 	seenObjects := map[string]bool{}
-	for _, objectKey := range orderedContinuousObjectKeys(windows) {
+	objectOrder, _ := continuousGroupWindowsByObject(windows)
+	for _, objectKey := range objectOrder {
 		if objectKey == "" || seenObjects[objectKey] {
 			continue
 		}
 		seenObjects[objectKey] = true
-		batch, err := s.loadContinuousStoredBatch(c.Request.Context(), objectKey)
+		// 阶段三：块只解压一次，收集块内全部成员 batch 的符号引用
+		batches, err := s.loadContinuousBatches(c.Request.Context(), objectKey)
 		if err != nil {
 			continue
 		}
-		collectContinuousSymbolRefs(batch.SymbolRefs, buildIDs, &kallsyms)
-		for _, window := range batch.Windows {
-			if windowOverlaps(window.WindowStart, window.WindowEnd, from, to) {
-				collectContinuousSymbolRefs(window.SymbolRefs, buildIDs, &kallsyms)
+		for i := range batches {
+			batch := &batches[i]
+			collectContinuousSymbolRefs(batch.SymbolRefs, buildIDs, &kallsyms)
+			for _, window := range batch.Windows {
+				if windowOverlaps(window.WindowStart, window.WindowEnd, from, to) {
+					collectContinuousSymbolRefs(window.SymbolRefs, buildIDs, &kallsyms)
+				}
 			}
 		}
 	}

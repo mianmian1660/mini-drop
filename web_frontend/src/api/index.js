@@ -148,3 +148,10 @@ export const schedules = {
 export const cosfiles = {
     list: (tid) => client.get('/api/v1/cosfiles', { params: { tid } }),
 };
+
+// ---------- 存储压力状态（阶段 0：磁盘止血） ----------
+export const storage = {
+    // 服务端磁盘快照（GET /api/v1/storage/status）
+    // data: { path, total_bytes, available_bytes, used_bytes, level, collection_allowed, checked_at }
+    status: () => client.get('/api/v1/storage/status'),
+};

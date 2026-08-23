@@ -103,8 +103,8 @@ func validateContinuousCreateRequest(req CreateContinuousSessionReq) string {
 	if req.UploadBatchSec < req.AggregationWindowSec || req.UploadBatchSec > 3600 {
 		return "upload_batch_sec 必须不小于聚合窗口且不超过 3600"
 	}
-	if req.RetentionHours < 1 || req.RetentionHours > 24*30 {
-		return "retention_hours 必须在 1 到 720 之间"
+	if req.RetentionHours < 1 || req.RetentionHours > 24 {
+		return "retention_hours 必须在 1 到 24 之间（持续采集原始数据最长保留 24 小时）"
 	}
 	if req.ContinuityMode != "strict" && req.ContinuityMode != "degraded" {
 		return "continuity_mode 仅支持 strict/degraded"

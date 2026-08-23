@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -26,6 +27,21 @@ ANALYZER_VERSION = os.environ.get("ANALYZER_VERSION", "b1-lease")
 PG_DSN = os.environ.get(
     "PG_DSN", "host=localhost user=postgres password=dev dbname=drop sslmode=disable"
 )
+WORK_ROOT = os.environ.get("ANALYSIS_WORK_ROOT", "/tmp/mini-drop-analysis")
+STALE_WORKSPACE_SECONDS = 2 * 60 * 60
+
+
+def cleanup_stale_workspaces():
+    """Remove only abandoned job directories; active jobs always own their directory."""
+    try:
+        os.makedirs(WORK_ROOT, exist_ok=True)
+        cutoff = time.time() - STALE_WORKSPACE_SECONDS
+        for entry in os.scandir(WORK_ROOT):
+            if entry.is_dir(follow_symlinks=False) and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry.path, ignore_errors=True)
+                log_event("analysis_workspace_stale_removed", workspace=entry.name)
+    except Exception as exc:
+        print(f"[analysis_daemon] 清理遗留工作区失败: {exc}", file=sys.stderr)
 
 
 def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None, bucket=None):
@@ -239,6 +255,10 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
     heartbeat_thread = _start_heartbeat(lease_client, job.id, stop_heartbeat)
 
     conn = None
+    workspace = os.path.join(WORK_ROOT, f"{job.id}-{tid}-{job.attempt}")
+    os.makedirs(workspace, exist_ok=True)
+    old_workspace = os.environ.get("ANALYSIS_JOB_WORK_DIR")
+    os.environ["ANALYSIS_JOB_WORK_DIR"] = workspace
     try:
         config = hm.load_config(config_path)
         db_cfg = config["database"]
@@ -337,6 +357,14 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
                 conn.close()
             except Exception:
                 pass
+        # Successful, failed and cancelled jobs never retain raw local files. A
+        # timed-out external worker may leave its directory behind; the next
+        # daemon sweep removes it after the two-hour safety window.
+        shutil.rmtree(workspace, ignore_errors=True)
+        if old_workspace is None:
+            os.environ.pop("ANALYSIS_JOB_WORK_DIR", None)
+        else:
+            os.environ["ANALYSIS_JOB_WORK_DIR"] = old_workspace
 
 
 def main():
@@ -363,6 +391,7 @@ def main():
         lease_seconds=args.lease_seconds,
     )
     registry = build_default_registry()
+    cleanup_stale_workspaces()
 
     print(f"[analysis_daemon] 启动 (interval={args.interval}s, "
           f"worker={lease_client.worker_id}, lease={args.lease_seconds}s, "
@@ -370,6 +399,7 @@ def main():
           f"task_types={registry.task_types()})", file=sys.stderr)
 
     while True:
+        cleanup_stale_workspaces()
         claim_started_at = now_seconds()
         try:
             job = lease_client.claim_one()

@@ -109,6 +109,29 @@ func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
 			zap.String("child_tid", trigger.ChildTID))
 		return
 	}
+	if ok, message, _ := s.canStartCollection(CollectionSourceScheduled); !ok {
+		now := time.Now()
+		_ = s.DB.Model(&model.ScheduleTrigger{}).Where("id = ?", trigger.ID).
+			Updates(map[string]interface{}{"status": "skipped_low_disk", "updated_at": now}).Error
+		s.Logger.Warn("定时采集因低磁盘跳过", zap.String("sid", sch.SID), zap.String("reason", message))
+		return
+	}
+	// Collection single-flight is deliberately independent from analysis: a
+	// completed upload may queue analysis while the next capture starts.
+	var active int64
+	if err := s.DB.Model(&model.HotmethodTask{}).
+		Where("target_ip = ? AND task_kind = ? AND status IN ?", sch.TargetIP, sch.TaskKind,
+			[]int{TaskStatusCreated, TaskStatusRunning, TaskStatusUploading}).Count(&active).Error; err != nil {
+		s.Logger.Warn("检查定时采集重叠失败", zap.String("sid", sch.SID), zap.Error(err))
+		return
+	}
+	if active > 0 {
+		now := time.Now()
+		_ = s.DB.Model(&model.ScheduleTrigger{}).Where("id = ?", trigger.ID).
+			Updates(map[string]interface{}{"status": "skipped_overlap", "updated_at": now}).Error
+		s.Logger.Info("上一轮采集尚未结束，本轮跳过", zap.String("sid", sch.SID), zap.Int64("active", active))
+		return
+	}
 
 	// 解析任务参数
 	var params PerfParams

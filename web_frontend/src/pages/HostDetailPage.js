@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { agents, continuous, profiles, schedules, tasks } from '../api';
+import { agents, continuous, profiles, schedules, storage, tasks } from '../api';
 import CreateTaskModal from '../components/CreateTaskModal';
 import CreateContinuousSessionModal from '../components/CreateContinuousSessionModal';
 import ContinuousSessionList from '../components/ContinuousSessionList';
@@ -10,6 +10,7 @@ import TaskCancelButton from '../components/TaskCancelButton';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
 import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
+import { computeStorageAlert, resolveStorageAlert } from '../utils/storageStatus';
 
 const S = {
     container: { width: '100%', maxWidth: 1320, minWidth: 0, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
@@ -39,6 +40,9 @@ const S = {
     hostBar: { height: '100%', borderRadius: 999, transition: 'width 0.4s ease' },
     hostResourceValue: { marginTop: 6, color: '#667085', fontSize: 12, wordBreak: 'break-all' },
     hostMissingNote: { marginTop: 12, color: '#667085', fontSize: 12, background: '#f8fafc', border: '1px dashed #d0d7de', borderRadius: 6, padding: '8px 12px' },
+    // 阶段 0：服务端存储压力紧凑提示（仅主机上下文卡片内，资源块上方）
+    storageAlertWarning: { marginTop: 12, background: '#fffaeb', border: '1px solid #fedf89', color: '#b54708', borderRadius: 6, padding: '8px 12px', fontSize: 12, lineHeight: 1.5 },
+    storageAlertDanger: { marginTop: 12, background: '#fff6f5', border: '1px solid #fda29b', color: '#b42318', borderRadius: 6, padding: '8px 12px', fontSize: 12, lineHeight: 1.5 },
     contextFooter: { display: 'flex', justifyContent: 'flex-end', marginTop: 12, borderTop: '1px solid #f2f4f7', paddingTop: 10 },
     contextToggle: { background: '#f8fafc', color: '#315efb', border: '1px solid #d0d7de', padding: '5px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700 },
     tabBar: { display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 16, borderBottom: '1px solid #e5e7eb' },
@@ -268,8 +272,42 @@ export default function HostDetailPage() {
     );
 }
 
+// 服务端存储压力轮询：每 30 秒刷新一次；接口临时失败时不显示错误大横幅，
+// 只保留上一次成功状态最多 90 秒，超时后自动隐藏。
+function useStorageStatus(intervalMs = 30000, staleMs = 90000) {
+    const [lastSuccess, setLastSuccess] = useState(null); // { alert, fetchedAt }
+    const [now, setNow] = useState(() => Date.now());
+
+    useEffect(() => {
+        let disposed = false;
+        const load = async () => {
+            try {
+                const res = await storage.status();
+                if (disposed) return;
+                if (res && res.code === 0 && res.data) {
+                    setLastSuccess({ alert: computeStorageAlert(res.data), fetchedAt: Date.now() });
+                }
+            } catch (err) {
+                // 接口临时失败：保留上一次成功状态，不展示错误横幅
+            }
+        };
+        load();
+        const timer = setInterval(load, intervalMs);
+        return () => { disposed = true; clearInterval(timer); };
+    }, [intervalMs]);
+
+    // 独立心跳驱动过期判定：即使接口持续失败，超过 staleMs 也会自动隐藏。
+    useEffect(() => {
+        const tick = setInterval(() => setNow(Date.now()), Math.min(intervalMs, staleMs));
+        return () => clearInterval(tick);
+    }, [intervalMs, staleMs]);
+
+    return resolveStorageAlert(lastSuccess, now, staleMs);
+}
+
 function HostContext({ target, activeTab, agent, stat, capabilities }) {
     const [expanded, setExpanded] = useState(false);
+    const storageAlert = useStorageStatus();
     const host = stat?.host || null;
     const online = agent?.online === true || target?.drop_agent_status === 'online';
     const sourceLabel = stat?.source === 'grpc' ? '实时 gRPC' : '数据库快照';
@@ -310,6 +348,9 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                     <span>最近采集 {collectedAt}</span>
                 </div>
             </div>
+
+            {/* 阶段 0：服务端存储压力紧凑提示（normal 时 computeStorageAlert 返回 null，不渲染） */}
+            {storageAlert && <StoragePressureBanner alert={storageAlert} />}
 
             {/* 整机资源块：无数据时保留稳定布局，数值显示 "--" */}
             <div style={S.hostResourceGrid}>
@@ -354,6 +395,16 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                 </div>
             )}
         </section>
+    );
+}
+
+// 阶段 0：服务端存储压力紧凑提示条。warning 用浅黄，critical/emergency/unknown 用浅红；
+// 只占一行，不遮挡操作。
+function StoragePressureBanner({ alert }) {
+    return (
+        <div data-testid="storage-pressure-banner" style={alert.tone === 'danger' ? S.storageAlertDanger : S.storageAlertWarning} role="status">
+            {alert.message}
+        </div>
     );
 }
 

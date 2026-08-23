@@ -293,6 +293,10 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, message)
 		return
 	}
+	if ok, message, _ := s.canStartCollection(CollectionSourceContinuous); !ok {
+		s.RespondHTTPError(c, http.StatusInsufficientStorage, ErrCodeStorageLowDisk, message)
+		return
+	}
 	var agent model.AgentInfo
 	if err := s.DB.Where("ip_addr = ?", req.TargetIP).Order("last_seen DESC").First(&agent).Error; err != nil {
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "目标 Agent 不存在")
@@ -781,9 +785,15 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 			duplicate = true
 			return nil
 		}
-		if err := s.storeContinuousBatchPayload(c.Request.Context(), req); err != nil {
+		if err := s.storeContinuousBatchPayload(c.Request.Context(), req, &batch); err != nil {
 			payloadStoreErr = err
 			return err
+		}
+		if batch.PayloadBytes > 0 {
+			// Create 时字段尚未算出，补写 payload_bytes（供 compactor 磁盘检查）
+			if err := tx.Model(&batch).Update("payload_bytes", batch.PayloadBytes).Error; err != nil {
+				return err
+			}
 		}
 		for _, in := range req.Windows {
 			if in.WindowStart.IsZero() || in.WindowEnd.IsZero() || !in.WindowStart.Before(in.WindowEnd) {
@@ -1099,7 +1109,7 @@ func (s *APIServer) ViewContinuousProfileObject(c *gin.Context) {
 	}
 }
 
-func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req ContinuousBatchIngestReq) error {
+func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req ContinuousBatchIngestReq, batch *model.ProfileBatch) error {
 	if !s.StorageConnected() {
 		return errProfileUnavailable
 	}
@@ -1124,6 +1134,8 @@ func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req Continu
 	if err != nil {
 		return err
 	}
+	// 阶段三：记录原始 payload 字节数，供 compactor 磁盘余量检查估算输入大小。
+	batch.PayloadBytes = uint64(len(body))
 	return s.Storage.PutObject(ctx, s.Config.Storage.Bucket, req.ObjectKey, bytes.NewReader(body), int64(len(body)), "application/json")
 }
 
@@ -1133,7 +1145,9 @@ func continuousBatchObjectKey(sessionSID, batchID string) string {
 
 func (s *APIServer) cleanupContinuousRetention(ctx context.Context, session model.ContinuousSession) {
 	retentionHours := session.RetentionHours
-	if retentionHours == 0 {
+	if retentionHours == 0 || retentionHours > 24 {
+		// Historical sessions may contain the former 30-day maximum. Phase two
+		// applies the fixed 24-hour raw-data ceiling during cleanup as well.
 		retentionHours = 24
 	}
 	cutoff := time.Now().Add(-time.Duration(retentionHours) * time.Hour)
@@ -1175,6 +1189,11 @@ func (s *APIServer) cleanupContinuousRetention(ctx context.Context, session mode
 	}
 
 	for _, batch := range expiredBatches {
+		// 阶段三：已压缩进块的 batch 不能直接删行/删对象——object_key 已指向
+		// 块，必须由 compactor 在重写块时统一移除成员并管理块生命周期。
+		if batch.BlockID != "" {
+			continue
+		}
 		var remaining int64
 		if err := s.DB.Model(&model.ProfileWindow{}).Where("session_sid = ? AND batch_bid = ?", session.SID, batch.BID).Count(&remaining).Error; err != nil {
 			s.Logger.Warn("Native Continuous Profiling retention 检查 batch 引用失败", zap.String("sid", session.SID), zap.String("batch", batch.BID), zap.Error(err))
@@ -1545,57 +1564,66 @@ func (s *APIServer) downsampleContinuousWindows(ctx context.Context, session mod
 	bucketEnds := map[bucketKey]time.Time{}
 
 	for objectKey, rows := range byObject {
-		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+		// 阶段三：对象可能是旧分钟 JSON 或 gzip 小时块；块解压一次后按
+		// (batch_bid, window start) 精确匹配这轮要降采样的 window。
+		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
 			s.Logger.Warn("Native Continuous Profiling 冷层摘要读取 batch 对象失败，本轮跳过这些窗口",
 				zap.String("session_sid", session.SID), zap.String("object_key", objectKey), zap.Error(err))
 			failedObjects[objectKey] = true
 			continue
 		}
-		// 用 Unix 秒比较，不直接比较 time.Time：row.WindowStart 是从数据库
-		// 读回来的（Postgres 时间戳精度可能比 Go 的 time.Time 低），
+		// 用 (batch_bid, Unix 秒) 匹配，不直接比较 time.Time：row.WindowStart
+		// 是从数据库读回来的（Postgres 时间戳精度可能比 Go 的 time.Time 低），
 		// window.WindowStart 是从 MinIO 里的原始 JSON 解析出来的（保留了
 		// Agent 上报时的完整精度），两边直接 Equal() 有极小概率因为精度
 		// 截断错判成"不匹配"，导致这个 window 被删除却从没进过摘要。
-		rowSet := map[int64]bool{}
+		rowSet := map[string]bool{}
 		for _, row := range rows {
-			rowSet[row.WindowStart.Unix()] = true
+			if row.BatchBID != "" {
+				rowSet[row.BatchBID+"|"+strconv.FormatInt(row.WindowStart.Unix(), 10)] = true
+			} else {
+				rowSet["|"+strconv.FormatInt(row.WindowStart.Unix(), 10)] = true
+			}
 		}
-		for _, window := range batch.Windows {
-			if firstNonEmpty(window.SignalType, "cpu_profile") != "cpu_profile" {
-				continue
-			}
-			if !rowSet[window.WindowStart.Unix()] {
-				continue // 这个 batch 对象里还有别的、这轮还没到期的 window，不动它
-			}
-			bucketStart := window.WindowStart.Truncate(continuousSummaryBucketDuration)
-			key := bucketKey{bucketStart: bucketStart}
-			agg, ok := buckets[key]
-			if !ok {
-				agg = &continuousAggregate{
-					Top:                map[string]*ProfileTopItem{},
-					Root:               &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
-					LabelValue:         map[string]map[string]bool{"comm": {}, "pid": {}, "process_start_ms": {}, "process_instance": {}, "exe": {}, "runtime": {}},
-					Backends:           map[string]bool{},
-					SymbolReasons:      map[string]bool{},
-					RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
-					SeenProfileIDs:     map[string]bool{},
-					Unit:               "samples",
+		for _, batch := range batches {
+			for _, window := range batch.Windows {
+				key := batch.BatchID + "|" + strconv.FormatInt(window.WindowStart.Unix(), 10)
+				if !rowSet[key] && !rowSet["|"+strconv.FormatInt(window.WindowStart.Unix(), 10)] {
+					continue // 这个 batch 对象里还有别的、这轮还没到期的 window，不动它
 				}
-				buckets[key] = agg
-			}
-			bucketEnd := bucketStart.Add(continuousSummaryBucketDuration)
-			if existing, ok := bucketEnds[key]; !ok || existing.Before(bucketEnd) {
-				bucketEnds[key] = bucketEnd
-			}
-			// 复用生产 TopN 路径同一套 continuousAddSample 聚合逻辑，不再
-			// 手写一份"取栈顶算 self"——这正是之前 TopN 排序 bug 的教训：
-			// 两处独立实现迟早会走偏。
-			for _, sample := range continuousProfileSamplesForQuery(window, ProfileQuery{}, agg.SeenProfileIDs) {
-				if !continuousSampleMatches(sample, window.Labels, nil) {
+				if firstNonEmpty(window.SignalType, "cpu_profile") != "cpu_profile" {
 					continue
 				}
-				continuousAddSample(agg, sample, window.Labels)
+				bucketStart := window.WindowStart.Truncate(continuousSummaryBucketDuration)
+				keyBucket := bucketKey{bucketStart: bucketStart}
+				agg, ok := buckets[keyBucket]
+				if !ok {
+					agg = &continuousAggregate{
+						Top:                map[string]*ProfileTopItem{},
+						Root:               &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
+						LabelValue:         map[string]map[string]bool{"comm": {}, "pid": {}, "process_start_ms": {}, "process_instance": {}, "exe": {}, "runtime": {}},
+						Backends:           map[string]bool{},
+						SymbolReasons:      map[string]bool{},
+						RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
+						SeenProfileIDs:     map[string]bool{},
+						Unit:               "samples",
+					}
+					buckets[keyBucket] = agg
+				}
+				bucketEnd := bucketStart.Add(continuousSummaryBucketDuration)
+				if existing, ok := bucketEnds[keyBucket]; !ok || existing.Before(bucketEnd) {
+					bucketEnds[keyBucket] = bucketEnd
+				}
+				// 复用生产 TopN 路径同一套 continuousAddSample 聚合逻辑，不再
+				// 手写一份"取栈顶算 self"——这正是之前 TopN 排序 bug 的教训：
+				// 两处独立实现迟早会走偏。
+				for _, sample := range continuousProfileSamplesForQuery(window, ProfileQuery{}, agg.SeenProfileIDs) {
+					if !continuousSampleMatches(sample, window.Labels, nil) {
+						continue
+					}
+					continuousAddSample(agg, sample, window.Labels)
+				}
 			}
 		}
 	}
@@ -1626,8 +1654,12 @@ func (s *APIServer) downsampleContinuousWindows(ctx context.Context, session mod
 func (s *APIServer) mergeContinuousWindowSummary(ctx context.Context, sessionSID, signalType string, bucketStart, bucketEnd time.Time, agg *continuousAggregate) error {
 	lockKey := sessionSID + "|" + signalType + "|" + bucketStart.UTC().Format(time.RFC3339)
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", lockKey).Error; err != nil {
-			return err
+		// SQLite backs unit tests and does not implement PostgreSQL advisory
+		// locks. Production uses PostgreSQL, where this serializes the bucket.
+		if tx.Dialector.Name() == "postgres" {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", lockKey).Error; err != nil {
+				return err
+			}
 		}
 		return s.mergeContinuousWindowSummaryLocked(ctx, tx, sessionSID, signalType, bucketStart, bucketEnd, agg)
 	})
@@ -1783,37 +1815,43 @@ func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q Profi
 	}
 
 	byKey := map[string]*ProfileTimeseriesSeries{}
-	loaded := map[string]bool{}
-	for _, row := range windows {
-		if row.ObjectKey == "" || loaded[row.ObjectKey] {
-			continue
-		}
-		loaded[row.ObjectKey] = true
-		batch, err := s.loadContinuousStoredBatch(ctx, row.ObjectKey)
+	objectOrder, byObject := continuousGroupWindowsByObject(windows)
+	for _, objectKey := range objectOrder {
+		// 阶段三：块只解压一次，再按 DB 行选中的 batch 关联
+		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
 			return nil, true, err
 		}
-		for _, window := range batch.Windows {
-			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+		batchByID := continuousBatchIndex(batches)
+		seenBatch := map[string]bool{}
+		for _, row := range byObject[objectKey] {
+			batch, rowKey, ok := continuousResolveBatch(row, batches, batchByID)
+			if !ok || seenBatch[rowKey] {
 				continue
 			}
-			for _, metric := range window.Metrics {
-				if metric.Metric != metricName || metric.Timestamp.Before(q.From) || metric.Timestamp.After(q.To) {
+			seenBatch[rowKey] = true
+			for _, window := range batch.Windows {
+				if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 					continue
 				}
-				sample := ContinuousStackSample{PID: metric.PID, Comm: metric.Comm, Exe: metric.Exe, Runtime: metric.Runtime, Labels: metric.Labels}
-				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
-					continue
-				}
-				key := continuousMetricSeriesKey(metric)
-				series := byKey[key]
-				if series == nil {
-					series = &ProfileTimeseriesSeries{PID: metric.PID, ProcessStartMs: metric.ProcessStartMs, Comm: metric.Comm, Exe: metric.Exe, Runtime: firstNonEmpty(metric.Runtime, "python"), Metric: metricName, Unit: firstNonEmpty(metric.Unit, "bytes"), Points: []ProfileTimeseriesPoint{}}
-					byKey[key] = series
-				}
-				series.Points = append(series.Points, ProfileTimeseriesPoint{Timestamp: metric.Timestamp, Value: metric.Value})
-				if metric.Value > series.Peak {
-					series.Peak = metric.Value
+				for _, metric := range window.Metrics {
+					if metric.Metric != metricName || metric.Timestamp.Before(q.From) || metric.Timestamp.After(q.To) {
+						continue
+					}
+					sample := ContinuousStackSample{PID: metric.PID, Comm: metric.Comm, Exe: metric.Exe, Runtime: metric.Runtime, Labels: metric.Labels}
+					if !continuousSampleMatches(sample, window.Labels, q.Filters) {
+						continue
+					}
+					key := continuousMetricSeriesKey(metric)
+					series := byKey[key]
+					if series == nil {
+						series = &ProfileTimeseriesSeries{PID: metric.PID, ProcessStartMs: metric.ProcessStartMs, Comm: metric.Comm, Exe: metric.Exe, Runtime: firstNonEmpty(metric.Runtime, "python"), Metric: metricName, Unit: firstNonEmpty(metric.Unit, "bytes"), Points: []ProfileTimeseriesPoint{}}
+						byKey[key] = series
+					}
+					series.Points = append(series.Points, ProfileTimeseriesPoint{Timestamp: metric.Timestamp, Value: metric.Value})
+					if metric.Value > series.Peak {
+						series.Peak = metric.Value
+					}
 				}
 			}
 		}
@@ -1919,30 +1957,41 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		byObject[window.ObjectKey] = append(byObject[window.ObjectKey], window)
 	}
 	for _, objectKey := range objectOrder {
-		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+		// 阶段三：一个对象要么是旧分钟 JSON（单 batch），要么是 gzip 小时块
+		// （多 batch）。块只加载解压一次，再按 DB 行选中的 batch_bid 关联。
+		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
 			return continuousAggregate{}, true, err
 		}
 		agg.ObjectKeys = append(agg.ObjectKeys, objectKey)
-		for _, window := range batch.Windows {
-			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+		batchByID := continuousBatchIndex(batches)
+		seenBatch := map[string]bool{}
+		for _, row := range byObject[objectKey] {
+			batch, rowKey, ok := continuousResolveBatch(row, batches, batchByID)
+			if !ok || seenBatch[rowKey] {
 				continue
 			}
-			matched := make([]ContinuousStackSample, 0)
-			relevantDSOs := map[string]bool{}
-			for _, sample := range continuousProfileSamplesForQuery(window, q, agg.SeenProfileIDs) {
-				if !continuousSampleMatches(sample, window.Labels, q.Filters) {
+			seenBatch[rowKey] = true
+			for _, window := range batch.Windows {
+				if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 					continue
 				}
-				matched = append(matched, sample)
-				if exe := strings.TrimSpace(continuousSampleLabel(sample, window.Labels, "exe")); exe != "" {
-					relevantDSOs[exe] = true
+				matched := make([]ContinuousStackSample, 0)
+				relevantDSOs := map[string]bool{}
+				for _, sample := range continuousProfileSamplesForQuery(window, q, agg.SeenProfileIDs) {
+					if !continuousSampleMatches(sample, window.Labels, q.Filters) {
+						continue
+					}
+					matched = append(matched, sample)
+					if exe := strings.TrimSpace(continuousSampleLabel(sample, window.Labels, "exe")); exe != "" {
+						relevantDSOs[exe] = true
+					}
 				}
-			}
-			continuousAggregateSymbolMetadata(&agg, window.SymbolRefs, relevantDSOs)
-			continuousAggregateRuntimeMetadata(&agg, window.SymbolRefs)
-			for _, sample := range matched {
-				continuousAddSample(&agg, sample, window.Labels)
+				continuousAggregateSymbolMetadata(&agg, window.SymbolRefs, relevantDSOs)
+				continuousAggregateRuntimeMetadata(&agg, window.SymbolRefs)
+				for _, sample := range matched {
+					continuousAddSample(&agg, sample, window.Labels)
+				}
 			}
 		}
 	}
@@ -2246,8 +2295,10 @@ func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q Profil
 	objectKeys := []string{}
 	seenObject := map[string]bool{}
 
-	for _, objectKey := range orderedContinuousObjectKeys(windows) {
-		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+	objectOrder, byObject := continuousGroupWindowsByObject(windows)
+	for _, objectKey := range objectOrder {
+		// 阶段三：块只解压一次，再按 DB 行选中的 batch 关联
+		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
 			return nil, true, err
 		}
@@ -2255,41 +2306,50 @@ func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q Profil
 			objectKeys = append(objectKeys, objectKey)
 			seenObject[objectKey] = true
 		}
-		for _, window := range batch.Windows {
-			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+		batchByID := continuousBatchIndex(batches)
+		seenBatch := map[string]bool{}
+		for _, row := range byObject[objectKey] {
+			batch, rowKey, ok := continuousResolveBatch(row, batches, batchByID)
+			if !ok || seenBatch[rowKey] {
 				continue
 			}
-			for _, hist := range window.Histograms {
-				if strings.ToLower(strings.TrimSpace(hist.SignalType)) != signalType {
+			seenBatch[rowKey] = true
+			for _, window := range batch.Windows {
+				if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 					continue
 				}
-				if hist.Backend != "" {
-					backends[hist.Backend] = true
-				}
-				if hist.Unavailable && unavailableReason == "" {
-					unavailableReason = hist.Reason
-				}
-				totalEvents = addContinuousCount(totalEvents, hist.EventCount)
-				for _, bucket := range hist.Buckets {
-					key := bucket.Range + "|" + strconv.FormatFloat(bucket.Low, 'f', -1, 64) + "|" + strconv.FormatFloat(bucket.High, 'f', -1, 64)
-					item := merged[key]
-					if item == nil {
-						item = &bucketAgg{Range: bucket.Range, Low: bucket.Low, High: bucket.High}
-						merged[key] = item
+				for _, hist := range window.Histograms {
+					if strings.ToLower(strings.TrimSpace(hist.SignalType)) != signalType {
+						continue
 					}
-					item.Count = addContinuousCount(item.Count, bucket.Count)
+					if hist.Backend != "" {
+						backends[hist.Backend] = true
+					}
+					if hist.Unavailable && unavailableReason == "" {
+						unavailableReason = hist.Reason
+					}
+					totalEvents = addContinuousCount(totalEvents, hist.EventCount)
+					for _, bucket := range hist.Buckets {
+						key := bucket.Range + "|" + strconv.FormatFloat(bucket.Low, 'f', -1, 64) + "|" + strconv.FormatFloat(bucket.High, 'f', -1, 64)
+						item := merged[key]
+						if item == nil {
+							item = &bucketAgg{Range: bucket.Range, Low: bucket.Low, High: bucket.High}
+							merged[key] = item
+						}
+						item.Count = addContinuousCount(item.Count, bucket.Count)
+					}
+					trend = append(trend, gin.H{
+						"window_start": window.WindowStart,
+						"window_end":   window.WindowEnd,
+						"event_count":  hist.EventCount,
+						"p50":          hist.Summary.P50,
+						"p95":          hist.Summary.P95,
+						"p99":          hist.Summary.P99,
+						"backend":      hist.Backend,
+						"unavailable":  hist.Unavailable,
+						"reason":       hist.Reason,
+					})
 				}
-				trend = append(trend, gin.H{
-					"window_start": window.WindowStart,
-					"window_end":   window.WindowEnd,
-					"event_count":  hist.EventCount,
-					"p50":          hist.Summary.P50,
-					"p95":          hist.Summary.P95,
-					"p99":          hist.Summary.P99,
-					"backend":      hist.Backend,
-					"unavailable":  hist.Unavailable,
-					"reason":       hist.Reason,
-				})
 			}
 		}
 	}
@@ -2399,8 +2459,10 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 	objectKeys := []string{}
 	seenObject := map[string]bool{}
 
-	for _, objectKey := range orderedContinuousObjectKeys(windows) {
-		batch, err := s.loadContinuousStoredBatch(ctx, objectKey)
+	objectOrder, byObject := continuousGroupWindowsByObject(windows)
+	for _, objectKey := range objectOrder {
+		// 阶段三：块只解压一次，再按 DB 行选中的 batch 关联
+		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
 			return nil, true, err
 		}
@@ -2408,37 +2470,46 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 			objectKeys = append(objectKeys, objectKey)
 			seenObject[objectKey] = true
 		}
-		for _, window := range batch.Windows {
-			if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+		batchByID := continuousBatchIndex(batches)
+		seenBatch := map[string]bool{}
+		for _, row := range byObject[objectKey] {
+			batch, rowKey, ok := continuousResolveBatch(row, batches, batchByID)
+			if !ok || seenBatch[rowKey] {
 				continue
 			}
-			for _, snap := range window.DBSnapshots {
-				switch snap.Kind {
-				case "digest":
-					key := snap.InstanceLabel + "|" + snap.SchemaName + "|" + snap.DigestText
-					item := digests[key]
-					if item == nil {
-						item = &digestAgg{
-							InstanceLabel: snap.InstanceLabel,
-							SchemaName:    snap.SchemaName,
-							DigestText:    snap.DigestText,
+			seenBatch[rowKey] = true
+			for _, window := range batch.Windows {
+				if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+					continue
+				}
+				for _, snap := range window.DBSnapshots {
+					switch snap.Kind {
+					case "digest":
+						key := snap.InstanceLabel + "|" + snap.SchemaName + "|" + snap.DigestText
+						item := digests[key]
+						if item == nil {
+							item = &digestAgg{
+								InstanceLabel: snap.InstanceLabel,
+								SchemaName:    snap.SchemaName,
+								DigestText:    snap.DigestText,
+							}
+							digests[key] = item
 						}
-						digests[key] = item
+						item.CallCount = addContinuousCount(item.CallCount, snap.CallCount)
+						item.TotalLatencyUs = addContinuousCount(item.TotalLatencyUs, snap.TotalLatencyUs)
+						item.RowsExamined = addContinuousCount(item.RowsExamined, snap.RowsExaminedTotal)
+					case "lock_wait":
+						lockWaits = append(lockWaits, gin.H{
+							"instance_label": snap.InstanceLabel,
+							"timestamp":      snap.Timestamp,
+							"waiting_pid":    snap.WaitingPID,
+							"waiting_query":  snap.WaitingQuery,
+							"blocking_pid":   snap.BlockingPID,
+							"blocking_query": snap.BlockingQuery,
+							"wait_seconds":   snap.WaitSeconds,
+							"locked_table":   snap.LockedTable,
+						})
 					}
-					item.CallCount = addContinuousCount(item.CallCount, snap.CallCount)
-					item.TotalLatencyUs = addContinuousCount(item.TotalLatencyUs, snap.TotalLatencyUs)
-					item.RowsExamined = addContinuousCount(item.RowsExamined, snap.RowsExaminedTotal)
-				case "lock_wait":
-					lockWaits = append(lockWaits, gin.H{
-						"instance_label": snap.InstanceLabel,
-						"timestamp":      snap.Timestamp,
-						"waiting_pid":    snap.WaitingPID,
-						"waiting_query":  snap.WaitingQuery,
-						"blocking_pid":   snap.BlockingPID,
-						"blocking_query": snap.BlockingQuery,
-						"wait_seconds":   snap.WaitSeconds,
-						"locked_table":   snap.LockedTable,
-					})
 				}
 			}
 		}
@@ -3085,10 +3156,15 @@ func continuousSessionSIDFromObjectKey(key string) string {
 		return ""
 	}
 	parts := strings.Split(key, "/")
-	if len(parts) != 3 || parts[0] != "continuous" || parts[1] == "" || path.Ext(parts[2]) != ".json" {
-		return ""
+	// 旧格式：continuous/{session}/{batch}.json
+	if len(parts) == 3 && parts[0] == "continuous" && parts[1] != "" && path.Ext(parts[2]) == ".json" {
+		return parts[1]
 	}
-	return parts[1]
+	// 阶段三块格式：continuous-blocks/{session}/{YYYY}/{MM}/{DD}/{HH}/{block}.json.gz
+	if len(parts) >= 7 && parts[0] == "continuous-blocks" && parts[1] != "" {
+		return parts[1]
+	}
+	return ""
 }
 
 func windowOverlaps(start, end, from, to time.Time) bool {
@@ -3279,19 +3355,6 @@ func normalizeContinuousSignalTypes(req ContinuousBatchIngestReq) []string {
 	}
 	if len(out) == 0 {
 		out = []string{"cpu_profile"}
-	}
-	return out
-}
-
-func orderedContinuousObjectKeys(windows []model.ProfileWindow) []string {
-	seen := map[string]bool{}
-	out := []string{}
-	for _, window := range windows {
-		if window.ObjectKey == "" || seen[window.ObjectKey] {
-			continue
-		}
-		seen[window.ObjectKey] = true
-		out = append(out, window.ObjectKey)
 	}
 	return out
 }

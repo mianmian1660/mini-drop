@@ -570,6 +570,9 @@ func profileRetentionDuration(target ProfileTarget) time.Duration {
 	if target.ContinuousSession != nil && target.ContinuousSession.RetentionHours > 0 {
 		hours = target.ContinuousSession.RetentionHours
 	}
+	if hours > 24 {
+		hours = 24
+	}
 	return time.Duration(hours) * time.Hour
 }
 

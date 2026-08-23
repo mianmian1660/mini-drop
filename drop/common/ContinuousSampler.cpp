@@ -2161,8 +2161,17 @@ enum class SpoolPostResult
 {
     Acknowledged,
     BatchIDConflict,
+    PermanentlyRejected,
     Failed,
 };
+
+static bool response_is_permanent_rejection(int httpStatus, const std::string &response)
+{
+    if (httpStatus < 400 || httpStatus >= 500)
+        return false;
+    return response.find("\"retryable\":false") != std::string::npos ||
+           response.find("\"retryable\": false") != std::string::npos;
+}
 
 static SpoolPostResult post_spooled_batch(const ContinuousSamplerConfig &cfg,
                                           const std::string &path,
@@ -2195,10 +2204,38 @@ static SpoolPostResult post_spooled_batch(const ContinuousSamplerConfig &cfg,
         std::cout << "[native-cp] batch ID conflict batch=" << batchID << std::endl;
         return SpoolPostResult::BatchIDConflict;
     }
+    if (rc == 0 && response_is_permanent_rejection(httpStatus, response))
+    {
+        std::cout << "[native-cp] batch permanently rejected batch=" << batchID
+                  << " http_status=" << httpStatus
+                  << " response=" << response << std::endl;
+        return SpoolPostResult::PermanentlyRejected;
+    }
     std::cout << "[native-cp] batch upload failed batch=" << batchID
               << " rc=" << rc << " http_status=" << httpStatus
               << " response=" << response << std::endl;
     return SpoolPostResult::Failed;
+}
+
+static bool quarantine_rejected_spooled_batch(const std::string &path,
+                                               const std::string &batchID)
+{
+    std::string rejectedPath = path + ".rejected";
+    if (file_exists_local(rejectedPath))
+        rejectedPath += "." + std::to_string(now_ms());
+    if (::rename(path.c_str(), rejectedPath.c_str()) != 0)
+        return false;
+    const size_t slash = rejectedPath.find_last_of('/');
+    const std::string directory = slash == std::string::npos ? "." : rejectedPath.substr(0, slash);
+    int dirfd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0)
+    {
+        ::fsync(dirfd);
+        ::close(dirfd);
+    }
+    std::cout << "[native-cp] quarantined permanently rejected batch=" << batchID
+              << " path=" << rejectedPath << std::endl;
+    return true;
 }
 
 static bool rekey_conflicted_spooled_batch(const ContinuousSamplerConfig &cfg,
@@ -2337,6 +2374,13 @@ static bool drain_one_spooled_batch(const ContinuousSamplerConfig &cfg,
     }
     if (result == SpoolPostResult::BatchIDConflict &&
         rekey_conflicted_spooled_batch(cfg, path, batchID))
+    {
+        retry->delaySec = 1;
+        retry->nextAttemptMs = 0;
+        return true;
+    }
+    if (result == SpoolPostResult::PermanentlyRejected &&
+        quarantine_rejected_spooled_batch(path, batchID))
     {
         retry->delaySec = 1;
         retry->nextAttemptMs = 0;
@@ -2898,6 +2942,14 @@ bool DrainOneContinuousSessionBatch(const ContinuousSamplerConfig &config)
     if (result == SpoolPostResult::BatchIDConflict)
     {
         if (!rekey_conflicted_spooled_batch(config, path, batchID))
+            return false;
+        return !list_session_spool_files(config, ".json").empty()
+                   ? DrainOneContinuousSessionBatch(config)
+                   : true;
+    }
+    if (result == SpoolPostResult::PermanentlyRejected)
+    {
+        if (!quarantine_rejected_spooled_batch(path, batchID))
             return false;
         return !list_session_spool_files(config, ".json").empty()
                    ? DrainOneContinuousSessionBatch(config)
@@ -3730,13 +3782,15 @@ static WindowPayload merge_shared_slices(const std::vector<WindowPayload> &slice
     if (slices.empty())
         return merged;
     merged.startMs = slices.front().startMs;
-    merged.endMs = slices.back().endMs;
+    merged.endMs = slices.front().endMs;
     std::map<std::string, std::vector<HistogramPayload>> histograms;
     std::set<std::string> attempted;
     bool anyFailed = false;
     bool anyDegraded = false;
     for (const auto &slice : slices)
     {
+        merged.startMs = std::min(merged.startMs, slice.startMs);
+        merged.endMs = std::max(merged.endMs, slice.endMs);
         merged.samples.insert(merged.samples.end(), slice.samples.begin(), slice.samples.end());
         merged.profiles.insert(merged.profiles.end(), slice.profiles.begin(), slice.profiles.end());
         merged.metrics.insert(merged.metrics.end(), slice.metrics.begin(), slice.metrics.end());
@@ -3766,9 +3820,13 @@ static std::vector<WindowPayload> merge_shared_slices_preserving_gaps(
     const std::vector<WindowPayload> &slices,
     int64_t continuityToleranceMs = 100)
 {
+    std::vector<WindowPayload> ordered = slices;
+    std::sort(ordered.begin(), ordered.end(), [](const auto &left, const auto &right) {
+        return left.startMs == right.startMs ? left.endMs < right.endMs : left.startMs < right.startMs;
+    });
     std::vector<WindowPayload> merged;
     std::vector<WindowPayload> contiguous;
-    for (const auto &slice : slices)
+    for (const auto &slice : ordered)
     {
         if (!contiguous.empty() && slice.startMs > contiguous.back().endMs + continuityToleranceMs)
         {

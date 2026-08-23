@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -37,8 +38,74 @@ func (s *APIServer) runRetentionCleanup(ctx context.Context) {
 		s.cleanupExpiredArtifacts(ctx, []string{model.ArtifactKindRaw, model.ArtifactKindIntermediate, model.ArtifactKindLog}, time.Duration(s.Config.Retention.RawRetentionHours)*time.Hour, limit)
 		s.cleanupExpiredArtifacts(ctx, []string{model.ArtifactKindResult, model.ArtifactKindManifest}, time.Duration(s.Config.Retention.ResultRetentionHours)*time.Hour, limit)
 		s.cleanupDeletedTaskArtifacts(ctx, limit)
+		s.cleanupHistoricalUnreferencedObjects(ctx)
 	}
 	s.cleanupAllContinuousRetention(ctx, limit)
+}
+
+// cleanupHistoricalUnreferencedObjects is a deliberately narrow migration
+// sweep. The database remains authoritative: only old objects absent from both
+// artifact and kernel-symbol ledgers can be removed. It never touches the last
+// seven days, so an interrupted historical upload remains recoverable.
+func (s *APIServer) cleanupHistoricalUnreferencedObjects(ctx context.Context) {
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	type candidate struct {
+		key    string
+		size   int64
+		prefix string
+	}
+	candidates := []candidate{}
+	for _, prefix := range []string{"tid-", "kernel-symbols/"} {
+		objects, err := s.Storage.ListObjects(ctx, s.Config.Storage.Bucket, prefix)
+		if err != nil {
+			s.Logger.Warn("历史对象扫尾列举失败", zap.String("prefix", prefix), zap.Error(err))
+			continue
+		}
+		for _, object := range objects {
+			if object.Name == "" || !object.LastModified.Before(cutoff) ||
+				(prefix == "tid-" && !strings.HasPrefix(object.Name, "tid-")) ||
+				(prefix == "kernel-symbols/" && !isKernelSymbolObjectKey(object.Name)) {
+				continue
+			}
+			var artifactRefs, symbolRefs int64
+			if s.DB.Model(&model.Artifact{}).Where("object_key = ?", object.Name).Count(&artifactRefs).Error != nil ||
+				s.DB.Model(&model.KernelSymbolFile{}).Where("object_key = ?", object.Name).Count(&symbolRefs).Error != nil {
+				s.Logger.Warn("历史对象扫尾引用检查失败", zap.String("object_key", object.Name))
+				continue
+			}
+			if artifactRefs == 0 && symbolRefs == 0 {
+				candidates = append(candidates, candidate{object.Name, object.Size, prefix})
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	var total int64
+	byPrefix := map[string]int{}
+	for _, c := range candidates {
+		total += c.size
+		byPrefix[c.prefix]++
+	}
+	s.Logger.Info("历史对象扫尾计划", zap.String("event", "gc_historical_sweep_plan"), zap.Int("objects", len(candidates)), zap.Int64("bytes", total), zap.Any("prefix_counts", byPrefix))
+	deleted, deletedBytes := 0, int64(0)
+	for _, candidate := range candidates {
+		// Recheck immediately before deletion: a late metadata transaction wins.
+		var refs int64
+		if err := s.DB.Model(&model.Artifact{}).Where("object_key = ?", candidate.key).Count(&refs).Error; err != nil || refs != 0 {
+			continue
+		}
+		if err := s.DB.Model(&model.KernelSymbolFile{}).Where("object_key = ?", candidate.key).Count(&refs).Error; err != nil || refs != 0 {
+			continue
+		}
+		if err := s.Storage.DeleteObject(ctx, s.Config.Storage.Bucket, candidate.key); err != nil {
+			s.Logger.Warn("历史对象扫尾删除失败", zap.String("object_key", candidate.key), zap.Error(err))
+			continue
+		}
+		deleted++
+		deletedBytes += candidate.size
+	}
+	s.Logger.Info("历史对象扫尾完成", zap.String("event", "gc_historical_sweep_completed"), zap.Int("objects", deleted), zap.Int64("bytes", deletedBytes), zap.Any("prefix_counts", byPrefix))
 }
 
 func (s *APIServer) retentionBatchLimit() int {

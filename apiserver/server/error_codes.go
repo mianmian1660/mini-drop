@@ -33,6 +33,7 @@ const (
 	ErrCodeAnalysisUnsupportedForm = "ANALYSIS_UNSUPPORTED_FORMAT"
 	ErrCodeAnalysisTimeout         = "ANALYSIS_TIMEOUT"
 	ErrCodeDependencyUnavailable   = "DEPENDENCY_UNAVAILABLE"
+	ErrCodeStorageLowDisk          = "STORAGE_LOW_DISK"
 )
 
 // ErrorCode 描述一个结构化错误码及其元数据。
@@ -61,6 +62,7 @@ var errorCodeRegistry = map[string]ErrorCode{
 	ErrCodeAnalysisUnsupportedForm: {ErrCodeAnalysisUnsupportedForm, "analysis", false, http.StatusUnprocessableEntity, "不支持的数据格式"},
 	ErrCodeAnalysisTimeout:         {ErrCodeAnalysisTimeout, "analysis", true, http.StatusGatewayTimeout, "分析超时"},
 	ErrCodeDependencyUnavailable:   {ErrCodeDependencyUnavailable, "infra", true, http.StatusServiceUnavailable, "依赖服务不可用"},
+	ErrCodeStorageLowDisk:          {ErrCodeStorageLowDisk, "collection", true, http.StatusInsufficientStorage, "服务器磁盘可用空间不足，已拒绝新的采集"},
 }
 
 // LookupErrorCode 返回错误码的元数据；找不到时 ok=false。

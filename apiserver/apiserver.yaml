@@ -36,10 +36,26 @@ storage:
 # 存储保留期配置
 retention:
   enabled: true
-  raw_retention_hours: 168      # RAW / INTERMEDIATE / LOG 默认保留 7 天
+  raw_retention_hours: 24       # 原始采集数据 RAW / INTERMEDIATE / LOG 保留 24 小时
   result_retention_hours: 720   # RESULT / MANIFEST 默认保留 30 天
+  continuous_summary_retention_hours: 168 # 冷层摘要保留 7 天
   cleanup_interval_sec: 3600
   batch_limit: 200
+
+# 阶段三：内建持续剖析块存储（compactor）
+# 每个 session 每小时一个 gzip 压缩块。默认关闭（等价旧行为：每分钟一个 JSON 对象）；
+# 生产由环境变量 CONTINUOUS_BLOCK_ENABLED=true 开启。
+continuous_block:
+  enabled: false
+  window_sec: 3600                 # UTC 小时桶长度（秒）
+  compaction_delay_sec: 600        # 桶结束多久后允许合并（给迟到 batch 留窗口）
+  compaction_interval_sec: 300     # compactor 扫描周期（秒）
+
+storage_disk:
+  path: /tmp                    # 宿主机采集/临时文件所在文件系统
+  warning_free_bytes: 8589934592    # 剩余低于 8 GiB 时告警（不拒收）
+  critical_free_bytes: 4294967296   # 剩余低于 4 GiB 时严重告警（不拒收）
+  min_free_bytes: 1073741824        # 剩余低于 1 GiB 时拒绝新的采集
 
 # 日志配置
 log:

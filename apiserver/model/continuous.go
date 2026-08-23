@@ -33,6 +33,12 @@ const (
 	ContinuousBatchStatusFailed = "failed"
 )
 
+const (
+	ContinuousBlockStatusActive     = "active"
+	ContinuousBlockStatusSuperseded = "superseded"
+	ContinuousBlockStatusDeleting   = "deleting"
+)
+
 type ContinuousSession struct {
 	ID                   uint           `gorm:"primaryKey" json:"id"`
 	SID                  string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
@@ -124,7 +130,49 @@ type ProfileBatch struct {
 	SymbolRefs         []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
 	ReceivedAt         time.Time `gorm:"column:received_at" json:"received_at"`
 	AgentClockOffsetMs int64     `gorm:"column:agent_clock_offset_ms;default:0" json:"agent_clock_offset_ms"`
-	CreatedAt          time.Time `gorm:"column:created_at" json:"created_at"`
+	// BlockID 指向所属 continuous_profile_blocks 行；为空表示该 batch 尚未被
+	// 压缩进小时块（热数据，仍读取原分钟对象）。
+	BlockID string `gorm:"column:block_id;size:64;index" json:"block_id"`
+	// SourceObjectKey 保存 compaction 前的原始分钟对象 key，compaction 成功
+	// 后 object_key 改写为块 key；源对象删除失败时保留该列供 sweep 重试。
+	SourceObjectKey string `gorm:"column:source_object_key;size:512" json:"source_object_key"`
+	// CompactedAt 记录首次被压缩进块的时间（nil 表示尚未压缩）。
+	CompactedAt *time.Time `gorm:"column:compacted_at" json:"compacted_at"`
+	// PayloadBytes 记录原始 payload JSON 字节数，供 compactor 磁盘余量检查
+	// 估算"本次输入大小"。
+	PayloadBytes uint64    `gorm:"column:payload_bytes" json:"payload_bytes"`
+	CreatedAt    time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+// ContinuousProfileBlock 是阶段三新增的块存储元数据行：每个 session 每小时
+// 一个 gzip 压缩块对象（continuous-blocks/{session}/{YYYY}/{MM}/{DD}/{HH}/{block-id}.json.gz），
+// 把同一 UTC 小时桶内的多个分钟 batch 合并存放。块内保留每个原始 batch 的
+// 完整 payload（CPU profile / io-sched 延迟直方图 / db_snapshot 原结构），
+// 查询侧按 object_key + batch_bid 去重加载，一个块只解压一次。
+//
+// 设计借鉴 Parca/Pyroscope 的块-压缩-索引-替换思路，但全部自研实现，
+// 不部署、不依赖、不调用任何开源 profiling 后端。status 区分 active
+// （当前可查）、superseded（被新版本块替换，对象在 15 分钟宽限后删除）
+// 与 deleting（已解除查询引用，对象删除失败时由 sweep 重试）。
+type ContinuousProfileBlock struct {
+	ID            uint       `gorm:"primaryKey" json:"id"`
+	BlockID       string     `gorm:"column:block_id;uniqueIndex;size:64" json:"block_id"`
+	SessionSID    string     `gorm:"column:session_sid;size:64;index" json:"session_sid"`
+	BucketStart   time.Time  `gorm:"column:bucket_start;index" json:"bucket_start"`
+	BucketEnd     time.Time  `gorm:"column:bucket_end" json:"bucket_end"`
+	ObjectKey     string     `gorm:"column:object_key;size:512" json:"object_key"`
+	Compression   string     `gorm:"column:compression;size:16;default:gzip" json:"compression"`
+	SchemaVersion uint32     `gorm:"column:schema_version;default:1" json:"schema_version"`
+	Version       int        `gorm:"column:version;default:1" json:"version"`
+	Status        string     `gorm:"column:status;size:16;default:active;index" json:"status"`
+	BatchCount    int        `gorm:"column:batch_count" json:"batch_count"`
+	SampleCount   uint64     `gorm:"column:sample_count" json:"sample_count"`
+	BytesBefore   int64      `gorm:"column:bytes_before" json:"bytes_before"`
+	BytesAfter    int64      `gorm:"column:bytes_after" json:"bytes_after"`
+	SupersededAt  *time.Time `gorm:"column:superseded_at" json:"superseded_at"`
+	ReplacedBy    string     `gorm:"column:replaced_by;size:64" json:"replaced_by"`
+	CreatedAt     time.Time  `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"column:updated_at" json:"updated_at"`
 }
 
 // ContinuousWindowSummary 是原始 ProfileWindow 过期硬删前的冷层降采样摘要：

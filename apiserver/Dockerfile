@@ -30,8 +30,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o apiserver .
 # 换一个超小的基础镜像（~5MB），只放编译好的程序
 FROM alpine:3.18
 
-# 安装运行必需的 SSL 证书和时区数据
-RUN apk add --no-cache ca-certificates tzdata
+# apiserver is a static Go binary and only talks to in-cluster services over
+# HTTP. Avoid a runtime apk download: deployment must remain possible when the
+# host is under disk/network pressure, exactly when retention recovery matters.
 
 WORKDIR /app
 # --from=builder：从阶段1的镜像里拿编译好的二进制文件

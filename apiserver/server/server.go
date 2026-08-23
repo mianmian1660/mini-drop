@@ -44,6 +44,9 @@ type APIServer struct {
 	CronJobs   map[string]cron.EntryID // SID → cron EntryID 映射（支持动态停止/删除）
 	TaskSvc    *TaskService            // 阶段 2：任务编排服务
 	ProfileCli ProfileClient           // Native Continuous Profiling 查询客户端
+
+	// 存储压力后台检测状态（阶段 0：磁盘止血）
+	storageState storageMonitorState
 }
 
 // New 创建一个新的 APIServer 实例
@@ -99,6 +102,13 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 
 	// 启动存储保留期清理器，避免任务产物和 stopped continuous session 长期堆积。
 	go s.startRetentionCleaner()
+
+	// 阶段三：启动内建持续剖析块存储 compactor（按配置开关；未启用时查询
+	// 继续走旧分钟对象，行为与阶段二完全一致）。
+	go s.startContinuousBlockCompactor()
+
+	// 阶段 0：启动存储压力后台检测（每 60 秒一次快照 + 指标 + 结构化日志）。
+	go s.startStorageMonitor()
 
 	// B: 启动时补偿历史已完成但未入分析队列的任务，修复回调缺失期间留下的卡住记录。
 	go func() {
@@ -742,6 +752,9 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/cosfiles/download", s.DownloadCOSFile)
 		api.POST("/cosfiles/upload", s.UploadTestFile)
 		api.GET("/files/:filename", s.ServeLocalFile) // W4: 本地文件服务
+
+		// 存储压力状态（阶段 0：磁盘止血）
+		api.GET("/storage/status", s.StorageStatus)
 
 		// 用户组管理（W5）
 		api.POST("/groups", s.CreateGroup)
