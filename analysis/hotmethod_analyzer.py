@@ -380,7 +380,8 @@ def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT object_key FROM artifacts WHERE task_tid = %s AND kind = 'RAW' ORDER BY created_at DESC, id DESC",
+            "SELECT object_key FROM artifacts WHERE task_tid = %s AND kind = 'RAW' "
+            "AND status = 'ready' AND deleted_at IS NULL ORDER BY created_at DESC, id DESC",
             (tid,),
         )
         for row in cur.fetchall():

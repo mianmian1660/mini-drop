@@ -71,6 +71,7 @@ def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None
             VALUES (%s, %s, %s, %s, %s, 'ready', %s, NOW())
             ON CONFLICT (task_tid, kind, object_key) DO UPDATE
             SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status, size = EXCLUDED.size
+            WHERE artifacts.deleted_at IS NULL
             RETURNING id
             """,
             (tid, attempt_id, kind, key, content_type, size),
@@ -78,6 +79,15 @@ def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None
         row = cur.fetchone()
         if row:
             artifact_ids.append(row[0])
+        elif storage is not None and bucket:
+            # 唯一键命中了 deleted tombstone，ON CONFLICT 的 WHERE 会拒绝复活。
+            # 分析产物已先上传，必须同步删除同 key 对象，避免留下不可见孤儿。
+            try:
+                storage.delete_object(bucket, key)
+                log_event("artifact_tombstone_upload_removed", task_tid=tid, object_key=key)
+            except Exception as exc:
+                log_event("artifact_tombstone_upload_remove_failed", task_tid=tid,
+                          object_key=key, error=str(exc))
     cur.close()
     return artifact_ids
 

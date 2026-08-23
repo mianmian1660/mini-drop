@@ -92,6 +92,8 @@ type TaskResultNotifyReq struct {
 	Partial        bool   `json:"partial"`
 }
 
+var errArtifactTombstoned = errors.New("artifact key belongs to a deleted tombstone")
+
 // CreateTask 创建性能采集任务
 // POST /api/v1/tasks
 func (s *APIServer) CreateTask(c *gin.Context) {
@@ -309,6 +311,19 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 
 	endTime := time.Now()
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		keys := []string{req.CosKey}
+		if strings.TrimSpace(req.ManifestKey) != "" {
+			keys = append(keys, req.ManifestKey)
+		}
+		var tombstones int64
+		if err := tx.Model(&model.Artifact{}).
+			Where("task_tid = ? AND object_key IN ? AND deleted_at IS NOT NULL", task.TID, keys).
+			Count(&tombstones).Error; err != nil {
+			return err
+		}
+		if tombstones > 0 {
+			return errArtifactTombstoned
+		}
 		if task.Status != TaskStatusDone {
 			currentStatus := task.Status
 			shouldAdvanceToDone := true
@@ -396,8 +411,12 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, req.ArtifactSize); err != nil {
 			return err
 		}
+		if err := ensureManifestArtifactTx(tx, task.TID, req.AttemptID, req.ManifestKey); err != nil {
+			return err
+		}
 		var artifact model.Artifact
-		if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ?", task.TID, model.ArtifactKindRaw, req.CosKey).First(&artifact).Error; err == nil {
+		// 只允许更新非墓碑行：同 key 的迟到通知不允许复活已删除的 tombstone。
+		if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ? AND deleted_at IS NULL", task.TID, model.ArtifactKindRaw, req.CosKey).First(&artifact).Error; err == nil {
 			updates := map[string]interface{}{}
 			if req.ArtifactSize > 0 {
 				updates["size"] = req.ArtifactSize
@@ -411,6 +430,9 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 			}
 			if req.Partial {
 				updates["status"] = model.ArtifactStatusUploading
+			} else {
+				// 完整通知到达：uploading 必须切回 ready（partial 上传的最终确认）。
+				updates["status"] = model.ArtifactStatusReady
 			}
 			if len(updates) > 0 {
 				if err := tx.Model(&artifact).Updates(updates).Error; err != nil {
@@ -422,6 +444,22 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		return s.finishTaskAttemptForNotifyTx(tx, task.TID, req.AttemptID, "", "", []string{req.CosKey}, 0)
 	})
 	if err != nil {
+		if errors.Is(err, errArtifactTombstoned) {
+			// 上传发生在通知之前；拒绝墓碑复活时同步删除迟到对象，避免留下
+			// 数据库不可见的同 key 孤儿。删除失败仍会被历史孤儿扫尾兜底。
+			if s.StorageConnected() {
+				for _, key := range []string{req.CosKey, req.ManifestKey} {
+					if strings.TrimSpace(key) == "" {
+						continue
+					}
+					if deleteErr := s.Storage.DeleteObject(c.Request.Context(), s.Config.Storage.Bucket, key); deleteErr != nil {
+						s.Logger.Warn("拒绝墓碑复活后删除迟到对象失败", zap.String("object_key", util.RedactObjectKey(key)), zap.Error(deleteErr))
+					}
+				}
+			}
+			c.JSON(http.StatusConflict, gin.H{"code": http.StatusConflict, "message": "产物已进入删除墓碑，拒绝同 key 迟到上传"})
+			return
+		}
 		incTaskNotifyFailed()
 		incArtifactUploadFailed()
 		s.Logger.Error("处理采集结果通知失败",
@@ -448,6 +486,26 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 	)
 	s.refreshCompositeParent(task)
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"tid": task.TID}})
+}
+
+func ensureManifestArtifactTx(tx *gorm.DB, tid string, attemptID uint, manifestKey string) error {
+	manifestKey = strings.TrimSpace(manifestKey)
+	if tx == nil || tid == "" || manifestKey == "" {
+		return nil
+	}
+	manifest := model.Artifact{
+		TaskTID:     tid,
+		AttemptID:   attemptID,
+		Kind:        model.ArtifactKindManifest,
+		ObjectKey:   manifestKey,
+		ContentType: "application/json",
+		Status:      model.ArtifactStatusReady,
+		CreatedAt:   time.Now(),
+	}
+	return tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "task_tid"}, {Name: "kind"}, {Name: "object_key"}},
+		DoNothing: true,
+	}).Create(&manifest).Error
 }
 
 func (s *APIServer) ensureAnalysisQueued(tid string, objectKey string, size int64) error {
@@ -491,7 +549,8 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey st
 	}
 	inputArtifactIDs := []uint{}
 	var savedArtifact model.Artifact
-	if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ?", tid, model.ArtifactKindRaw, objectKey).First(&savedArtifact).Error; err == nil {
+	// 排除墓碑：tombstone 不允许被重新作为分析输入（同 key 迟到通知保持墓碑）。
+	if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ? AND deleted_at IS NULL", tid, model.ArtifactKindRaw, objectKey).First(&savedArtifact).Error; err == nil {
 		inputArtifactIDs = append(inputArtifactIDs, savedArtifact.ID)
 	}
 	inputArtifactJSON, _ := util.MarshalJSONB(inputArtifactIDs)
@@ -755,6 +814,7 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	statusEvents := s.fetchTaskStatusEvents(task.TID)
 	attempts := s.fetchTaskAttempts(task.TID)
 	artifacts := s.fetchArtifacts(task.TID)
+	deletedArtifacts := s.fetchDeletedArtifacts(task.TID)
 	if childPayload, err := s.compositeChildrenPayload(task.TID); err == nil {
 		result["children"] = childPayload
 	}
@@ -799,12 +859,17 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	}
 	publicArtifacts := make([]gin.H, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		publicArtifacts = append(publicArtifacts, publicArtifact(artifact))
+		publicArtifacts = append(publicArtifacts, publicArtifact(artifact, task.ArtifactsPinned))
+	}
+	cleanedArtifacts := make([]gin.H, 0, len(deletedArtifacts))
+	for _, artifact := range deletedArtifacts {
+		cleanedArtifacts = append(cleanedArtifacts, publicArtifact(artifact, task.ArtifactsPinned))
 	}
 
 	result["status_events"] = statusEvents
 	result["attempts"] = attempts
 	result["artifacts"] = publicArtifacts
+	result["cleaned_artifacts"] = cleanedArtifacts
 	result["files"] = files
 
 	return result
@@ -817,25 +882,29 @@ func taskDetailResponse(task model.HotmethodTask) gin.H {
 	}
 
 	return gin.H{
-		"id":              task.ID,
-		"tid":             task.TID,
-		"name":            task.Name,
-		"task_kind":       task.TaskKind,
-		"request_id":      task.RequestID,
-		"type":            task.Type,
-		"profiler_type":   task.ProfilerType,
-		"target_ip":       task.TargetIP,
-		"request_params":  params,
-		"status":          task.Status,
-		"status_info":     task.StatusInfo,
-		"analysis_status": task.AnalysisStatus,
-		"uid":             task.UID,
-		"user_name":       task.UserName,
-		"create_time":     task.CreateTime,
-		"begin_time":      task.BeginTime,
-		"end_time":        task.EndTime,
-		"master_task_tid": task.MasterTaskTID,
-		"can_manage":      task.CanManage,
+		"id":                   task.ID,
+		"tid":                  task.TID,
+		"name":                 task.Name,
+		"task_kind":            task.TaskKind,
+		"request_id":           task.RequestID,
+		"type":                 task.Type,
+		"profiler_type":        task.ProfilerType,
+		"target_ip":            task.TargetIP,
+		"request_params":       params,
+		"status":               task.Status,
+		"status_info":          task.StatusInfo,
+		"analysis_status":      task.AnalysisStatus,
+		"uid":                  task.UID,
+		"user_name":            task.UserName,
+		"create_time":          task.CreateTime,
+		"begin_time":           task.BeginTime,
+		"end_time":             task.EndTime,
+		"master_task_tid":      task.MasterTaskTID,
+		"can_manage":           task.CanManage,
+		"artifacts_pinned":     task.ArtifactsPinned,
+		"artifacts_pinned_at":  task.ArtifactsPinnedAt,
+		"artifacts_pinned_by":  task.ArtifactsPinnedBy,
+		"artifacts_pin_reason": task.ArtifactsPinReason,
 	}
 }
 
@@ -1249,7 +1318,19 @@ func (s *APIServer) fetchTaskAttempts(tid string) []model.TaskAttempt {
 
 func (s *APIServer) fetchArtifacts(tid string) []model.Artifact {
 	var artifacts []model.Artifact
-	if err := s.DB.Where("task_tid = ?", tid).Order("created_at ASC, id ASC").Find(&artifacts).Error; err != nil || artifacts == nil {
+	// 默认只展示可用产物（排除 deleted 墓碑；deleting 属于清理中，同样不展示为可用）。
+	if err := s.DB.Where("task_tid = ? AND deleted_at IS NULL AND status = ?", tid, model.ArtifactStatusReady).
+		Order("created_at ASC, id ASC").Find(&artifacts).Error; err != nil || artifacts == nil {
+		return []model.Artifact{}
+	}
+	return artifacts
+}
+
+// fetchDeletedArtifacts 返回任务的 deleted 墓碑（已清理产物折叠区）。
+func (s *APIServer) fetchDeletedArtifacts(tid string) []model.Artifact {
+	var artifacts []model.Artifact
+	if err := s.DB.Where("task_tid = ? AND deleted_at IS NOT NULL", tid).
+		Order("deleted_at DESC, id DESC").Find(&artifacts).Error; err != nil || artifacts == nil {
 		return []model.Artifact{}
 	}
 	return artifacts
@@ -1285,11 +1366,11 @@ func (s *APIServer) DeleteTask(c *gin.Context) {
 
 	s.Logger.Info("任务已删除", zap.String("tid", tid))
 
-	if s.StorageConnected() {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-		defer cancel()
-		s.cleanupTaskArtifacts(ctx, tid, true)
-	}
+	// 即使对象存储当前不可用也必须登记 deleting 并进入重试状态；否则任务
+	// 已软删除后将失去后续回收入口。未登记对象的前缀扫描仍只在存储可用时执行。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	s.cleanupTaskArtifacts(ctx, tid, true)
 
 	s.RespondOK(c, gin.H{"message": "任务已删除"})
 }

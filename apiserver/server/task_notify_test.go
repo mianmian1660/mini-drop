@@ -339,8 +339,15 @@ func TestNotifyTaskResultPersistsAttemptArtifactMetadataIdempotently(t *testing.
 	}
 	var artifactCount int64
 	s.DB.Model(&model.Artifact{}).Where("task_tid = ?", task.TID).Count(&artifactCount)
-	if artifactCount != 1 {
-		t.Fatalf("artifact count=%d, want 1 after replay", artifactCount)
+	if artifactCount != 2 {
+		t.Fatalf("artifact count=%d, want 2 after replay (profile and manifest)", artifactCount)
+	}
+	var manifest model.Artifact
+	if err := s.DB.Where("task_tid = ? AND object_key = ?", task.TID, task.TID+"/manifest.json").First(&manifest).Error; err != nil {
+		t.Fatalf("load manifest artifact: %v", err)
+	}
+	if manifest.Kind != model.ArtifactKindManifest || manifest.AttemptID != attempt.ID {
+		t.Fatalf("manifest artifact=%#v, want MANIFEST for attempt %d", manifest, attempt.ID)
 	}
 	var jobCount int64
 	s.DB.Model(&model.AnalysisJob{}).Where("task_tid = ?", task.TID).Count(&jobCount)

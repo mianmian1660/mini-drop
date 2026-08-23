@@ -91,8 +91,35 @@ func (s *APIServer) logStorageLevel(snap StorageDiskSnapshot, changed bool) {
 	}
 }
 
-// StorageStatus 返回最新磁盘快照（每次请求实时读取一次 statfs）。
+// StorageStatus 返回最新磁盘快照 + Artifact 生命周期统计。
 // GET /api/v1/storage/status（鉴权分组内）
 func (s *APIServer) StorageStatus(c *gin.Context) {
-	s.RespondOK(c, s.currentStorageSnapshot())
+	snap := s.currentStorageSnapshot()
+	// 每次请求实时刷新统计（量级可控：4-5 条聚合 SQL）。
+	s.collectLifecycleStats(c.Request.Context())
+	lifecycle := s.lifecycleStatsSnapshot()
+	s.RespondOK(c, gin.H{
+		"path":                 snap.Path,
+		"total_bytes":          snap.TotalBytes,
+		"available_bytes":      snap.AvailableBytes,
+		"used_bytes":           snap.UsedBytes,
+		"level":                snap.Level,
+		"collection_allowed":   snap.CollectionAllowed,
+		"checked_at":           snap.CheckedAt,
+		"lifecycle_mode":       lifecycle.Mode,
+		"policy_version":       lifecycle.PolicyVersion,
+		"reconcile_backlog":    lifecycle.ReconcileBacklog,
+		"ready_count":          lifecycle.ReadyCount,
+		"ready_bytes":          lifecycle.ReadyBytes,
+		"pinned_count":         lifecycle.PinnedCount,
+		"pinned_bytes":         lifecycle.PinnedBytes,
+		"due_count":            lifecycle.DueCount,
+		"due_bytes":            lifecycle.DueBytes,
+		"deleting_count":       lifecycle.DeletingCount,
+		"deleting_bytes":       lifecycle.DeletingBytes,
+		"deleted_count":        lifecycle.DeletedCount,
+		"deleted_bytes":        lifecycle.DeletedBytes,
+		"lifecycle_last_run":   lifecycle.LastRunAt,
+		"lifecycle_last_error": lifecycle.LastError,
+	})
 }

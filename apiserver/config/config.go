@@ -92,6 +92,30 @@ type RetentionConfig struct {
 	// 成这张摘要表，摘要本身再按这个全局配置单独过期——默认比原始数据
 	// 保留期长一个数量级（7 天），因为摘要体积小很多。
 	ContinuousSummaryRetentionHours int `mapstructure:"continuous_summary_retention_hours"`
+
+	// ---- 存储阶段一：Artifact 生命周期闭环 ----
+	// LifecycleMode 运行模式：observe（回填/重算/统计/候选日志，不做自动
+	// 到期删除；用户主动删除任务仍正常执行）或 enforce（完整自动删除状态机）。
+	// compose 通过 ${ARTIFACT_LIFECYCLE_MODE:-observe} 注入。
+	LifecycleMode string `mapstructure:"lifecycle_mode"`
+	// ReconcileIntervalSec 策略重算/回填周期（秒），默认 300。
+	ReconcileIntervalSec int `mapstructure:"reconcile_interval_sec"`
+	// ReconcileBatch 每轮重算的最大 Artifact 数，默认 2000。
+	ReconcileBatch int `mapstructure:"reconcile_batch"`
+	// NotBeforeProtectionHours 首次回填与策略缩短时给予的清理保护期，默认 24。
+	NotBeforeProtectionHours int `mapstructure:"not_before_protection_hours"`
+	// 各类别的保留时长（小时）。未单独配置时：
+	//   raw_large / intermediate 回退到 RawRetentionHours（ARTIFACT_RAW_RETENTION_HOURS）
+	//   result 回退到 ResultRetentionHours（ARTIFACT_RESULT_RETENTION_HOURS）
+	//   raw_portable 默认 168（7 天）
+	//   diagnostic 默认 72
+	//   manifest 永不过期
+	RawLargeHours     int `mapstructure:"raw_large_hours"`
+	RawPortableHours  int `mapstructure:"raw_portable_hours"`
+	IntermediateHours int `mapstructure:"intermediate_hours"`
+	DiagnosticHours   int `mapstructure:"diagnostic_hours"`
+	// ManifestPermanent 为 true 时 manifest 类永不过期（默认 true）。
+	ManifestPermanent bool `mapstructure:"manifest_permanent"`
 }
 
 // ContinuousBlockConfig 控制阶段三的持续采集块存储（compactor）：
@@ -196,6 +220,15 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("retention.cleanup_interval_sec", 300)
 	v.SetDefault("retention.batch_limit", 200)
 	v.SetDefault("retention.continuous_summary_retention_hours", 168)
+	v.SetDefault("retention.lifecycle_mode", "observe")
+	v.SetDefault("retention.reconcile_interval_sec", 300)
+	v.SetDefault("retention.reconcile_batch", 2000)
+	v.SetDefault("retention.not_before_protection_hours", 24)
+	v.SetDefault("retention.raw_large_hours", 24)
+	v.SetDefault("retention.raw_portable_hours", 168)
+	v.SetDefault("retention.intermediate_hours", 24)
+	v.SetDefault("retention.diagnostic_hours", 72)
+	v.SetDefault("retention.manifest_permanent", true)
 	v.SetDefault("continuous_block.enabled", false)
 	v.SetDefault("continuous_block.window_sec", 3600)
 	v.SetDefault("continuous_block.compaction_delay_sec", 600)
@@ -258,6 +291,33 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envContinuousSummaryRetention := os.Getenv("CONTINUOUS_SUMMARY_RETENTION_HOURS"); envContinuousSummaryRetention != "" {
 		v.Set("retention.continuous_summary_retention_hours", envContinuousSummaryRetention)
+	}
+	if envLifecycleMode := os.Getenv("ARTIFACT_LIFECYCLE_MODE"); envLifecycleMode != "" {
+		v.Set("retention.lifecycle_mode", envLifecycleMode)
+	}
+	if envReconcileInterval := os.Getenv("ARTIFACT_LIFECYCLE_RECONCILE_INTERVAL_SEC"); envReconcileInterval != "" {
+		v.Set("retention.reconcile_interval_sec", envReconcileInterval)
+	}
+	if envReconcileBatch := os.Getenv("ARTIFACT_LIFECYCLE_RECONCILE_BATCH"); envReconcileBatch != "" {
+		v.Set("retention.reconcile_batch", envReconcileBatch)
+	}
+	if envNotBeforeProtection := os.Getenv("ARTIFACT_NOT_BEFORE_PROTECTION_HOURS"); envNotBeforeProtection != "" {
+		v.Set("retention.not_before_protection_hours", envNotBeforeProtection)
+	}
+	if envRawLarge := os.Getenv("ARTIFACT_RAW_LARGE_HOURS"); envRawLarge != "" {
+		v.Set("retention.raw_large_hours", envRawLarge)
+	}
+	if envRawPortable := os.Getenv("ARTIFACT_RAW_PORTABLE_HOURS"); envRawPortable != "" {
+		v.Set("retention.raw_portable_hours", envRawPortable)
+	}
+	if envIntermediate := os.Getenv("ARTIFACT_INTERMEDIATE_HOURS"); envIntermediate != "" {
+		v.Set("retention.intermediate_hours", envIntermediate)
+	}
+	if envDiagnostic := os.Getenv("ARTIFACT_DIAGNOSTIC_HOURS"); envDiagnostic != "" {
+		v.Set("retention.diagnostic_hours", envDiagnostic)
+	}
+	if envManifestPermanent := os.Getenv("ARTIFACT_MANIFEST_PERMANENT"); envManifestPermanent != "" {
+		v.Set("retention.manifest_permanent", parseBoolEnv(envManifestPermanent))
 	}
 	if envBlockEnabled := os.Getenv("CONTINUOUS_BLOCK_ENABLED"); envBlockEnabled != "" {
 		v.Set("continuous_block.enabled", parseBoolEnv(envBlockEnabled))
@@ -354,6 +414,37 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Retention.ContinuousSummaryRetentionHours <= 0 {
 		cfg.Retention.ContinuousSummaryRetentionHours = 168
+	}
+	// 生命周期模式归一化（observe / enforce；其它值按 observe 处理，安全回滚）。
+	mode := strings.ToLower(strings.TrimSpace(cfg.Retention.LifecycleMode))
+	if mode != "enforce" && mode != "observe" {
+		mode = "observe"
+	}
+	cfg.Retention.LifecycleMode = mode
+	if cfg.Retention.ReconcileIntervalSec <= 0 {
+		cfg.Retention.ReconcileIntervalSec = 300
+	}
+	if cfg.Retention.ReconcileBatch <= 0 {
+		cfg.Retention.ReconcileBatch = 2000
+	}
+	if cfg.Retention.NotBeforeProtectionHours <= 0 {
+		cfg.Retention.NotBeforeProtectionHours = 24
+	}
+	// 类别时长：未配置时用兼容回退（legacy env / 默认值）。
+	if cfg.Retention.RawLargeHours <= 0 {
+		cfg.Retention.RawLargeHours = cfg.Retention.RawRetentionHours
+	}
+	if cfg.Retention.RawPortableHours <= 0 {
+		cfg.Retention.RawPortableHours = 168
+	}
+	if cfg.Retention.IntermediateHours <= 0 {
+		cfg.Retention.IntermediateHours = cfg.Retention.RawRetentionHours
+	}
+	if cfg.Retention.DiagnosticHours <= 0 {
+		cfg.Retention.DiagnosticHours = 72
+	}
+	if cfg.Retention.ResultRetentionHours <= 0 {
+		cfg.Retention.ResultRetentionHours = 720
 	}
 	if cfg.ContinuousBlock.WindowSec <= 0 {
 		cfg.ContinuousBlock.WindowSec = 3600

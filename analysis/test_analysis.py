@@ -729,6 +729,36 @@ def t_finalize_success_updates_job_and_task_in_one_connection():
     assert "UPDATE hotmethod_tasks" in sql
     assert "INSERT INTO task_status_events" in sql
 
+def t_record_result_artifacts_removes_upload_rejected_by_tombstone():
+    from analysis_daemon import record_result_artifacts
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            self.fetchone_value = (7,) if "SELECT id FROM task_attempts" in query else None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakeStorage:
+        def __init__(self):
+            self.deleted = []
+        def stat_object(self, bucket, key):
+            return 123
+        def delete_object(self, bucket, key):
+            self.deleted.append((bucket, key))
+
+    storage = FakeStorage()
+    ids = record_result_artifacts(
+        FakeConn(), "tid", ["tid/top.json"], storage=storage, bucket="drop-data"
+    )
+    assert ids == []
+    assert storage.deleted == [("drop-data", "tid/top.json")]
+
 def t_stage6_collector_declarations_are_gated():
     from analyzer_registry import collector_declarations
     decls = {item["task_kind"]: item for item in collector_declarations()}

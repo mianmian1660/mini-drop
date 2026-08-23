@@ -312,6 +312,7 @@ def _load_raw_artifacts(conn, tid: str, input_artifact_ids=None) -> List[dict]:
                 SELECT id, object_key, size, sha256, hash, etag, manifest_key
                 FROM artifacts
                 WHERE task_tid = %s AND kind = 'RAW' AND id = ANY(%s)
+                  AND status = 'ready' AND deleted_at IS NULL
                 ORDER BY id ASC
                 """,
                 (tid, ids),
@@ -322,6 +323,7 @@ def _load_raw_artifacts(conn, tid: str, input_artifact_ids=None) -> List[dict]:
                 SELECT id, object_key, size, sha256, hash, etag, manifest_key
                 FROM artifacts
                 WHERE task_tid = %s AND kind = 'RAW' AND status = 'ready'
+                  AND deleted_at IS NULL
                 ORDER BY created_at ASC, id ASC
                 LIMIT 1
                 """,

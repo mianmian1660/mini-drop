@@ -69,6 +69,8 @@ export const tasks = {
     artifacts: (tid) => client.get(`/api/v1/tasks/${tid}/artifacts`),
     // 任务级 Artifact 短期下载链接
     artifactDownload: (tid, artifactId) => client.get(`/api/v1/tasks/${tid}/artifacts/${artifactId}/download`),
+    // 任务级固定/取消固定全部产物（POST /api/v1/tasks/:tid/artifacts/pin）
+    artifactPin: (tid, data) => client.post(`/api/v1/tasks/${tid}/artifacts/pin`, data),
     eventsStreamURL: (tid) => apiURL(`/api/v1/tasks/${encodeURIComponent(tid)}/events/stream`),
     suggestionsStreamURL: (tid) => apiURL(`/api/v1/tasks/${encodeURIComponent(tid)}/suggestions/stream`),
     // Periodic Deep Sampling 时间轴

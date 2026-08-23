@@ -32,6 +32,17 @@ var (
 	metricStorageTotalBytes     int64 // gauge：受监控文件系统总字节数
 	metricStorageAvailableBytes int64 // gauge：受监控文件系统剩余字节数
 	metricStoragePressureLevel  int64 // gauge：0=normal 1=warning 2=critical 3=emergency 4=unknown
+	// 存储阶段一：Artifact 生命周期指标
+	metricArtifactCleanupDeletedTotal      int64 // counter：清理成功删除的对象数
+	metricArtifactCleanupDeletedBytesTotal int64 // counter：清理回收的字节数
+	metricArtifactCleanupFailuresTotal     int64 // counter：对象删除失败次数
+	metricArtifactReadyBytes               int64 // gauge：ready 状态字节数
+	metricArtifactPinnedBytes              int64 // gauge：固定任务下非 deleted 字节数
+	metricArtifactExpirationBacklog        int64 // gauge：到期候选（due）数量
+	metricArtifactPolicyReconcileBacklog   int64 // gauge：策略版本不一致待重算数量
+	// 按 status 计数的 gauge（label: status）
+	metricArtifactsByStatusMu sync.Mutex
+	metricArtifactsByStatus   = map[string]int64{}
 )
 
 // 按来源计数的低磁盘拒收计数（label: source）。
@@ -58,6 +69,42 @@ func incContinuousSourceDeleteRetry() { atomic.AddInt64(&metricContinuousSourceD
 func incContinuousCompactionSkip()    { atomic.AddInt64(&metricContinuousCompactionSkipTotal, 1) }
 func incContinuousReclaimedBytes(bytes int64) {
 	atomic.AddInt64(&metricContinuousReclaimedBytesTotal, bytes)
+}
+
+func incArtifactCleanupDeleted(_ string) {
+	atomic.AddInt64(&metricArtifactCleanupDeletedTotal, 1)
+}
+func incArtifactCleanupDeletedBytes(bytes int64) {
+	atomic.AddInt64(&metricArtifactCleanupDeletedBytesTotal, bytes)
+}
+func incArtifactCleanupFailures() {
+	atomic.AddInt64(&metricArtifactCleanupFailuresTotal, 1)
+}
+
+// updateArtifactLifecycleGauges 用最新生命周期统计刷新 gauge 指标。
+func updateArtifactLifecycleGauges(stats artifactLifecycleStats) {
+	atomic.StoreInt64(&metricArtifactReadyBytes, stats.ReadyBytes)
+	atomic.StoreInt64(&metricArtifactPinnedBytes, stats.PinnedBytes)
+	atomic.StoreInt64(&metricArtifactExpirationBacklog, stats.DueCount)
+	atomic.StoreInt64(&metricArtifactPolicyReconcileBacklog, stats.ReconcileBacklog)
+}
+
+// refreshArtifactsByStatusGauge 从 DB 刷新按状态计数的 gauge（在指标输出时兜底）。
+func (s *APIServer) refreshArtifactsByStatusGauge() {
+	if s == nil || s.DB == nil {
+		return
+	}
+	rows := []struct {
+		Status string
+		Count  int64
+	}{}
+	_ = s.DB.Model(&model.Artifact{}).Select("status, count(*) as count").Group("status").Scan(&rows).Error
+	metricArtifactsByStatusMu.Lock()
+	metricArtifactsByStatus = map[string]int64{}
+	for _, r := range rows {
+		metricArtifactsByStatus[r.Status] = r.Count
+	}
+	metricArtifactsByStatusMu.Unlock()
 }
 
 // storagePressureLevelNumeric 把等级映射为数值（供 gauge 使用）。
@@ -117,6 +164,16 @@ func resetMetricsForTest() {
 	atomic.StoreInt64(&metricStorageTotalBytes, 0)
 	atomic.StoreInt64(&metricStorageAvailableBytes, 0)
 	atomic.StoreInt64(&metricStoragePressureLevel, 4) // unknown 兜底
+	atomic.StoreInt64(&metricArtifactCleanupDeletedTotal, 0)
+	atomic.StoreInt64(&metricArtifactCleanupDeletedBytesTotal, 0)
+	atomic.StoreInt64(&metricArtifactCleanupFailuresTotal, 0)
+	atomic.StoreInt64(&metricArtifactReadyBytes, 0)
+	atomic.StoreInt64(&metricArtifactPinnedBytes, 0)
+	atomic.StoreInt64(&metricArtifactExpirationBacklog, 0)
+	atomic.StoreInt64(&metricArtifactPolicyReconcileBacklog, 0)
+	metricArtifactsByStatusMu.Lock()
+	metricArtifactsByStatus = map[string]int64{}
+	metricArtifactsByStatusMu.Unlock()
 	metricCollectionRejectedLowDiskMu.Lock()
 	metricCollectionRejectedLowDisk = map[string]int64{}
 	metricCollectionRejectedLowDiskMu.Unlock()
@@ -170,8 +227,38 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	}
 
 	if s != nil && s.DB != nil {
+		s.refreshArtifactsByStatusGauge()
 		s.writeDBMetrics(&b)
 	}
+	// 存储阶段一：Artifact 生命周期指标
+	writeMetricHeader(&b, "mini_drop_artifacts_by_status", "gauge", "Current artifacts grouped by status.")
+	metricArtifactsByStatusMu.Lock()
+	statuses := make([]string, 0, len(metricArtifactsByStatus))
+	for status := range metricArtifactsByStatus {
+		statuses = append(statuses, status)
+	}
+	metricArtifactsByStatusMu.Unlock()
+	sort.Strings(statuses)
+	for _, status := range statuses {
+		metricArtifactsByStatusMu.Lock()
+		count := metricArtifactsByStatus[status]
+		metricArtifactsByStatusMu.Unlock()
+		fmt.Fprintf(&b, "mini_drop_artifacts_by_status{status=%q} %d\n", prometheusLabel(status), count)
+	}
+	writeMetricHeader(&b, "mini_drop_artifact_ready_bytes", "gauge", "Bytes of artifacts in ready status.")
+	fmt.Fprintf(&b, "mini_drop_artifact_ready_bytes %d\n", atomic.LoadInt64(&metricArtifactReadyBytes))
+	writeMetricHeader(&b, "mini_drop_artifact_pinned_bytes", "gauge", "Bytes of non-deleted artifacts under pinned tasks.")
+	fmt.Fprintf(&b, "mini_drop_artifact_pinned_bytes %d\n", atomic.LoadInt64(&metricArtifactPinnedBytes))
+	writeMetricHeader(&b, "mini_drop_artifact_expiration_backlog", "gauge", "Artifacts due for expiration cleanup.")
+	fmt.Fprintf(&b, "mini_drop_artifact_expiration_backlog %d\n", atomic.LoadInt64(&metricArtifactExpirationBacklog))
+	writeMetricHeader(&b, "mini_drop_artifact_cleanup_deleted_total", "counter", "Artifacts deleted by lifecycle cleanup.")
+	fmt.Fprintf(&b, "mini_drop_artifact_cleanup_deleted_total %d\n", atomic.LoadInt64(&metricArtifactCleanupDeletedTotal))
+	writeMetricHeader(&b, "mini_drop_artifact_cleanup_deleted_bytes_total", "counter", "Object bytes reclaimed by lifecycle cleanup.")
+	fmt.Fprintf(&b, "mini_drop_artifact_cleanup_deleted_bytes_total %d\n", atomic.LoadInt64(&metricArtifactCleanupDeletedBytesTotal))
+	writeMetricHeader(&b, "mini_drop_artifact_cleanup_failures_total", "counter", "Artifact object deletion failures.")
+	fmt.Fprintf(&b, "mini_drop_artifact_cleanup_failures_total %d\n", atomic.LoadInt64(&metricArtifactCleanupFailuresTotal))
+	writeMetricHeader(&b, "mini_drop_artifact_policy_reconcile_backlog", "gauge", "Artifacts awaiting retention policy reconciliation.")
+	fmt.Fprintf(&b, "mini_drop_artifact_policy_reconcile_backlog %d\n", atomic.LoadInt64(&metricArtifactPolicyReconcileBacklog))
 	c.Data(http.StatusOK, "text/plain; version=0.0.4; charset=utf-8", []byte(b.String()))
 }
 
