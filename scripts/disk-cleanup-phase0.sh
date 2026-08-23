@@ -4,7 +4,7 @@
 # ==============================================================================
 # 用法：
 #   bash scripts/disk-cleanup-phase0.sh report   # 只读报告
-#   bash scripts/disk-cleanup-phase0.sh clean    # 安全清理（含 rollback tag）
+#   bash scripts/disk-cleanup-phase0.sh clean    # 安全清理（保护现有容器镜像和业务卷）
 # ==============================================================================
 set -euo pipefail
 

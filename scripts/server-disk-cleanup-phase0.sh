@@ -4,11 +4,11 @@
 # ==============================================================================
 # 用法：
 #   bash server-disk-cleanup-phase0.sh report    # 只读报告，不做任何修改
-#   bash server-disk-cleanup-phase0.sh clean     # 安全清理（report 后 + rollback tag）
+#   bash server-disk-cleanup-phase0.sh clean     # 安全清理（先自动执行 report）
 #
 # 清理范围（仅限以下，绝不越界）：
 #   1. 未被任何容器引用的 mini-drop-drop-tests / mini-drop-drop-test 镜像
-#   2. 不属于当前/rollback 镜像的 mini-drop/phase1-predeploy 标签
+#   2. 不属于任何现有容器镜像的 mini-drop/phase1-predeploy 标签
 #   3. 删除上述镜像后变成无引用的构建缓存（docker builder prune -f）
 #   4. 经挂载检查确认未被使用、且名称明确属于测试环境的测试卷（mini-drop-test_*）
 #
@@ -23,7 +23,6 @@ set -euo pipefail
 
 MODE="${1:-report}"
 PROJECT="mini-drop"
-RELEASES_ROOT="/home/ubuntu/mini-drop-releases"
 
 say() { printf '[cleanup] %s\n' "$*"; }
 die() { printf '[cleanup] ❌ %s\n' "$*" >&2; exit 1; }
@@ -46,8 +45,7 @@ report() {
     size="$(docker run --rm -v "${vol}:/v" alpine du -sh /v 2>/dev/null | awk '{print $1}' || echo '?')"
     printf '  %-40s containers_using=%-3s size=%s\n' "${vol}" "${used}" "${size}"
   done
-  echo "--- release/source/build cache 大小 ---"
-  du -sh "${RELEASES_ROOT}" 2>/dev/null || echo "  (no releases dir)"
+  echo "--- source/build cache 大小 ---"
   du -sh /home/ubuntu/mini-drop 2>/dev/null || echo "  (no source dir)"
   du -sh /var/lib/docker/buildkit 2>/dev/null || true
   du -sh /var/lib/mini-drop/continuous-spool 2>/dev/null || echo "  (no spool)"
@@ -60,30 +58,17 @@ container_refs() { # container_refs <image> → 引用容器数
   docker ps -aq --filter "ancestor=$1" 2>/dev/null | wc -l | tr -d ' '
 }
 
-# 运行中/已打 rollback 标签的镜像 ID 集合（这些绝不允许删）
+# 所有现有容器引用的镜像 ID 集合（这些绝不允许删）
 protected_image_ids() {
-  {
-    for c in $(docker ps -aq); do docker inspect -f '{{.Image}}' "$c"; done
-    for img in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E "^${PROJECT}-[a-z_]+:rollback-"); do
-      docker inspect -f '{{.Id}}' "${img}"
-    done
-  } | sort -u
+  for c in $(docker ps -aq); do docker inspect -f '{{.Image}}' "$c"; done | sort -u
 }
 
 # ---------------------------------------------------------------------------
 # 安全清理
 # ---------------------------------------------------------------------------
 clean() {
-  say "===== 0) 清理前快照（给运行镜像打 rollback tag）====="
-  TS="$(date +%Y%m%d-%H%M%S)"
-  for svc in apiserver drop_agent drop_server web_frontend analysis postgres minio; do
-    cname="${PROJECT}-${svc}-1"
-    img="$(docker inspect -f '{{.Image}}' "${cname}" 2>/dev/null || true)"
-    if [[ -n "${img}" ]]; then
-      tag="${PROJECT}-${svc}:rollback-${TS}"
-      docker tag "${img}" "${tag}" && say "  rollback tag: ${tag}"
-    fi
-  done
+  say "===== 0) 清理前确认现有容器镜像（这些镜像不会删除）====="
+  docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.ID}}\t{{.Status}}'
 
   say "===== 1) 删除未被任何容器引用的测试镜像 ====="
   for img in "mini-drop-drop-tests:latest" "mini-drop-drop-test:latest"; do
@@ -96,12 +81,12 @@ clean() {
     fi
   done
 
-  say "===== 2) 删除不属于当前/rollback 镜像的 phase1-predeploy 标签 ====="
+  say "===== 2) 删除不属于任何现有容器镜像的 phase1-predeploy 标签 ====="
   mapfile -t prot_ids < <(protected_image_ids)
   for tag in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^mini-drop/phase1-predeploy:' || true); do
     img_id="$(docker inspect -f '{{.Id}}' "${tag}")"
     if printf '%s\n' "${prot_ids[@]}" | grep -qx "${img_id}"; then
-      say "  保留 ${tag}（ID ${img_id} 属于当前/rollback 镜像）"
+      say "  保留 ${tag}（ID ${img_id} 正被现有容器引用）"
     else
       say "  删除 ${tag}（ID ${img_id} 不属于当前/rollback 镜像）"
       docker rmi "${tag}" || say "  警告：${tag} 删除失败"
@@ -129,7 +114,7 @@ clean() {
   AVAIL_BYTES="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
   MIN=$((8 * 1024 * 1024 * 1024))
   if [[ "${AVAIL_BYTES}" -ge "${MIN}" ]]; then
-    say "✅ 根盘可用 $((AVAIL_BYTES / 1024 / 1024 / 1024)) GiB ≥ 8GiB，可以构建"
+    say "✅ 根盘可用 $((AVAIL_BYTES / 1024 / 1024 / 1024)) GiB ≥ 8GiB，可以按原 sync.sh 流程构建"
   else
     say "⚠️ 根盘可用 $((AVAIL_BYTES / 1024 / 1024 / 1024)) GiB < 8GiB，本次服务器构建停止（阶段 0 不通过删除业务数据强行腾空间）"
   fi
