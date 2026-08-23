@@ -234,6 +234,20 @@ services:
       STORAGE_WARNING_FREE_BYTES: "${STORAGE_WARNING_FREE_BYTES:-8589934592}"
       STORAGE_CRITICAL_FREE_BYTES: "${STORAGE_CRITICAL_FREE_BYTES:-4294967296}"
       STORAGE_MIN_FREE_BYTES: "${STORAGE_MIN_FREE_BYTES:-1073741824}"
+      # 存储阶段二：物理 Blob（扩展发布 A→B→C，默认全部关闭 = 兼容 Reader）
+      # A：兼容 schema + Reader + 指标（开关全关）。
+      # B：开 BLOB_BACKFILL_ENABLED / BLOB_MIGRATION_ENABLED（kallsyms→ELF→结果）。
+      # C：24h 宽限后开 BLOB_GC_ENABLED。
+      BLOB_BACKFILL_ENABLED: "${BLOB_BACKFILL_ENABLED:-false}"
+      BLOB_MIGRATION_ENABLED: "${BLOB_MIGRATION_ENABLED:-false}"
+      BLOB_GC_ENABLED: "${BLOB_GC_ENABLED:-false}"
+      BLOB_MIN_COMPRESS_BYTES: "${BLOB_MIN_COMPRESS_BYTES:-4096}"
+      BLOB_GC_SAFE_GRACE_HOURS: "${BLOB_GC_SAFE_GRACE_HOURS:-24}"
+      BLOB_MIGRATION_BATCH: "${BLOB_MIGRATION_BATCH:-50}"
+      BLOB_MIGRATION_INTERVAL_SEC: "${BLOB_MIGRATION_INTERVAL_SEC:-60}"
+      BLOB_MIGRATE_KALLSYMS: "${BLOB_MIGRATE_KALLSYMS:-true}"
+      BLOB_MIGRATE_ELF: "${BLOB_MIGRATE_ELF:-true}"
+      BLOB_MIGRATE_RESULTS: "${BLOB_MIGRATE_RESULTS:-true}"
       CONTINUOUS_SUMMARY_RETENTION_HOURS: "168"
       # 阶段三：内建持续剖析块存储（compactor）
       # 每个 session 每小时一个 gzip 压缩块；开启后查询自动按 object_key+batch_bid
@@ -275,6 +289,10 @@ services:
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"
       ANALYSIS_WORK_ROOT: "/tmp/mini-drop-analysis"
+      # 阶段二：单次 CPU 采样标准 pprof 转换模式（observe/enforce）。
+      # observe：生成并校验 pprof，失败只记录指标不影响原分析结果。
+      # enforce：pprof 失败导致 AnalysisJob 重试，达上限后任务失败。
+      PORTABLE_PROFILE_MODE: "${PORTABLE_PROFILE_MODE:-observe}"
     depends_on:
       - postgres
       - minio

@@ -189,7 +189,7 @@ def t_analyze_bpf_prefers_raw_bpf_artifact():
             if key == "tid-bpf/raw.bpf":
                 return b"@io_lat_us:\n[1, 2) 5\n[2, 4) 10\n"
             return None
-        def put_object(self, bucket, key, data, content_type):
+        def put_object(self, bucket, key, data, content_type, content_encoding=""):
             self.writes[key] = content_type
         def presigned_get_url(self, bucket, key):
             return "http://example/" + key
@@ -233,7 +233,7 @@ def t_analyze_bpf_falls_back_to_legacy_perf_data():
             if key == "tid-old/perf.data":
                 return b"@sched_lat_us:\n[0, 10) 3\n"
             return None
-        def put_object(self, bucket, key, data, content_type):
+        def put_object(self, bucket, key, data, content_type, content_encoding=""):
             self.writes[key] = content_type
         def presigned_get_url(self, bucket, key):
             return "http://example/" + key
@@ -290,7 +290,7 @@ class _FakeMemleakStorage:
         return self.has_object
     def get_object(self, bucket, key):
         return None
-    def put_object(self, bucket, key, data, content_type):
+    def put_object(self, bucket, key, data, content_type, content_encoding=""):
         self.writes[key] = content_type
     def presigned_get_url(self, bucket, key):
         return "http://example/" + key

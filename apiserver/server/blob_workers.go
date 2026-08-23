@@ -499,12 +499,21 @@ func (s *APIServer) switchMigrationRefsTx(tx *gorm.DB, oldKey string, blobID uin
 	return nil
 }
 
+// blobMigrateReady 判断 blob 引用是否指向"旧物理 key"（非 CAS key），
+// 或尚未回填（blob_id 为空）——两种情况都构成迁移候选。
+func blobMigrateReady(blob *model.StorageBlob) bool {
+	if blob == nil {
+		return true
+	}
+	return !strings.HasPrefix(blob.ObjectKey, "blobs/sha256/")
+}
+
 // migrateNextKallsyms 迁移一个旧未压缩 kallsyms（"kernel-symbols/<sha>/kallsyms"，
 // 不带 .gz 后缀）。已压缩的 .gz 对象由回填覆盖，不重复压缩。
 func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 	var row model.KernelSymbolFile
 	err := s.DB.WithContext(ctx).
-		Where("object_key LIKE 'kernel-symbols/%/kallsyms' AND object_key NOT LIKE '%.gz' AND (blob_id IS NULL OR blob_id = 0)").
+		Where("object_key LIKE 'kernel-symbols/%/kallsyms' AND object_key NOT LIKE '%.gz'").
 		Order("created_at ASC").Limit(1).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
@@ -512,17 +521,26 @@ func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// 已回填且 blob 已是 CAS key → 跳过。
+	if row.BlobID != nil && *row.BlobID > 0 {
+		var blob model.StorageBlob
+		if err := s.DB.WithContext(ctx).Where("id = ?", *row.BlobID).First(&blob).Error; err == nil && !blobMigrateReady(&blob) {
+			return false, nil
+		}
+	}
 	_, _, err = s.migrationCommon(ctx, migrationCommonInput{
 		OldKey:             row.ObjectKey,
 		Format:             model.BlobFormatKallsyms,
 		ContentType:        "application/octet-stream",
 		SwitchKernelLedger: true,
+		SwitchArtifacts:    true, // kallsyms 的 artifacts 引用也指向旧 key
 	})
 	if err != nil {
 		s.incBlobFailedObjects(1)
 		incBlobMigrationFailures()
 		s.logBlobWarn("kallsyms migration failed",
 			zap.String("object_key", redactBlobKey(row.ObjectKey)), zap.Error(err))
+		return true, err
 	}
 	return true, nil
 }
@@ -531,13 +549,19 @@ func (s *APIServer) migrateNextKallsyms(ctx context.Context) (bool, error) {
 func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 	var row model.SymbolFile
 	err := s.DB.WithContext(ctx).
-		Where("(blob_id IS NULL OR blob_id = 0) AND object_key LIKE 'symbols/%'").
+		Where("object_key LIKE 'symbols/%'").
 		Order("created_at ASC").Limit(1).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	if row.BlobID != nil && *row.BlobID > 0 {
+		var blob model.StorageBlob
+		if err := s.DB.WithContext(ctx).Where("id = ?", *row.BlobID).First(&blob).Error; err == nil && !blobMigrateReady(&blob) {
+			return false, nil
+		}
 	}
 	_, _, err = s.migrationCommon(ctx, migrationCommonInput{
 		OldKey:            row.ObjectKey,
@@ -550,6 +574,7 @@ func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 		incBlobMigrationFailures()
 		s.logBlobWarn("elf migration failed",
 			zap.String("object_key", redactBlobKey(row.ObjectKey)), zap.Error(err))
+		return true, err
 	}
 	return true, nil
 }
@@ -558,7 +583,7 @@ func (s *APIServer) migrateNextELF(ctx context.Context) (bool, error) {
 func (s *APIServer) migrateNextResult(ctx context.Context) (bool, error) {
 	var a model.Artifact
 	err := s.DB.WithContext(ctx).
-		Where("artifacts.kind IN ? AND artifacts.size >= ? AND artifacts.deleted_at IS NULL AND artifacts.status NOT IN ? AND (artifacts.blob_id IS NULL OR artifacts.blob_id = 0)",
+		Where("artifacts.kind IN ? AND artifacts.size >= ? AND artifacts.deleted_at IS NULL AND artifacts.status NOT IN ?",
 			[]string{model.ArtifactKindResult, model.ArtifactKindIntermediate},
 			s.Config.Blob.MinCompressBytes,
 			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
@@ -568,6 +593,12 @@ func (s *APIServer) migrateNextResult(ctx context.Context) (bool, error) {
 	}
 	if err != nil {
 		return false, err
+	}
+	if a.BlobID != nil && *a.BlobID > 0 {
+		var blob model.StorageBlob
+		if err := s.DB.WithContext(ctx).Where("id = ?", *a.BlobID).First(&blob).Error; err == nil && !blobMigrateReady(&blob) {
+			return false, nil
+		}
 	}
 	// 只迁移文本类结果（svg/json/md/txt/collapsed）；二进制/perf.data 跳过。
 	format := blobFormatFromKey(a.ObjectKey)
@@ -593,6 +624,7 @@ func (s *APIServer) migrateNextResult(ctx context.Context) (bool, error) {
 		incBlobMigrationFailures()
 		s.logBlobWarn("result migration failed",
 			zap.String("object_key", redactBlobKey(a.ObjectKey)), zap.Error(err))
+		return true, err
 	}
 	return true, nil
 }

@@ -53,8 +53,9 @@ class Storage(abc.ABC):
 
     @abc.abstractmethod
     def put_object(self, bucket: str, key: str,
-                   data: bytes, content_type: str = "application/octet-stream") -> bool:
-        """上传文件到指定路径"""
+                   data: bytes, content_type: str = "application/octet-stream",
+                   content_encoding: str = "") -> bool:
+        """上传文件到指定路径（content_encoding 支持透明 gzip 解码）"""
         ...
 
     @abc.abstractmethod
@@ -144,13 +145,17 @@ class MinIOStorage(Storage):
 
     # ---------- put_object ----------
     def put_object(self, bucket: str, key: str,
-                   data: bytes, content_type: str = "application/octet-stream") -> bool:
+                   data: bytes, content_type: str = "application/octet-stream",
+                   content_encoding: str = "") -> bool:
         """上传文件"""
         try:
+            opts = {}
+            if content_encoding:
+                opts["content_encoding"] = content_encoding
             self.client.put_object(
                 bucket, key,
                 io.BytesIO(data), len(data),
-                content_type=content_type
+                content_type=content_type, **opts
             )
             print(f"[storage] 上传成功: {bucket}/{key} ({len(data)} bytes)", file=sys.stderr)
             return True

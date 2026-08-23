@@ -34,19 +34,21 @@ import (
 // ------------------------------------------------------------
 
 // blobCASKey 构造内容寻址物理对象 key。
-// 格式：blobs/sha256/<ab>/<logical_sha256>/<format>-v<schema><suffix>
-//   - suffix：gzip→.gz，zstd→.zst，未压缩→""。
-// 该格式与 analysis/pprof_builder.py 的 blob_cas_key 保持一致（跨端契约）。
+// 格式：blobs/sha256/<ab>/<logical_sha256>/<format>-v<schema><ext>
+//   - ext：pprof→".pb.gz"（格式自带扩展名）；gzip→".gz"；zstd→".zst"；未压缩→""。
+// 该格式与 analysis/artifact_descriptor.py 的 blob_cas_key 保持一致（跨端契约）。
 func blobCASKey(logicalSHA256, format, schemaVersion, compression string) string {
 	if len(logicalSHA256) < 2 {
 		logicalSHA256 = "00"
 	}
-	suffix := ""
-	switch compression {
-	case model.CompressionGzip:
-		suffix = ".gz"
-	case model.CompressionZstd:
-		suffix = ".zst"
+	ext := ""
+	switch {
+	case format == model.BlobFormatPprof:
+		ext = ".pb.gz"
+	case compression == model.CompressionGzip:
+		ext = ".gz"
+	case compression == model.CompressionZstd:
+		ext = ".zst"
 	}
 	schema := schemaVersion
 	if schema == "" {
@@ -57,7 +59,7 @@ func blobCASKey(logicalSHA256, format, schemaVersion, compression string) string
 		format = "unknown"
 	}
 	return fmt.Sprintf("blobs/sha256/%s/%s/%s-v%s%s",
-		logicalSHA256[:2], logicalSHA256, format, schema, suffix)
+		logicalSHA256[:2], logicalSHA256, format, schema, ext)
 }
 
 // blobFormatFromKey 从对象/逻辑 key 推断内容格式（best effort）。
@@ -345,26 +347,32 @@ func (s *APIServer) collectBlobStats(ctx context.Context) blobStats {
 }
 
 // blobMigrationBacklog 迁移剩余候选数（kallsyms/ELF/SVG/folded 未迁移对象）。
+// 候选 = 尚未回填（blob_id 空）或 blob 仍指向旧物理 key（非 CAS key）。
 func (s *APIServer) blobMigrationBacklog(ctx context.Context) int64 {
 	if s == nil || s.DB == nil {
 		return 0
 	}
+	casPrefix := "blobs/sha256/%"
 	var n int64
 	_ = s.DB.WithContext(ctx).Model(&model.KernelSymbolFile{}).
-		Where("object_key LIKE '%/kallsyms' AND object_key NOT LIKE '%.gz' AND (blob_id IS NULL OR blob_id = 0)").
+		Joins("LEFT JOIN storage_blobs b ON b.id = kernel_symbol_files.blob_id").
+		Where("kernel_symbol_files.object_key LIKE '%/kallsyms' AND kernel_symbol_files.object_key NOT LIKE '%.gz'").
+		Where("(kernel_symbol_files.blob_id IS NULL OR b.object_key NOT LIKE ?)", casPrefix).
 		Count(&n).Error
 	var n2 int64
 	_ = s.DB.WithContext(ctx).Model(&model.SymbolFile{}).
-		Where("(blob_id IS NULL OR blob_id = 0)").
+		Joins("LEFT JOIN storage_blobs b ON b.id = symbol_files.blob_id").
+		Where("(symbol_files.blob_id IS NULL OR b.object_key NOT LIKE ?)", casPrefix).
 		Count(&n2).Error
 	var n3 int64
 	_ = s.DB.WithContext(ctx).Model(&model.Artifact{}).
 		Joins("LEFT JOIN hotmethod_tasks t ON t.tid = artifacts.task_tid").
+		Joins("LEFT JOIN storage_blobs b ON b.id = artifacts.blob_id").
 		Where("artifacts.kind IN ? AND artifacts.size >= ? AND artifacts.deleted_at IS NULL AND artifacts.status NOT IN ?",
 			[]string{model.ArtifactKindResult, model.ArtifactKindIntermediate},
 			s.Config.Blob.MinCompressBytes,
 			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
-		Where("(artifacts.blob_id IS NULL OR artifacts.blob_id = 0)").
+		Where("(artifacts.blob_id IS NULL OR b.object_key NOT LIKE ?)", casPrefix).
 		Count(&n3).Error
 	return n + n2 + n3
 }

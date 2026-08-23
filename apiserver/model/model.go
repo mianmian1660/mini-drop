@@ -256,5 +256,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&SymbolFile{},
 		&KernelSymbolFile{},
 		&TaskBuildID{},
+		&StorageBlob{},
+		&StorageObjectGC{},
 	)
 }
