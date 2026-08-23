@@ -71,9 +71,12 @@ def _string_field(field: int, value: str) -> bytes:
 # perf script 解析 → 规范样本模型
 # ----------------------------------------------------------
 
-# comm pid tid [cpu] time: event:   ip sym (dso)
+# perf script 头行兼容多种版本输出：
+#   comm pid tid [cpu] time: event: <frame>      (旧格式)
+#   comm pid/tid [cpu] time: event: <frame>      (pid/tid 合并)
+#   comm pid/tid time: event:                    (无 [cpu] 字段，帧在下一行)
 _HEADER_RE = re.compile(
-    r"^(\S+)\s+(\d+)\s+(\d+)\s+\[\d+\]\s+([\d.]+):\s+([^:]+):\s*(.*)$"
+    r"^(\S+)\s+(\S+)(?:\s+\[\d+\])?\s+([\d.]+):\s+([^:]+):(?:\s*(.*))?$"
 )
 # 帧：ip sym (dso) 或 ip sym 或 [unknown] 形式
 _FRAME_RE = re.compile(
@@ -111,7 +114,8 @@ def parse_perf_script(output: str) -> dict:
         if m:
             if current is not None:
                 samples.append(current)
-            comm, pid, tid, tstr, event, first_frame = m.groups()
+            comm, pidtid, tstr, event, first_frame = m.groups()
+            pid, tid = _parse_pid_tid(pidtid)
             frames = []
             if first_frame and first_frame.strip():
                 fm = _FRAME_RE.match(first_frame)
@@ -120,8 +124,8 @@ def parse_perf_script(output: str) -> dict:
                     frames.append(_parse_frame(ip, sym, dso))
             current = {
                 "comm": comm,
-                "pid": int(pid),
-                "tid": int(tid),
+                "pid": pid,
+                "tid": tid,
                 "event": event.strip(),
                 "time": float(tstr),
                 "frames": frames,
@@ -135,6 +139,18 @@ def parse_perf_script(output: str) -> dict:
     if current is not None:
         samples.append(current)
     return {"samples": samples}
+
+
+def _parse_pid_tid(pidtid: str):
+    """解析 pid/tid 字段："123/456" → (123,456)；"123" → (123,123)。"""
+    try:
+        if "/" in pidtid:
+            p, t = pidtid.split("/", 1)
+            return int(p), int(t)
+        v = int(pidtid)
+        return v, v
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 def _parse_frame(ip_raw, sym, dso):

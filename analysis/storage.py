@@ -151,7 +151,9 @@ class MinIOStorage(Storage):
         try:
             opts = {}
             if content_encoding:
-                opts["content_encoding"] = content_encoding
+                # minio SDK 的 metadata 白名单包含 content-encoding（小写），
+                # 会原样作为真实 HTTP 头，实现浏览器透明 gzip 解码。
+                opts["metadata"] = {"content-encoding": content_encoding}
             self.client.put_object(
                 bucket, key,
                 io.BytesIO(data), len(data),
