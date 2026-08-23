@@ -515,7 +515,9 @@ func pqAccumulateSignalMembers(acc map[string]map[string]*pqSignalMemberAcc, sig
 	default:
 		return
 	}
-	if total == 0 || bid == "" {
+	// 被消费的 batch 必须登记为 member（即使该信号 0 行——如空 samples 窗口，
+	// 否则周期对账会把它们当作遗漏）。统计为 0 不影响 lineage 语义。
+	if bid == "" {
 		return
 	}
 	if acc[signal] == nil {
