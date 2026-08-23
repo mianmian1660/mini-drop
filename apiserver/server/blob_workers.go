@@ -460,7 +460,7 @@ func upsertBlobByContent(tx *gorm.DB, row *model.StorageBlob, logicalHash, forma
 				 format, schema_version, compression, content_encoding, content_type,
 				 status, delete_reason, delete_attempts, next_delete_attempt_at,
 				 last_delete_error, verified_at, deleted_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?, NULL, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (logical_sha256, format, compression)
 			  WHERE logical_sha256 IS NOT NULL
 			DO UPDATE SET
@@ -478,8 +478,8 @@ func upsertBlobByContent(tx *gorm.DB, row *model.StorageBlob, logicalHash, forma
 				updated_at = NOW()`,
 			row.ObjectKey, row.LogicalSHA256, row.StoredSHA256, row.StoredSize, row.LogicalSize,
 			row.Format, row.SchemaVersion, row.Compression, row.ContentEncoding, row.ContentType,
-			row.Status, row.DeleteReason, row.DeleteAttempts, row.LastDeleteError, row.VerifiedAt,
-			row.CreatedAt, row.UpdatedAt).Error; err != nil {
+			row.Status, row.DeleteReason, row.DeleteAttempts, row.NextDeleteAttemptAt, row.LastDeleteError,
+			row.VerifiedAt, row.DeletedAt, row.CreatedAt, row.UpdatedAt).Error; err != nil {
 			return err
 		}
 		var id uint
