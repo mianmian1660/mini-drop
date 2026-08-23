@@ -55,8 +55,14 @@ export const tasks = {
     createComposite: (data) => client.post('/api/v1/tasks/composite', data),
     // 任务列表（GET /api/v1/tasks?page=&pageSize=&keyword=&status=）
     list: (params = {}) => client.get('/api/v1/tasks', { params }),
-    // 任务详情（GET /api/v1/tasks/:tid）
-    detail: (tid) => client.get(`/api/v1/tasks/${tid}`),
+    // 任务详情（GET /api/v1/tasks/:tid；阶段 4 支持 ?analysis_job_id= 选择代次）
+    detail: (tid, params = {}) => client.get(`/api/v1/tasks/${tid}`, { params }),
+    // 阶段 4：分析作业列表（GET /api/v1/tasks/:tid/analysis-jobs）
+    analysisJobs: (tid) => client.get(`/api/v1/tasks/${tid}/analysis-jobs`),
+    // 阶段 4：人工重分析（POST /api/v1/tasks/:tid/reanalyze）
+    reanalyze: (tid, data) => client.post(`/api/v1/tasks/${tid}/reanalyze`, data),
+    // 阶段 4：按 Artifact ID 读取内容（GET /api/v1/tasks/:tid/artifacts/:id/content）
+    artifactContent: (tid, artifactId) => `/api/v1/tasks/${tid}/artifacts/${artifactId}/content`,
     // 复合任务子任务列表（GET /api/v1/tasks/:tid/children）
     children: (tid) => client.get(`/api/v1/tasks/${tid}/children`),
     // 删除任务（DELETE /api/v1/tasks/:tid）

@@ -22,6 +22,23 @@ namespace drop_agent
     /// 采集产物在 MinIO 里的相对文件名（不含 "<tid>/" 前缀，调用方自己拼）。
     std::string RemoteKeyFor(const std::string &profilerName);
 
+    /// 阶段 4：RAW 对象 key。
+    /// v2 布局（DROP_AGENT_LAYOUT_V2 默认开启）：tasks/{tid}/attempts/{attempt_id}/raw/{basename}
+    /// 旧布局回退：{tid}/{basename}。attemptId<=0 或 basename 非法时回退旧布局。
+    std::string RawObjectKey(const std::string &tid, uint64_t attemptId,
+                             const std::string &basename);
+
+    /// 阶段 4：采集 manifest key。
+    /// v2 布局：tasks/{tid}/attempts/{attempt_id}/manifest.json；否则 {tid}/manifest.json。
+    std::string ManifestObjectKey(const std::string &tid, uint64_t attemptId);
+
+    /// basename 合法性校验：只允许 [A-Za-z0-9._-]，禁止空、"."、".." 与目录分隔符。
+    bool ValidRemoteBasename(const std::string &basename);
+
+    /// 阶段 4 布局开关（环境变量 DROP_AGENT_LAYOUT_V2，1/true/yes/on 视为开启，
+    /// 默认开启；关闭时保持旧 {tid}/... 写入）。
+    bool LayoutV2Enabled();
+
     /// 采集产物的 HTTP Content-Type。
     std::string ContentTypeFor(const std::string &profilerName);
 

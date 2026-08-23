@@ -25,6 +25,7 @@
 
 import hashlib
 import json
+import os
 
 from pprof_builder import blob_cas_key, gzip_deterministic
 
@@ -36,6 +37,19 @@ _COMPRESSIBLE_FORMATS = {"svg", "folded", "pprof"}
 
 # 压缩阈值：大于等于该字节数才压缩（小 JSON/Markdown 不强制压缩）
 DEFAULT_MIN_COMPRESS_BYTES = 4096
+
+
+def current_output_prefix(tid: str) -> str:
+    """返回当前分析作业的输出前缀。
+
+    阶段 4：daemon 为每个作业设置 ANALYSIS_OUTPUT_PREFIX 环境变量
+    （tasks/{tid}/analysis/{pipeline}/{analyzer_version}/g{generation}）；
+    旧链路（未设置）回退到 {tid}，保持历史 key 形态。
+    """
+    prefix = os.environ.get("ANALYSIS_OUTPUT_PREFIX", "").strip()
+    if prefix:
+        return prefix
+    return tid or ""
 
 
 def format_from_filename(filename: str) -> str:
@@ -106,19 +120,23 @@ def build_descriptor(tid: str, filename: str, content,
                      kind: str = "", fmt: str = "",
                      schema_version: str = "1",
                      min_compress_bytes: int = DEFAULT_MIN_COMPRESS_BYTES,
-                     compression: str = None) -> dict:
+                     compression: str = None,
+                     logical_name: str = "") -> dict:
     """把一份新生成的结果转成 descriptor，并完成压缩与双哈希计算。
 
     compression=None 时按规则自动决定（svg/folded/pprof 压缩、大文本压缩）；
     显式传 "" / "gzip" 强制不压缩/压缩。pprof 调用方应传 compression=""
     （内容本身就是 .pb.gz 文件格式，不再二次压缩）。
 
+    阶段 4：object_key 使用当前作业输出前缀（ANALYSIS_OUTPUT_PREFIX 环境变量，
+    未设置时回退 {tid}）；logical_name 为稳定角色名（filename）。
+
     不负责上传；调用方用 descriptor["blob_key"] 上传后，
     把 descriptor 交给 analysis_daemon.record_result_artifacts 登记。
 
     返回: descriptor dict；内容既可以是 str 也可以是 bytes/dict。
     """
-    object_key = f"{tid}/{filename}"
+    object_key = f"{current_output_prefix(tid)}/{filename}"
     if isinstance(content, str):
         raw = content.encode("utf-8")
     elif isinstance(content, bytes):
@@ -147,6 +165,7 @@ def build_descriptor(tid: str, filename: str, content,
 
     return {
         "object_key": object_key,
+        "logical_name": logical_name or filename,
         "blob_key": blob_key,
         "kind": kind,
         "format": fmt,

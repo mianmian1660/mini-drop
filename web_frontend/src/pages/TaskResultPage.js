@@ -111,6 +111,16 @@ export default function TaskResultPage() {
     const [foldedLoading, setFoldedLoading] = useState(false);
     const [foldedError, setFoldedError] = useState('');
     const [manualRefreshSeq, setManualRefreshSeq] = useState(0);
+    // 阶段 4：多代分析
+    const [analysisJobs, setAnalysisJobs] = useState([]);
+    const [activeAnalysisJobId, setActiveAnalysisJobId] = useState(null);
+    const [selectedJobId, setSelectedJobId] = useState(null);
+    const [reanalyzeCandidates, setReanalyzeCandidates] = useState([]);
+    const [reanalyzeOpen, setReanalyzeOpen] = useState(false);
+    const [reanalyzeAttempt, setReanalyzeAttempt] = useState(0);
+    const [reanalyzeBusy, setReanalyzeBusy] = useState(false);
+    const [reanalyzeError, setReanalyzeError] = useState('');
+    const [reanalyzeNotice, setReanalyzeNotice] = useState('');
     const taskRef = useRef(null);
     const filesRef = useRef([]);
 
@@ -142,6 +152,11 @@ export default function TaskResultPage() {
         setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
         setArtifacts(Array.isArray(data.artifacts) ? data.artifacts : []);
         setCleanedArtifacts(Array.isArray(data.cleaned_artifacts) ? data.cleaned_artifacts : []);
+        // 阶段 4：分析作业信息
+        const jobsPayload = data.analysis_jobs || {};
+        setAnalysisJobs(Array.isArray(jobsPayload.analysis_jobs) ? jobsPayload.analysis_jobs : []);
+        setActiveAnalysisJobId(jobsPayload.active_analysis_job_id ?? data.active_analysis_job_id ?? null);
+        setReanalyzeCandidates(Array.isArray(jobsPayload.reanalysis_candidates) ? jobsPayload.reanalysis_candidates : []);
         if (!options.preserveVisualFiles) {
             applyFiles(data.files || []);
         }
@@ -154,7 +169,8 @@ export default function TaskResultPage() {
         setPolling(isPoll);
 
         try {
-            const res = await tasks.detail(tid);
+            const params = selectedJobId ? { analysis_job_id: selectedJobId } : {};
+            const res = await tasks.detail(tid, params);
             if (res.code !== 0) {
                 if (!isPoll) setError(res.message || '任务不存在');
                 return;
@@ -166,7 +182,58 @@ export default function TaskResultPage() {
             setLoading(false);
             setPolling(false);
         }
+    }, [tid, selectedJobId, applyTaskData]);
+
+    // 阶段 4：切换展示代次
+    const selectAnalysisJob = useCallback(async (jobId) => {
+        const next = jobId ? Number(jobId) : null;
+        setSelectedJobId(next);
+        setLoading(true);
+        try {
+            const params = next ? { analysis_job_id: next } : {};
+            const res = await tasks.detail(tid, params);
+            if (res.code === 0) applyTaskData(res.data || {}, { preserveVisualFiles: false });
+        } catch (err) {
+            setError('切换分析版本失败: ' + (err.message || '未知错误'));
+        } finally {
+            setLoading(false);
+        }
     }, [tid, applyTaskData]);
+
+    // 阶段 4：人工重分析
+    const openReanalyze = useCallback(() => {
+        const latest = (reanalyzeCandidates && reanalyzeCandidates.length > 0)
+            ? reanalyzeCandidates[0].attempt_id
+            : 0;
+        setReanalyzeAttempt(latest);
+        setReanalyzeError('');
+        setReanalyzeNotice('');
+        setReanalyzeOpen(true);
+    }, [reanalyzeCandidates]);
+
+    const submitReanalyze = useCallback(async () => {
+        if (!tid) return;
+        setReanalyzeBusy(true);
+        setReanalyzeError('');
+        setReanalyzeNotice('');
+        try {
+            const res = await tasks.reanalyze(tid, { attempt_id: reanalyzeAttempt || undefined });
+            if (res.code === 202 || res.job_id) {
+                setReanalyzeNotice(`重分析作业已创建（generation ${res.generation ?? ''}）`);
+                setReanalyzeOpen(false);
+                await loadTask(true);
+            } else if (res.code === 409) {
+                setReanalyzeError(res.message || '该任务已有进行中的分析作业');
+            } else {
+                setReanalyzeError(res.message || '创建重分析失败');
+            }
+        } catch (err) {
+            const msg = err?.response?.data?.message || err.message || '未知错误';
+            setReanalyzeError(`创建重分析失败: ${msg}`);
+        } finally {
+            setReanalyzeBusy(false);
+        }
+    }, [tid, reanalyzeAttempt, loadTask]);
 
     useEffect(() => {
         if (attribution) return;
@@ -472,6 +539,29 @@ export default function TaskResultPage() {
 
             {failure && <FailurePanel failure={failure} retrying={retrying} onRetry={retryTask} notice={retryNotice} canManage={Boolean(task.can_manage)} />}
 
+            <AnalysisVersionPanel
+                jobs={analysisJobs}
+                activeJobId={activeAnalysisJobId}
+                selectedJobId={selectedJobId}
+                onSelect={selectAnalysisJob}
+                canManage={Boolean(task.can_manage)}
+                onReanalyze={openReanalyze}
+                hasCandidates={reanalyzeCandidates.length > 0}
+            />
+
+            {reanalyzeOpen && (
+                <ReanalyzeDialog
+                    candidates={reanalyzeCandidates}
+                    attemptId={reanalyzeAttempt}
+                    setAttemptId={setReanalyzeAttempt}
+                    busy={reanalyzeBusy}
+                    error={reanalyzeError}
+                    notice={reanalyzeNotice}
+                    onSubmit={submitReanalyze}
+                    onClose={() => setReanalyzeOpen(false)}
+                />
+            )}
+
             <div style={styles.card}>
                 <h3 style={styles.sectionTitle}>任务概览</h3>
                 <div style={styles.grid}>
@@ -586,8 +676,117 @@ function readEmbeddedAttribution(items) {
     return null;
 }
 
-function Metric({ label, value }) {
+const jobStatusMeta = {
+    pending: { label: '待分析', color: '#d97706', bg: '#fef3c7' },
+    running: { label: '分析中', color: '#2563eb', bg: '#dbeafe' },
+    retry: { label: '重试中', color: '#d97706', bg: '#fef3c7' },
+    success: { label: '成功', color: '#16a34a', bg: '#dcfce7' },
+    failed: { label: '失败', color: '#dc2626', bg: '#fee2e2' },
+};
+
+// 阶段 4：分析版本区域（当前代次 / 历史代次 / 重分析入口）
+function AnalysisVersionPanel({ jobs, activeJobId, selectedJobId, onSelect, canManage, onReanalyze, hasCandidates }) {
+    const list = Array.isArray(jobs) ? jobs : [];
+    if (list.length === 0 && !canManage) return null;
+    const active = Number(activeJobId) || null;
+    const selected = selectedJobId ? Number(selectedJobId) : null;
+    const selectedJob = list.find(j => Number(j.id) === selected) || null;
+
     return (
+        <div style={{ ...styles.card, background: '#fbfcfe' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+                <h3 style={{ ...styles.sectionTitle, margin: 0 }}>分析版本</h3>
+                {canManage && hasCandidates && (
+                    <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onReanalyze}>
+                        重分析
+                    </button>
+                )}
+            </div>
+            {list.length === 0 ? (
+                <p style={styles.paramHint}>该任务暂无分析作业记录（旧任务兼容：继续展示 {`{tid}/...`} 历史产物）。</p>
+            ) : (
+                <div style={{ display: 'grid', gap: 10 }}>
+                    {list.map(job => {
+                        const meta = jobStatusMeta[job.status] || { label: job.status, color: '#64748b', bg: '#f1f5f9' };
+                        const isActive = Number(job.id) === active;
+                        const isSelected = Number(job.id) === selected;
+                        const boxStyle = {
+                            border: `1px solid ${isSelected ? '#315efb' : isActive ? '#16a34a' : '#e5e7eb'}`,
+                            background: isSelected ? '#eff4ff' : '#fff',
+                            borderRadius: 6, padding: '10px 12px', cursor: 'pointer',
+                        };
+                        return (
+                            <div key={job.id} style={boxStyle}
+                                 onClick={() => onSelect && Number(job.id) !== selected && onSelect(job.id)}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                                    <span style={{ fontSize: 13, fontWeight: 700, color: '#202124' }}>
+                                        Generation {job.generation || 1}
+                                        {isActive && <span style={{ marginLeft: 8, borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700, color: '#16a34a', background: '#dcfce7' }}>当前结果</span>}
+                                        {isSelected && !isActive && <span style={{ marginLeft: 8, borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700, color: '#1d4ed8', background: '#dbeafe' }}>正在查看</span>}
+                                        {job.superseded_at && <span style={{ marginLeft: 8, borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700, color: '#667085', background: '#f1f5f9' }}>已替换</span>}
+                                    </span>
+                                    <span style={{ borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700, color: meta.color, background: meta.bg }}>{meta.label}</span>
+                                </div>
+                                <div style={{ marginTop: 6, fontSize: 12, color: '#475467', display: 'grid', gap: 4 }}>
+                                    <span>流水线：{job.pipeline || '-'} · 分析器版本：{job.analyzer_version || '-'}</span>
+                                    <span>输入尝试：attempt #{job.attempt_seq ? `${job.attempt_seq} (id=${job.attempt_id})` : (job.attempt_id || '-')} · 触发：{job.trigger === 'manual' ? '人工重分析' : '采集自动'}{job.requested_by ? ` · 请求者：${job.requested_by}` : ''}</span>
+                                    <span>创建：{job.created_at ? formatTime(job.created_at) : '-'}{job.superseded_at ? ` · 替换：${formatTime(job.superseded_at)}` : ''}</span>
+                                    {job.last_error ? <span style={{ color: '#b42318', whiteSpace: 'pre-wrap' }}>错误：{job.last_error}</span> : null}
+                                    {!job.artifacts_available && job.status === 'success' && (
+                                        <span style={{ color: '#b45309' }}>产物已过期/清理，仅保留作业记录。</span>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+            {selectedJob && selectedJob.status === 'failed' && (
+                <p style={{ ...styles.inlineError, marginTop: 10 }}>该代次分析失败，页面仍展示上一代成功结果。</p>
+            )}
+        </div>
+    );
+}
+
+// 阶段 4：重分析弹窗（选择输入 attempt）
+function ReanalyzeDialog({ candidates, attemptId, setAttemptId, busy, error, notice, onSubmit, onClose }) {
+    const list = Array.isArray(candidates) ? candidates : [];
+    return (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(16,24,40,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20 }}>
+            <div style={{ background: '#fff', borderRadius: 10, padding: 20, maxWidth: 480, width: '100%', boxShadow: '0 12px 32px rgba(16,24,40,0.2)' }}>
+                <h3 style={{ margin: '0 0 12px 0', fontSize: 16 }}>重分析</h3>
+                <p style={{ margin: '0 0 12px 0', fontSize: 13, color: '#475467', lineHeight: 1.6 }}>
+                    选择要重新分析的采集尝试。新分析会生成独立的新一代结果；成功后才切换为当前结果，失败不影响现有展示。
+                </p>
+                {list.length === 0 ? (
+                    <p style={styles.inlineError}>没有可重分析的采集尝试（RAW 可能已过期）。</p>
+                ) : (
+                    <div style={{ display: 'grid', gap: 8, maxHeight: 240, overflowY: 'auto' }}>
+                        {list.map(c => (
+                            <label key={c.attempt_id} style={{ display: 'flex', gap: 10, alignItems: 'center', border: `1px solid ${Number(attemptId) === Number(c.attempt_id) ? '#315efb' : '#e5e7eb'}`, borderRadius: 6, padding: '10px 12px', background: Number(attemptId) === Number(c.attempt_id) ? '#eff4ff' : '#fff', cursor: 'pointer' }}>
+                                <input type="radio" name="reanalyze-attempt" checked={Number(attemptId) === Number(c.attempt_id)} onChange={() => setAttemptId(Number(c.attempt_id))} />
+                                <span style={{ fontSize: 13, color: '#202124' }}>
+                                    attempt #{c.attempt_seq}（id={c.attempt_id}）· {c.created_at ? formatTime(c.created_at) : '-'}
+                                    {!c.raw_available ? <span style={{ color: '#b45309' }}> · RAW 已过期</span> : ` · ${c.raw_artifact_count ?? ''} 个 RAW`}
+                                </span>
+                            </label>
+                        ))}
+                    </div>
+                )}
+                {notice && <p style={{ ...styles.notice, marginTop: 10 }}>{notice}</p>}
+                {error && <p style={{ ...styles.inlineError, marginTop: 10 }}>{error}</p>}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
+                    <button style={styles.button} onClick={onClose} disabled={busy}>取消</button>
+                    <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onSubmit} disabled={busy || list.length === 0}>
+                        {busy ? '创建中...' : '开始重分析'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function Metric({ label, value }) {    return (
         <div style={styles.metric}>
             <div style={styles.metricLabel}>{label}</div>
             <div style={styles.metricValue}>{value}</div>
@@ -946,6 +1145,31 @@ export function ArtifactsPanel({
     const cleaned = Array.isArray(cleanedArtifacts) ? cleanedArtifacts : [];
     const pinned = Boolean(task?.artifacts_pinned);
     const [showCleaned, setShowCleaned] = useState(false);
+    // 阶段 4：按"采集尝试 / 当前分析 / 历史分析 / 其他"分组
+    const groups = useMemo(() => {
+        const g = { capture: [], current: [], history: [], other: [] };
+        (Array.isArray(artifacts) ? artifacts : []).forEach(a => {
+            const jobId = Number(a.analysis_job_id || 0);
+            const gen = Number(a.generation || 0);
+            const activeGen = Number(a.active_generation || 0);
+            if (a.kind === 'RAW' || a.kind === 'LOG') {
+                g.capture.push(a);
+            } else if (jobId > 0 && activeGen > 0 && gen === activeGen) {
+                g.current.push(a);
+            } else if (jobId > 0) {
+                g.history.push(a);
+            } else {
+                g.other.push(a);
+            }
+        });
+        return g;
+    }, [artifacts]);
+    const groupTitles = [
+        { key: 'capture', title: '采集尝试（RAW / 日志）' },
+        { key: 'current', title: '当前分析结果' },
+        { key: 'history', title: '历史分析（已替换/过期）' },
+        { key: 'other', title: '其他产物' },
+    ];
     return (
         <div style={styles.card}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
@@ -999,29 +1223,41 @@ export function ArtifactsPanel({
             {pinError && <div style={styles.inlineError}>{safeText(pinError)}</div>}
             {artifactError && <div style={styles.inlineError}>{safeText(artifactError)}</div>}
             {hasRegisteredArtifacts ? (
-                <div style={styles.fileList}>
-                    {artifacts.map((artifact) => {
-                        const link = artifactLinks[artifact.id];
+                <div style={{ display: 'grid', gap: 14 }}>
+                    {groupTitles.map(({ key, title }) => {
+                        const items = groups[key];
+                        if (!items || items.length === 0) return null;
                         return (
-                            <div key={artifact.id} style={styles.fileItem}>
-                                <div style={{ minWidth: 0 }}>
-                                    <div style={styles.fileName}>{displayFileName(artifact.name)}</div>
-                                    <div style={styles.fileMeta}>
-                                        {artifact.content_type || 'application/octet-stream'} · {formatSize(artifact.size)} · {artifact.kind || 'artifact'}
-                                        {artifact.retention_class ? ` · ${artifact.retention_class}` : ''}
-                                        {artifact.expires_at ? ` · 保留至 ${formatTime(artifact.expires_at)}` : ''}
-                                        {link?.expiresAt ? ` · 链接过期 ${formatTime(link.expiresAt)}` : ''}
-                                    </div>
-                                </div>
-                                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-                                    {link?.url && (
-                                        <a href={link.url} download={displayFileName(artifact.name)} style={{ ...styles.button, ...styles.primaryButton }}>
-                                            下载
-                                        </a>
-                                    )}
-                                    <button style={styles.button} onClick={() => onRefreshDownload(artifact)}>
-                                        {link?.url ? '刷新链接' : '生成链接'}
-                                    </button>
+                            <div key={key}>
+                                <div style={{ fontSize: 13, fontWeight: 700, color: '#475467', marginBottom: 8 }}>{title}</div>
+                                <div style={styles.fileList}>
+                                    {items.map((artifact) => {
+                                        const link = artifactLinks[artifact.id];
+                                        return (
+                                            <div key={artifact.id} style={styles.fileItem}>
+                                                <div style={{ minWidth: 0 }}>
+                                                    <div style={styles.fileName}>{displayFileName(artifact.name || artifact.logical_name)}</div>
+                                                    <div style={styles.fileMeta}>
+                                                        {artifact.content_type || 'application/octet-stream'} · {formatSize(artifact.size)} · {artifact.kind || 'artifact'}
+                                                        {artifact.generation ? ` · g${artifact.generation}` : ''}
+                                                        {artifact.retention_class ? ` · ${artifact.retention_class}` : ''}
+                                                        {artifact.expires_at ? ` · 保留至 ${formatTime(artifact.expires_at)}` : ''}
+                                                        {link?.expiresAt ? ` · 链接过期 ${formatTime(link.expiresAt)}` : ''}
+                                                    </div>
+                                                </div>
+                                                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                                                    {link?.url && (
+                                                        <a href={link.url} download={displayFileName(artifact.name || artifact.logical_name)} style={{ ...styles.button, ...styles.primaryButton }}>
+                                                            下载
+                                                        </a>
+                                                    )}
+                                                    <button style={styles.button} onClick={() => onRefreshDownload(artifact)}>
+                                                        {link?.url ? '刷新链接' : '生成链接'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
                                 </div>
                             </div>
                         );

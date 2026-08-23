@@ -28,6 +28,20 @@ type Config struct {
 	Observability   ObservabilityConfig   `mapstructure:"observability"`
 	Profile         ProfileConfig         `mapstructure:"profile"`
 	AgentDiscovery  AgentDiscoveryConfig  `mapstructure:"agent_discovery"`
+	SingleShot      SingleShotConfig      `mapstructure:"single_shot"`
+}
+
+// SingleShotConfig 阶段 4：单次采样最终存储模型的发布开关。
+// 对应 Release B/C/D 的分阶段发布，全部默认关闭，部署侧显式开启：
+//   - LayoutV2Enabled（SINGLE_SHOT_LAYOUT_V2_ENABLED）：Agent v2 路径
+//     tasks/{tid}/attempts/{attempt_id}/raw/... 写入（apiserver 读取双格式）。
+//   - GenerationsEnabled（ANALYSIS_GENERATIONS_ENABLED）：多代分析写入与
+//     active 切换（关闭时等价于桥接版本单代行为）。
+//   - ReanalyzeEnabled（ANALYSIS_REANALYZE_ENABLED）：人工重分析入口。
+type SingleShotConfig struct {
+	LayoutV2Enabled    bool `mapstructure:"layout_v2_enabled"`
+	GenerationsEnabled bool `mapstructure:"generations_enabled"`
+	ReanalyzeEnabled   bool `mapstructure:"reanalyze_enabled"`
 }
 
 // StorageDiskConfig protects the host filesystem used by containers and
@@ -115,6 +129,9 @@ type RetentionConfig struct {
 	RawPortableHours  int `mapstructure:"raw_portable_hours"`
 	IntermediateHours int `mapstructure:"intermediate_hours"`
 	DiagnosticHours   int `mapstructure:"diagnostic_hours"`
+	// SupersededResultHours 阶段 4：被新代次替换的旧代 RESULT/INTERMEDIATE
+	// 保留时长（小时），默认 72（ARTIFACT_SUPERSEDED_RESULT_HOURS）。
+	SupersededResultHours int `mapstructure:"superseded_result_hours"`
 	// ManifestPermanent 为 true 时 manifest 类永不过期（默认 true）。
 	ManifestPermanent bool `mapstructure:"manifest_permanent"`
 }
@@ -255,6 +272,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("retention.raw_portable_hours", 168)
 	v.SetDefault("retention.intermediate_hours", 24)
 	v.SetDefault("retention.diagnostic_hours", 72)
+	v.SetDefault("retention.superseded_result_hours", 72)
 	v.SetDefault("retention.manifest_permanent", true)
 	v.SetDefault("continuous_block.enabled", false)
 	v.SetDefault("continuous_block.window_sec", 3600)
@@ -283,6 +301,9 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("profile.enabled", false)
 	v.SetDefault("profile.timeout_sec", 5)
 	v.SetDefault("agent_discovery.extra_ips", "")
+	v.SetDefault("single_shot.layout_v2_enabled", false)
+	v.SetDefault("single_shot.generations_enabled", false)
+	v.SetDefault("single_shot.reanalyze_enabled", false)
 
 	// 环境变量覆盖（优先级最高）
 	// PG_DSN → database.dsn
@@ -352,6 +373,18 @@ func Load(configPath string) (*Config, error) {
 	}
 	if envDiagnostic := os.Getenv("ARTIFACT_DIAGNOSTIC_HOURS"); envDiagnostic != "" {
 		v.Set("retention.diagnostic_hours", envDiagnostic)
+	}
+	if envSuperseded := os.Getenv("ARTIFACT_SUPERSEDED_RESULT_HOURS"); envSuperseded != "" {
+		v.Set("retention.superseded_result_hours", envSuperseded)
+	}
+	if envLayoutV2 := os.Getenv("SINGLE_SHOT_LAYOUT_V2_ENABLED"); envLayoutV2 != "" {
+		v.Set("single_shot.layout_v2_enabled", parseBoolEnv(envLayoutV2))
+	}
+	if envGenerations := os.Getenv("ANALYSIS_GENERATIONS_ENABLED"); envGenerations != "" {
+		v.Set("single_shot.generations_enabled", parseBoolEnv(envGenerations))
+	}
+	if envReanalyze := os.Getenv("ANALYSIS_REANALYZE_ENABLED"); envReanalyze != "" {
+		v.Set("single_shot.reanalyze_enabled", parseBoolEnv(envReanalyze))
 	}
 	if envManifestPermanent := os.Getenv("ARTIFACT_MANIFEST_PERMANENT"); envManifestPermanent != "" {
 		v.Set("retention.manifest_permanent", parseBoolEnv(envManifestPermanent))
@@ -509,6 +542,9 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Retention.DiagnosticHours <= 0 {
 		cfg.Retention.DiagnosticHours = 72
+	}
+	if cfg.Retention.SupersededResultHours <= 0 {
+		cfg.Retention.SupersededResultHours = 72
 	}
 	if cfg.Retention.ResultRetentionHours <= 0 {
 		cfg.Retention.ResultRetentionHours = 720

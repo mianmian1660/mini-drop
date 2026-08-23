@@ -122,6 +122,8 @@ func (s *APIServer) StorageStatus(c *gin.Context) {
 		"deleting_bytes":       lifecycle.DeletingBytes,
 		"deleted_count":        lifecycle.DeletedCount,
 		"deleted_bytes":        lifecycle.DeletedBytes,
+		"superseded_count":     lifecycle.SupersededCount,
+		"superseded_bytes":     lifecycle.SupersededBytes,
 		"lifecycle_last_run":   lifecycle.LastRunAt,
 		"lifecycle_last_error": lifecycle.LastError,
 		// 阶段二：Blob 物理/逻辑容量

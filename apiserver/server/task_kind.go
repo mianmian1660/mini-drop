@@ -103,7 +103,7 @@ func taskKindDefinitions() []TaskKindDefinition {
 		},
 		{
 			ID: TaskKindGoPprof, Name: "go_pprof", DisplayName: "Go pprof CPU",
-			Runner: "pprof", AnalysisPipeline: "perf_flamegraph",
+			Runner: "pprof", AnalysisPipeline: "pprof", // 与 analyzer 注册表一致（阶段 4 重分析格式匹配依赖此 pipeline）
 			Capabilities: []string{"pprof"}, SupportedOS: []string{"linux"},
 			Default: map[string]interface{}{"target_pid": 0, "duration": 10, "frequency": 1, "pprof_url": ""},
 			Schema: []TaskKindField{

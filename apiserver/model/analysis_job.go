@@ -5,6 +5,13 @@
 // `FOR UPDATE SKIP LOCKED` 领取（新复刻指南第 7.3 节的领取 SQL）。
 // 采集状态（HotmethodTask.Status）和分析状态在这里彻底分离，
 // 对应新复刻指南第 2.5 节。
+//
+// 阶段 4（单次采样最终存储模型）扩展：
+//   - task_tid 单列唯一约束已删除（015 迁移），一个任务可有多条 AnalysisJob；
+//     (task_tid, generation) 承担代次唯一性。
+//   - attempt_id：本次分析使用的采集尝试；generation：任务内单调递增代次；
+//     trigger：initial（采集通知自动创建）/ manual（人工重分析）；
+//     requested_by：人工重分析请求者；superseded_at：被新代次替换的时间。
 // ============================================================
 
 package model
@@ -21,10 +28,16 @@ const (
 	AnalysisJobStatusRetry   = "retry"
 )
 
-// AnalysisJob — 一次异步分析作业（MVP：一个任务对应一条分析作业）
+// AnalysisJob 触发方式：采集通知自动创建 / 人工重分析。
+const (
+	AnalysisJobTriggerInitial = "initial"
+	AnalysisJobTriggerManual   = "manual"
+)
+
+// AnalysisJob — 一次异步分析作业（阶段 4：一个任务可有多代作业）
 type AnalysisJob struct {
 	ID                uint       `gorm:"primaryKey" json:"id"`
-	TaskTID           string     `gorm:"column:task_tid;size:64;uniqueIndex" json:"task_tid"`
+	TaskTID           string     `gorm:"column:task_tid;size:64;index:idx_analysis_jobs_task_attempt_status,priority:1" json:"task_tid"`
 	Pipeline          string     `gorm:"column:pipeline;size:64" json:"pipeline"` // perf_flamegraph / bpf_histogram ...
 	Status            string     `gorm:"column:status;size:32;default:pending;index:idx_analysis_job_claim" json:"status"`
 	Attempt           int        `gorm:"column:attempt;default:0" json:"attempt"`
@@ -35,6 +48,12 @@ type AnalysisJob struct {
 	LeaseOwner        string     `gorm:"column:lease_owner;size:64" json:"lease_owner"`
 	LeaseExpiresAt    *time.Time `gorm:"column:lease_expires_at" json:"lease_expires_at"`
 	AnalyzerVersion   string     `gorm:"column:analyzer_version;size:32" json:"analyzer_version"`
-	CreatedAt         time.Time  `gorm:"column:created_at;index:idx_analysis_job_claim" json:"created_at"`
-	UpdatedAt         time.Time  `gorm:"column:updated_at" json:"updated_at"`
+	// ---- 阶段 4：多代分析 ----
+	AttemptID     uint       `gorm:"column:attempt_id;index:idx_analysis_jobs_task_attempt_status,priority:2" json:"attempt_id"` // 输入 RAW 所属 TaskAttempt.ID
+	Generation    int        `gorm:"column:generation;default:0" json:"generation"`                                              // 任务内单调递增（1 起）
+	Trigger       string     `gorm:"column:trigger;size:32;default:initial" json:"trigger"`                                     // initial / manual
+	RequestedBy   string     `gorm:"column:requested_by;size:128" json:"requested_by"`
+	SupersededAt  *time.Time `gorm:"column:superseded_at" json:"superseded_at"`
+	CreatedAt     time.Time  `gorm:"column:created_at;index:idx_analysis_job_claim" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"column:updated_at" json:"updated_at"`
 }

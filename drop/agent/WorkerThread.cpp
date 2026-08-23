@@ -283,7 +283,8 @@ namespace drop_agent
             cout << "[runner] stage=Collect taskID=" << task.taskid()
                  << " outputPath=" << out.outputPath
                  << " partial=" << (out.partial ? "true" : "false") << endl;
-            out.remoteKey = task.taskid() + "/" + drop_agent::RemoteKeyFor(profilerName);
+            out.remoteKey = drop_agent::RawObjectKey(task.taskid(), task.attempt_id(),
+                                                     drop_agent::RemoteKeyFor(profilerName));
             out.contentType = drop_agent::ContentTypeFor(profilerName);
             return out;
         }

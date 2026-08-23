@@ -26,6 +26,10 @@ class AnalysisJob:
     attempt: int
     max_attempts: int = 3
     input_artifact_ids: object = None
+    attempt_id: int = 0  # 阶段 4：输入 RAW 所属 TaskAttempt.ID
+    generation: int = 0  # 阶段 4：任务内代次（1 起）
+    trigger: str = "initial"  # 阶段 4：initial / manual
+    requested_by: str = ""
 
 
 def default_worker_id() -> str:
@@ -78,7 +82,9 @@ class AnalysisLeaseClient:
                 FROM picked
                 WHERE j.id = picked.id
                 RETURNING j.id, j.task_tid, j.pipeline, j.status, j.attempt,
-                          COALESCE(j.max_attempts, 3), j.input_artifact_ids
+                          COALESCE(j.max_attempts, 3), j.input_artifact_ids,
+                          COALESCE(j.attempt_id, 0), COALESCE(j.generation, 0),
+                          COALESCE(j.trigger, 'initial'), COALESCE(j.requested_by, '')
                 """,
                 (
                     STATUS_PENDING,
@@ -102,6 +108,10 @@ class AnalysisLeaseClient:
                 attempt=row[4],
                 max_attempts=row[5],
                 input_artifact_ids=row[6],
+                attempt_id=int(row[7] or 0),
+                generation=int(row[8] or 0),
+                trigger=str(row[9] or "initial"),
+                requested_by=str(row[10] or ""),
             )
         except Exception:
             conn.rollback()

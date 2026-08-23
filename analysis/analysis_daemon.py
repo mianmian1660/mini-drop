@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -118,18 +119,25 @@ def _upsert_blob_row(conn, descriptor: dict) -> int:
     return blob_id
 
 
-def _insert_artifact_from_descriptor(conn, tid: str, attempt_id: int,
+def _insert_artifact_from_descriptor(conn, tid: str, attempt_id: int, job_id: int,
                                      descriptor: dict, blob_id: int) -> int:
-    """按 descriptor 登记 artifact（带 blob_id / 双大小 / 双哈希语义）。"""
+    """按 descriptor 登记 artifact（带 blob_id / 双大小 / 双哈希语义）。
+
+    阶段 4：登记 analysis_job_id 与 logical_name；object_key 已是
+    generation 前缀的逻辑路径，跨代不冲突，同代重试由唯一键覆盖。
+    """
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, format,
+        INSERT INTO artifacts (task_tid, attempt_id, analysis_job_id, logical_name,
+            kind, object_key, format,
             schema_version, blob_id, content_type, status, size, logical_size,
             compression, sha256, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ready', %s, %s, %s, %s, NOW())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ready', %s, %s, %s, %s, NOW())
         ON CONFLICT (task_tid, kind, object_key) DO UPDATE
         SET attempt_id = EXCLUDED.attempt_id,
+            analysis_job_id = EXCLUDED.analysis_job_id,
+            logical_name = EXCLUDED.logical_name,
             status = EXCLUDED.status,
             size = EXCLUDED.size,
             logical_size = EXCLUDED.logical_size,
@@ -144,6 +152,8 @@ def _insert_artifact_from_descriptor(conn, tid: str, attempt_id: int,
         (
             tid,
             attempt_id,
+            job_id or None,
+            descriptor.get("logical_name") or descriptor["object_key"].rsplit("/", 1)[-1],
             descriptor["kind"],
             descriptor["object_key"],
             descriptor.get("format"),
@@ -160,7 +170,7 @@ def _insert_artifact_from_descriptor(conn, tid: str, attempt_id: int,
     return row[0] if row else 0
 
 
-def _insert_artifact_from_key(conn, tid: str, attempt_id: int, key: str,
+def _insert_artifact_from_key(conn, tid: str, attempt_id: int, job_id: int, key: str,
                               storage=None, bucket=None) -> int:
     """兼容路径：无 descriptor 的历史 analyzer 产物（字符串 key）。"""
     name = key.rsplit("/", 1)[-1]
@@ -172,14 +182,19 @@ def _insert_artifact_from_key(conn, tid: str, attempt_id: int, key: str,
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, size, created_at)
-        VALUES (%s, %s, %s, %s, %s, 'ready', %s, NOW())
+        INSERT INTO artifacts (task_tid, attempt_id, analysis_job_id, logical_name,
+            kind, object_key, content_type, status, size, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'ready', %s, NOW())
         ON CONFLICT (task_tid, kind, object_key) DO UPDATE
-        SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status, size = EXCLUDED.size
+        SET attempt_id = EXCLUDED.attempt_id,
+            analysis_job_id = EXCLUDED.analysis_job_id,
+            logical_name = EXCLUDED.logical_name,
+            status = EXCLUDED.status,
+            size = EXCLUDED.size
         WHERE artifacts.deleted_at IS NULL
         RETURNING id
         """,
-        (tid, attempt_id, kind, key, content_type, size),
+        (tid, attempt_id, job_id or None, name, kind, key, content_type, size),
     )
     row = cur.fetchone()
     if row:
@@ -196,34 +211,37 @@ def _insert_artifact_from_key(conn, tid: str, attempt_id: int, key: str,
     return 0
 
 
-def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None, bucket=None):
+def record_result_artifacts(conn, tid: str, attempt_id: int, job_id: int,
+                            generation: int, outputs, manifest=None,
+                            storage=None, bucket=None):
     """Persist analyzer outputs as Artifact metadata without storing URLs.
 
     阶段二：outputs 元素既可以是字符串 key（兼容旧 analyzer），也可以是
     Artifact descriptor（dict，见 artifact_descriptor.build_descriptor）。
     descriptor 会同时登记 storage_blobs（内容去重）与 artifacts（blob_id 引用）。
+
+    阶段 4：全部登记带 analysis_job_id 与 logical_name；attempt_id 取作业的
+    attempt_id（不再猜测"最新 attempt"）。
     """
     descriptors = []
     keys = []
     for value in (outputs or []):
         if isinstance(value, dict) and value.get("object_key") and value.get("blob_key"):
             descriptors.append(value)
-        elif isinstance(value, str) and value.startswith(tid + "/"):
+        elif isinstance(value, str) and ("/" in value):
             keys.append(value)
-    if manifest and f"{tid}/manifest.json" not in keys:
-        keys.append(f"{tid}/manifest.json")
+    if manifest:
+        prefix = os.environ.get("ANALYSIS_OUTPUT_PREFIX", "").strip() or tid
+        manifest_key = f"{prefix}/manifest.json"
+        if manifest_key not in keys:
+            keys.append(manifest_key)
     if not descriptors and not keys:
         return []
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM task_attempts WHERE task_tid = %s ORDER BY attempt_seq DESC LIMIT 1", (tid,)
-    )
-    row = cur.fetchone()
-    attempt_id = row[0] if row else 0
     artifact_ids = []
     for descriptor in descriptors:
         blob_id = _upsert_blob_row(conn, descriptor)
-        aid = _insert_artifact_from_descriptor(conn, tid, attempt_id, descriptor, blob_id)
+        aid = _insert_artifact_from_descriptor(conn, tid, attempt_id, job_id, descriptor, blob_id)
         if aid:
             artifact_ids.append(aid)
         else:
@@ -233,7 +251,7 @@ def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None
             log_event("artifact_tombstone_blob_unreferenced", task_tid=tid,
                       object_key=descriptor["object_key"], blob_key=descriptor["blob_key"])
     for key in keys:
-        aid = _insert_artifact_from_key(conn, tid, attempt_id, key, storage, bucket)
+        aid = _insert_artifact_from_key(conn, tid, attempt_id, job_id, key, storage, bucket)
         if aid:
             artifact_ids.append(aid)
     cur.close()
@@ -344,10 +362,80 @@ def _upload_manifest(storage_cfg: dict, bucket: str, tid: str, manifest: dict) -
         raise RuntimeError(f"manifest 上传失败: {exc}") from exc
 
 
+# 阶段 4：被替换旧代 RESULT/INTERMEDIATE 保留时长（小时）。
+SUPERSEDED_RESULT_HOURS = int(os.environ.get("ARTIFACT_SUPERSEDED_RESULT_HOURS", "72"))
+
+
+def _switch_active_job_tx(conn, job, tid: str) -> bool:
+    """同一事务内完成 active 切换与旧代降级（阶段 4）。
+
+    - trigger=manual：总是切换（人工明确选择历史 attempt 的重分析成功后允许切换）。
+    - trigger=initial：仅当本作业 attempt 不早于当前 active 作业的 attempt 才切换
+      （迟到的旧 attempt 自动分析不覆盖更新 attempt 的结果）。
+    - 切换时（同一事务）：新 job 已 complete → 旧 job 写 superseded_at →
+      旧代 RESULT/INTERMEDIATE 降级为 result_superseded（72h，到期=切换时间+72h）→
+      manifest 保持永久（不动）→ 更新 active_analysis_job_id。
+      pinned 任务由任务级 pin 机制保护全部代次。
+    返回是否切换。
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT active_analysis_job_id FROM hotmethod_tasks WHERE tid = %s FOR UPDATE", (tid,))
+    row = cur.fetchone()
+    prev_active = int(row[0]) if row and row[0] else 0
+    if prev_active == job.id:
+        cur.close()
+        return True
+
+    should_switch = True
+    if getattr(job, "trigger", "initial") == "initial" and prev_active:
+        cur.execute("SELECT attempt_id FROM analysis_jobs WHERE id = %s", (prev_active,))
+        prow = cur.fetchone()
+        prev_attempt = int(prow[0]) if prow and prow[0] else 0
+        if prev_attempt > int(getattr(job, "attempt_id", 0) or 0):
+            should_switch = False
+
+    if should_switch:
+        if prev_active:
+            cur.execute(
+                "UPDATE analysis_jobs SET superseded_at = NOW(), updated_at = NOW() "
+                "WHERE id = %s AND superseded_at IS NULL",
+                (prev_active,),
+            )
+            cur.execute(
+                """
+                UPDATE artifacts
+                SET retention = 'result_superseded',
+                    expires_at = NOW() + (%s || ' hours')::interval,
+                    retention_task_state = 'done',
+                    updated_at = NOW()
+                WHERE analysis_job_id = %s AND kind IN ('RESULT', 'INTERMEDIATE')
+                  AND deleted_at IS NULL AND status = 'ready'
+                """,
+                (SUPERSEDED_RESULT_HOURS, prev_active),
+            )
+        cur.execute(
+            "UPDATE hotmethod_tasks SET active_analysis_job_id = %s WHERE tid = %s",
+            (job.id, tid),
+        )
+        log_event("analysis_active_switched", task_tid=tid,
+                  job_id=job.id, generation=getattr(job, "generation", 0),
+                  attempt_id=getattr(job, "attempt_id", 0),
+                  prev_active=prev_active, trigger=getattr(job, "trigger", "initial"))
+    else:
+        log_event("analysis_active_kept_late_attempt", task_tid=tid,
+                  job_id=job.id, attempt_id=getattr(job, "attempt_id", 0),
+                  active_job_id=prev_active)
+    cur.close()
+    return should_switch
+
+
 def finalize_success_tx(conn, lease_client, job, tid: str, result: dict,
                         analyzer_version: str, storage=None, bucket=None):
     manifest = result.get("manifest") or {}
-    artifact_ids = record_result_artifacts(conn, tid, result.get("outputs", []), manifest=manifest,
+    attempt_id = int(getattr(job, "attempt_id", 0) or 0)
+    generation = int(getattr(job, "generation", 0) or 0)
+    artifact_ids = record_result_artifacts(conn, tid, attempt_id, job.id, generation,
+                                           result.get("outputs", []), manifest=manifest,
                                            storage=storage, bucket=bucket)
     if not lease_client.complete(
         job.id,
@@ -356,6 +444,8 @@ def finalize_success_tx(conn, lease_client, job, tid: str, result: dict,
         output_artifact_ids=json.dumps(artifact_ids),
     ):
         raise RuntimeError("AnalysisJob 完成失败：lease_owner 已变化")
+    # 阶段 4：active 切换 + 旧代降级（与 job 完成同一事务；失败整体回滚不切 active）。
+    _switch_active_job_tx(conn, job, tid)
     cur = conn.cursor()
     cur.execute(
         """
@@ -371,7 +461,8 @@ def finalize_success_tx(conn, lease_client, job, tid: str, result: dict,
     )
     cur.close()
     _record_task_event_tx(conn, tid, "分析完成", "analysis_daemon",
-                          {"job_id": job.id, "outputs": result.get("outputs", [])})
+                          {"job_id": job.id, "generation": generation,
+                           "attempt_id": attempt_id, "outputs": result.get("outputs", [])})
 
 
 def finalize_failure_tx(conn, lease_client, job, tid: str, error: str, retry: bool,
@@ -402,6 +493,38 @@ def finalize_failure_tx(conn, lease_client, job, tid: str, error: str, retry: bo
                           {"job_id": job.id, "retryable": retry})
 
 
+def _safe_token(value: str) -> str:
+    """把 pipeline/analyzer_version 规范化为 [A-Za-z0-9._-]（阶段 4 输出前缀）。"""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(value or ""))
+
+
+def _setup_job_env(job, tid: str, analyzer_version: str):
+    """阶段 4：向分析进程注入当前作业上下文。
+
+    ANALYSIS_OUTPUT_PREFIX = tasks/{tid}/analysis/{pipeline}/{version}/g{generation}
+    （generation>0 且 pipeline 非空时；旧链路回退 {tid} 形态）。
+    """
+    generation = int(getattr(job, "generation", 0) or 0)
+    pipeline = getattr(job, "pipeline", "") or ""
+    os.environ["ANALYSIS_JOB_ID"] = str(getattr(job, "id", 0) or 0)
+    os.environ["ANALYSIS_ATTEMPT_ID"] = str(getattr(job, "attempt_id", 0) or 0)
+    os.environ["ANALYSIS_GENERATION"] = str(generation)
+    os.environ["ANALYSIS_PIPELINE"] = pipeline
+    os.environ["ANALYSIS_ANALYZER_VERSION"] = analyzer_version
+    prefix = ""
+    if generation > 0 and pipeline:
+        prefix = "tasks/{tid}/analysis/{p}/{v}/g{gen}".format(
+            tid=tid,
+            p=_safe_token(pipeline),
+            v=_safe_token(analyzer_version),
+            gen=generation,
+        )
+    if prefix:
+        os.environ["ANALYSIS_OUTPUT_PREFIX"] = prefix
+    else:
+        os.environ.pop("ANALYSIS_OUTPUT_PREFIX", None)
+
+
 def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
             local_output_dir: str, registry) -> bool:
     """执行一个已领取的 AnalysisJob。"""
@@ -415,9 +538,13 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         "pipeline": job.pipeline,
         "attempt": job.attempt,
         "worker_id": lease_client.worker_id,
+        "generation": getattr(job, "generation", 0),
+        "attempt_id": getattr(job, "attempt_id", 0),
     }
     print(f"[analysis_daemon] 开始分析: job_id={job.id} tid={tid} "
-          f"pipeline={job.pipeline} attempt={job.attempt}", file=sys.stderr)
+          f"pipeline={job.pipeline} attempt={job.attempt} "
+          f"generation={common['generation']} attempt_id={common['attempt_id']}",
+          file=sys.stderr)
     log_event("analysis_started", **common)
 
     stop_heartbeat = threading.Event()
@@ -440,6 +567,7 @@ def run_job(dsn: str, lease_client: AnalysisLeaseClient, job, config_path: str,
         analyzer = registry.require(task_type)
         analyzer_version = getattr(analyzer, "analyzer_version", ANALYZER_VERSION)
 
+        _setup_job_env(job, tid, analyzer_version)
         hm.update_analysis_status(conn, tid, 1, "分析中")
         result = analyzer(
             conn, storage_cfg, task, bucket, tid, local_dir=local_output_dir, job=job

@@ -268,14 +268,27 @@ func (svc *TaskService) ListArtifacts(tid string, auth AuthContext) (gin.H, *Ser
 		return nil, serr
 	}
 	artifacts := svc.server.fetchArtifacts(task.TID)
+	genMap := svc.server.jobGenerationMap(task.TID)
+	activeGen := 0
+	if task.ActiveAnalysisJobID != nil {
+		activeGen = genMap[*task.ActiveAnalysisJobID]
+	}
 	out := make([]gin.H, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		out = append(out, publicArtifact(artifact, task.ArtifactsPinned))
+		gen := 0
+		if artifact.AnalysisJobID != nil {
+			gen = genMap[*artifact.AnalysisJobID]
+		}
+		out = append(out, publicArtifactFull(artifact, task.ArtifactsPinned, gen, activeGen))
 	}
 	cleaned := svc.server.fetchDeletedArtifacts(task.TID)
 	cleanedOut := make([]gin.H, 0, len(cleaned))
 	for _, artifact := range cleaned {
-		cleanedOut = append(cleanedOut, publicArtifact(artifact, false))
+		gen := 0
+		if artifact.AnalysisJobID != nil {
+			gen = genMap[*artifact.AnalysisJobID]
+		}
+		cleanedOut = append(cleanedOut, publicArtifactFull(artifact, false, gen, activeGen))
 	}
 	return gin.H{
 		"artifacts":         out,
@@ -334,12 +347,27 @@ func (svc *TaskService) requireReadableTask(tid string, auth AuthContext) (model
 }
 
 func publicArtifact(artifact model.Artifact, pinned bool) gin.H {
-	return gin.H{
+	return publicArtifactFull(artifact, pinned, 0, 0)
+}
+
+// publicArtifactFull 产物公共视图。
+// generation 为该产物所属 AnalysisJob 的代次（0 表示未知/RAW）；activeGeneration
+// 为任务当前 active 代次（两者相等表示当前展示结果；activeGeneration=0 表示无 active job）。
+func publicArtifactFull(artifact model.Artifact, pinned bool, generation int, activeGeneration int) gin.H {
+	logicalName := artifact.LogicalName
+	if logicalName == "" {
+		logicalName = filepath.Base(artifact.ObjectKey)
+	}
+	out := gin.H{
 		"id":                   artifact.ID,
 		"task_tid":             artifact.TaskTID,
 		"attempt_id":           artifact.AttemptID,
+		"analysis_job_id":      artifact.AnalysisJobID,
+		"logical_name":         logicalName,
+		"generation":           generation,
+		"active_generation":    activeGeneration,
 		"kind":                 artifact.Kind,
-		"name":                 filepath.Base(artifact.ObjectKey),
+		"name":                 logicalName,
 		"size":                 artifact.Size,
 		"sha256":               artifact.SHA256,
 		"etag":                 artifact.ETag,
@@ -355,4 +383,5 @@ func publicArtifact(artifact model.Artifact, pinned bool) gin.H {
 		"delete_reason":        artifact.DeleteReason,
 		"created_at":           artifact.CreatedAt,
 	}
+	return out
 }

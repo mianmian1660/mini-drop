@@ -338,8 +338,10 @@ namespace drop_agent
                     if (slashPos != string::npos)
                         fileName = fileName.substr(slashPos + 1);
 
-                    string remoteKey = outcome.remoteKey.empty() ? task.taskid() + "/perf.data" : outcome.remoteKey;
-                    string manifestKey = task.taskid() + "/manifest.json";
+                    string remoteKey = outcome.remoteKey.empty()
+                        ? drop_agent::RawObjectKey(task.taskid(), task.attempt_id(), "perf.data")
+                        : outcome.remoteKey;
+                    string manifestKey = drop_agent::ManifestObjectKey(task.taskid(), task.attempt_id());
                     string sha256 = Sha256File(actualPath);
                     string manifestPath = "/tmp/" + task.taskid() + "_manifest.json";
                     bool manifestWritten = WriteManifestFile(task, remoteKey, actualPath, sha256, manifestPath, outcome.partial,

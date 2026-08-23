@@ -722,7 +722,10 @@ func (s *APIServer) registerRoutes() {
 		api.POST("/tasks/:tid/cancel", s.CancelTask)
 		api.GET("/tasks/:tid/artifacts", s.ListTaskArtifacts)
 		api.GET("/tasks/:tid/artifacts/:artifact_id/download", s.DownloadTaskArtifact)
+		api.GET("/tasks/:tid/artifacts/:artifact_id/content", s.ServeTaskArtifactContent)
 		api.POST("/tasks/:tid/artifacts/pin", s.PinTaskArtifacts)
+		api.POST("/tasks/:tid/reanalyze", s.ReanalyzeTask)
+		api.GET("/tasks/:tid/analysis-jobs", s.ListAnalysisJobs)
 		api.GET("/tasks/:tid/events/stream", s.StreamTaskEvents)
 		api.GET("/tasks/:tid/suggestions/stream", s.StreamTaskSuggestions)
 

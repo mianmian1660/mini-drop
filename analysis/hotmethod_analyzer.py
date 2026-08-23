@@ -79,6 +79,42 @@ def env_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _analysis_job_id() -> int:
+    """当前作业的 AnalysisJob.ID（阶段 4，daemon 设置 ANALYSIS_JOB_ID 环境变量）。"""
+    raw = os.environ.get("ANALYSIS_JOB_ID", "").strip()
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _analysis_attempt_id() -> int:
+    """当前作业输入 RAW 所属 TaskAttempt.ID（阶段 4）。"""
+    raw = os.environ.get("ANALYSIS_ATTEMPT_ID", "").strip()
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _analysis_generation() -> int:
+    """当前作业代次（阶段 4）。"""
+    raw = os.environ.get("ANALYSIS_GENERATION", "").strip()
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _output_prefix(tid: str) -> str:
+    """当前作业输出前缀：tasks/{tid}/analysis/{pipeline}/{ver}/g{n}；旧链路回退 {tid}。"""
+    try:
+        from artifact_descriptor import current_output_prefix
+        return current_output_prefix(tid)
+    except Exception:
+        return tid or ""
+
+
 def load_config(config_path: str) -> dict:
     """
     加载配置文件（ini 格式）并支持环境变量覆盖
@@ -249,41 +285,68 @@ def update_analysis_status(conn, tid: str, status: int, status_info: str = ""):
 def insert_suggestion(conn, tid: str, func_name: str,
                       suggestion: str, ai_suggestion: str = ""):
     """
-    往 analysis_suggestion 表插入一条分析建议
+    往 analysis_suggestion 表插入一条分析建议（阶段 4：关联当前 generation）
+
+    注意：本函数与 persist_attribution 共享 daemon 的主连接。失败时必须
+    rollback，否则连接事务进入 aborted 状态，后续 finalize 全部级联失败
+    （超长 C++ 符号名超过 func varchar(512) 时曾触发过）。
     """
     try:
+        func_name = (func_name or "")[:512]
+        job_id = _analysis_job_id()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO analysis_suggestions (tid, func, suggestion, ai_suggestion, status) "
-            "VALUES (%s, %s, %s, %s, 0)",
-            (tid, func_name, suggestion, ai_suggestion)
+            "INSERT INTO analysis_suggestions (tid, func, suggestion, ai_suggestion, status, analysis_job_id) "
+            "VALUES (%s, %s, %s, %s, 0, %s)",
+            (tid, func_name, suggestion, ai_suggestion, job_id or None)
         )
         conn.commit()
         cur.close()
         print(f"[analysis] 插入建议: {func_name}", file=sys.stderr)
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         print(f"[analysis] 插入建议失败: {e}", file=sys.stderr)
 
 
 def persist_attribution(conn, tid: str, attribution: dict):
-    """将一份可验证的归因 JSON 附加到该任务已有建议上。"""
+    """将一份可验证的归因 JSON 附加到该任务已有建议上（阶段 4：按 generation 过滤）。
+
+    失败时 rollback，避免污染 daemon 主连接事务（见 insert_suggestion 注释）。
+    """
     try:
         value = json.dumps(attribution, ensure_ascii=False)
+        job_id = _analysis_job_id()
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE analysis_suggestions SET ai_suggestion = %s "
-            "WHERE tid = %s AND (ai_suggestion = '' OR ai_suggestion IS NULL)",
-            (value, tid),
-        )
+        if job_id:
+            cur.execute(
+                "UPDATE analysis_suggestions SET ai_suggestion = %s "
+                "WHERE tid = %s AND analysis_job_id = %s "
+                "AND (ai_suggestion = '' OR ai_suggestion IS NULL)",
+                (value, tid, job_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE analysis_suggestions SET ai_suggestion = %s "
+                "WHERE tid = %s AND (analysis_job_id IS NULL OR analysis_job_id = 0) "
+                "AND (ai_suggestion = '' OR ai_suggestion IS NULL)",
+                (value, tid),
+            )
         if cur.rowcount == 0:
             cur.execute(
-                "INSERT INTO analysis_suggestions (tid, func, suggestion, ai_suggestion, status) "
-                "VALUES (%s, %s, %s, %s, 0)",
-                (tid, "智能归因", attribution.get("suggestion", ""), value),
+                "INSERT INTO analysis_suggestions (tid, func, suggestion, ai_suggestion, status, analysis_job_id) "
+                "VALUES (%s, %s, %s, %s, 0, %s)",
+                (tid, "智能归因", (attribution.get("suggestion") or "")[:512], value, job_id or None),
             )
         conn.commit()
         cur.close()
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         print(f"[analysis] 写入智能归因失败: {e}", file=sys.stderr)
 
 
@@ -347,38 +410,28 @@ def _connect_storage(storage_cfg: dict):
 
 
 def _download_perf_data(storage, bucket: str, tid: str,
-                        local_path: str) -> bool:
+                        local_path: str, conn=None) -> bool:
     """
     从 MinIO 下载 perf.data 到本地
 
+    阶段 4：优先按 artifacts 账本（attempt 过滤）取物理 key（兼容 v2 布局与
+    CAS blob），再回退到历史固定路径 {tid}/perf.data。
     返回: True=下载成功, False=失败
     """
     if storage is None:
         return False
 
-    perf_key = f"{tid}/perf.data"
-    if not storage.object_exists(bucket, perf_key):
-        print(f"[analysis] MinIO 上不存在 {perf_key}", file=sys.stderr)
-        return False
-
-    try:
-        data = storage.get_object(bucket, perf_key)
-        if data is None:
-            return False
-        with open(local_path, "wb") as f:
-            f.write(data)
-        print(f"[analysis] 下载 perf.data → {local_path} ({len(data)} bytes)",
-              file=sys.stderr)
-        return True
-    except Exception as e:
-        print(f"[analysis] 下载 perf.data 失败: {e}", file=sys.stderr)
-        return False
+    keys = _raw_artifact_keys(conn, tid, suffixes=["perf.data"]) if conn else []
+    keys.append(f"{tid}/perf.data")
+    return _download_first_existing(storage, bucket, keys, local_path, "perf.data")
 
 
 def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
     """读取任务 RAW artifact 的物理 object_key 列表。
 
     阶段二：blob_id 非空时返回物理 CAS key；否则兼容返回原逻辑 key。
+    阶段 4：设置了 ANALYSIS_ATTEMPT_ID 时只返回该 attempt 的 RAW
+    （分析作业禁止退回同任务其他 attempt 的采集数据）。
     """
     suffixes = suffixes or []
     keys = []
@@ -386,15 +439,20 @@ def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
         return keys
     try:
         cur = conn.cursor()
-        cur.execute(
+        sql = (
             "SELECT COALESCE(b.object_key, a.object_key) AS object_key "
             "FROM artifacts a "
             "LEFT JOIN storage_blobs b ON b.id = a.blob_id AND b.deleted_at IS NULL "
             "WHERE a.task_tid = %s AND a.kind = 'RAW' "
-            "AND a.status = 'ready' AND a.deleted_at IS NULL "
-            "ORDER BY a.created_at DESC, a.id DESC",
-            (tid,),
+            "AND a.status = 'ready' AND a.deleted_at IS NULL"
         )
+        params = [tid]
+        attempt_id = _analysis_attempt_id()
+        if attempt_id:
+            sql += " AND a.attempt_id = %s"
+            params.append(attempt_id)
+        sql += " ORDER BY a.created_at DESC, a.id DESC"
+        cur.execute(sql, params)
         for row in cur.fetchall():
             key = row[0]
             if not key:
@@ -467,14 +525,16 @@ def _upload_output(storage, bucket: str, tid: str,
     """
     上传分析产物到 MinIO
 
-    返回: MinIO key，失败返回空字符串
+    阶段 4：key 使用当前作业输出前缀
+    （tasks/{tid}/analysis/{pipeline}/{ver}/g{n}/{filename}），
+    旧链路回退 {tid}/{filename}。返回 MinIO key，失败返回空字符串。
     """
     if storage is None:
         log_event("artifact_upload_skipped", task_tid=tid, filename=filename,
                   reason="storage_unavailable")
         return ""
 
-    key = f"{tid}/{filename}"
+    key = f"{_output_prefix(tid)}/{filename}"
     started_at = now_seconds()
     try:
         if isinstance(content, str):
@@ -722,7 +782,7 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
     has_perf = False
 
     if storage_ok:
-        has_perf = _download_perf_data(storage, bucket, tid, local_perf)
+        has_perf = _download_perf_data(storage, bucket, tid, local_perf, conn=conn)
 
     if not has_perf:
         # MinIO 不可用或文件不存在时，尝试用本地 perf.data（仅本地测试用）
@@ -1500,13 +1560,13 @@ def _analyze_bpf(conn, storage_cfg: dict, task: dict,
         f.write(bpf_text)
     local_files.append({"name": raw_name, "path": raw_path})
 
-    # 上传 MinIO
+    # 上传 MinIO（阶段 4：key 使用当前作业输出前缀）
     if storage_ok:
         for lf in local_files:
             object_name = lf["name"]
             if object_name.startswith(f"{tid}_"):
                 object_name = object_name[len(tid) + 1:]
-            key = f"{tid}/{object_name}"
+            key = f"{_output_prefix(tid)}/{object_name}"
             content_type = "application/octet-stream"
             if object_name.endswith(".svg"):
                 content_type = "image/svg+xml"

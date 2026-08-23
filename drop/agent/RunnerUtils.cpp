@@ -9,12 +9,56 @@
 
 #include "agent/RunnerUtils.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <sys/stat.h>
 
 using namespace std;
 
 namespace drop_agent
 {
+
+    bool LayoutV2Enabled()
+    {
+        const char *raw = getenv("DROP_AGENT_LAYOUT_V2");
+        if (raw == nullptr || *raw == '\0')
+            return true; // 阶段 4 Release C 默认开启
+        string s(raw);
+        return s == "1" || s == "true" || s == "yes" || s == "on" ||
+               s == "TRUE" || s == "YES" || s == "ON";
+    }
+
+    bool ValidRemoteBasename(const string &base)
+    {
+        if (base.empty() || base == "." || base == "..")
+            return false;
+        for (unsigned char c : base)
+        {
+            if (!(isalnum(c) || c == '-' || c == '_' || c == '.'))
+                return false;
+        }
+        return true;
+    }
+
+    string RawObjectKey(const string &tid, uint64_t attemptId, const string &basename)
+    {
+        if (LayoutV2Enabled() && attemptId > 0 && ValidRemoteBasename(basename))
+        {
+            return "tasks/" + tid + "/attempts/" + to_string(attemptId) +
+                   "/raw/" + basename;
+        }
+        return tid + "/" + basename;
+    }
+
+    string ManifestObjectKey(const string &tid, uint64_t attemptId)
+    {
+        if (LayoutV2Enabled() && attemptId > 0)
+        {
+            return "tasks/" + tid + "/attempts/" + to_string(attemptId) +
+                   "/manifest.json";
+        }
+        return tid + "/manifest.json";
+    }
 
     string ResolveOutputPath(const string &basePath)
     {

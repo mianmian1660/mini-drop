@@ -193,3 +193,36 @@ TEST(BpfRunner, SignaledMapsToDashTwoNotDashFive)
     EXPECT_EQ(collect.resultCode, -2);
     EXPECT_EQ(collect.remoteKeyHint, "raw.bpf");
 }
+
+TEST(RawObjectKey, V2LayoutByDefault)
+{
+    EXPECT_EQ(drop_agent::RawObjectKey("t1", 7, "perf.data"),
+              "tasks/t1/attempts/7/raw/perf.data");
+    EXPECT_EQ(drop_agent::RawObjectKey("t1", 7, "profile.pb.gz"),
+              "tasks/t1/attempts/7/raw/profile.pb.gz");
+    EXPECT_EQ(drop_agent::RawObjectKey("t1", 7, "raw.bpf"),
+              "tasks/t1/attempts/7/raw/raw.bpf");
+    EXPECT_EQ(drop_agent::ManifestObjectKey("t1", 7),
+              "tasks/t1/attempts/7/manifest.json");
+}
+
+TEST(RawObjectKey, FallsBackToLegacyWhenAttemptZeroOrInvalidBasename)
+{
+    // attempt_id=0：旧布局回退
+    EXPECT_EQ(drop_agent::RawObjectKey("t1", 0, "perf.data"), "t1/perf.data");
+    EXPECT_EQ(drop_agent::ManifestObjectKey("t1", 0), "t1/manifest.json");
+    // 非法 basename：旧布局回退（不拼接 v2 路径）
+    EXPECT_EQ(drop_agent::RawObjectKey("t1", 7, "../evil"), "t1/../evil");
+}
+
+TEST(ValidRemoteBasename, RejectsDotsSlashesAndEmpty)
+{
+    EXPECT_TRUE(drop_agent::ValidRemoteBasename("perf.data"));
+    EXPECT_TRUE(drop_agent::ValidRemoteBasename("profile.pb.gz"));
+    EXPECT_FALSE(drop_agent::ValidRemoteBasename(""));
+    EXPECT_FALSE(drop_agent::ValidRemoteBasename("."));
+    EXPECT_FALSE(drop_agent::ValidRemoteBasename(".."));
+    EXPECT_FALSE(drop_agent::ValidRemoteBasename("a/b"));
+    EXPECT_FALSE(drop_agent::ValidRemoteBasename("a\\b"));
+    EXPECT_FALSE(drop_agent::ValidRemoteBasename("a b"));
+}

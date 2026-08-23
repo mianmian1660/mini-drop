@@ -729,6 +729,164 @@ def t_finalize_success_updates_job_and_task_in_one_connection():
     assert "UPDATE hotmethod_tasks" in sql
     assert "INSERT INTO task_status_events" in sql
 
+def t_switch_active_manual_reanalysis_wins():
+    """阶段 4：人工重分析（manual）成功后总是切换 active，并降级旧代产物。"""
+    from lease import AnalysisJob
+    from analysis_daemon import _switch_active_job_tx
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.rowcount = 1
+        def execute(self, query, params=None):
+            self.conn.queries.append(query)
+            if "SELECT active_analysis_job_id" in query:
+                self.fetchone_value = (3,)
+            elif "SELECT attempt_id FROM analysis_jobs" in query:
+                self.fetchone_value = (10,)
+            else:
+                self.fetchone_value = None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def __init__(self):
+            self.queries = []
+        def cursor(self):
+            return FakeCursor(self)
+
+    conn = FakeConn()
+    job = AnalysisJob(id=9, task_tid="tid", pipeline="perf", status="running",
+                      attempt=1, attempt_id=7, generation=2, trigger="manual")
+    switched = _switch_active_job_tx(conn, job, "tid")
+    assert switched is True
+    sql = "\n".join(conn.queries)
+    assert "superseded_at = NOW()" in sql
+    assert "result_superseded" in sql and "hours" in sql
+    assert "active_analysis_job_id = %s" in sql
+
+def t_switch_active_initial_late_attempt_kept():
+    """阶段 4：迟到的旧 attempt 自动分析（initial）成功时不覆盖更新 attempt 的结果。"""
+    from lease import AnalysisJob
+    from analysis_daemon import _switch_active_job_tx
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.rowcount = 1
+        def execute(self, query, params=None):
+            self.conn.queries.append(query)
+            if "SELECT active_analysis_job_id" in query:
+                self.fetchone_value = (3,)
+            elif "SELECT attempt_id FROM analysis_jobs" in query:
+                self.fetchone_value = (10,)  # active job 的 attempt 更新（10 > 7）
+            else:
+                self.fetchone_value = None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def __init__(self):
+            self.queries = []
+        def cursor(self):
+            return FakeCursor(self)
+
+    conn = FakeConn()
+    job = AnalysisJob(id=9, task_tid="tid", pipeline="perf", status="running",
+                      attempt=1, attempt_id=7, generation=2, trigger="initial")
+    switched = _switch_active_job_tx(conn, job, "tid")
+    assert switched is False
+    sql = "\n".join(conn.queries)
+    assert "superseded_at" not in sql
+    assert "active_analysis_job_id = %s" not in sql
+
+def t_switch_active_initial_newer_attempt_switches():
+    """阶段 4：新 attempt 的自动分析（initial）成功时正常切换。"""
+    from lease import AnalysisJob
+    from analysis_daemon import _switch_active_job_tx
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.rowcount = 1
+        def execute(self, query, params=None):
+            self.conn.queries.append(query)
+            if "SELECT active_analysis_job_id" in query:
+                self.fetchone_value = (3,)
+            elif "SELECT attempt_id FROM analysis_jobs" in query:
+                self.fetchone_value = (6,)  # active job 的 attempt 更旧（6 < 12）
+            else:
+                self.fetchone_value = None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def __init__(self):
+            self.queries = []
+        def cursor(self):
+            return FakeCursor(self)
+
+    conn = FakeConn()
+    job = AnalysisJob(id=9, task_tid="tid", pipeline="perf", status="running",
+                      attempt=1, attempt_id=12, generation=3, trigger="initial")
+    switched = _switch_active_job_tx(conn, job, "tid")
+    assert switched is True
+    sql = "\n".join(conn.queries)
+    assert "superseded_at = NOW()" in sql
+
+def t_record_result_artifacts_carries_job_and_logical_name():
+    """阶段 4：descriptor 登记携带 analysis_job_id 与 logical_name。"""
+    from analysis_daemon import record_result_artifacts
+
+    class FakeCursor:
+        rowcount = 1
+        def __init__(self, conn):
+            self.conn = conn
+        def execute(self, query, params=None):
+            self.conn.queries.append((query, params))
+            if "INSERT INTO storage_blobs" in query:
+                self.fetchone_value = (11,)
+            elif "RETURNING id" in query:
+                self.fetchone_value = (22,)
+            else:
+                self.fetchone_value = None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def __init__(self):
+            self.queries = []
+        def cursor(self):
+            return FakeCursor(self)
+
+    descriptor = {
+        "object_key": "tasks/tid/analysis/perf_flamegraph/v4/g2/flamegraph.svg",
+        "logical_name": "flamegraph.svg",
+        "blob_key": "blobs/sha256/aa/x/svg-v1.gz",
+        "kind": "RESULT", "format": "svg", "schema_version": "1",
+        "compression": "gzip", "logical_sha256": "a" * 64,
+        "stored_sha256": "b" * 64, "logical_size": 100, "stored_size": 20,
+        "content_encoding": "gzip", "content_type": "image/svg+xml",
+    }
+    conn = FakeConn()
+    ids = record_result_artifacts(conn, "tid", 7, 9, 2, [descriptor])
+    assert ids == [22]
+    # 找到 artifacts INSERT 的参数，校验 analysis_job_id / logical_name / 前缀 key
+    inserts = [q for q in conn.queries if "INSERT INTO artifacts" in q[0]]
+    assert len(inserts) == 1
+    query, params = inserts[0]
+    assert "analysis_job_id" in query and "logical_name" in query
+    assert 9 in params and "flamegraph.svg" in params
+    assert params[params.index("tasks/tid/analysis/perf_flamegraph/v4/g2/flamegraph.svg")] == descriptor["object_key"]
+
 def t_record_result_artifacts_removes_upload_rejected_by_tombstone():
     from analysis_daemon import record_result_artifacts
 
@@ -754,7 +912,7 @@ def t_record_result_artifacts_removes_upload_rejected_by_tombstone():
 
     storage = FakeStorage()
     ids = record_result_artifacts(
-        FakeConn(), "tid", ["tid/top.json"], storage=storage, bucket="drop-data"
+        FakeConn(), "tid", 0, 0, 0, ["tid/top.json"], storage=storage, bucket="drop-data"
     )
     assert ids == []
     assert storage.deleted == [("drop-data", "tid/top.json")]
@@ -796,7 +954,7 @@ def t_record_result_artifacts_never_deletes_shared_cas_on_tombstone():
         "content_encoding": "gzip", "content_type": "image/svg+xml",
     }
     storage = FakeStorage()
-    ids = record_result_artifacts(FakeConn(), "tid", [descriptor],
+    ids = record_result_artifacts(FakeConn(), "tid", 0, 0, 0, [descriptor],
                                   storage=storage, bucket="drop-data")
     assert ids == []
     assert storage.deleted == []

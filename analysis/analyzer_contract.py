@@ -98,6 +98,8 @@ class BaseAnalyzer:
         return build_manifest(
             task_id=prepared["tid"],
             job_id=getattr(prepared.get("job"), "id", None),
+            attempt_id=getattr(prepared.get("job"), "attempt_id", 0) or 0,
+            generation=getattr(prepared.get("job"), "generation", 0) or 0,
             pipeline=self.pipeline,
             analyzer_name=self.name,
             analyzer_version=self.analyzer_version,
@@ -109,6 +111,9 @@ class BaseAnalyzer:
         return None
 
     def run(self, conn, storage_cfg, task, bucket, tid, local_dir="", job=None) -> dict:
+        import os
+        generation = int(getattr(job, "generation", 0) or 0) if job else 0
+        attempt_id = int(getattr(job, "attempt_id", 0) or 0) if job else 0
         context = {
             "conn": conn,
             "storage_cfg": storage_cfg,
@@ -117,6 +122,13 @@ class BaseAnalyzer:
             "tid": tid,
             "local_dir": local_dir,
             "job": job,
+            # 阶段 4：明确运行上下文
+            "job_id": getattr(job, "id", None) if job else None,
+            "attempt_id": attempt_id,
+            "generation": generation,
+            "pipeline": self.pipeline,
+            "analyzer_version": self.analyzer_version,
+            "output_prefix": os.environ.get("ANALYSIS_OUTPUT_PREFIX", "").strip() or tid,
         }
         validated = self.validate(context)
         prepared = self.prepare(context, validated)
@@ -267,6 +279,8 @@ def build_manifest(
     *,
     task_id: str,
     job_id: Optional[int],
+    attempt_id: int = 0,
+    generation: int = 0,
     pipeline: str,
     analyzer_name: str,
     analyzer_version: str,
@@ -279,7 +293,7 @@ def build_manifest(
             key = str(output["object_key"])
             output_artifacts.append({
                 "object_key": key,
-                "name": key.rsplit("/", 1)[-1],
+                "name": output.get("logical_name") or key.rsplit("/", 1)[-1],
                 "kind": output.get("kind") or (
                     "RESULT" if key.endswith((".svg", ".json", ".md", ".html"))
                     else "INTERMEDIATE"
@@ -302,7 +316,9 @@ def build_manifest(
             })
     return {
         "task_id": task_id,
+        "attempt_id": attempt_id,
         "job_id": job_id,
+        "generation": generation,
         "pipeline": pipeline,
         "analyzer": analyzer_name,
         "analyzer_version": analyzer_version,

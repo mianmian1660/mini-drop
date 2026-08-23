@@ -121,6 +121,8 @@ services:
       DROP_PERF_BIN: "/usr/local/bin/perf-real"
       DROP_AGENT_HOSTNAME: "cloud-server-111-230-29-115"
       DROP_AGENT_IP: "111.230.29.115"
+      # 阶段 4 Release C：Agent v2 对象布局（tasks/{tid}/attempts/{aid}/raw/...）
+      DROP_AGENT_LAYOUT_V2: "${DROP_AGENT_LAYOUT_V2:-true}"
       DROP_NATIVE_CP_ENABLED: "${DROP_NATIVE_CP_ENABLED:-true}"
       DROP_NATIVE_CP_EBPF_ENABLED: "${DROP_NATIVE_CP_EBPF_ENABLED:-true}"
       DROP_NATIVE_CP_SIGNALS: "${DROP_NATIVE_CP_SIGNALS:-cpu,io,sched}"
@@ -229,7 +231,13 @@ services:
       ARTIFACT_RAW_PORTABLE_HOURS: "${ARTIFACT_RAW_PORTABLE_HOURS:-168}"
       ARTIFACT_INTERMEDIATE_HOURS: "${ARTIFACT_INTERMEDIATE_HOURS:-24}"
       ARTIFACT_DIAGNOSTIC_HOURS: "${ARTIFACT_DIAGNOSTIC_HOURS:-72}"
+      # 阶段 4：被新代次替换的旧代 RESULT/INTERMEDIATE 保留时长（小时）
+      ARTIFACT_SUPERSEDED_RESULT_HOURS: "${ARTIFACT_SUPERSEDED_RESULT_HOURS:-72}"
       ARTIFACT_MANIFEST_PERMANENT: "${ARTIFACT_MANIFEST_PERMANENT:-true}"
+      # 阶段 4：单次采样最终存储模型发布开关（Release B/C/D）
+      SINGLE_SHOT_LAYOUT_V2_ENABLED: "${SINGLE_SHOT_LAYOUT_V2_ENABLED:-true}"
+      ANALYSIS_GENERATIONS_ENABLED: "${ANALYSIS_GENERATIONS_ENABLED:-true}"
+      ANALYSIS_REANALYZE_ENABLED: "${ANALYSIS_REANALYZE_ENABLED:-true}"
       STORAGE_DISK_PATH: "${STORAGE_DISK_PATH:-/tmp}"
       STORAGE_WARNING_FREE_BYTES: "${STORAGE_WARNING_FREE_BYTES:-8589934592}"
       STORAGE_CRITICAL_FREE_BYTES: "${STORAGE_CRITICAL_FREE_BYTES:-4294967296}"
@@ -289,6 +297,8 @@ services:
       S3_ACCESS_KEY: "drop"
       S3_SECRET_KEY: "dropdrop"
       ANALYSIS_WORK_ROOT: "/tmp/mini-drop-analysis"
+      # 阶段 4：被替换旧代产物保留时长（与 apiserver 一致，finalize 切换时写 expires_at）
+      ARTIFACT_SUPERSEDED_RESULT_HOURS: "${ARTIFACT_SUPERSEDED_RESULT_HOURS:-72}"
       # 阶段二：单次 CPU 采样标准 pprof 转换模式（observe/enforce）。
       # observe：生成并校验 pprof，失败只记录指标不影响原分析结果。
       # enforce：pprof 失败导致 AnalysisJob 重试，达上限后任务失败。

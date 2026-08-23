@@ -108,8 +108,11 @@ type HotmethodTask struct {
 	ArtifactsPinnedAt  *time.Time     `gorm:"column:artifacts_pinned_at" json:"artifacts_pinned_at"`
 	ArtifactsPinnedBy  string         `gorm:"column:artifacts_pinned_by;size:128" json:"artifacts_pinned_by"`
 	ArtifactsPinReason string         `gorm:"column:artifacts_pin_reason;size:256" json:"artifacts_pin_reason"`
-	DeletedAt          gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
-	CanManage          bool           `gorm:"-" json:"can_manage"`
+	// ActiveAnalysisJobID 当前对用户展示的成功 AnalysisJob（阶段 4：多代结果）。
+	// 为 NULL 时表示无 active job（旧任务继续走 {tid}/... 旧逻辑路径兼容读取）。
+	ActiveAnalysisJobID *uint `gorm:"column:active_analysis_job_id;index:idx_tasks_active_analysis_job" json:"active_analysis_job_id"`
+	DeletedAt           gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	CanManage           bool           `gorm:"-" json:"can_manage"`
 }
 
 // ----------------------------------------------------------
@@ -180,6 +183,8 @@ type AnalysisSuggestion struct {
 	Suggestion   string `gorm:"column:suggestion;type:text" json:"suggestion"`
 	AISuggestion string `gorm:"column:ai_suggestion;type:text" json:"ai_suggestion"`
 	Status       int    `gorm:"column:status;default:0" json:"status"`
+	// AnalysisJobID 建议所属 generation（阶段 4）；NULL 为旧数据，仅 legacy 回退使用。
+	AnalysisJobID *uint `gorm:"column:analysis_job_id;index:idx_analysis_suggestions_job" json:"analysis_job_id"`
 }
 
 // ----------------------------------------------------------

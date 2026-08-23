@@ -266,6 +266,18 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		return
 	}
 
+	// 阶段 4：Agent v2 路径（tasks/{tid}/attempts/{attempt_id}/raw/...）严格校验。
+	// 通知中的 cos_key / manifest_key / attempt_id 必须相互匹配；v2 布局未开启时
+	// 拒绝 v2 路径（Release C 前 Agent 不会发送，避免误解析历史 key）。
+	if verr := s.validateNotifyObjectKeys(&req); verr != nil {
+		incTaskNotifyFailed()
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    400,
+			"message": verr.Error(),
+		})
+		return
+	}
+
 	if strings.TrimSpace(req.ErrorMessage) != "" {
 		incTaskNotifyFailed()
 		endTime := time.Now()
@@ -408,7 +420,7 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 					zap.Int("actual_status", currentStatus))
 			}
 		}
-		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, req.ArtifactSize); err != nil {
+		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.AttemptID, req.CosKey, req.ArtifactSize, model.AnalysisJobTriggerInitial, ""); err != nil {
 			return err
 		}
 		if err := ensureManifestArtifactTx(tx, task.TID, req.AttemptID, req.ManifestKey); err != nil {
@@ -510,24 +522,43 @@ func ensureManifestArtifactTx(tx *gorm.DB, tid string, attemptID uint, manifestK
 
 func (s *APIServer) ensureAnalysisQueued(tid string, objectKey string, size int64) error {
 	return s.DB.Transaction(func(tx *gorm.DB) error {
-		return s.ensureAnalysisQueuedTx(tx, tid, objectKey, size)
+		return s.ensureAnalysisQueuedTx(tx, tid, 0, objectKey, size, model.AnalysisJobTriggerInitial, "")
 	})
 }
 
-func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey string, size int64) error {
+// ensureAnalysisQueuedTx 为采集 RAW 创建/复用 AnalysisJob（阶段 4：多代）。
+//
+// 语义：
+//   - 幂等：同一 (task, attempt, pipeline, trigger='initial') 只创建一条初始作业。
+//     事务内先锁任务行（generation 分配与并发去重都依赖这把锁），再做存在性
+//     检查；PostgreSQL 侧的 partial unique index（uidx_analysis_jobs_initial_once）
+//     兜底并发竞态。
+//   - generation：在锁内按 MAX(generation)+1 分配，从 1 单调递增。
+//   - input_artifact_ids 只包含该 attempt 的 RAW。
+//   - attemptID == 0（旧链路/轮询补建）时解析为该任务最新的 TaskAttempt。
+func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, attemptID uint, objectKey string, size int64, trigger string, requestedBy string) error {
 	objectKey = strings.TrimSpace(objectKey)
 	if tid == "" || objectKey == "" {
 		return nil
 	}
+	if trigger == "" {
+		trigger = model.AnalysisJobTriggerInitial
+	}
+	ownsTx := tx == nil
+	if ownsTx {
+		tx = s.DB
+	}
 
 	artifact := model.Artifact{
 		TaskTID:     tid,
+		AttemptID:   attemptID,
 		Kind:        model.ArtifactKindRaw,
 		ObjectKey:   objectKey,
 		Size:        size,
 		ContentType: mimeType(objectKey),
 		Status:      model.ArtifactStatusReady,
 		CreatedAt:   time.Now(),
+		LogicalName: filepath.Base(objectKey),
 	}
 	if err := tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
@@ -553,10 +584,49 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey st
 	if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ? AND deleted_at IS NULL", tid, model.ArtifactKindRaw, objectKey).First(&savedArtifact).Error; err == nil {
 		inputArtifactIDs = append(inputArtifactIDs, savedArtifact.ID)
 	}
+	if attemptID == 0 {
+		attemptID = resolveLatestTaskAttemptIDTx(tx, tid)
+	}
+
+	// 锁任务行：generation 分配与"同一 attempt 初始作业只建一次"的并发安全
+	// 都依赖这把锁（reanalyze 入口用同一把锁，互斥）。
+	q := tx.Where("tid = ?", tid)
+	if tx.Dialector.Name() == "postgres" {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var locked model.HotmethodTask
+	if err := q.First(&locked).Error; err != nil {
+		return err
+	}
+
+	if trigger == model.AnalysisJobTriggerInitial {
+		var existing int64
+		if err := tx.Model(&model.AnalysisJob{}).
+			Where("task_tid = ? AND attempt_id = ? AND pipeline = ? AND trigger = ?", tid, attemptID, pipeline, model.AnalysisJobTriggerInitial).
+			Count(&existing).Error; err != nil {
+			return err
+		}
+		if existing > 0 {
+			return nil // 幂等：同一采集通知不重复建作业
+		}
+	}
+	var maxGen int
+	if err := tx.Model(&model.AnalysisJob{}).
+		Where("task_tid = ?", tid).
+		Select("COALESCE(MAX(generation), 0)").
+		Scan(&maxGen).Error; err != nil {
+		return err
+	}
+	generation := maxGen + 1
+
 	inputArtifactJSON, _ := util.MarshalJSONB(inputArtifactIDs)
 	job := model.AnalysisJob{
 		TaskTID:          tid,
+		AttemptID:        attemptID,
+		Generation:       generation,
 		Pipeline:         pipeline,
+		Trigger:          trigger,
+		RequestedBy:      requestedBy,
 		Status:           model.AnalysisJobStatusPending,
 		Attempt:          0,
 		MaxAttempts:      3,
@@ -564,10 +634,7 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey st
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
 	}
-	result := tx.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "task_tid"}},
-		DoNothing: true,
-	}).Create(&job)
+	result := tx.Create(&job)
 	if err := result.Error; err != nil {
 		return err
 	}
@@ -800,12 +867,16 @@ func (s *APIServer) GetTaskDetail(c *gin.Context) {
 	}
 	task.CanManage = s.canManageOwner(task.UID, auth)
 
-	result := s.taskDetailPayload(task)
+	result, serr := s.taskDetailPayload(task, c.Query("analysis_job_id"))
+	if serr != nil {
+		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
+		return
+	}
 
 	s.RespondOK(c, result)
 }
 
-func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
+func (s *APIServer) taskDetailPayload(task model.HotmethodTask, explicitJobID string) (gin.H, *ServiceError) {
 	result := gin.H{"task": taskDetailResponse(task)}
 	files := []map[string]interface{}{}
 	var topFuncs []map[string]interface{}
@@ -819,6 +890,27 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 		result["children"] = childPayload
 	}
 
+	// 阶段 4：按代选择结果。优先级：显式 analysis_job_id → active job → legacy。
+	selectedJob, selectErr := s.resolveSelectedAnalysisJob(&task, explicitJobID)
+	if selectErr != nil {
+		return nil, serviceError(http.StatusBadRequest, ErrCodeTaskInvalidArgument, selectErr.Error())
+	}
+	// legacyFallback：旧任务回填的 active job 没有关联产物（产物 analysis_job_id
+	// 为 NULL），此时回退旧 {tid}/... 路径，保持历史任务正常展示。
+	legacyFallback := false
+	if selectedJob != nil {
+		topFuncs = s.fetchTopFunctionsForJob(task.TID, selectedJob)
+		bpfData = s.fetchBPFDataForJob(task.TID, selectedJob)
+		suggestions = s.fetchSuggestionsForJob(task.TID, selectedJob)
+		if flame := s.fetchJobFlamegraphArtifact(task.TID, selectedJob); flame != nil {
+			result["flamegraph_artifact_id"] = flame.ID
+			result["flamegraph_artifact_url"] = fmt.Sprintf("/api/v1/tasks/%s/artifacts/%d/content", task.TID, flame.ID)
+		}
+		if !s.jobHasAnyArtifacts(task.TID, selectedJob.ID) {
+			legacyFallback = true
+		}
+	}
+
 	// W4: 优先从对象存储列出产物，存储不可用或无产物时回退本地目录。
 	if s.StorageConnected() {
 		storageFiles, err := s.listTaskFiles(task.TID)
@@ -827,10 +919,13 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 		} else {
 			files = storageFiles
 
-			// 尝试从 MinIO 读取 top.json → TopN 热点数据
-			topFuncs = s.fetchTopFunctions(task.TID)
-			bpfData = s.fetchBPFData(task.TID)
-			suggestions = s.fetchSuggestions(task.TID)
+			if selectedJob == nil || legacyFallback {
+				// 旧链路（无 active job 或旧任务回填的 job 无关联产物）：
+				// 从 MinIO 读取 {tid}/top.json 等
+				topFuncs = s.fetchTopFunctions(task.TID)
+				bpfData = s.fetchBPFData(task.TID)
+				suggestions = s.fetchSuggestions(task.TID)
+			}
 		}
 	}
 	if len(files) == 0 {
@@ -845,7 +940,7 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	if len(suggestions) == 0 {
 		suggestions = s.fetchLocalSuggestions(task.TID)
 	}
-	if len(suggestions) == 0 {
+	if len(suggestions) == 0 && selectedJob == nil {
 		suggestions = s.fetchDBSuggestions(task.TID)
 	}
 	if len(topFuncs) > 0 {
@@ -857,13 +952,26 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	if len(suggestions) > 0 {
 		result["suggestions"] = suggestions
 	}
+	genMap := s.jobGenerationMap(task.TID)
+	activeGen := 0
+	if task.ActiveAnalysisJobID != nil {
+		activeGen = genMap[*task.ActiveAnalysisJobID]
+	}
 	publicArtifacts := make([]gin.H, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		publicArtifacts = append(publicArtifacts, publicArtifact(artifact, task.ArtifactsPinned))
+		gen := 0
+		if artifact.AnalysisJobID != nil {
+			gen = genMap[*artifact.AnalysisJobID]
+		}
+		publicArtifacts = append(publicArtifacts, publicArtifactFull(artifact, task.ArtifactsPinned, gen, activeGen))
 	}
 	cleanedArtifacts := make([]gin.H, 0, len(deletedArtifacts))
 	for _, artifact := range deletedArtifacts {
-		cleanedArtifacts = append(cleanedArtifacts, publicArtifact(artifact, task.ArtifactsPinned))
+		gen := 0
+		if artifact.AnalysisJobID != nil {
+			gen = genMap[*artifact.AnalysisJobID]
+		}
+		cleanedArtifacts = append(cleanedArtifacts, publicArtifactFull(artifact, task.ArtifactsPinned, gen, activeGen))
 	}
 
 	result["status_events"] = statusEvents
@@ -871,8 +979,14 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	result["artifacts"] = publicArtifacts
 	result["cleaned_artifacts"] = cleanedArtifacts
 	result["files"] = files
+	result["active_analysis_job_id"] = task.ActiveAnalysisJobID
+	if selectedJob != nil {
+		result["selected_analysis_job_id"] = selectedJob.ID
+		result["selected_generation"] = selectedJob.Generation
+	}
+	result["analysis_jobs"] = s.analysisJobsPayload(task.TID)
 
-	return result
+	return result, nil
 }
 
 func taskDetailResponse(task model.HotmethodTask) gin.H {
@@ -1068,10 +1182,20 @@ func (s *APIServer) taskEventStreamPayload(task model.HotmethodTask) gin.H {
 		"sequence":        latest,
 		"request_id":      task.RequestID,
 		"task":            taskDetailResponse(task),
-		"task_snapshot":   s.taskDetailPayload(task),
+		"task_snapshot":   s.taskDetailPayloadWithFallback(task),
 		"status_events":   events,
 		"latest_event_id": latest,
 	}
+}
+
+// taskDetailPayloadWithFallback SSE 场景没有 analysis_job_id 查询参数，
+// 使用默认（active/legacy）选择；载荷构造失败时退回最小快照。
+func (s *APIServer) taskDetailPayloadWithFallback(task model.HotmethodTask) gin.H {
+	payload, _ := s.taskDetailPayload(task, "")
+	if payload != nil {
+		return payload
+	}
+	return gin.H{"task": taskDetailResponse(task)}
 }
 
 func (s *APIServer) taskSuggestionStreamPayload(tid string, requestID string) gin.H {

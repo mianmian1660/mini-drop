@@ -38,6 +38,7 @@ var (
 	metricArtifactCleanupFailuresTotal     int64 // counter：对象删除失败次数
 	metricArtifactReadyBytes               int64 // gauge：ready 状态字节数
 	metricArtifactPinnedBytes              int64 // gauge：固定任务下非 deleted 字节数
+	metricArtifactSupersededBytes          int64 // gauge：被替换旧代（result_superseded）字节数
 	metricArtifactExpirationBacklog        int64 // gauge：到期候选（due）数量
 	metricArtifactPolicyReconcileBacklog   int64 // gauge：策略版本不一致待重算数量
 	// 按 status 计数的 gauge（label: status）
@@ -113,6 +114,7 @@ func incArtifactCleanupFailures() {
 func updateArtifactLifecycleGauges(stats artifactLifecycleStats) {
 	atomic.StoreInt64(&metricArtifactReadyBytes, stats.ReadyBytes)
 	atomic.StoreInt64(&metricArtifactPinnedBytes, stats.PinnedBytes)
+	atomic.StoreInt64(&metricArtifactSupersededBytes, stats.SupersededBytes)
 	atomic.StoreInt64(&metricArtifactExpirationBacklog, stats.DueCount)
 	atomic.StoreInt64(&metricArtifactPolicyReconcileBacklog, stats.ReconcileBacklog)
 }
@@ -285,6 +287,7 @@ func resetMetricsForTest() {
 	atomic.StoreInt64(&metricArtifactCleanupFailuresTotal, 0)
 	atomic.StoreInt64(&metricArtifactReadyBytes, 0)
 	atomic.StoreInt64(&metricArtifactPinnedBytes, 0)
+	atomic.StoreInt64(&metricArtifactSupersededBytes, 0)
 	atomic.StoreInt64(&metricArtifactExpirationBacklog, 0)
 	atomic.StoreInt64(&metricArtifactPolicyReconcileBacklog, 0)
 	atomic.StoreInt64(&metricBlobPhysicalBytes, 0)
@@ -391,6 +394,8 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_artifact_ready_bytes %d\n", atomic.LoadInt64(&metricArtifactReadyBytes))
 	writeMetricHeader(&b, "mini_drop_artifact_pinned_bytes", "gauge", "Bytes of non-deleted artifacts under pinned tasks.")
 	fmt.Fprintf(&b, "mini_drop_artifact_pinned_bytes %d\n", atomic.LoadInt64(&metricArtifactPinnedBytes))
+	writeMetricHeader(&b, "mini_drop_artifact_superseded_bytes", "gauge", "Bytes of superseded generation results (result_superseded, phase 4).")
+	fmt.Fprintf(&b, "mini_drop_artifact_superseded_bytes %d\n", atomic.LoadInt64(&metricArtifactSupersededBytes))
 	writeMetricHeader(&b, "mini_drop_artifact_expiration_backlog", "gauge", "Artifacts due for expiration cleanup.")
 	fmt.Fprintf(&b, "mini_drop_artifact_expiration_backlog %d\n", atomic.LoadInt64(&metricArtifactExpirationBacklog))
 	writeMetricHeader(&b, "mini_drop_artifact_cleanup_deleted_total", "counter", "Artifacts deleted by lifecycle cleanup.")

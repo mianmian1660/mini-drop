@@ -36,7 +36,8 @@ import (
 
 const (
 	// lifecycleRulesVersion 分类规则版本：修改分类/期限语义时递增，参与 policy version。
-	lifecycleRulesVersion = "v1"
+	// v2：阶段 4 引入 result_superseded（被新代次替换的旧代 RESULT/INTERMEDIATE，72h）。
+	lifecycleRulesVersion = "v2"
 
 	// deleteBackoffStages 删除失败退避：第 n 次失败（1 起）对应间隔。
 	deleteBackoffMin           = 1 * time.Minute
@@ -71,10 +72,10 @@ var (
 // 策略配置变化 → 版本变化 → reconciler 重算历史 Artifact。
 func (s *APIServer) lifecyclePolicyVersion() string {
 	r := s.Config.Retention
-	raw := fmt.Sprintf("%s|%d|%d|%d|%d|%d|%v",
+	raw := fmt.Sprintf("%s|%d|%d|%d|%d|%d|%d|%v",
 		lifecycleRulesVersion,
 		r.RawLargeHours, r.RawPortableHours, r.IntermediateHours,
-		r.DiagnosticHours, r.ResultRetentionHours, r.ManifestPermanent)
+		r.DiagnosticHours, r.ResultRetentionHours, r.SupersededResultHours, r.ManifestPermanent)
 	sum := sha256.Sum256([]byte(raw))
 	return lifecycleRulesVersion + "-" + hex.EncodeToString(sum[:])[:12]
 }
@@ -112,17 +113,24 @@ func (s *APIServer) lifecycleStaleQuery(ctx context.Context, version string) *go
 // ------------------------------------------------------------
 
 // classifyArtifactRetentionFull 完整分类：
+//   - superseded（阶段 4）：所属 AnalysisJob 已被新代次替换的 RESULT/INTERMEDIATE
+//     → result_superseded（72h）；MANIFEST 仍为 manifest（审计清单永久保留）。
 //   - MANIFEST → manifest（永不过期）
 //   - RESULT → result
 //   - LOG → diagnostic
 //   - 失败/取消任务的 RAW/INTERMEDIATE → diagnostic
 //   - RAW：.pb.gz / .collapsed → raw_portable，其余 → raw_large
 //   - INTERMEDIATE → intermediate
-func classifyArtifactRetentionFull(kind, objectKey string, taskStatus int) string {
-	switch kind {
-	case model.ArtifactKindManifest:
+func classifyArtifactRetentionFull(kind, objectKey string, taskStatus int, superseded bool) string {
+	if kind == model.ArtifactKindManifest {
 		return model.RetentionClassManifest
-	case model.ArtifactKindResult:
+	}
+	if superseded {
+		if kind == model.ArtifactKindResult || kind == model.ArtifactKindIntermediate {
+			return model.RetentionClassResultSuperseded
+		}
+	}
+	if kind == model.ArtifactKindResult {
 		return model.RetentionClassResult
 	}
 	if taskStatus == TaskStatusFailed || taskStatus == TaskStatusCanceled {
@@ -164,6 +172,8 @@ func (s *APIServer) retentionDurationForClass(class string) time.Duration {
 		return hours(r.DiagnosticHours)
 	case model.RetentionClassResult:
 		return hours(r.ResultRetentionHours)
+	case model.RetentionClassResultSuperseded:
+		return hours(r.SupersededResultHours)
 	case model.RetentionClassManifest:
 		return 0
 	default: // raw_large
@@ -189,7 +199,9 @@ func (s *APIServer) notBeforeProtection() time.Duration {
 //     not_before 提升到 now+24h。
 //   - 策略延长：立即按新时长计算，不动 not_before。
 //   - manifest 永不过期：expires_at=nil。
-func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.HotmethodTask) (class string, expiresAt *time.Time, notBefore *time.Time) {
+//   - superseded（阶段 4）：被替换旧代按 created_at 起算 72h，不做 24h 保护
+//     （切换事务已写入精确到期，重算只求一致，不延长清理）。
+func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.HotmethodTask, superseded bool) (class string, expiresAt *time.Time, notBefore *time.Time) {
 	now := time.Now()
 	guard := now.Add(s.notBeforeProtection())
 
@@ -201,7 +213,7 @@ func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.Hotmet
 		taskStatus = task.Status
 		terminal = isTerminalTaskStatus(task.Status)
 	}
-	class = classifyArtifactRetentionFull(a.Kind, a.ObjectKey, taskStatus)
+	class = classifyArtifactRetentionFull(a.Kind, a.ObjectKey, taskStatus, superseded)
 
 	// manifest 永不过期
 	if class == model.RetentionClassManifest && s.Config.Retention.ManifestPermanent {
@@ -219,6 +231,11 @@ func (s *APIServer) lifecycleComputeExpiry(a *model.Artifact, task *model.Hotmet
 	base := start.Add(s.retentionDurationForClass(class))
 	exp := base
 	nb := a.RetentionNotBefore
+
+	// 被替换旧代：直接按自身时间起算，不参与"策略缩短 24h 保护"（避免延长清理）。
+	if class == model.RetentionClassResultSuperseded {
+		return class, &exp, nb
+	}
 
 	// 首次回填：not_before = now + 24h
 	if a.RetentionPolicyVersion == "" && a.RetentionNotBefore == nil {
@@ -289,6 +306,28 @@ func (s *APIServer) reconcileLifecycle(ctx context.Context) int64 {
 				}
 			}
 		}
+		// 阶段 4：批量加载涉及的分析作业（superseded 判定，避免 N+1）。
+		jobByID := map[uint]*model.AnalysisJob{}
+		{
+			jobIDs := map[uint]bool{}
+			for i := range stale {
+				if stale[i].AnalysisJobID != nil && *stale[i].AnalysisJobID > 0 {
+					jobIDs[*stale[i].AnalysisJobID] = true
+				}
+			}
+			if len(jobIDs) > 0 {
+				ids := make([]uint, 0, len(jobIDs))
+				for id := range jobIDs {
+					ids = append(ids, id)
+				}
+				var jobs []model.AnalysisJob
+				if err := s.DB.WithContext(ctx).Where("id IN ?", ids).Find(&jobs).Error; err == nil {
+					for i := range jobs {
+						jobByID[jobs[i].ID] = &jobs[i]
+					}
+				}
+			}
+		}
 
 		processed := 0
 		for i := range stale {
@@ -297,7 +336,13 @@ func (s *APIServer) reconcileLifecycle(ctx context.Context) int64 {
 			}
 			a := &stale[i]
 			task := taskByTID[a.TaskTID]
-			class, exp, nb := s.lifecycleComputeExpiry(a, task)
+			superseded := false
+			if a.AnalysisJobID != nil {
+				if job := jobByID[*a.AnalysisJobID]; job != nil && job.SupersededAt != nil {
+					superseded = true
+				}
+			}
+			class, exp, nb := s.lifecycleComputeExpiry(a, task, superseded)
 			updates := map[string]interface{}{
 				"retention":                class,
 				"retention_policy_version": version,
@@ -989,6 +1034,8 @@ type artifactLifecycleStats struct {
 	DeletingBytes    int64      `json:"deleting_bytes"`
 	DeletedCount     int64      `json:"deleted_count"`
 	DeletedBytes     int64      `json:"deleted_bytes"`
+	SupersededCount  int64      `json:"superseded_count"` // 阶段 4：被替换旧代（result_superseded）
+	SupersededBytes  int64      `json:"superseded_bytes"`
 	LastRunAt        *time.Time `json:"last_run_at"`
 	LastError        string     `json:"last_error"`
 }
@@ -1066,6 +1113,15 @@ func (s *APIServer) collectLifecycleStats(ctx context.Context) artifactLifecycle
 			stats.DeletedCount, stats.DeletedBytes = r.Cnt, r.Bytes
 		}
 	}
+
+	// 阶段 4：被替换旧代统计（result_superseded，非 deleted）。
+	_ = s.DB.WithContext(ctx).Model(&model.Artifact{}).
+		Select("COALESCE(SUM(size),0) as bytes").
+		Where("retention = ? AND deleted_at IS NULL AND status = ?", model.RetentionClassResultSuperseded, model.ArtifactStatusReady).
+		Scan(&stats.SupersededBytes).Error
+	_ = s.DB.WithContext(ctx).Model(&model.Artifact{}).
+		Where("retention = ? AND deleted_at IS NULL AND status = ?", model.RetentionClassResultSuperseded, model.ArtifactStatusReady).
+		Count(&stats.SupersededCount).Error
 
 	// pinned：任务固定集合下的非 deleted artifact
 	pinned := s.pinnedTaskSet(ctx)

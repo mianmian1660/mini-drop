@@ -39,13 +39,14 @@ const (
 
 // 保留类别（retention_class，写入 retention 列）
 const (
-	RetentionClassRawLarge     = "raw_large"
-	RetentionClassRawPortable  = "raw_portable"
-	RetentionClassIntermediate = "intermediate"
-	RetentionClassDiagnostic   = "diagnostic"
-	RetentionClassResult       = "result"
-	RetentionClassManifest     = "manifest"
-	RetentionClassUnknown      = ""
+	RetentionClassRawLarge          = "raw_large"
+	RetentionClassRawPortable       = "raw_portable"
+	RetentionClassIntermediate      = "intermediate"
+	RetentionClassDiagnostic        = "diagnostic"
+	RetentionClassResult            = "result"
+	RetentionClassResultSuperseded  = "result_superseded" // 阶段 4：被新代次替换的旧代 RESULT/INTERMEDIATE（72h）
+	RetentionClassManifest          = "manifest"
+	RetentionClassUnknown           = ""
 )
 
 // 主动删除原因
@@ -108,6 +109,14 @@ type Artifact struct {
 	// DeletedAt tombstone 时间；非 NULL 表示对象已删除，行保留。
 	DeletedAt *time.Time `gorm:"column:deleted_at" json:"deleted_at"`
 	UpdatedAt time.Time  `gorm:"column:updated_at" json:"updated_at"`
+
+	// ---- 阶段 4：单次采样最终存储模型 ----
+	// AnalysisJobID 分析产物所属 generation（AnalysisJob.ID）；RAW 与采集
+	// manifest 为 NULL。
+	AnalysisJobID *uint `gorm:"column:analysis_job_id;index:idx_artifacts_analysis_job" json:"analysis_job_id"`
+	// LogicalName 稳定文件角色名（perf.data / top.json / flamegraph.svg ...），
+	// 不再依靠完整路径判断用途。旧数据为 NULL 时回退到 object_key 的 basename。
+	LogicalName string `gorm:"column:logical_name;size:256" json:"logical_name"`
 }
 
 // IsDeleted 判断是否为墓碑行。
