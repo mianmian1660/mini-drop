@@ -108,7 +108,7 @@ if [[ "$DRY_RUN" == "0" ]]; then
   say "全面检查：API / PostgreSQL / MinIO / Agent / Web"
   curl -fsS http://127.0.0.1:8191/healthz >/dev/null && say "  API /healthz ok"          || die "API /healthz 异常"
   curl -fsS http://127.0.0.1:8191/readyz  >/dev/null && say "  API /readyz ok"           || die "API /readyz 异常"
-  pg_isready -h 127.0.0.1 -p 15432 -U postgres >/dev/null 2>&1 && say "  PostgreSQL ok"     || die "PostgreSQL 异常"
+  docker exec mini-drop-postgres-1 pg_isready -U postgres >/dev/null 2>&1 && say "  PostgreSQL ok" || die "PostgreSQL 异常"
   docker inspect -f '{{.State.Running}}' "${PROJECT}-minio-1" 2>/dev/null | grep -q true && say "  MinIO 容器运行中" || die "MinIO 容器异常"
   state="$(docker inspect -f '{{.State.Running}}' "${PROJECT}-drop_agent-1" 2>/dev/null || echo false)"
   [[ "$state" == "true" ]] && say "  Agent 容器运行中" || die "Agent 容器异常"

@@ -125,7 +125,7 @@ else
   printf '%s\n' "${PREV_COMPOSE}" > "${SNAP_DIR}/previous-compose.txt"
   cp "${PROD_ENV}" "${SNAP_DIR}/production.env"
   "${COMPOSE[@]}" ps > "${SNAP_DIR}/compose-ps.txt" 2>&1 || true
-  pg_isready -h 127.0.0.1 -p 15432 -U postgres > "${SNAP_DIR}/pg-health.txt" 2>&1 || true
+  docker exec mini-drop-postgres-1 pg_isready -U postgres > "${SNAP_DIR}/pg-health.txt" 2>&1 || true
 fi
 
 say "为当前运行服务镜像添加 rollback tag（rollback-${TS}）"
