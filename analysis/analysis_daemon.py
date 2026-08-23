@@ -289,11 +289,22 @@ def _record_task_event_tx(conn, tid: str, reason: str, source: str, payload: dic
             source,
             sequence,
             source,
-            json.dumps(payload or {}, ensure_ascii=False),
+            json.dumps(_json_safe(payload or {}), ensure_ascii=False),
             tid,
         ),
     )
     cur.close()
+
+
+def _json_safe(value):
+    """递归移除不可 JSON 序列化的内容（descriptor 的 _payload 是 bytes）。"""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items() if k != "_payload"}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, bytes):
+        return "<bytes:%d>" % len(value)
+    return value
 
 
 def _upload_manifest(storage_cfg: dict, bucket: str, tid: str, manifest: dict) -> str:
