@@ -10,6 +10,7 @@ import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
 import InteractiveFlamegraph, { foldedTextToFlamegraph } from '../components/InteractiveFlamegraph';
 import AICard from '../components/AICard';
 import { collectorLabelFromTask, collectorLabelByKind, parseRequestParams } from '../utils/collectors';
+import createFlamegraphWorker from '../workers/createFlamegraphWorker';
 
 const styles = {
     container: { width: '100%', maxWidth: 1280, minWidth: 0, margin: '0 auto', padding: 20, fontFamily: 'Arial, sans-serif', color: '#202124' },
@@ -57,6 +58,7 @@ const styles = {
     fileName: { fontSize: 13, color: '#202124', wordBreak: 'break-all', fontWeight: 600 },
     fileMeta: { fontSize: 11, color: '#667085', marginTop: 4 },
     streamState: { marginTop: 6, color: '#667085', fontSize: 12 },
+    input: { border: '1px solid #d0d7de', borderRadius: 6, background: '#fff', color: '#24292f', fontFamily: 'inherit' },
     inlineError: { color: '#b42318', fontSize: 12, marginTop: 8, wordBreak: 'break-word' },
     error: { textAlign: 'center', padding: 60, color: '#b42318' },
     loading: { textAlign: 'center', padding: 60, color: '#667085' },
@@ -85,8 +87,14 @@ export default function TaskResultPage() {
     const [task, setTask] = useState(null);
     const [files, setFiles] = useState([]);
     const [artifacts, setArtifacts] = useState([]);
+    const [cleanedArtifacts, setCleanedArtifacts] = useState([]);
     const [artifactLinks, setArtifactLinks] = useState({});
     const [artifactError, setArtifactError] = useState('');
+    const [pinBusy, setPinBusy] = useState(false);
+    const [pinError, setPinError] = useState('');
+    const [pinReason, setPinReason] = useState('');
+    const [showPinReason, setShowPinReason] = useState(false);
+    const [confirmUnpin, setConfirmUnpin] = useState(false);
     const [topFunctions, setTopFunctions] = useState([]);
     const [bpfHistogram, setBpfHistogram] = useState(null);
     const [suggestions, setSuggestions] = useState([]);
@@ -133,6 +141,7 @@ export default function TaskResultPage() {
         setAttribution(readEmbeddedAttribution(data.suggestions));
         setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
         setArtifacts(Array.isArray(data.artifacts) ? data.artifacts : []);
+        setCleanedArtifacts(Array.isArray(data.cleaned_artifacts) ? data.cleaned_artifacts : []);
         if (!options.preserveVisualFiles) {
             applyFiles(data.files || []);
         }
@@ -291,7 +300,7 @@ export default function TaskResultPage() {
             return undefined;
         }
         let cancelled = false;
-        const worker = new Worker(new URL('../workers/flamegraphWorker.js', import.meta.url));
+        const worker = createFlamegraphWorker();
         worker.onmessage = (event) => {
             if (!cancelled) setFlameMeta(event.data || null);
         };
@@ -406,6 +415,40 @@ export default function TaskResultPage() {
         }
     };
 
+    const pinArtifacts = async () => {
+        if (!tid || pinBusy) return;
+        setPinBusy(true);
+        setPinError('');
+        try {
+            const response = await tasks.artifactPin(tid, { pinned: true, reason: pinReason });
+            if (response.code !== 0) throw new Error(response.message || '固定失败');
+            setShowPinReason(false);
+            setPinReason('');
+            await loadTask(true);
+        } catch (err) {
+            setPinError(`固定失败：${err.message || '未知错误'}`);
+        } finally {
+            setPinBusy(false);
+        }
+    };
+
+    const unpinArtifacts = async () => {
+        if (!tid || pinBusy) return;
+        setPinBusy(true);
+        setPinError('');
+        try {
+            const response = await tasks.artifactPin(tid, { pinned: false, reason: pinReason });
+            if (response.code !== 0) throw new Error(response.message || '取消失败');
+            setConfirmUnpin(false);
+            setPinReason('');
+            await loadTask(true);
+        } catch (err) {
+            setPinError(`取消固定失败：${err.message || '未知错误'}`);
+        } finally {
+            setPinBusy(false);
+        }
+    };
+
     return (
         <div style={styles.container}>
             <div style={styles.header}>
@@ -506,9 +549,22 @@ export default function TaskResultPage() {
             <ArtifactsPanel
                 files={files}
                 artifacts={artifacts}
+                cleanedArtifacts={cleanedArtifacts}
                 artifactLinks={artifactLinks}
                 artifactError={artifactError}
                 onRefreshDownload={refreshArtifactLink}
+                task={task}
+                canManage={Boolean(task.can_manage)}
+                pinBusy={pinBusy}
+                pinError={pinError}
+                pinReason={pinReason}
+                setPinReason={setPinReason}
+                showPinReason={showPinReason}
+                setShowPinReason={setShowPinReason}
+                confirmUnpin={confirmUnpin}
+                setConfirmUnpin={setConfirmUnpin}
+                onPin={pinArtifacts}
+                onUnpin={unpinArtifacts}
             />
         </div>
     );
@@ -881,11 +937,66 @@ function SuggestionsPanel({ suggestions, bpfHistogram, isBpfHistogramTask, statu
     );
 }
 
-function ArtifactsPanel({ files, artifacts, artifactLinks, artifactError, onRefreshDownload }) {
+export function ArtifactsPanel({
+    files, artifacts, cleanedArtifacts, artifactLinks, artifactError, onRefreshDownload,
+    task, canManage, pinBusy, pinError, pinReason, setPinReason, showPinReason, setShowPinReason,
+    confirmUnpin, setConfirmUnpin, onPin, onUnpin,
+}) {
     const hasRegisteredArtifacts = Array.isArray(artifacts) && artifacts.length > 0;
+    const cleaned = Array.isArray(cleanedArtifacts) ? cleanedArtifacts : [];
+    const pinned = Boolean(task?.artifacts_pinned);
+    const [showCleaned, setShowCleaned] = useState(false);
     return (
         <div style={styles.card}>
-            <h3 style={styles.sectionTitle}>产物文件下载</h3>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                <h3 style={{ ...styles.sectionTitle, marginBottom: 0 }}>产物文件下载</h3>
+                {canManage && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                        {pinned && (
+                            <span style={{ fontSize: 12, color: '#067647', background: '#ecfdf3', padding: '2px 8px', borderRadius: 4 }}>
+                                已固定（产物受保护，不会自动清理）
+                            </span>
+                        )}
+                        {!pinned && !showPinReason && !confirmUnpin && (
+                            <button style={{ ...styles.button, ...styles.primaryButton }} onClick={() => setShowPinReason(true)} disabled={pinBusy}>
+                                固定全部产物
+                            </button>
+                        )}
+                        {!pinned && showPinReason && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                <input
+                                    value={pinReason}
+                                    onChange={(e) => setPinReason(e.target.value)}
+                                    placeholder="固定原因（可选）"
+                                    maxLength={256}
+                                    style={{ ...styles.input, width: 200, padding: '6px 8px', fontSize: 12 }}
+                                />
+                                <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onPin} disabled={pinBusy}>
+                                    {pinBusy ? '固定中...' : '确认固定'}
+                                </button>
+                                <button style={styles.button} onClick={() => setShowPinReason(false)} disabled={pinBusy}>取消</button>
+                            </div>
+                        )}
+                        {pinned && !confirmUnpin && (
+                            <button style={styles.button} onClick={() => setConfirmUnpin(true)} disabled={pinBusy}>
+                                取消固定
+                            </button>
+                        )}
+                        {pinned && confirmUnpin && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                <span style={{ fontSize: 12, color: '#b42318' }}>
+                                    已过期对象可能立即进入清理队列，确认取消固定？
+                                </span>
+                                <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onUnpin} disabled={pinBusy}>
+                                    {pinBusy ? '处理中...' : '确认取消固定'}
+                                </button>
+                                <button style={styles.button} onClick={() => setConfirmUnpin(false)} disabled={pinBusy}>返回</button>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+            {pinError && <div style={styles.inlineError}>{safeText(pinError)}</div>}
             {artifactError && <div style={styles.inlineError}>{safeText(artifactError)}</div>}
             {hasRegisteredArtifacts ? (
                 <div style={styles.fileList}>
@@ -897,7 +1008,9 @@ function ArtifactsPanel({ files, artifacts, artifactLinks, artifactError, onRefr
                                     <div style={styles.fileName}>{displayFileName(artifact.name)}</div>
                                     <div style={styles.fileMeta}>
                                         {artifact.content_type || 'application/octet-stream'} · {formatSize(artifact.size)} · {artifact.kind || 'artifact'}
-                                        {link?.expiresAt ? ` · 过期 ${formatTime(link.expiresAt)}` : ''}
+                                        {artifact.retention_class ? ` · ${artifact.retention_class}` : ''}
+                                        {artifact.expires_at ? ` · 保留至 ${formatTime(artifact.expires_at)}` : ''}
+                                        {link?.expiresAt ? ` · 链接过期 ${formatTime(link.expiresAt)}` : ''}
                                     </div>
                                 </div>
                                 <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
@@ -944,6 +1057,30 @@ function ArtifactsPanel({ files, artifacts, artifactLinks, artifactError, onRefr
                 </div>
             ) : (
                 <p style={{ textAlign: 'center', padding: 24, color: '#667085', margin: 0 }}>暂无产物文件</p>
+            )}
+            {cleaned.length > 0 && (
+                <div style={{ marginTop: 16, borderTop: '1px solid #eaecf0', paddingTop: 12 }}>
+                    <button style={{ ...styles.button, fontSize: 12, color: '#475467' }} onClick={() => setShowCleaned(v => !v)}>
+                        {showCleaned ? '收起' : '展开'} 已清理产物（{cleaned.length}）
+                    </button>
+                    {showCleaned && (
+                        <div style={{ marginTop: 10, ...styles.fileList }}>
+                            {cleaned.map((artifact) => (
+                                <div key={artifact.id} style={{ ...styles.fileItem, opacity: 0.75 }}>
+                                    <div style={{ minWidth: 0 }}>
+                                        <div style={styles.fileName}>{displayFileName(artifact.name)}</div>
+                                        <div style={styles.fileMeta}>
+                                            {artifact.kind || 'artifact'} · 原大小 {formatSize(artifact.size)}
+                                            {artifact.delete_reason ? ` · ${artifact.delete_reason}` : ''}
+                                            {artifact.deleted_at ? ` · ${formatTime(artifact.deleted_at)}` : ''}
+                                        </div>
+                                    </div>
+                                    <span style={{ color: '#98a2b3', fontSize: 12, flexShrink: 0 }}>已清理</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
             )}
         </div>
     );

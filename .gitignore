@@ -87,8 +87,6 @@ web_frontend/node_modules/
 .agents/
 skills-lock.json
 .claude/
-.workbuddy/memory/MEMORY.md
-.workbuddy/memory/2026-08-19.md
-.workbuddy/memory/2026-08-20.md
-.workbuddy/memory/2026-08-22.md
-.workbuddy/memory/2026-08-23.md
+
+# ----- WorkBuddy 项目数据（记忆/临时分析文件，不入库）-----
+.workbuddy/

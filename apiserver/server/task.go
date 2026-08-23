@@ -92,6 +92,8 @@ type TaskResultNotifyReq struct {
 	Partial        bool   `json:"partial"`
 }
 
+var errArtifactTombstoned = errors.New("artifact key belongs to a deleted tombstone")
+
 // CreateTask 创建性能采集任务
 // POST /api/v1/tasks
 func (s *APIServer) CreateTask(c *gin.Context) {
@@ -309,6 +311,19 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 
 	endTime := time.Now()
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		keys := []string{req.CosKey}
+		if strings.TrimSpace(req.ManifestKey) != "" {
+			keys = append(keys, req.ManifestKey)
+		}
+		var tombstones int64
+		if err := tx.Model(&model.Artifact{}).
+			Where("task_tid = ? AND object_key IN ? AND deleted_at IS NOT NULL", task.TID, keys).
+			Count(&tombstones).Error; err != nil {
+			return err
+		}
+		if tombstones > 0 {
+			return errArtifactTombstoned
+		}
 		if task.Status != TaskStatusDone {
 			currentStatus := task.Status
 			shouldAdvanceToDone := true
@@ -396,8 +411,12 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		if err := s.ensureAnalysisQueuedTx(tx, task.TID, req.CosKey, req.ArtifactSize); err != nil {
 			return err
 		}
+		if err := ensureManifestArtifactTx(tx, task.TID, req.AttemptID, req.ManifestKey); err != nil {
+			return err
+		}
 		var artifact model.Artifact
-		if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ?", task.TID, model.ArtifactKindRaw, req.CosKey).First(&artifact).Error; err == nil {
+		// 只允许更新非墓碑行：同 key 的迟到通知不允许复活已删除的 tombstone。
+		if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ? AND deleted_at IS NULL", task.TID, model.ArtifactKindRaw, req.CosKey).First(&artifact).Error; err == nil {
 			updates := map[string]interface{}{}
 			if req.ArtifactSize > 0 {
 				updates["size"] = req.ArtifactSize
@@ -411,6 +430,9 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 			}
 			if req.Partial {
 				updates["status"] = model.ArtifactStatusUploading
+			} else {
+				// 完整通知到达：uploading 必须切回 ready（partial 上传的最终确认）。
+				updates["status"] = model.ArtifactStatusReady
 			}
 			if len(updates) > 0 {
 				if err := tx.Model(&artifact).Updates(updates).Error; err != nil {
@@ -422,6 +444,22 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 		return s.finishTaskAttemptForNotifyTx(tx, task.TID, req.AttemptID, "", "", []string{req.CosKey}, 0)
 	})
 	if err != nil {
+		if errors.Is(err, errArtifactTombstoned) {
+			// 上传发生在通知之前；拒绝墓碑复活时同步删除迟到对象，避免留下
+			// 数据库不可见的同 key 孤儿。删除失败仍会被历史孤儿扫尾兜底。
+			if s.StorageConnected() {
+				for _, key := range []string{req.CosKey, req.ManifestKey} {
+					if strings.TrimSpace(key) == "" {
+						continue
+					}
+					if deleteErr := s.Storage.DeleteObject(c.Request.Context(), s.Config.Storage.Bucket, key); deleteErr != nil {
+						s.Logger.Warn("拒绝墓碑复活后删除迟到对象失败", zap.String("object_key", util.RedactObjectKey(key)), zap.Error(deleteErr))
+					}
+				}
+			}
+			c.JSON(http.StatusConflict, gin.H{"code": http.StatusConflict, "message": "产物已进入删除墓碑，拒绝同 key 迟到上传"})
+			return
+		}
 		incTaskNotifyFailed()
 		incArtifactUploadFailed()
 		s.Logger.Error("处理采集结果通知失败",
@@ -448,6 +486,26 @@ func (s *APIServer) NotifyTaskResult(c *gin.Context) {
 	)
 	s.refreshCompositeParent(task)
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"tid": task.TID}})
+}
+
+func ensureManifestArtifactTx(tx *gorm.DB, tid string, attemptID uint, manifestKey string) error {
+	manifestKey = strings.TrimSpace(manifestKey)
+	if tx == nil || tid == "" || manifestKey == "" {
+		return nil
+	}
+	manifest := model.Artifact{
+		TaskTID:     tid,
+		AttemptID:   attemptID,
+		Kind:        model.ArtifactKindManifest,
+		ObjectKey:   manifestKey,
+		ContentType: "application/json",
+		Status:      model.ArtifactStatusReady,
+		CreatedAt:   time.Now(),
+	}
+	return tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "task_tid"}, {Name: "kind"}, {Name: "object_key"}},
+		DoNothing: true,
+	}).Create(&manifest).Error
 }
 
 func (s *APIServer) ensureAnalysisQueued(tid string, objectKey string, size int64) error {
@@ -491,7 +549,8 @@ func (s *APIServer) ensureAnalysisQueuedTx(tx *gorm.DB, tid string, objectKey st
 	}
 	inputArtifactIDs := []uint{}
 	var savedArtifact model.Artifact
-	if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ?", tid, model.ArtifactKindRaw, objectKey).First(&savedArtifact).Error; err == nil {
+	// 排除墓碑：tombstone 不允许被重新作为分析输入（同 key 迟到通知保持墓碑）。
+	if err := tx.Where("task_tid = ? AND kind = ? AND object_key = ? AND deleted_at IS NULL", tid, model.ArtifactKindRaw, objectKey).First(&savedArtifact).Error; err == nil {
 		inputArtifactIDs = append(inputArtifactIDs, savedArtifact.ID)
 	}
 	inputArtifactJSON, _ := util.MarshalJSONB(inputArtifactIDs)
@@ -755,6 +814,7 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	statusEvents := s.fetchTaskStatusEvents(task.TID)
 	attempts := s.fetchTaskAttempts(task.TID)
 	artifacts := s.fetchArtifacts(task.TID)
+	deletedArtifacts := s.fetchDeletedArtifacts(task.TID)
 	if childPayload, err := s.compositeChildrenPayload(task.TID); err == nil {
 		result["children"] = childPayload
 	}
@@ -799,12 +859,17 @@ func (s *APIServer) taskDetailPayload(task model.HotmethodTask) gin.H {
 	}
 	publicArtifacts := make([]gin.H, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		publicArtifacts = append(publicArtifacts, publicArtifact(artifact))
+		publicArtifacts = append(publicArtifacts, publicArtifact(artifact, task.ArtifactsPinned))
+	}
+	cleanedArtifacts := make([]gin.H, 0, len(deletedArtifacts))
+	for _, artifact := range deletedArtifacts {
+		cleanedArtifacts = append(cleanedArtifacts, publicArtifact(artifact, task.ArtifactsPinned))
 	}
 
 	result["status_events"] = statusEvents
 	result["attempts"] = attempts
 	result["artifacts"] = publicArtifacts
+	result["cleaned_artifacts"] = cleanedArtifacts
 	result["files"] = files
 
 	return result
@@ -817,25 +882,29 @@ func taskDetailResponse(task model.HotmethodTask) gin.H {
 	}
 
 	return gin.H{
-		"id":              task.ID,
-		"tid":             task.TID,
-		"name":            task.Name,
-		"task_kind":       task.TaskKind,
-		"request_id":      task.RequestID,
-		"type":            task.Type,
-		"profiler_type":   task.ProfilerType,
-		"target_ip":       task.TargetIP,
-		"request_params":  params,
-		"status":          task.Status,
-		"status_info":     task.StatusInfo,
-		"analysis_status": task.AnalysisStatus,
-		"uid":             task.UID,
-		"user_name":       task.UserName,
-		"create_time":     task.CreateTime,
-		"begin_time":      task.BeginTime,
-		"end_time":        task.EndTime,
-		"master_task_tid": task.MasterTaskTID,
-		"can_manage":      task.CanManage,
+		"id":                   task.ID,
+		"tid":                  task.TID,
+		"name":                 task.Name,
+		"task_kind":            task.TaskKind,
+		"request_id":           task.RequestID,
+		"type":                 task.Type,
+		"profiler_type":        task.ProfilerType,
+		"target_ip":            task.TargetIP,
+		"request_params":       params,
+		"status":               task.Status,
+		"status_info":          task.StatusInfo,
+		"analysis_status":      task.AnalysisStatus,
+		"uid":                  task.UID,
+		"user_name":            task.UserName,
+		"create_time":          task.CreateTime,
+		"begin_time":           task.BeginTime,
+		"end_time":             task.EndTime,
+		"master_task_tid":      task.MasterTaskTID,
+		"can_manage":           task.CanManage,
+		"artifacts_pinned":     task.ArtifactsPinned,
+		"artifacts_pinned_at":  task.ArtifactsPinnedAt,
+		"artifacts_pinned_by":  task.ArtifactsPinnedBy,
+		"artifacts_pin_reason": task.ArtifactsPinReason,
 	}
 }
 
@@ -1249,7 +1318,19 @@ func (s *APIServer) fetchTaskAttempts(tid string) []model.TaskAttempt {
 
 func (s *APIServer) fetchArtifacts(tid string) []model.Artifact {
 	var artifacts []model.Artifact
-	if err := s.DB.Where("task_tid = ?", tid).Order("created_at ASC, id ASC").Find(&artifacts).Error; err != nil || artifacts == nil {
+	// 默认只展示可用产物（排除 deleted 墓碑；deleting 属于清理中，同样不展示为可用）。
+	if err := s.DB.Where("task_tid = ? AND deleted_at IS NULL AND status = ?", tid, model.ArtifactStatusReady).
+		Order("created_at ASC, id ASC").Find(&artifacts).Error; err != nil || artifacts == nil {
+		return []model.Artifact{}
+	}
+	return artifacts
+}
+
+// fetchDeletedArtifacts 返回任务的 deleted 墓碑（已清理产物折叠区）。
+func (s *APIServer) fetchDeletedArtifacts(tid string) []model.Artifact {
+	var artifacts []model.Artifact
+	if err := s.DB.Where("task_tid = ? AND deleted_at IS NOT NULL", tid).
+		Order("deleted_at DESC, id DESC").Find(&artifacts).Error; err != nil || artifacts == nil {
 		return []model.Artifact{}
 	}
 	return artifacts
@@ -1285,11 +1366,11 @@ func (s *APIServer) DeleteTask(c *gin.Context) {
 
 	s.Logger.Info("任务已删除", zap.String("tid", tid))
 
-	if s.StorageConnected() {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-		defer cancel()
-		s.cleanupTaskArtifacts(ctx, tid, true)
-	}
+	// 即使对象存储当前不可用也必须登记 deleting 并进入重试状态；否则任务
+	// 已软删除后将失去后续回收入口。未登记对象的前缀扫描仍只在存储可用时执行。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	s.cleanupTaskArtifacts(ctx, tid, true)
 
 	s.RespondOK(c, gin.H{"message": "任务已删除"})
 }
@@ -1484,6 +1565,8 @@ func (s *APIServer) ServeLocalFile(c *gin.Context) {
 
 // ViewCOSFile 通过 apiserver 代理查看对象存储中的小型可视化产物。
 // 主要用于修正历史 SVG 对象的 Content-Type，避免浏览器因 nosniff 拒绝渲染。
+// 阶段二：key 可以是逻辑名（Artifact.object_key）或物理 key；内部经
+// Blob resolver 解析；SVG/folded 等浏览器资源透明 gzip 解码。
 // GET /api/v1/cosfiles/view?key=tid/flamegraph.svg
 func (s *APIServer) ViewCOSFile(c *gin.Context) {
 	key := c.Query("key")
@@ -1499,7 +1582,11 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "仅支持查看 SVG 可视化产物")
 		return
 	}
-	if _, serr := s.taskService().requireReadableTask(objectKeyTID(key), s.AuthContext(c)); serr != nil {
+	tid := strings.TrimSpace(c.Query("tid"))
+	if tid == "" {
+		tid = objectKeyTID(key)
+	}
+	if _, serr := s.taskService().requireReadableTask(tid, s.AuthContext(c)); serr != nil {
 		s.RespondHTTPError(c, serr.HTTPStatus, serr.Code, serr.Message)
 		return
 	}
@@ -1511,7 +1598,8 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, key)
+	resolved := s.resolveBlobForKey(ctx, key)
+	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, resolved.PhysicalKey)
 	if err != nil {
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在")
 		return
@@ -1519,10 +1607,14 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 	defer reader.Close()
 
 	c.Header("Content-Type", mimeType(key))
+	// 透明 gzip：浏览器按 Content-Encoding 自动解码，无需前端感知物理压缩。
+	if resolved.Blob != nil && resolved.Blob.ContentEncoding != "" {
+		c.Header("Content-Encoding", resolved.Blob.ContentEncoding)
+	}
 	c.Header("Content-Disposition", contentDisposition("inline", filepath.Base(key)))
 	c.Status(http.StatusOK)
 	if _, err := io.Copy(c.Writer, reader); err != nil {
-		s.Logger.Warn("代理输出对象存储文件失败", zap.String("key", key), zap.Error(err))
+		s.Logger.Warn("代理输出对象存储文件失败", zap.String("key", util.RedactObjectKey(key)), zap.Error(err))
 	}
 }
 
@@ -1532,6 +1624,8 @@ func (s *APIServer) ViewCOSFile(c *gin.Context) {
 // 去重共享对象，key 是 kernel-symbols/<sha256>/kallsyms，猜不出真实 tid。
 // 调用方（DownloadArtifact）已经用真实 tid 做过鉴权，这里优先信任显式传入
 // 的 tid 参数，没传时才回退到从 key 里猜（兼容旧链接/ListCOSFiles 场景）。
+// 阶段二：key 可以是逻辑名或物理 key，内部经 Blob resolver 解析。
+// SVG/folded 透明 gzip；pprof 作为文件格式本身保持 .gz 原始字节。
 func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 	key := c.Query("key")
 	if key == "" {
@@ -1558,7 +1652,8 @@ func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, key)
+	resolved := s.resolveBlobForKey(ctx, key)
+	reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, resolved.PhysicalKey)
 	if err != nil {
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "文件不存在")
 		return
@@ -1567,10 +1662,14 @@ func (s *APIServer) DownloadCOSFile(c *gin.Context) {
 
 	filename := filepath.Base(key)
 	c.Header("Content-Type", mimeType(key))
+	// 透明 gzip 只用于浏览器展示类资源；pprof 下载保持 .gz 原样。
+	if resolved.Blob != nil && resolved.Blob.ContentEncoding != "" {
+		c.Header("Content-Encoding", resolved.Blob.ContentEncoding)
+	}
 	c.Header("Content-Disposition", contentDisposition("attachment", filename))
 	c.Status(http.StatusOK)
 	if _, err := io.Copy(c.Writer, reader); err != nil {
-		s.Logger.Warn("代理下载对象存储文件失败", zap.String("key", key), zap.Error(err))
+		s.Logger.Warn("代理下载对象存储文件失败", zap.String("key", util.RedactObjectKey(key)), zap.Error(err))
 	}
 }
 
@@ -1619,43 +1718,98 @@ func objectKeyTID(key string) string {
 	return ""
 }
 
-// listTaskFiles 列出指定 tid 下的所有产物文件，并生成签名下载 URL
+// listTaskFiles 列出指定 tid 下的所有产物文件，并生成签名下载 URL。
+// 阶段二：产物以 Artifact 账本为准（逻辑名 + blob 物理 key），
+// MinIO 列表只用于补充账本外的历史/孤儿对象（key 直接当物理 key 用）。
 func (s *APIServer) listTaskFiles(tid string) ([]map[string]interface{}, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	bucket := s.Config.Storage.Bucket
-	prefix := tid + "/" // MinIO 中以 tid/ 为前缀存放该任务的所有产物
+	var files []map[string]interface{}
+	seen := map[string]bool{}
 
-	objects, err := s.Storage.ListObjects(ctx, bucket, prefix)
-	if err != nil {
+	// 1) Artifact 账本（含 blob 引用）为准。
+	var artifacts []model.Artifact
+	if err := s.DB.WithContext(ctx).
+		Where("task_tid = ? AND deleted_at IS NULL AND status NOT IN ?", tid,
+			[]string{model.ArtifactStatusDeleting, model.ArtifactStatusDeleted}).
+		Order("id ASC").Find(&artifacts).Error; err != nil {
 		return nil, err
 	}
-
-	var files []map[string]interface{}
-	for _, obj := range objects {
-		contentType := obj.ContentType
-		if contentType == "" || contentType == "application/octet-stream" {
-			contentType = mimeType(obj.Name)
+	blobCache := map[uint]*model.StorageBlob{}
+	for i := range artifacts {
+		a := &artifacts[i]
+		if a.ObjectKey == "" || seen[a.ObjectKey] {
+			continue
+		}
+		seen[a.ObjectKey] = true
+		name := a.ObjectKey
+		size := a.Size
+		contentType := firstNonEmpty(a.ContentType, mimeType(name))
+		if a.BlobID != nil && *a.BlobID > 0 {
+			blob, ok := blobCache[*a.BlobID]
+			if !ok {
+				blob = &model.StorageBlob{}
+				if err := s.DB.WithContext(ctx).Where("id = ?", *a.BlobID).First(blob).Error; err != nil {
+					blob = nil
+				}
+				blobCache[*a.BlobID] = blob
+			}
+			if blob != nil && blob.ObjectKey != "" {
+				if blob.StoredSize > 0 {
+					size = blob.StoredSize
+				}
+				if blob.ContentType != "" {
+					contentType = blob.ContentType
+				}
+			}
 		}
 		fileInfo := map[string]interface{}{
-			"name":          obj.Name,
-			"size":          obj.Size,
-			"last_modified": obj.LastModified,
+			"name":          name,
+			"size":          size,
 			"content_type":  contentType,
+			"artifact_id":   a.ID,
+			"kind":          a.Kind,
+			"retention":     a.Retention,
+			"last_modified": a.CreatedAt,
 		}
-
-		fileInfo["download_url"] = "/api/v1/cosfiles/download?key=" + url.QueryEscape(obj.Name)
-		if filepath.Ext(obj.Name) == ".svg" {
-			fileInfo["view_url"] = "/api/v1/cosfiles/view?key=" + url.QueryEscape(obj.Name)
+		fileInfo["download_url"] = "/api/v1/cosfiles/download?key=" + url.QueryEscape(name) + "&tid=" + url.QueryEscape(tid)
+		if filepath.Ext(name) == ".svg" {
+			fileInfo["view_url"] = "/api/v1/cosfiles/view?key=" + url.QueryEscape(name) + "&tid=" + url.QueryEscape(tid)
 		}
 		files = append(files, fileInfo)
 	}
 
-	if files == nil {
-		files = []map[string]interface{}{}
+	// 2) MinIO 列表补充账本外对象（历史遗留/无元数据文件）。
+	prefix := tid + "/"
+	objects, err := s.Storage.ListObjects(ctx, bucket, prefix)
+	if err != nil {
+		// 账本数据仍然有效；MinIO 列表失败不阻塞。
+		s.Logger.Warn("列出任务文件失败（MinIO）", zap.String("tid", tid), zap.Error(err))
+	} else {
+		for _, obj := range objects {
+			if seen[obj.Name] {
+				continue
+			}
+			seen[obj.Name] = true
+			contentType := obj.ContentType
+			if contentType == "" || contentType == "application/octet-stream" {
+				contentType = mimeType(obj.Name)
+			}
+			fileInfo := map[string]interface{}{
+				"name":          obj.Name,
+				"size":          obj.Size,
+				"last_modified": obj.LastModified,
+				"content_type":  contentType,
+			}
+			fileInfo["download_url"] = "/api/v1/cosfiles/download?key=" + url.QueryEscape(obj.Name) + "&tid=" + url.QueryEscape(tid)
+			if filepath.Ext(obj.Name) == ".svg" {
+				fileInfo["view_url"] = "/api/v1/cosfiles/view?key=" + url.QueryEscape(obj.Name) + "&tid=" + url.QueryEscape(tid)
+			}
+			files = append(files, fileInfo)
+		}
 	}
-
 	return files, nil
 }
 

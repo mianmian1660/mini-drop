@@ -48,4 +48,8 @@ type Storage interface {
 
 	// ObjectExists 检查文件是否存在
 	ObjectExists(ctx context.Context, bucket, key string) (bool, error)
+
+	// StatObject 返回对象大小（字节）；对象不存在时返回 os.ErrNotExist 语义错误。
+	// 阶段二 Blob 回填用它校准物理大小，不重新下载内容。
+	StatObject(ctx context.Context, bucket, key string) (int64, error)
 }

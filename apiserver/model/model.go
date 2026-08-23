@@ -94,16 +94,22 @@ type HotmethodTask struct {
 	// 重复请求会命中已有任务而不是新建一条（新复刻指南 4.2 节）。
 	IdempotencyKey *string `gorm:"column:idempotency_key;size:128;uniqueIndex:idx_task_uid_idempotency" json:"idempotency_key,omitempty"`
 	// CreateTime 同时是 idx_tasks_uid_created 和 idx_tasks_target_status 两个联合索引的最后一列。
-	CreateTime      time.Time      `gorm:"column:create_time;index:idx_tasks_uid_created,priority:2;index:idx_tasks_target_status,priority:3" json:"create_time"`
-	BeginTime       *time.Time     `gorm:"column:begin_time" json:"begin_time"`
-	EndTime         *time.Time     `gorm:"column:end_time" json:"end_time"`
-	MasterTaskTID   string         `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
-	DeadlineUnixMS  int64          `gorm:"column:deadline_unix_ms" json:"deadline_unix_ms"`
-	ResourceBudget  []byte         `gorm:"column:resource_budget;type:jsonb" json:"resource_budget"`
-	CancelRequested bool           `gorm:"column:cancel_requested;default:false;index" json:"cancel_requested"`
-	CanceledAt      *time.Time     `gorm:"column:canceled_at" json:"canceled_at"`
-	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
-	CanManage       bool           `gorm:"-" json:"can_manage"`
+	CreateTime      time.Time  `gorm:"column:create_time;index:idx_tasks_uid_created,priority:2;index:idx_tasks_target_status,priority:3" json:"create_time"`
+	BeginTime       *time.Time `gorm:"column:begin_time" json:"begin_time"`
+	EndTime         *time.Time `gorm:"column:end_time" json:"end_time"`
+	MasterTaskTID   string     `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
+	DeadlineUnixMS  int64      `gorm:"column:deadline_unix_ms" json:"deadline_unix_ms"`
+	ResourceBudget  []byte     `gorm:"column:resource_budget;type:jsonb" json:"resource_budget"`
+	CancelRequested bool       `gorm:"column:cancel_requested;default:false;index" json:"cancel_requested"`
+	CanceledAt      *time.Time `gorm:"column:canceled_at" json:"canceled_at"`
+	// 存储阶段一：任务级 Artifact 固定（pin）。任务字段是 pin 的唯一当前状态来源：
+	// 任务固定后新产生的 Artifact 自动受保护，无需批量复制 pin 状态。
+	ArtifactsPinned    bool           `gorm:"column:artifacts_pinned;default:false" json:"artifacts_pinned"`
+	ArtifactsPinnedAt  *time.Time     `gorm:"column:artifacts_pinned_at" json:"artifacts_pinned_at"`
+	ArtifactsPinnedBy  string         `gorm:"column:artifacts_pinned_by;size:128" json:"artifacts_pinned_by"`
+	ArtifactsPinReason string         `gorm:"column:artifacts_pin_reason;size:256" json:"artifacts_pin_reason"`
+	DeletedAt          gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	CanManage          bool           `gorm:"-" json:"can_manage"`
 }
 
 // ----------------------------------------------------------
@@ -250,5 +256,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&SymbolFile{},
 		&KernelSymbolFile{},
 		&TaskBuildID{},
+		&StorageBlob{},
+		&StorageObjectGC{},
+		&StorageMigrationFailure{},
 	)
 }

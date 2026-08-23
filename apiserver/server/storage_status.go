@@ -91,8 +91,51 @@ func (s *APIServer) logStorageLevel(snap StorageDiskSnapshot, changed bool) {
 	}
 }
 
-// StorageStatus 返回最新磁盘快照（每次请求实时读取一次 statfs）。
+// StorageStatus 返回最新磁盘快照 + Artifact 生命周期统计 + Blob 统计。
 // GET /api/v1/storage/status（鉴权分组内）
 func (s *APIServer) StorageStatus(c *gin.Context) {
-	s.RespondOK(c, s.currentStorageSnapshot())
+	snap := s.currentStorageSnapshot()
+	// 每次请求实时刷新统计（量级可控：聚合 SQL）。
+	s.collectLifecycleStats(c.Request.Context())
+	lifecycle := s.lifecycleStatsSnapshot()
+	blob := s.collectBlobStats(c.Request.Context())
+	s.RespondOK(c, gin.H{
+		"path":                 snap.Path,
+		"total_bytes":          snap.TotalBytes,
+		"available_bytes":      snap.AvailableBytes,
+		"used_bytes":           snap.UsedBytes,
+		"level":                snap.Level,
+		"collection_allowed":   snap.CollectionAllowed,
+		"new_collection_allowed": snap.CollectionAllowed,
+		"maintenance_allowed":  blob.MaintenanceAllowed,
+		"checked_at":           snap.CheckedAt,
+		"lifecycle_mode":       lifecycle.Mode,
+		"policy_version":       lifecycle.PolicyVersion,
+		"reconcile_backlog":    lifecycle.ReconcileBacklog,
+		"ready_count":          lifecycle.ReadyCount,
+		"ready_bytes":          lifecycle.ReadyBytes,
+		"pinned_count":         lifecycle.PinnedCount,
+		"pinned_bytes":         lifecycle.PinnedBytes,
+		"due_count":            lifecycle.DueCount,
+		"due_bytes":            lifecycle.DueBytes,
+		"deleting_count":       lifecycle.DeletingCount,
+		"deleting_bytes":       lifecycle.DeletingBytes,
+		"deleted_count":        lifecycle.DeletedCount,
+		"deleted_bytes":        lifecycle.DeletedBytes,
+		"lifecycle_last_run":   lifecycle.LastRunAt,
+		"lifecycle_last_error": lifecycle.LastError,
+		// 阶段二：Blob 物理/逻辑容量
+		"artifact_logical_bytes":  blob.BlobLogicalBytes,
+		"blob_physical_bytes":     blob.BlobPhysicalBytes,
+		"blob_count":              blob.BlobCount,
+		"deduplicated_bytes":      blob.BlobDedupBytes,
+		"blob_by_status_count":    blob.ByStatusCount,
+		"blob_by_status_bytes":    blob.ByStatusBytes,
+		"migration_backlog":       blob.Backlog,
+		"backfill_backlog":        blob.BackfillBacklog,
+		"migration_failures":      blob.FailedObjects,
+		"migration_reclaimed_bytes": blob.ReclaimedBytes,
+		"migration_last_run":      blob.LastRunAt,
+		"migration_last_error":    blob.LastError,
+	})
 }

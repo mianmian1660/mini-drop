@@ -189,7 +189,7 @@ def t_analyze_bpf_prefers_raw_bpf_artifact():
             if key == "tid-bpf/raw.bpf":
                 return b"@io_lat_us:\n[1, 2) 5\n[2, 4) 10\n"
             return None
-        def put_object(self, bucket, key, data, content_type):
+        def put_object(self, bucket, key, data, content_type, content_encoding=""):
             self.writes[key] = content_type
         def presigned_get_url(self, bucket, key):
             return "http://example/" + key
@@ -233,7 +233,7 @@ def t_analyze_bpf_falls_back_to_legacy_perf_data():
             if key == "tid-old/perf.data":
                 return b"@sched_lat_us:\n[0, 10) 3\n"
             return None
-        def put_object(self, bucket, key, data, content_type):
+        def put_object(self, bucket, key, data, content_type, content_encoding=""):
             self.writes[key] = content_type
         def presigned_get_url(self, bucket, key):
             return "http://example/" + key
@@ -290,7 +290,7 @@ class _FakeMemleakStorage:
         return self.has_object
     def get_object(self, bucket, key):
         return None
-    def put_object(self, bucket, key, data, content_type):
+    def put_object(self, bucket, key, data, content_type, content_encoding=""):
         self.writes[key] = content_type
     def presigned_get_url(self, bucket, key):
         return "http://example/" + key
@@ -728,6 +728,157 @@ def t_finalize_success_updates_job_and_task_in_one_connection():
     assert "UPDATE analysis_jobs" in sql and "output_artifact_ids" in sql
     assert "UPDATE hotmethod_tasks" in sql
     assert "INSERT INTO task_status_events" in sql
+
+def t_record_result_artifacts_removes_upload_rejected_by_tombstone():
+    from analysis_daemon import record_result_artifacts
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            self.fetchone_value = (7,) if "SELECT id FROM task_attempts" in query else None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakeStorage:
+        def __init__(self):
+            self.deleted = []
+        def stat_object(self, bucket, key):
+            return 123
+        def delete_object(self, bucket, key):
+            self.deleted.append((bucket, key))
+
+    storage = FakeStorage()
+    ids = record_result_artifacts(
+        FakeConn(), "tid", ["tid/top.json"], storage=storage, bucket="drop-data"
+    )
+    assert ids == []
+    assert storage.deleted == [("drop-data", "tid/top.json")]
+
+def t_record_result_artifacts_never_deletes_shared_cas_on_tombstone():
+    from analysis_daemon import record_result_artifacts
+
+    class FakeCursor:
+        rowcount = 1
+        def execute(self, query, params=None):
+            if "SELECT id FROM task_attempts" in query:
+                self.fetchone_value = (7,)
+            elif "INSERT INTO storage_blobs" in query:
+                self.fetchone_value = (11,)
+            elif "INSERT INTO artifacts" in query:
+                self.fetchone_value = None
+            else:
+                self.fetchone_value = None
+        def fetchone(self):
+            return self.fetchone_value
+        def close(self):
+            pass
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakeStorage:
+        def __init__(self):
+            self.deleted = []
+        def delete_object(self, bucket, key):
+            self.deleted.append((bucket, key))
+
+    descriptor = {
+        "object_key": "tid/flamegraph.svg", "blob_key": "blobs/sha256/aa/x/svg-v1.gz",
+        "kind": "RESULT", "format": "svg", "schema_version": "1",
+        "compression": "gzip", "logical_sha256": "a" * 64,
+        "stored_sha256": "b" * 64, "logical_size": 100, "stored_size": 20,
+        "content_encoding": "gzip", "content_type": "image/svg+xml",
+    }
+    storage = FakeStorage()
+    ids = record_result_artifacts(FakeConn(), "tid", [descriptor],
+                                  storage=storage, bucket="drop-data")
+    assert ids == []
+    assert storage.deleted == []
+
+def t_blob_registration_rejects_deleting_blob():
+    from analysis_daemon import _upsert_blob_row
+    from analyzer_contract import AnalyzerTemporaryError
+
+    class FakeCursor:
+        rowcount = 0
+        def execute(self, query, params=None):
+            if "INSERT INTO storage_blobs" in query:
+                self.fetchone_value = None
+            elif "SELECT id, status" in query:
+                self.fetchone_value = (11, "deleting")
+            else:
+                self.fetchone_value = None
+        def fetchone(self):
+            return self.fetchone_value
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    descriptor = {
+        "blob_key": "blobs/sha256/aa/x/svg-v1.gz", "format": "svg",
+        "schema_version": "1", "compression": "gzip",
+        "logical_sha256": "a" * 64, "stored_sha256": "b" * 64,
+        "logical_size": 100, "stored_size": 20,
+        "content_encoding": "gzip", "content_type": "image/svg+xml",
+    }
+    try:
+        _upsert_blob_row(FakeConn(), descriptor)
+        raise AssertionError("deleting blob must reject registration")
+    except AnalyzerTemporaryError:
+        pass
+
+def t_manifest_includes_descriptor_outputs_without_payload():
+    from analyzer_contract import build_manifest
+    descriptor = {
+        "object_key": "tid/flamegraph.svg", "blob_key": "blobs/sha256/aa/x/svg-v1.gz",
+        "kind": "RESULT", "format": "svg", "schema_version": "1",
+        "compression": "gzip", "logical_sha256": "a" * 64,
+        "stored_sha256": "b" * 64, "logical_size": 100, "stored_size": 20,
+        "content_encoding": "gzip", "content_type": "image/svg+xml", "_payload": b"gzip",
+    }
+    manifest = build_manifest(task_id="tid", job_id=1, pipeline="perf",
+                              analyzer_name="cpu", analyzer_version="v1",
+                              input_artifacts=[], outputs=[descriptor, "tid/suggestions.md"])
+    outputs = manifest["output_artifacts"]
+    assert [item["object_key"] for item in outputs] == [
+        "tid/flamegraph.svg", "tid/suggestions.md"
+    ]
+    assert outputs[0]["logical_sha256"] == "a" * 64
+    assert "_payload" not in outputs[0]
+
+def t_pprof_enforce_rejects_upload_failure():
+    import hotmethod_analyzer as hm
+    from analyzer_contract import AnalyzerTemporaryError
+
+    old = os.environ.get("PORTABLE_PROFILE_MODE")
+    os.environ["PORTABLE_PROFILE_MODE"] = "enforce"
+    try:
+        try:
+            hm._upload_cpu_pprof(False, None, "drop-data", {"_payload": b"x"}, "tid")
+            raise AssertionError("enforce upload failure must raise")
+        except AnalyzerTemporaryError:
+            pass
+    finally:
+        if old is None:
+            os.environ.pop("PORTABLE_PROFILE_MODE", None)
+        else:
+            os.environ["PORTABLE_PROFILE_MODE"] = old
+
+def t_task_time_nanos_uses_database_timestamps():
+    from datetime import datetime, timezone
+    from hotmethod_analyzer import _task_time_nanos
+    start = datetime(2026, 8, 23, 1, 2, 3, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 23, 1, 2, 5, tzinfo=timezone.utc)
+    start_ns, duration_ns = _task_time_nanos({"create_time": start, "end_time": end})
+    assert start_ns == int(start.timestamp() * 1e9)
+    assert duration_ns == 2_000_000_000
 
 def t_stage6_collector_declarations_are_gated():
     from analyzer_registry import collector_declarations

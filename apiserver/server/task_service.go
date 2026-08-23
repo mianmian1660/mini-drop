@@ -270,9 +270,22 @@ func (svc *TaskService) ListArtifacts(tid string, auth AuthContext) (gin.H, *Ser
 	artifacts := svc.server.fetchArtifacts(task.TID)
 	out := make([]gin.H, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		out = append(out, publicArtifact(artifact))
+		out = append(out, publicArtifact(artifact, task.ArtifactsPinned))
 	}
-	return gin.H{"artifacts": out, "total": len(out)}, nil
+	cleaned := svc.server.fetchDeletedArtifacts(task.TID)
+	cleanedOut := make([]gin.H, 0, len(cleaned))
+	for _, artifact := range cleaned {
+		cleanedOut = append(cleanedOut, publicArtifact(artifact, false))
+	}
+	return gin.H{
+		"artifacts":         out,
+		"cleaned_artifacts": cleanedOut,
+		"total":             len(out),
+		"pinned":            task.ArtifactsPinned,
+		"pinned_at":         task.ArtifactsPinnedAt,
+		"pinned_by":         task.ArtifactsPinnedBy,
+		"pin_reason":        task.ArtifactsPinReason,
+	}, nil
 }
 
 func (svc *TaskService) DownloadArtifact(tid string, artifactIDRaw string, auth AuthContext) (gin.H, *ServiceError) {
@@ -303,7 +316,7 @@ func (svc *TaskService) DownloadArtifact(tid string, artifactIDRaw string, auth 
 	)
 	svc.server.recordTaskStatusEvent(task.TID, task.Status, task.Status, fmt.Sprintf("用户 %s 生成产物下载链接", auth.UID), "artifact_download")
 	return gin.H{
-		"artifact":   publicArtifact(artifact),
+		"artifact":   publicArtifact(artifact, task.ArtifactsPinned),
 		"url":        downloadURL,
 		"expires_at": time.Now().Add(expires),
 	}, nil
@@ -320,18 +333,26 @@ func (svc *TaskService) requireReadableTask(tid string, auth AuthContext) (model
 	return task, nil
 }
 
-func publicArtifact(artifact model.Artifact) gin.H {
+func publicArtifact(artifact model.Artifact, pinned bool) gin.H {
 	return gin.H{
-		"id":           artifact.ID,
-		"task_tid":     artifact.TaskTID,
-		"attempt_id":   artifact.AttemptID,
-		"kind":         artifact.Kind,
-		"name":         filepath.Base(artifact.ObjectKey),
-		"size":         artifact.Size,
-		"sha256":       artifact.SHA256,
-		"etag":         artifact.ETag,
-		"content_type": artifact.ContentType,
-		"status":       artifact.Status,
-		"created_at":   artifact.CreatedAt,
+		"id":                   artifact.ID,
+		"task_tid":             artifact.TaskTID,
+		"attempt_id":           artifact.AttemptID,
+		"kind":                 artifact.Kind,
+		"name":                 filepath.Base(artifact.ObjectKey),
+		"size":                 artifact.Size,
+		"sha256":               artifact.SHA256,
+		"etag":                 artifact.ETag,
+		"content_type":         artifact.ContentType,
+		"status":               artifact.Status,
+		"retention_class":      artifact.Retention,
+		"expires_at":           artifact.ExpiresAt,
+		"retention_not_before": artifact.RetentionNotBefore,
+		"pinned":               pinned,
+		"compression":          artifact.Compression,
+		"logical_size":         artifact.LogicalSize,
+		"deleted_at":           artifact.DeletedAt,
+		"delete_reason":        artifact.DeleteReason,
+		"created_at":           artifact.CreatedAt,
 	}
 }

@@ -101,7 +101,15 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	go s.startTaskPoller()
 
 	// 启动存储保留期清理器，避免任务产物和 stopped continuous session 长期堆积。
+	// 阶段一起，Artifact 的到期清理改由生命周期循环（observe/enforce）负责，
+	// 这里仅保留 continuous retention 部分。
 	go s.startRetentionCleaner()
+
+	// 存储阶段一：Artifact 生命周期循环（策略重算 + observe/enforce 清理状态机）。
+	go s.startArtifactLifecycleCleaner()
+
+	// 存储阶段二：物理 Blob 后台 worker（回填 / 压缩迁移 / 延迟 GC，按配置开关）。
+	go s.startBlobWorkers()
 
 	// 阶段三：启动内建持续剖析块存储 compactor（按配置开关；未启用时查询
 	// 继续走旧分钟对象，行为与阶段二完全一致）。
@@ -714,6 +722,7 @@ func (s *APIServer) registerRoutes() {
 		api.POST("/tasks/:tid/cancel", s.CancelTask)
 		api.GET("/tasks/:tid/artifacts", s.ListTaskArtifacts)
 		api.GET("/tasks/:tid/artifacts/:artifact_id/download", s.DownloadTaskArtifact)
+		api.POST("/tasks/:tid/artifacts/pin", s.PinTaskArtifacts)
 		api.GET("/tasks/:tid/events/stream", s.StreamTaskEvents)
 		api.GET("/tasks/:tid/suggestions/stream", s.StreamTaskSuggestions)
 

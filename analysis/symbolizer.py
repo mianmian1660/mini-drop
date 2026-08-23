@@ -15,6 +15,7 @@
 # 不应该让整条分析链路失败。
 # ============================================================
 
+import gzip
 import os
 import sys
 
@@ -41,10 +42,11 @@ def get_task_build_ids(conn, tid: str) -> list:
         return []
 
 
-def install_symbol(storage, bucket: str, build_id: str) -> bool:
+def install_symbol(storage, bucket: str, build_id: str, physical_key: str = None,
+                   compression: str = "") -> bool:
     """
-    从 MinIO 下载 symbols/{build_id}，写入 perf 的 build-id 缓存结构
-    ~/.debug/.build-id/<xx>/<rest>/elf。
+    从 MinIO 下载符号（阶段二：已迁移时用物理 CAS key，gzip 压缩时先解压），
+    写入 perf 的 build-id 缓存结构 ~/.debug/.build-id/<xx>/<rest>/elf。
 
     build_id 理论上已经过服务端正则校验（十六进制串），这里仍按不可信
     输入处理：长度过短或包含路径分隔符的一律拒绝，防止被拼进文件路径。
@@ -55,7 +57,7 @@ def install_symbol(storage, bucket: str, build_id: str) -> bool:
         print(f"[symbolizer] build_id 格式不合法，跳过: {build_id!r}", file=sys.stderr)
         return False
 
-    key = f"symbols/{build_id}"
+    key = physical_key or f"symbols/{build_id}"
     try:
         if not storage.object_exists(bucket, key):
             print(f"[symbolizer] 符号未在服务端就绪: {key}", file=sys.stderr)
@@ -63,6 +65,8 @@ def install_symbol(storage, bucket: str, build_id: str) -> bool:
         data = storage.get_object(bucket, key)
         if not data:
             return False
+        if compression == "gzip":
+            data = gzip.decompress(data)
 
         buildid_dir = os.path.join(os.path.expanduser("~"), ".debug", ".build-id",
                                    build_id[:2], build_id[2:])
@@ -81,6 +85,10 @@ def install_symbols_for_task(conn, storage, bucket: str, tid: str) -> int:
     """
     编排函数：查这个任务需要哪些符号，逐个下载安装。
 
+    阶段二：优先从 symbol_files 账本解析物理 key（blob_id → storage_blobs），
+    已迁移的 ELF 从 CAS key 下载并按 compression 解压；未回填时回退
+    symbols/{build_id}。
+
     返回: 成功安装的数量（供调用方打日志用，0 不代表出错，可能这个
     任务本来就没有需要额外安装的用户态符号）
     """
@@ -90,6 +98,25 @@ def install_symbols_for_task(conn, storage, bucket: str, tid: str) -> int:
 
     installed = 0
     for entry in entries:
-        if install_symbol(storage, bucket, entry["build_id"]):
+        physical_key = None
+        compression = ""
+        if conn is not None:
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COALESCE(b.object_key, s.object_key), COALESCE(b.compression, '') "
+                    "FROM symbol_files s "
+                    "LEFT JOIN storage_blobs b ON b.id = s.blob_id AND b.deleted_at IS NULL "
+                    "WHERE s.build_id = %s AND s.status = 1",
+                    (entry["build_id"],),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    physical_key = row[0]
+                    compression = row[1] or ""
+                cur.close()
+            except Exception:
+                physical_key = None
+        if install_symbol(storage, bucket, entry["build_id"], physical_key, compression):
             installed += 1
     return installed

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 
-from analyzer_contract import AnalyzerError, AnalyzerInputError
+from analyzer_contract import AnalyzerError, AnalyzerInputError, AnalyzerTemporaryError
 from analyzer_registry import build_default_registry
 from lease import AnalysisLeaseClient
 from observability import elapsed_seconds, log_event, now_seconds
@@ -44,12 +44,175 @@ def cleanup_stale_workspaces():
         print(f"[analysis_daemon] 清理遗留工作区失败: {exc}", file=sys.stderr)
 
 
+def _upsert_blob_row(conn, descriptor: dict) -> int:
+    """按内容唯一键 (logical_sha256, format, compression) upsert storage_blobs。
+
+    内容寻址去重：同内容复用同一 blob。登记方与 cleaner 共用行锁协议：
+    deleting Blob 不允许新增引用，等待分析任务重试；deleted/failed Blob 只有在
+    本次 CAS 上传完成后才复活。返回 blob_id。
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO storage_blobs (object_key, logical_sha256, stored_sha256,
+            stored_size, logical_size, format, schema_version, compression,
+            content_encoding, content_type, status, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ready', NOW(), NOW())
+        ON CONFLICT (logical_sha256, format, compression)
+          WHERE logical_sha256 IS NOT NULL
+        DO NOTHING
+        RETURNING id
+        """,
+        (
+            descriptor["blob_key"],
+            descriptor.get("logical_sha256"),
+            descriptor.get("stored_sha256"),
+            descriptor.get("stored_size", 0),
+            descriptor.get("logical_size", 0),
+            descriptor.get("format"),
+            descriptor.get("schema_version"),
+            descriptor.get("compression"),
+            descriptor.get("content_encoding"),
+            descriptor.get("content_type"),
+        ),
+    )
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
+    cur.execute(
+        """
+        SELECT id, status
+        FROM storage_blobs
+        WHERE logical_sha256 = %s AND format = %s AND compression = %s
+        FOR UPDATE
+        """,
+        (descriptor.get("logical_sha256"), descriptor.get("format"),
+         descriptor.get("compression")),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise AnalyzerTemporaryError("CAS Blob 并发登记失败，请重试")
+    blob_id, status = row[0], row[1]
+    if status in ("deleting", "uploading"):
+        raise AnalyzerTemporaryError("CAS Blob 正在变更状态，请重试")
+    if status != "ready":
+        cur.execute(
+            """
+            UPDATE storage_blobs
+            SET object_key = %s, stored_sha256 = %s, stored_size = %s,
+                logical_size = %s, schema_version = %s,
+                content_encoding = %s, content_type = %s,
+                status = 'ready', deleted_at = NULL, delete_reason = NULL,
+                delete_attempts = 0, next_delete_attempt_at = NULL,
+                last_delete_error = '', updated_at = NOW()
+            WHERE id = %s AND status <> 'deleting'
+            """,
+            (descriptor["blob_key"], descriptor.get("stored_sha256"),
+             descriptor.get("stored_size", 0), descriptor.get("logical_size", 0),
+             descriptor.get("schema_version"), descriptor.get("content_encoding"),
+             descriptor.get("content_type"), blob_id),
+        )
+        if getattr(cur, "rowcount", 1) != 1:
+            raise AnalyzerTemporaryError("CAS Blob 状态发生变化，请重试")
+    return blob_id
+
+
+def _insert_artifact_from_descriptor(conn, tid: str, attempt_id: int,
+                                     descriptor: dict, blob_id: int) -> int:
+    """按 descriptor 登记 artifact（带 blob_id / 双大小 / 双哈希语义）。"""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, format,
+            schema_version, blob_id, content_type, status, size, logical_size,
+            compression, sha256, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ready', %s, %s, %s, %s, NOW())
+        ON CONFLICT (task_tid, kind, object_key) DO UPDATE
+        SET attempt_id = EXCLUDED.attempt_id,
+            status = EXCLUDED.status,
+            size = EXCLUDED.size,
+            logical_size = EXCLUDED.logical_size,
+            compression = EXCLUDED.compression,
+            blob_id = EXCLUDED.blob_id,
+            format = EXCLUDED.format,
+            schema_version = EXCLUDED.schema_version,
+            sha256 = EXCLUDED.sha256
+        WHERE artifacts.deleted_at IS NULL
+        RETURNING id
+        """,
+        (
+            tid,
+            attempt_id,
+            descriptor["kind"],
+            descriptor["object_key"],
+            descriptor.get("format"),
+            descriptor.get("schema_version"),
+            blob_id or None,
+            descriptor.get("content_type") or "application/octet-stream",
+            descriptor.get("stored_size", 0),
+            descriptor.get("logical_size", 0),
+            descriptor.get("compression"),
+            descriptor.get("stored_sha256"),
+        ),
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def _insert_artifact_from_key(conn, tid: str, attempt_id: int, key: str,
+                              storage=None, bucket=None) -> int:
+    """兼容路径：无 descriptor 的历史 analyzer 产物（字符串 key）。"""
+    name = key.rsplit("/", 1)[-1]
+    kind = "MANIFEST" if name == "manifest.json" else "RESULT" if name.endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE"
+    content_type = "application/json" if name.endswith(".json") else "image/svg+xml" if name.endswith(".svg") else "text/markdown" if name.endswith(".md") else "application/octet-stream"
+    size = 0
+    if storage is not None and bucket:
+        size = storage.stat_object(bucket, key) or 0
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, size, created_at)
+        VALUES (%s, %s, %s, %s, %s, 'ready', %s, NOW())
+        ON CONFLICT (task_tid, kind, object_key) DO UPDATE
+        SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status, size = EXCLUDED.size
+        WHERE artifacts.deleted_at IS NULL
+        RETURNING id
+        """,
+        (tid, attempt_id, kind, key, content_type, size),
+    )
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    if storage is not None and bucket:
+        # 唯一键命中了 deleted tombstone：分析产物已先上传，同步删除同 key 对象，
+        # 避免留下不可见孤儿。
+        try:
+            storage.delete_object(bucket, key)
+            log_event("artifact_tombstone_upload_removed", task_tid=tid, object_key=key)
+        except Exception as exc:
+            log_event("artifact_tombstone_upload_remove_failed", task_tid=tid,
+                      object_key=key, error=str(exc))
+    return 0
+
+
 def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None, bucket=None):
-    """Persist analyzer outputs as Artifact metadata without storing URLs."""
-    keys = [value for value in (outputs or []) if isinstance(value, str) and value.startswith(tid + "/")]
+    """Persist analyzer outputs as Artifact metadata without storing URLs.
+
+    阶段二：outputs 元素既可以是字符串 key（兼容旧 analyzer），也可以是
+    Artifact descriptor（dict，见 artifact_descriptor.build_descriptor）。
+    descriptor 会同时登记 storage_blobs（内容去重）与 artifacts（blob_id 引用）。
+    """
+    descriptors = []
+    keys = []
+    for value in (outputs or []):
+        if isinstance(value, dict) and value.get("object_key") and value.get("blob_key"):
+            descriptors.append(value)
+        elif isinstance(value, str) and value.startswith(tid + "/"):
+            keys.append(value)
     if manifest and f"{tid}/manifest.json" not in keys:
         keys.append(f"{tid}/manifest.json")
-    if not keys:
+    if not descriptors and not keys:
         return []
     cur = conn.cursor()
     cur.execute(
@@ -58,26 +221,21 @@ def record_result_artifacts(conn, tid: str, outputs, manifest=None, storage=None
     row = cur.fetchone()
     attempt_id = row[0] if row else 0
     artifact_ids = []
+    for descriptor in descriptors:
+        blob_id = _upsert_blob_row(conn, descriptor)
+        aid = _insert_artifact_from_descriptor(conn, tid, attempt_id, descriptor, blob_id)
+        if aid:
+            artifact_ids.append(aid)
+        else:
+            # 唯一键命中 deleted tombstone：只拒绝逻辑引用。blob_key 是共享 CAS
+            # 对象，绝不能在未检查其它引用时直接删除；服务端孤儿对账会在安全
+            # 宽限期后回收真正的零引用 Blob。
+            log_event("artifact_tombstone_blob_unreferenced", task_tid=tid,
+                      object_key=descriptor["object_key"], blob_key=descriptor["blob_key"])
     for key in keys:
-        name = key.rsplit("/", 1)[-1]
-        kind = "MANIFEST" if name == "manifest.json" else "RESULT" if name.endswith((".svg", ".json", ".md", ".html")) else "INTERMEDIATE"
-        content_type = "application/json" if name.endswith(".json") else "image/svg+xml" if name.endswith(".svg") else "text/markdown" if name.endswith(".md") else "application/octet-stream"
-        size = 0
-        if storage is not None and bucket:
-            size = storage.stat_object(bucket, key) or 0
-        cur.execute(
-            """
-            INSERT INTO artifacts (task_tid, attempt_id, kind, object_key, content_type, status, size, created_at)
-            VALUES (%s, %s, %s, %s, %s, 'ready', %s, NOW())
-            ON CONFLICT (task_tid, kind, object_key) DO UPDATE
-            SET attempt_id = EXCLUDED.attempt_id, status = EXCLUDED.status, size = EXCLUDED.size
-            RETURNING id
-            """,
-            (tid, attempt_id, kind, key, content_type, size),
-        )
-        row = cur.fetchone()
-        if row:
-            artifact_ids.append(row[0])
+        aid = _insert_artifact_from_key(conn, tid, attempt_id, key, storage, bucket)
+        if aid:
+            artifact_ids.append(aid)
     cur.close()
     return artifact_ids
 
@@ -156,11 +314,22 @@ def _record_task_event_tx(conn, tid: str, reason: str, source: str, payload: dic
             source,
             sequence,
             source,
-            json.dumps(payload or {}, ensure_ascii=False),
+            json.dumps(_json_safe(payload or {}), ensure_ascii=False),
             tid,
         ),
     )
     cur.close()
+
+
+def _json_safe(value):
+    """递归移除不可 JSON 序列化的内容（descriptor 的 _payload 是 bytes）。"""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items() if k != "_payload"}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, bytes):
+        return "<bytes:%d>" % len(value)
+    return value
 
 
 def _upload_manifest(storage_cfg: dict, bucket: str, tid: str, manifest: dict) -> str:

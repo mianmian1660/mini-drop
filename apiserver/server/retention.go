@@ -34,10 +34,15 @@ func (s *APIServer) runRetentionCleanup(ctx context.Context) {
 		return
 	}
 	limit := s.retentionBatchLimit()
-	if s.StorageConnected() {
-		s.cleanupExpiredArtifacts(ctx, []string{model.ArtifactKindRaw, model.ArtifactKindIntermediate, model.ArtifactKindLog}, time.Duration(s.Config.Retention.RawRetentionHours)*time.Hour, limit)
-		s.cleanupExpiredArtifacts(ctx, []string{model.ArtifactKindResult, model.ArtifactKindManifest}, time.Duration(s.Config.Retention.ResultRetentionHours)*time.Hour, limit)
-		s.cleanupDeletedTaskArtifacts(ctx, limit)
+	// 用户主动删除属于显式授权，即使请求进程在软删后崩溃，也要由后台
+	// 对账继续把剩余 Artifact 送入 tombstone 状态机。observe 同样执行。
+	s.cleanupDeletedTaskArtifacts(ctx, limit)
+	// 存储阶段一：Artifact 的到期清理已移交生命周期循环（observe/enforce 状态机，
+	// 删除成功后保留墓碑）。这里只保留 Continuous retention 与历史对象扫尾。
+	// 历史对象扫尾现在只统计非 deleted 引用（墓碑不计），不会误删被 tombstone
+	// 覆盖的对象。
+	// observe 必须是非破坏模式：历史未登记对象扫尾同样延后到 enforce。
+	if s.StorageConnected() && s.Config.Retention.LifecycleMode == "enforce" {
 		s.cleanupHistoricalUnreferencedObjects(ctx)
 	}
 	s.cleanupAllContinuousRetention(ctx, limit)
@@ -68,7 +73,7 @@ func (s *APIServer) cleanupHistoricalUnreferencedObjects(ctx context.Context) {
 				continue
 			}
 			var artifactRefs, symbolRefs int64
-			if s.DB.Model(&model.Artifact{}).Where("object_key = ?", object.Name).Count(&artifactRefs).Error != nil ||
+			if s.DB.Model(&model.Artifact{}).Where("object_key = ? AND deleted_at IS NULL", object.Name).Count(&artifactRefs).Error != nil ||
 				s.DB.Model(&model.KernelSymbolFile{}).Where("object_key = ?", object.Name).Count(&symbolRefs).Error != nil {
 				s.Logger.Warn("历史对象扫尾引用检查失败", zap.String("object_key", object.Name))
 				continue
@@ -92,7 +97,7 @@ func (s *APIServer) cleanupHistoricalUnreferencedObjects(ctx context.Context) {
 	for _, candidate := range candidates {
 		// Recheck immediately before deletion: a late metadata transaction wins.
 		var refs int64
-		if err := s.DB.Model(&model.Artifact{}).Where("object_key = ?", candidate.key).Count(&refs).Error; err != nil || refs != 0 {
+		if err := s.DB.Model(&model.Artifact{}).Where("object_key = ? AND deleted_at IS NULL", candidate.key).Count(&refs).Error; err != nil || refs != 0 {
 			continue
 		}
 		if err := s.DB.Model(&model.KernelSymbolFile{}).Where("object_key = ?", candidate.key).Count(&refs).Error; err != nil || refs != 0 {
@@ -137,7 +142,8 @@ func (s *APIServer) cleanupDeletedTaskArtifacts(ctx context.Context, limit int) 
 	}
 	var tids []string
 	if err := s.DB.Raw(
-		"SELECT DISTINCT a.task_tid FROM artifacts a JOIN hotmethod_tasks t ON t.tid = a.task_tid WHERE t.deleted_at IS NOT NULL LIMIT ?",
+		"SELECT DISTINCT a.task_tid FROM artifacts a JOIN hotmethod_tasks t ON t.tid = a.task_tid WHERE t.deleted_at IS NOT NULL AND a.deleted_at IS NULL AND a.status <> ? LIMIT ?",
+		model.ArtifactStatusDeleted,
 		limit,
 	).Scan(&tids).Error; err != nil {
 		s.Logger.Warn("查询已软删任务 artifact 失败", zap.Error(err))
@@ -148,21 +154,22 @@ func (s *APIServer) cleanupDeletedTaskArtifacts(ctx context.Context, limit int) 
 	}
 }
 
+// cleanupTaskArtifacts 任务主动删除入口（存储阶段一版本）：
+//   - 已登记 Artifact 走 tombstone 状态机（reason=task_deleted），忽略 pin 与期限；
+//   - includeUntrackedObjects 为 true 时额外清扫 tid/ 前缀下未登记对象（跳过
+//     已登记 key 与共享 kallsyms 对象）。
 func (s *APIServer) cleanupTaskArtifacts(ctx context.Context, tid string, includeUntrackedObjects bool) {
 	if tid == "" {
 		return
 	}
-	var artifacts []model.Artifact
-	if err := s.DB.Where("task_tid = ?", tid).Find(&artifacts).Error; err != nil {
-		s.Logger.Warn("查询任务 artifact 失败", zap.String("tid", tid), zap.Error(err))
-		return
-	}
-	known := map[string]bool{}
-	for _, artifact := range artifacts {
-		known[artifact.ObjectKey] = true
-	}
-	s.cleanupArtifactRows(ctx, artifacts)
+	s.taskDeletedArtifacts(ctx, tid)
 	if includeUntrackedObjects && s.StorageConnected() {
+		var keys []string
+		_ = s.DB.Model(&model.Artifact{}).Where("task_tid = ?", tid).Pluck("object_key", &keys).Error
+		known := map[string]bool{}
+		for _, key := range keys {
+			known[key] = true
+		}
 		objects, err := s.Storage.ListObjects(ctx, s.Config.Storage.Bucket, tid+"/")
 		if err != nil {
 			s.Logger.Warn("列出待删除任务对象失败", zap.String("tid", tid), zap.Error(err))
@@ -206,7 +213,8 @@ func (s *APIServer) cleanupArtifactRows(ctx context.Context, artifacts []model.A
 
 func (s *APIServer) cleanupOrphanKernelSymbol(ctx context.Context, objectKey string) {
 	var refs int64
-	if err := s.DB.Model(&model.Artifact{}).Where("object_key = ?", objectKey).Count(&refs).Error; err != nil {
+	// 只统计非 deleted 引用：墓碑行不计，避免 tombstone 长期挡住共享对象回收。
+	if err := s.DB.Model(&model.Artifact{}).Where("object_key = ? AND deleted_at IS NULL", objectKey).Count(&refs).Error; err != nil {
 		s.Logger.Warn("统计 kallsyms 引用失败", zap.String("object_key", objectKey), zap.Error(err))
 		return
 	}

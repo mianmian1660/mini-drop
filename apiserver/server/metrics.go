@@ -32,12 +32,51 @@ var (
 	metricStorageTotalBytes     int64 // gauge：受监控文件系统总字节数
 	metricStorageAvailableBytes int64 // gauge：受监控文件系统剩余字节数
 	metricStoragePressureLevel  int64 // gauge：0=normal 1=warning 2=critical 3=emergency 4=unknown
+	// 存储阶段一：Artifact 生命周期指标
+	metricArtifactCleanupDeletedTotal      int64 // counter：清理成功删除的对象数
+	metricArtifactCleanupDeletedBytesTotal int64 // counter：清理回收的字节数
+	metricArtifactCleanupFailuresTotal     int64 // counter：对象删除失败次数
+	metricArtifactReadyBytes               int64 // gauge：ready 状态字节数
+	metricArtifactPinnedBytes              int64 // gauge：固定任务下非 deleted 字节数
+	metricArtifactExpirationBacklog        int64 // gauge：到期候选（due）数量
+	metricArtifactPolicyReconcileBacklog   int64 // gauge：策略版本不一致待重算数量
+	// 按 status 计数的 gauge（label: status）
+	metricArtifactsByStatusMu sync.Mutex
+	metricArtifactsByStatus   = map[string]int64{}
+	// 存储阶段二：物理 Blob 指标
+	metricBlobPhysicalBytes       int64 // gauge：ready blob 物理字节
+	metricBlobLogicalBytes        int64 // gauge：ready blob 逻辑字节
+	metricBlobDeduplicatedBytes   int64 // gauge：去重+压缩收益
+	metricBlobMigrationBacklog    int64 // gauge：迁移剩余候选
+	metricBlobBackfillBacklog     int64 // gauge：待回填引用数
+	metricBlobBackfillCreated     int64 // counter：回填创建的 blob 数
+	metricBlobBackfillLinked      int64 // counter：回填关联的引用数
+	metricBlobBackfillStatFail    int64 // counter：回填 Stat 失败次数
+	metricBlobBackfillConflicts   int64 // counter：同 key 多大小冲突次数
+	metricBlobMigrationObjects    int64 // counter：迁移完成对象数
+	metricBlobMigrationFailures   int64 // counter：迁移失败对象数
+	metricBlobMigrationReclaimed  int64 // counter：迁移回收字节（逻辑-存储）
+	metricBlobGCDeleted           int64 // counter：GC 删除对象数
+	metricBlobGCDeletedBytes      int64 // counter：GC 回收字节
+	metricBlobGCFailures          int64 // counter：GC 删除失败次数
+	metricBlobOrphanReconciled    int64 // counter：孤儿回填 blob 墓碑化数
+	metricMaintenanceSkipTotal    int64 // counter：maintenance 跳过（低磁盘/unknown）
+	metricBlobByStatusMu          sync.Mutex
+	metricBlobByStatus            = map[string]int64{}
+	metricBlobByStatusBytesMu     sync.Mutex
+	metricBlobByStatusBytes       = map[string]int64{}
 )
 
 // 按来源计数的低磁盘拒收计数（label: source）。
 var (
 	metricCollectionRejectedLowDiskMu sync.Mutex
 	metricCollectionRejectedLowDisk   = map[string]int64{}
+)
+
+// maintenance 跳过计数（label: kind：continuous_compaction / format_migration）。
+var (
+	metricMaintenanceSkipMu sync.Mutex
+	metricMaintenanceSkip   = map[string]int64{}
 )
 
 func incTasksCreated()         { atomic.AddInt64(&metricTasksCreatedTotal, 1) }
@@ -58,6 +97,42 @@ func incContinuousSourceDeleteRetry() { atomic.AddInt64(&metricContinuousSourceD
 func incContinuousCompactionSkip()    { atomic.AddInt64(&metricContinuousCompactionSkipTotal, 1) }
 func incContinuousReclaimedBytes(bytes int64) {
 	atomic.AddInt64(&metricContinuousReclaimedBytesTotal, bytes)
+}
+
+func incArtifactCleanupDeleted(_ string) {
+	atomic.AddInt64(&metricArtifactCleanupDeletedTotal, 1)
+}
+func incArtifactCleanupDeletedBytes(bytes int64) {
+	atomic.AddInt64(&metricArtifactCleanupDeletedBytesTotal, bytes)
+}
+func incArtifactCleanupFailures() {
+	atomic.AddInt64(&metricArtifactCleanupFailuresTotal, 1)
+}
+
+// updateArtifactLifecycleGauges 用最新生命周期统计刷新 gauge 指标。
+func updateArtifactLifecycleGauges(stats artifactLifecycleStats) {
+	atomic.StoreInt64(&metricArtifactReadyBytes, stats.ReadyBytes)
+	atomic.StoreInt64(&metricArtifactPinnedBytes, stats.PinnedBytes)
+	atomic.StoreInt64(&metricArtifactExpirationBacklog, stats.DueCount)
+	atomic.StoreInt64(&metricArtifactPolicyReconcileBacklog, stats.ReconcileBacklog)
+}
+
+// refreshArtifactsByStatusGauge 从 DB 刷新按状态计数的 gauge（在指标输出时兜底）。
+func (s *APIServer) refreshArtifactsByStatusGauge() {
+	if s == nil || s.DB == nil {
+		return
+	}
+	rows := []struct {
+		Status string
+		Count  int64
+	}{}
+	_ = s.DB.Model(&model.Artifact{}).Select("status, count(*) as count").Group("status").Scan(&rows).Error
+	metricArtifactsByStatusMu.Lock()
+	metricArtifactsByStatus = map[string]int64{}
+	for _, r := range rows {
+		metricArtifactsByStatus[r.Status] = r.Count
+	}
+	metricArtifactsByStatusMu.Unlock()
 }
 
 // storagePressureLevelNumeric 把等级映射为数值（供 gauge 使用）。
@@ -90,6 +165,94 @@ func incCollectionRejectedLowDisk(source string) {
 	metricCollectionRejectedLowDiskMu.Unlock()
 }
 
+// ---- 存储阶段二：Blob 指标 ----
+
+func incBlobBackfillBlobsCreated() { atomic.AddInt64(&metricBlobBackfillCreated, 1) }
+func incBlobBackfillRefsLinked(n int64) {
+	if n > 0 {
+		atomic.AddInt64(&metricBlobBackfillLinked, n)
+	}
+}
+func incBlobBackfillStatFailures() { atomic.AddInt64(&metricBlobBackfillStatFail, 1) }
+func incBlobBackfillConflicts()    { atomic.AddInt64(&metricBlobBackfillConflicts, 1) }
+func incBlobMigrationObjects(format string) {
+	atomic.AddInt64(&metricBlobMigrationObjects, 1)
+	_ = format // 日志已带 format，计数器不细分避免 label 膨胀
+}
+func incBlobMigrationFailures()        { atomic.AddInt64(&metricBlobMigrationFailures, 1) }
+func incBlobMigrationReclaimedBytes(n int64) {
+	if n > 0 {
+		atomic.AddInt64(&metricBlobMigrationReclaimed, n)
+	}
+}
+func incBlobGCDeleted()      { atomic.AddInt64(&metricBlobGCDeleted, 1) }
+func incBlobGCDeletedBytes(n int64) {
+	if n > 0 {
+		atomic.AddInt64(&metricBlobGCDeletedBytes, n)
+	}
+}
+func incBlobGCFailures() { atomic.AddInt64(&metricBlobGCFailures, 1) }
+
+func incBlobOrphanReconciled() { atomic.AddInt64(&metricBlobOrphanReconciled, 1) }
+
+// incMaintenanceSkip 累加 maintenance 跳过计数（compactor / 格式迁移）。
+// 与采集拒收口径分离：maintenance 跳过不是"采集拒绝"。
+func incMaintenanceSkip(kind string) {
+	metricMaintenanceSkipMu.Lock()
+	metricMaintenanceSkip[kind]++
+	metricMaintenanceSkipMu.Unlock()
+}
+
+// updateBlobGauges 用最新 Blob 统计刷新 gauge 指标。
+func updateBlobGauges(stats blobStats) {
+	atomic.StoreInt64(&metricBlobPhysicalBytes, stats.BlobPhysicalBytes)
+	atomic.StoreInt64(&metricBlobLogicalBytes, stats.BlobLogicalBytes)
+	atomic.StoreInt64(&metricBlobDeduplicatedBytes, stats.BlobDedupBytes)
+	atomic.StoreInt64(&metricBlobMigrationBacklog, stats.Backlog)
+	atomic.StoreInt64(&metricBlobBackfillBacklog, stats.BackfillBacklog)
+	metricBlobByStatusMu.Lock()
+	metricBlobByStatus = map[string]int64{}
+	for k, v := range stats.ByStatusCount {
+		metricBlobByStatus[k] = v
+	}
+	metricBlobByStatusMu.Unlock()
+	metricBlobByStatusBytesMu.Lock()
+	metricBlobByStatusBytes = map[string]int64{}
+	for k, v := range stats.ByStatusBytes {
+		metricBlobByStatusBytes[k] = v
+	}
+	metricBlobByStatusBytesMu.Unlock()
+}
+
+// pprofArtifactStats 从 DB 统计 pprof 转换结果（成功=ready、失败=failed）。
+func (s *APIServer) pprofArtifactStats() (ready int64, failed int64, logicalBytes int64, storedBytes int64) {
+	if s == nil || s.DB == nil {
+		return 0, 0, 0, 0
+	}
+	type cnt struct {
+		Status string
+		Cnt    int64
+	}
+	var rows []cnt
+	_ = s.DB.Model(&model.Artifact{}).
+		Select("status, count(*) as cnt").
+		Where("format = ?", model.BlobFormatPprof).
+		Group("status").Scan(&rows).Error
+	for _, r := range rows {
+		switch r.Status {
+		case model.ArtifactStatusReady:
+			ready = r.Cnt
+		case model.ArtifactStatusFailed:
+			failed = r.Cnt
+		}
+	}
+	_ = s.DB.Model(&model.StorageBlob{}).
+		Where("format = ? AND status = ? AND deleted_at IS NULL", model.BlobFormatPprof, model.BlobStatusReady).
+		Select("COALESCE(SUM(logical_size),0), COALESCE(SUM(stored_size),0)").
+		Row().Scan(&logicalBytes, &storedBytes)
+	return ready, failed, logicalBytes, storedBytes
+}
+
 func snapshotRejectedLowDiskCounts() map[string]int64 {
 	metricCollectionRejectedLowDiskMu.Lock()
 	defer metricCollectionRejectedLowDiskMu.Unlock()
@@ -117,9 +280,45 @@ func resetMetricsForTest() {
 	atomic.StoreInt64(&metricStorageTotalBytes, 0)
 	atomic.StoreInt64(&metricStorageAvailableBytes, 0)
 	atomic.StoreInt64(&metricStoragePressureLevel, 4) // unknown 兜底
+	atomic.StoreInt64(&metricArtifactCleanupDeletedTotal, 0)
+	atomic.StoreInt64(&metricArtifactCleanupDeletedBytesTotal, 0)
+	atomic.StoreInt64(&metricArtifactCleanupFailuresTotal, 0)
+	atomic.StoreInt64(&metricArtifactReadyBytes, 0)
+	atomic.StoreInt64(&metricArtifactPinnedBytes, 0)
+	atomic.StoreInt64(&metricArtifactExpirationBacklog, 0)
+	atomic.StoreInt64(&metricArtifactPolicyReconcileBacklog, 0)
+	atomic.StoreInt64(&metricBlobPhysicalBytes, 0)
+	atomic.StoreInt64(&metricBlobLogicalBytes, 0)
+	atomic.StoreInt64(&metricBlobDeduplicatedBytes, 0)
+	atomic.StoreInt64(&metricBlobMigrationBacklog, 0)
+	atomic.StoreInt64(&metricBlobBackfillBacklog, 0)
+	atomic.StoreInt64(&metricBlobBackfillCreated, 0)
+	atomic.StoreInt64(&metricBlobBackfillLinked, 0)
+	atomic.StoreInt64(&metricBlobBackfillStatFail, 0)
+	atomic.StoreInt64(&metricBlobBackfillConflicts, 0)
+	atomic.StoreInt64(&metricBlobMigrationObjects, 0)
+	atomic.StoreInt64(&metricBlobMigrationFailures, 0)
+	atomic.StoreInt64(&metricBlobMigrationReclaimed, 0)
+	atomic.StoreInt64(&metricBlobGCDeleted, 0)
+	atomic.StoreInt64(&metricBlobGCDeletedBytes, 0)
+	atomic.StoreInt64(&metricBlobGCFailures, 0)
+	atomic.StoreInt64(&metricBlobOrphanReconciled, 0)
+	atomic.StoreInt64(&metricMaintenanceSkipTotal, 0)
+	metricArtifactsByStatusMu.Lock()
+	metricArtifactsByStatus = map[string]int64{}
+	metricArtifactsByStatusMu.Unlock()
+	metricBlobByStatusMu.Lock()
+	metricBlobByStatus = map[string]int64{}
+	metricBlobByStatusMu.Unlock()
+	metricBlobByStatusBytesMu.Lock()
+	metricBlobByStatusBytes = map[string]int64{}
+	metricBlobByStatusBytesMu.Unlock()
 	metricCollectionRejectedLowDiskMu.Lock()
 	metricCollectionRejectedLowDisk = map[string]int64{}
 	metricCollectionRejectedLowDiskMu.Unlock()
+	metricMaintenanceSkipMu.Lock()
+	metricMaintenanceSkip = map[string]int64{}
+	metricMaintenanceSkipMu.Unlock()
 }
 
 func (s *APIServer) Metrics(c *gin.Context) {
@@ -170,7 +369,110 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	}
 
 	if s != nil && s.DB != nil {
+		s.refreshArtifactsByStatusGauge()
 		s.writeDBMetrics(&b)
+	}
+	// 存储阶段一：Artifact 生命周期指标
+	writeMetricHeader(&b, "mini_drop_artifacts_by_status", "gauge", "Current artifacts grouped by status.")
+	metricArtifactsByStatusMu.Lock()
+	statuses := make([]string, 0, len(metricArtifactsByStatus))
+	for status := range metricArtifactsByStatus {
+		statuses = append(statuses, status)
+	}
+	metricArtifactsByStatusMu.Unlock()
+	sort.Strings(statuses)
+	for _, status := range statuses {
+		metricArtifactsByStatusMu.Lock()
+		count := metricArtifactsByStatus[status]
+		metricArtifactsByStatusMu.Unlock()
+		fmt.Fprintf(&b, "mini_drop_artifacts_by_status{status=%q} %d\n", prometheusLabel(status), count)
+	}
+	writeMetricHeader(&b, "mini_drop_artifact_ready_bytes", "gauge", "Bytes of artifacts in ready status.")
+	fmt.Fprintf(&b, "mini_drop_artifact_ready_bytes %d\n", atomic.LoadInt64(&metricArtifactReadyBytes))
+	writeMetricHeader(&b, "mini_drop_artifact_pinned_bytes", "gauge", "Bytes of non-deleted artifacts under pinned tasks.")
+	fmt.Fprintf(&b, "mini_drop_artifact_pinned_bytes %d\n", atomic.LoadInt64(&metricArtifactPinnedBytes))
+	writeMetricHeader(&b, "mini_drop_artifact_expiration_backlog", "gauge", "Artifacts due for expiration cleanup.")
+	fmt.Fprintf(&b, "mini_drop_artifact_expiration_backlog %d\n", atomic.LoadInt64(&metricArtifactExpirationBacklog))
+	writeMetricHeader(&b, "mini_drop_artifact_cleanup_deleted_total", "counter", "Artifacts deleted by lifecycle cleanup.")
+	fmt.Fprintf(&b, "mini_drop_artifact_cleanup_deleted_total %d\n", atomic.LoadInt64(&metricArtifactCleanupDeletedTotal))
+	writeMetricHeader(&b, "mini_drop_artifact_cleanup_deleted_bytes_total", "counter", "Object bytes reclaimed by lifecycle cleanup.")
+	fmt.Fprintf(&b, "mini_drop_artifact_cleanup_deleted_bytes_total %d\n", atomic.LoadInt64(&metricArtifactCleanupDeletedBytesTotal))
+	writeMetricHeader(&b, "mini_drop_artifact_cleanup_failures_total", "counter", "Artifact object deletion failures.")
+	fmt.Fprintf(&b, "mini_drop_artifact_cleanup_failures_total %d\n", atomic.LoadInt64(&metricArtifactCleanupFailuresTotal))
+	writeMetricHeader(&b, "mini_drop_artifact_policy_reconcile_backlog", "gauge", "Artifacts awaiting retention policy reconciliation.")
+	fmt.Fprintf(&b, "mini_drop_artifact_policy_reconcile_backlog %d\n", atomic.LoadInt64(&metricArtifactPolicyReconcileBacklog))
+	// 存储阶段二：物理 Blob 指标
+	writeMetricHeader(&b, "mini_drop_blob_physical_bytes", "gauge", "Physical bytes of ready storage blobs (deduplicated).")
+	fmt.Fprintf(&b, "mini_drop_blob_physical_bytes %d\n", atomic.LoadInt64(&metricBlobPhysicalBytes))
+	writeMetricHeader(&b, "mini_drop_blob_logical_bytes", "gauge", "Logical (uncompressed) bytes of ready storage blobs.")
+	fmt.Fprintf(&b, "mini_drop_blob_logical_bytes %d\n", atomic.LoadInt64(&metricBlobLogicalBytes))
+	writeMetricHeader(&b, "mini_drop_blob_deduplicated_bytes", "gauge", "Bytes saved by content deduplication and compression.")
+	fmt.Fprintf(&b, "mini_drop_blob_deduplicated_bytes %d\n", atomic.LoadInt64(&metricBlobDeduplicatedBytes))
+	writeMetricHeader(&b, "mini_drop_blob_by_status", "gauge", "Storage blobs grouped by status.")
+	metricBlobByStatusMu.Lock()
+	blobStatuses := make([]string, 0, len(metricBlobByStatus))
+	for status := range metricBlobByStatus {
+		blobStatuses = append(blobStatuses, status)
+	}
+	metricBlobByStatusMu.Unlock()
+	sort.Strings(blobStatuses)
+	for _, status := range blobStatuses {
+		metricBlobByStatusMu.Lock()
+		count := metricBlobByStatus[status]
+		metricBlobByStatusMu.Unlock()
+		fmt.Fprintf(&b, "mini_drop_blob_by_status{status=%q} %d\n", prometheusLabel(status), count)
+	}
+	writeMetricHeader(&b, "mini_drop_blob_backfill_created_total", "counter", "Storage blobs created by backfill.")
+	fmt.Fprintf(&b, "mini_drop_blob_backfill_created_total %d\n", atomic.LoadInt64(&metricBlobBackfillCreated))
+	writeMetricHeader(&b, "mini_drop_blob_backfill_linked_total", "counter", "References linked to blobs by backfill.")
+	fmt.Fprintf(&b, "mini_drop_blob_backfill_linked_total %d\n", atomic.LoadInt64(&metricBlobBackfillLinked))
+	writeMetricHeader(&b, "mini_drop_blob_backfill_stat_failures_total", "counter", "Backfill StatObject failures.")
+	fmt.Fprintf(&b, "mini_drop_blob_backfill_stat_failures_total %d\n", atomic.LoadInt64(&metricBlobBackfillStatFail))
+	writeMetricHeader(&b, "mini_drop_blob_backfill_conflicts_total", "counter", "Backfill keys skipped due to conflicting sizes.")
+	fmt.Fprintf(&b, "mini_drop_blob_backfill_conflicts_total %d\n", atomic.LoadInt64(&metricBlobBackfillConflicts))
+	writeMetricHeader(&b, "mini_drop_blob_migration_objects_total", "counter", "Objects migrated to compressed CAS blobs.")
+	fmt.Fprintf(&b, "mini_drop_blob_migration_objects_total %d\n", atomic.LoadInt64(&metricBlobMigrationObjects))
+	writeMetricHeader(&b, "mini_drop_blob_migration_failures_total", "counter", "Migration failures (old references kept).")
+	fmt.Fprintf(&b, "mini_drop_blob_migration_failures_total %d\n", atomic.LoadInt64(&metricBlobMigrationFailures))
+	writeMetricHeader(&b, "mini_drop_blob_migration_reclaimed_bytes_total", "counter", "Bytes reclaimed by compression migration (logical - stored).")
+	fmt.Fprintf(&b, "mini_drop_blob_migration_reclaimed_bytes_total %d\n", atomic.LoadInt64(&metricBlobMigrationReclaimed))
+	writeMetricHeader(&b, "mini_drop_blob_migration_backlog", "gauge", "Objects remaining for migration.")
+	fmt.Fprintf(&b, "mini_drop_blob_migration_backlog %d\n", atomic.LoadInt64(&metricBlobMigrationBacklog))
+	writeMetricHeader(&b, "mini_drop_blob_backfill_backlog", "gauge", "References awaiting blob backfill.")
+	fmt.Fprintf(&b, "mini_drop_blob_backfill_backlog %d\n", atomic.LoadInt64(&metricBlobBackfillBacklog))
+	writeMetricHeader(&b, "mini_drop_blob_gc_deleted_total", "counter", "Legacy objects deleted by delayed GC.")
+	fmt.Fprintf(&b, "mini_drop_blob_gc_deleted_total %d\n", atomic.LoadInt64(&metricBlobGCDeleted))
+	writeMetricHeader(&b, "mini_drop_blob_gc_deleted_bytes_total", "counter", "Bytes reclaimed by delayed GC.")
+	fmt.Fprintf(&b, "mini_drop_blob_gc_deleted_bytes_total %d\n", atomic.LoadInt64(&metricBlobGCDeletedBytes))
+	writeMetricHeader(&b, "mini_drop_blob_gc_failures_total", "counter", "Delayed GC deletion failures.")
+	fmt.Fprintf(&b, "mini_drop_blob_gc_failures_total %d\n", atomic.LoadInt64(&metricBlobGCFailures))
+	writeMetricHeader(&b, "mini_drop_blob_orphan_reconciled_total", "counter", "Orphan backfill blobs tombstoned after migration.")
+	fmt.Fprintf(&b, "mini_drop_blob_orphan_reconciled_total %d\n", atomic.LoadInt64(&metricBlobOrphanReconciled))
+	writeMetricHeader(&b, "mini_drop_maintenance_skip_total", "counter", "Maintenance operations skipped (low disk / unknown), by kind.")
+	kinds := make([]string, 0, len(metricMaintenanceSkip))
+	metricMaintenanceSkipMu.Lock()
+	for kind := range metricMaintenanceSkip {
+		kinds = append(kinds, kind)
+	}
+	metricMaintenanceSkipMu.Unlock()
+	sort.Strings(kinds)
+	for _, kind := range kinds {
+		metricMaintenanceSkipMu.Lock()
+		count := metricMaintenanceSkip[kind]
+		metricMaintenanceSkipMu.Unlock()
+		fmt.Fprintf(&b, "mini_drop_maintenance_skip_total{kind=%q} %d\n", prometheusLabel(kind), count)
+	}
+	// pprof 转换结果（由 artifacts.format=pprof 状态统计）
+	if s != nil && s.DB != nil {
+		pprofReady, pprofFailed, pprofLogical, pprofStored := s.pprofArtifactStats()
+		writeMetricHeader(&b, "mini_drop_pprof_artifacts_ready_total", "gauge", "Ready pprof artifacts (conversion success).")
+		fmt.Fprintf(&b, "mini_drop_pprof_artifacts_ready_total %d\n", pprofReady)
+		writeMetricHeader(&b, "mini_drop_pprof_artifacts_failed_total", "gauge", "Failed pprof artifacts (conversion failure).")
+		fmt.Fprintf(&b, "mini_drop_pprof_artifacts_failed_total %d\n", pprofFailed)
+		if pprofStored > 0 {
+			writeMetricHeader(&b, "mini_drop_pprof_compression_ratio", "gauge", "Average pprof compression ratio (logical/stored).")
+			fmt.Fprintf(&b, "mini_drop_pprof_compression_ratio %.3f\n", float64(pprofLogical)/float64(pprofStored))
+		}
 	}
 	c.Data(http.StatusOK, "text/plain; version=0.0.4; charset=utf-8", []byte(b.String()))
 }

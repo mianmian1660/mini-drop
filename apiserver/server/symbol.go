@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"regexp"
@@ -241,8 +242,10 @@ func (s *APIServer) CheckKernelSymbol(c *gin.Context) {
 			"last_used_at": &now,
 			"target_ip":    firstNonEmpty(req.TargetIP, row.TargetIP),
 		}).Error
-		if err := s.recordKernelSymbolArtifact(req.TID, row.ObjectKey, row.SizeBytes, req.SHA256); err != nil {
+		if err := s.recordKernelSymbolArtifact(req.TID, row.ObjectKey, row.SizeBytes, req.SHA256, row.BlobID); err != nil {
 			s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", req.TID), zap.String("sha256", req.SHA256), zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "kallsyms 对象正在回收，请重试"})
+			return
 		}
 		c.JSON(http.StatusOK, gin.H{"upload_required": false, "object_key": row.ObjectKey})
 		return
@@ -289,7 +292,7 @@ func (s *APIServer) CheckKernelSymbol(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "落库失败: " + err.Error()})
 			return
 		}
-		if err := s.recordKernelSymbolArtifact(req.TID, objectKey, req.SizeBytes, req.SHA256); err != nil {
+		if err := s.recordKernelSymbolArtifact(req.TID, objectKey, req.SizeBytes, req.SHA256, nil); err != nil {
 			s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", req.TID), zap.String("sha256", req.SHA256), zap.Error(err))
 		}
 		c.JSON(http.StatusOK, gin.H{"upload_required": false, "object_key": objectKey})
@@ -391,7 +394,7 @@ func (s *APIServer) UploadKernelSymbol(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "落库失败: " + err.Error()})
 		return
 	}
-	if err := s.recordKernelSymbolArtifact(tid, objectKey, int64(compressed.Len()), sum); err != nil {
+	if err := s.recordKernelSymbolArtifact(tid, objectKey, int64(compressed.Len()), sum, nil); err != nil {
 		s.Logger.Warn("登记 kallsyms artifact 引用失败", zap.String("tid", tid), zap.String("sha256", sum), zap.Error(err))
 	}
 	c.JSON(http.StatusOK, gin.H{"sha256": sum, "status": "ready", "object_key": objectKey})
@@ -416,7 +419,10 @@ func (s *APIServer) putObjectWithEncoding(ctx context.Context, key string, data 
 	return s.Storage.PutObject(ctx, s.Config.Storage.Bucket, key, data, size, contentType)
 }
 
-func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64, sum string) error {
+// recordKernelSymbolArtifact 登记 kallsyms artifact 引用。
+// 阶段二：blobID 非空时把 artifact 直接关联到已迁移的 CAS blob
+// （避免新引用指向旧 key 造成孤儿 blob、阻塞 GC）。
+func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64, sum string, blobID *uint) error {
 	if tid == "" || objectKey == "" {
 		return nil
 	}
@@ -430,19 +436,41 @@ func (s *APIServer) recordKernelSymbolArtifact(tid, objectKey string, size int64
 		Retention:   "raw",
 		ContentType: "application/octet-stream",
 		Status:      model.ArtifactStatusReady,
+		BlobID:      blobID,
 		CreatedAt:   time.Now(),
 	}
-	return s.DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "task_tid"}, {Name: "kind"}, {Name: "object_key"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"size":         artifact.Size,
-			"sha256":       artifact.SHA256,
-			"hash":         artifact.Hash,
-			"retention":    artifact.Retention,
-			"content_type": artifact.ContentType,
-			"status":       artifact.Status,
-		}),
-	}).Create(&artifact).Error
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		if blobID != nil && *blobID > 0 {
+			var blob model.StorageBlob
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND status = ? AND deleted_at IS NULL", *blobID, model.BlobStatusReady).
+				First(&blob).Error; err != nil {
+				return err
+			}
+		}
+		res := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "task_tid"}, {Name: "kind"}, {Name: "object_key"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"size":         artifact.Size,
+				"sha256":       artifact.SHA256,
+				"hash":         artifact.Hash,
+				"retention":    artifact.Retention,
+				"content_type": artifact.ContentType,
+				"status":       artifact.Status,
+				"blob_id":      artifact.BlobID,
+			}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Eq{Column: clause.Column{Table: "artifacts", Name: "deleted_at"}, Value: nil},
+			}},
+		}).Create(&artifact)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return errors.New("kallsyms artifact tombstone cannot be revived")
+		}
+		return nil
+	})
 }
 
 func looksLikeKallsyms(body []byte) bool {

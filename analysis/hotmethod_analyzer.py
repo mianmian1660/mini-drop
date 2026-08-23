@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 # 引入同目录下的模块
 from storage import MinIOStorage, create_storage
 from error import ErrorCode, ErrorInfo, exit_ok, exit_error
-from flamegraph import generate_flamegraph, get_folded_stacks
+from flamegraph import generate_flamegraph, get_folded_stacks, run_flamegraph, run_perf_script, run_stackcollapse, _looks_like_folded_stacks
 from symbolizer import install_symbols_for_task
 from collapsed_data_parser import analyze_collapsed
 from analysis_advisor import generate_suggestions as advisor_generate_suggestions
@@ -46,6 +46,9 @@ from bpf_analyzer import analyze_bpf_output, bpf_histogram_to_svg
 from java_analyzer import analyze_java_profile, generate_java_suggestions
 from attribution import run_attribution
 from observability import elapsed_seconds, log_event, now_seconds
+import artifact_descriptor as ad
+import pprof_builder as pprof_builder
+from analyzer_contract import AnalyzerTemporaryError
 
 
 # ============================================================
@@ -180,7 +183,7 @@ def get_task(conn, tid: str) -> dict:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             "SELECT tid, name, type, profiler_type, target_ip, "
-            "request_params, status, analysis_status "
+            "request_params, status, analysis_status, create_time, end_time "
             "FROM hotmethod_tasks WHERE tid = %s AND deleted_at IS NULL",
             (tid,)
         )
@@ -373,6 +376,10 @@ def _download_perf_data(storage, bucket: str, tid: str,
 
 
 def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
+    """读取任务 RAW artifact 的物理 object_key 列表。
+
+    阶段二：blob_id 非空时返回物理 CAS key；否则兼容返回原逻辑 key。
+    """
     suffixes = suffixes or []
     keys = []
     if conn is None:
@@ -380,7 +387,12 @@ def _raw_artifact_keys(conn, tid: str, suffixes=None) -> list:
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT object_key FROM artifacts WHERE task_tid = %s AND kind = 'RAW' ORDER BY created_at DESC, id DESC",
+            "SELECT COALESCE(b.object_key, a.object_key) AS object_key "
+            "FROM artifacts a "
+            "LEFT JOIN storage_blobs b ON b.id = a.blob_id AND b.deleted_at IS NULL "
+            "WHERE a.task_tid = %s AND a.kind = 'RAW' "
+            "AND a.status = 'ready' AND a.deleted_at IS NULL "
+            "ORDER BY a.created_at DESC, a.id DESC",
             (tid,),
         )
         for row in cur.fetchall():
@@ -542,6 +554,146 @@ def _get_presigned_url(storage, bucket: str, key: str,
         return ""
 
 
+def _task_time_nanos(task: dict) -> tuple:
+    """任务开始/时长（Unix 纳秒）。解析失败返回 (0, 0)。"""
+    try:
+        start_raw = task.get("start_time") or task.get("create_time")
+        end_raw = task.get("end_time")
+        start = None
+        end = None
+        for raw in (start_raw, end_raw):
+            if not raw:
+                continue
+            if isinstance(raw, (int, float)):
+                value = float(raw)
+                value = value * 1e9 if value < 1e12 else value * 1e6  # 秒→纳秒 / 毫秒→纳秒
+                if start is None:
+                    start = value
+                else:
+                    end = value
+            else:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                ts = parsed.timestamp() * 1e9
+                if start is None:
+                    start = ts
+                else:
+                    end = ts
+        if start is None:
+            return 0, 0
+        if end is None or end < start:
+            return int(start), 0
+        return int(start), int(end - start)
+    except Exception:
+        return 0, 0
+
+
+def _perf_build_ids(local_perf: str) -> dict:
+    """获取 perf.data 中 DSO 的 build-id（尽力而为，失败返回空映射）。"""
+    if not local_perf or not os.path.exists(local_perf):
+        return {}
+    try:
+        result = subprocess.run(
+            ["perf", "buildid-list", "-i", local_perf],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return {}
+        build_ids = {}
+        # 输出格式: <buildid> <dso_path>
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                build_ids[parts[1]] = parts[0]
+        return build_ids
+    except Exception:
+        return {}
+
+
+def _build_cpu_pprof(script_output, folded_text, local_perf, task, tid) -> dict:
+    """从同一规范样本模型生成 cpu.pprof.pb.gz descriptor。
+
+    PORTABLE_PROFILE_MODE=observe（默认）：生成并校验，失败只记录指标，
+    不影响原分析结果；enforce：失败抛 AnalyzerError 触发 AnalysisJob 重试。
+    返回 descriptor（dict）或 None（observe 模式下失败）。
+    """
+    mode = os.environ.get("PORTABLE_PROFILE_MODE", "observe").strip().lower()
+    if mode not in ("observe", "enforce"):
+        mode = "observe"
+
+    params = task.get("request_params") or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            params = {}
+    frequency = 0
+    if isinstance(params, dict):
+        try:
+            frequency = int(params.get("frequency") or 0)
+        except (TypeError, ValueError):
+            frequency = 0
+    # period = 1e9 / 频率；未配置频率时按 100Hz 兜底（与 drop_agent 默认一致）。
+    period_ns = int(round(1e9 / frequency)) if frequency > 0 else 10000000
+    start_ns, duration_ns = _task_time_nanos(task)
+
+    try:
+        if script_output:
+            model = pprof_builder.parse_perf_script(script_output)
+        else:
+            model = pprof_builder.folded_to_model(folded_text)
+        build_ids = _perf_build_ids(local_perf)
+        raw_gz = pprof_builder.pprof_gz(
+            model, period_ns=period_ns,
+            time_nanos=start_ns, duration_nanos=duration_ns,
+            build_ids=build_ids,
+        )
+        check = pprof_builder.validate_pprof_proto(raw_gz)
+        log_event("pprof_conversion", task_tid=tid, ok=bool(check["ok"]),
+                  samples=check.get("samples"), period_ns=period_ns,
+                  mode=mode, error=check.get("error") or "")
+        if not check["ok"]:
+            raise RuntimeError("pprof 校验失败: " + check["error"])
+        folded_samples = 0
+        for line in (folded_text or "").splitlines():
+            parts = line.rsplit(None, 1)
+            if len(parts) == 2:
+                try:
+                    folded_samples += int(parts[1])
+                except ValueError:
+                    pass
+        if folded_samples <= 0:
+            raise RuntimeError("folded 样本总数为零")
+        if check.get("total_samples") != folded_samples:
+            raise RuntimeError(
+                "pprof/folded 样本数不一致: pprof=%s folded=%s" %
+                (check.get("total_samples"), folded_samples)
+            )
+        # pprof 内容本身就是 .pb.gz 文件格式：compression="" 不再二次压缩。
+        return ad.build_descriptor(tid, "cpu.pprof.pb.gz", raw_gz,
+                                   kind="RAW", fmt="pprof",
+                                   schema_version="1", compression="")
+    except Exception as exc:
+        log_event("pprof_conversion", task_tid=tid, ok=False,
+                  mode=mode, error=str(exc))
+        print(f"[analysis] pprof 生成失败（mode={mode}）: {exc}", file=sys.stderr)
+        if mode == "enforce":
+            from analyzer_contract import AnalyzerError
+            raise AnalyzerError(f"pprof 生成失败: {exc}") from exc
+        return None
+
+
+def _upload_cpu_pprof(storage_ok, storage, bucket, descriptor, tid) -> bool:
+    """上传 portable profile；enforce 模式把缺失产物视为可重试失败。"""
+    if storage_ok and ad.upload_descriptor(storage, bucket, descriptor):
+        return True
+    mode = os.environ.get("PORTABLE_PROFILE_MODE", "observe").strip().lower()
+    print(f"[analysis] pprof 上传失败（mode={mode}）", file=sys.stderr)
+    log_event("pprof_upload_failed", task_tid=tid, mode=mode)
+    if mode == "enforce":
+        raise AnalyzerTemporaryError("pprof 上传失败")
+    return False
+
+
 def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                             bucket: str, tid: str,
                             local_dir: str = "") -> dict:
@@ -550,10 +702,10 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
 
     完整流水线:
       1. 从 MinIO 下载 perf.data
-      2. perf script → stackcollapse → flamegraph.pl → SVG
-      3. 解析折叠栈 → TopN 热点 JSON
+      2. 单次 perf script → stackcollapse → 规范样本模型
+      3. 同一模型生成 folded / SVG / TopN / cpu.pprof.pb.gz
       4. 规则建议引擎 → suggestions.md
-      5. 上传产物到 MinIO（或保存到本地 local_dir）
+      5. 结果经 Artifact descriptor 上传（压缩 + 双哈希 + CAS 去重）
       6. 生成预签名 URL（MinIO 可用时）
       7. 写结果到 analysis_suggestions 表
 
@@ -604,73 +756,99 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
         installed_count = install_symbols_for_task(conn, storage, bucket, tid)
         print(f"[analysis] 已安装 {installed_count} 个用户态符号", file=sys.stderr)
 
-    # --- 3. 生成火焰图 SVG ---
+    # --- 3. 单次 perf script → 规范样本模型 ---
+    # 阶段二：perf script 只执行一次，从同一规范样本模型生成
+    # folded / SVG / TopN / cpu.pprof.pb.gz（不再重复跑 perf script）。
     task_name = task.get("name", tid)
     title = f"CPU Flame Graph: {task_name}"
 
-    print(f"[analysis] 开始生成火焰图 ...", file=sys.stderr)
+    print(f"[analysis] 开始单次 perf script → 折叠栈/火焰图/pprof ...", file=sys.stderr)
+    script_output = None
+    folded_text = ""
     try:
-        svg_content = generate_flamegraph(local_perf, title=title,
-                                          kallsyms_path=local_kallsyms)
+        # 输入若已是折叠文本（本地测试/历史数据），跳过 perf script，直接使用。
+        is_folded_input = False
+        with open(local_perf, "r", errors="replace") as probe:
+            sample_lines = [l.strip() for l in probe.readlines()[:30] if l.strip()]
+        is_folded_input = _looks_like_folded_stacks(sample_lines)
+        if is_folded_input:
+            with open(local_perf, "r", errors="replace") as source:
+                folded_text = source.read()
+            print(f"[analysis] 输入已是折叠栈格式（{len(folded_text)} 字节），跳过 perf script",
+                  file=sys.stderr)
+        else:
+            script_output = run_perf_script(local_perf, kallsyms_path=local_kallsyms)
+            folded_text = run_stackcollapse(script_output)
+    except Exception as e:
+        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
+                   f"perf script / 折叠栈生成失败: {e}",
+                   traceback.format_exc())
+
+    if not folded_text or not folded_text.strip():
+        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
+                   "perf script 输出为空，无法生成火焰图",
+                   traceback.format_exc())
+
+    # --- 4. 同一模型生成 SVG 与 TopN ---
+    try:
+        svg_content = run_flamegraph(folded_text, title=title)
     except Exception as e:
         exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
                    f"火焰图生成失败: {e}",
                    traceback.format_exc())
 
-    # --- 4. 获取折叠栈 ---
-    try:
-        folded_text = get_folded_stacks(local_perf, local_kallsyms)
-    except Exception as e:
-        print(f"[analysis] 折叠栈生成失败: {e}", file=sys.stderr)
-        folded_text = ""
-
-    # --- 5. 解析折叠栈 → TopN 热点 ---
     top_json = {}
-    if folded_text:
-        try:
-            top_json = analyze_collapsed(folded_text, top_n=20)
-        except Exception as e:
-            print(f"[analysis] 热点分析失败: {e}", file=sys.stderr)
+    try:
+        top_json = analyze_collapsed(folded_text, top_n=20)
+    except Exception as e:
+        print(f"[analysis] 热点分析失败: {e}", file=sys.stderr)
 
-    # --- 6. 上传产物到 MinIO / 保存到本地 ---
+    # --- 4b. 标准 pprof（PORTABLE_PROFILE_MODE=observe|enforce）---
+    pprof_descriptor = _build_cpu_pprof(script_output, folded_text, local_perf, task, tid)
+
+    # --- 5. 上传产物到 MinIO / 保存到本地（descriptor 走 Blob：压缩+双哈希）---
     presigned_urls = {}
     local_files = []
 
-    # 火焰图 SVG
-    svg_key = _upload_output(storage, bucket, tid,
-                             "flamegraph.svg", svg_content, "image/svg+xml")
-    if svg_key:
-        outputs.append(svg_key)
-        presigned_urls["flamegraph.svg"] = _get_presigned_url(storage, bucket, svg_key)
+    # 火焰图 SVG：gzip + CAS key + 透明 Content-Encoding
+    svg_desc = ad.build_descriptor(tid, "flamegraph.svg", svg_content, fmt="svg")
+    if storage_ok and ad.upload_descriptor(storage, bucket, svg_desc):
+        outputs.append(svg_desc)
+        presigned_urls["flamegraph.svg"] = _get_presigned_url(storage, bucket, svg_desc["blob_key"])
     else:
         local_path = _save_local_output(local_dir, f"{tid}_flamegraph.svg", svg_content)
         if local_path:
             local_files.append(local_path)
             outputs.append(local_path)
 
-    # 折叠栈
-    folded_key = _upload_output(storage, bucket, tid,
-                                "folded.txt", folded_text, "text/plain")
-    if folded_key:
-        outputs.append(folded_key)
-        presigned_urls["folded.txt"] = _get_presigned_url(storage, bucket, folded_key)
+    # 折叠栈：gzip + CAS key + 透明 Content-Encoding
+    folded_desc = ad.build_descriptor(tid, "folded.txt", folded_text, fmt="folded")
+    if storage_ok and ad.upload_descriptor(storage, bucket, folded_desc):
+        outputs.append(folded_desc)
+        presigned_urls["folded.txt"] = _get_presigned_url(storage, bucket, folded_desc["blob_key"])
     else:
         local_path = _save_local_output(local_dir, f"{tid}_folded.txt", folded_text)
         if local_path:
             local_files.append(local_path)
             outputs.append(local_path)
 
-    # TopN JSON
-    top_key = _upload_output(storage, bucket, tid,
-                             "top.json", top_json, "application/json")
-    if top_key:
-        outputs.append(top_key)
-        presigned_urls["top.json"] = _get_presigned_url(storage, bucket, top_key)
+    # TopN JSON：小 JSON 不强制压缩（CAS key 无后缀）
+    top_desc = ad.build_descriptor(tid, "top.json", top_json, fmt="json")
+    if storage_ok and ad.upload_descriptor(storage, bucket, top_desc):
+        outputs.append(top_desc)
+        presigned_urls["top.json"] = _get_presigned_url(storage, bucket, top_desc["blob_key"])
     else:
         local_path = _save_local_output(local_dir, f"{tid}_top.json", top_json)
         if local_path:
             local_files.append(local_path)
             outputs.append(local_path)
+
+    # cpu.pprof.pb.gz：RAW/pprof/v1，raw_portable（7 天）
+    if pprof_descriptor is not None:
+        if _upload_cpu_pprof(storage_ok, storage, bucket, pprof_descriptor, tid):
+            outputs.append(pprof_descriptor)
+            presigned_urls["cpu.pprof.pb.gz"] = _get_presigned_url(
+                storage, bucket, pprof_descriptor["blob_key"])
 
     # --- 7. 规则建议引擎：匹配热点函数 → 生成优化建议 ---
     suggestions_result = {}
@@ -690,16 +868,14 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                   f"{len(suggestions_result.get('suggestions', []))} 条建议",
                   file=sys.stderr)
 
-            # 上传/保存 suggestions.md
+            # 上传/保存 suggestions.md（descriptor：大文本 gzip，小文本走 CAS 无压缩）
             md_content = suggestions_result.get("suggestions_md", "")
             if md_content:
-                md_key = _upload_output(storage, bucket, tid,
-                                        "suggestions.md", md_content,
-                                        "text/markdown")
-                if md_key:
-                    outputs.append(md_key)
+                md_desc = ad.build_descriptor(tid, "suggestions.md", md_content, fmt="markdown")
+                if storage_ok and ad.upload_descriptor(storage, bucket, md_desc):
+                    outputs.append(md_desc)
                     presigned_urls["suggestions.md"] = _get_presigned_url(
-                        storage, bucket, md_key)
+                        storage, bucket, md_desc["blob_key"])
                 else:
                     local_path = _save_local_output(
                         local_dir, f"{tid}_suggestions.md", md_content)
@@ -707,19 +883,17 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
                         local_files.append(local_path)
                         outputs.append(local_path)
 
-            # 上传/保存 suggestions.json
+            # 上传/保存 suggestions.json（小 JSON 不强制压缩）
             sugg_json = {
                 "suggestions": suggestions_result.get("suggestions", []),
                 "rules_loaded": suggestions_result.get("rules_loaded", 0),
                 "rule_version": suggestions_result.get("rule_version", ""),
             }
-            sugg_key = _upload_output(storage, bucket, tid,
-                                      "suggestions.json", sugg_json,
-                                      "application/json")
-            if sugg_key:
-                outputs.append(sugg_key)
+            sugg_desc = ad.build_descriptor(tid, "suggestions.json", sugg_json, fmt="json")
+            if storage_ok and ad.upload_descriptor(storage, bucket, sugg_desc):
+                outputs.append(sugg_desc)
                 presigned_urls["suggestions.json"] = _get_presigned_url(
-                    storage, bucket, sugg_key)
+                    storage, bucket, sugg_desc["blob_key"])
             else:
                 local_path = _save_local_output(
                     local_dir, f"{tid}_suggestions.json", sugg_json)
