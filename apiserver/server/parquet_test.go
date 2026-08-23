@@ -6,7 +6,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -18,21 +20,21 @@ func pqTestConfig() *config.Config {
 	return &config.Config{
 		Storage: config.StorageConfig{Bucket: "drop-data", PresignExpireSec: 900},
 		ContinuousParquet: config.ContinuousParquetConfig{
-			Mode:                  "off",
-			Tenant:                "default",
-			RawRetentionHours:     24,
-			Res5mRetentionHours:   168,
-			Res1hRetentionHours:   720,
-			QuotaBytes:            4 << 30,
-			QuotaTargetBytes:      3600 << 20,
+			Mode:                    "off",
+			Tenant:                  "default",
+			RawRetentionHours:       24,
+			Res5mRetentionHours:     168,
+			Res1hRetentionHours:     720,
+			QuotaBytes:              4 << 30,
+			QuotaTargetBytes:        3600 << 20,
 			StagingMinutesRetention: 120,
-			RowGroupTargetBytes:   16 << 20,
-			MaxPartBytes:          128 << 20,
-			MinFreeReserve:        512 << 20,
-			RecoverHysteresisBytes: 512 << 20,
-			RecoveryChecks:        2,
-			V1RollbackWindowHours: 24,
-			V1DeleteBatch:         200,
+			RowGroupTargetBytes:     16 << 20,
+			MaxPartBytes:            128 << 20,
+			MinFreeReserve:          512 << 20,
+			RecoverHysteresisBytes:  512 << 20,
+			RecoveryChecks:          2,
+			V1RollbackWindowHours:   24,
+			V1DeleteBatch:           200,
 		},
 		StorageDisk: config.StorageDiskConfig{
 			Path: "/tmp", WarningFreeBytes: 8 << 30, CriticalFreeBytes: 4 << 30, MinFreeBytes: 1 << 30,
@@ -74,6 +76,13 @@ func TestPQFramesFromLegacyStack(t *testing.T) {
 	// display name 兼容旧格式
 	if got := frameDisplayName(frames[1]); got != "0x7f1234 [libc.so.6]" {
 		t.Errorf("display name: %q", got)
+	}
+}
+
+func TestPQFramesFromLegacyStackString(t *testing.T) {
+	frames := normalizedSampleFrames(ContinuousStackSample{StackString: "main;runtime.main"})
+	if len(frames) != 2 || frames[0].Function != "main" || frames[1].Function != "runtime.main" {
+		t.Fatalf("stack_string fallback failed: %+v", frames)
 	}
 }
 
@@ -373,6 +382,23 @@ func TestPQRequiredFreeFormula(t *testing.T) {
 	}
 }
 
+func TestPQP95HourlyIngestScansAggregates(t *testing.T) {
+	s := pqTestServer(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+	for i, size := range []uint64{100, 200, 300} {
+		if err := s.DB.Create(&model.ProfileBatch{
+			BID: fmt.Sprintf("p95-%d", i), SessionSID: "s1", ObjectKey: fmt.Sprintf("p95-%d", i),
+			StartTime: now.Add(time.Duration(i) * time.Hour), EndTime: now.Add(time.Duration(i)*time.Hour + time.Minute),
+			PayloadBytes: size, CreatedAt: now,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := s.p95HourlyIngestBytes(context.Background()); got != 200 {
+		t.Fatalf("p95 hourly ingest=%d want=200", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 连续配额
 // ---------------------------------------------------------------------------
@@ -405,6 +431,50 @@ func TestPQContinuousQuota(t *testing.T) {
 	}
 }
 
+func TestPQStagingReclaimRequiresEnforceAndValidatedLineage(t *testing.T) {
+	s := pqTestServer(t)
+	mem := s.Storage.(*continuousMemoryStorage)
+	mem.objects["staging.json"] = "payload"
+	mem.modified["staging.json"] = time.Now().Add(-3 * time.Hour)
+	batch := model.ProfileBatch{
+		BID: "b-covered", SessionSID: "s1", ObjectKey: "staging.json",
+		StartTime: time.Now().Add(-3 * time.Hour), EndTime: time.Now().Add(-3*time.Hour + time.Minute),
+		SignalTypes: []byte(`["cpu_profile"]`), PayloadBytes: 7, CreatedAt: time.Now().Add(-3 * time.Hour),
+	}
+	if err := s.DB.Create(&batch).Error; err != nil {
+		t.Fatal(err)
+	}
+	block := model.ContinuousParquetBlock{
+		BlockID: "pq-covered", Tenant: "default", BucketStart: batch.StartTime.UTC().Truncate(time.Hour),
+		BucketEnd: batch.StartTime.UTC().Truncate(time.Hour).Add(time.Hour), SignalType: model.ContinuousParquetSignalCPU,
+		Resolution: model.ContinuousParquetResolutionRaw, Status: model.ContinuousParquetStatusActive,
+		Validation: model.ContinuousParquetValidationPassed, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := s.DB.Create(&block).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&model.ContinuousParquetBlockMember{
+		BlockID: block.BlockID, SourceKind: "batch", SourceRef: batch.BID, CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	s.Config.ContinuousParquet.Mode = "shadow"
+	s.pqReclaimStaging(context.Background())
+	if _, ok := mem.objects["staging.json"]; !ok {
+		t.Fatal("shadow mode must retain v1 staging object")
+	}
+	s.Config.ContinuousParquet.Mode = "enforce"
+	s.pqReclaimStaging(context.Background())
+	if _, ok := mem.objects["staging.json"]; ok {
+		t.Fatal("covered staging object should be reclaimed in enforce mode")
+	}
+	var count int64
+	s.DB.Model(&model.ProfileBatch{}).Where("bid = ?", batch.BID).Count(&count)
+	if count != 0 {
+		t.Fatal("reclaimed staging metadata should be removed")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 对象 key 布局
 // ---------------------------------------------------------------------------
@@ -415,6 +485,159 @@ func TestPQObjectKeyLayout(t *testing.T) {
 	want := "continuous/v2/default/date=2026-08-23/hour=10/signal=cpu/resolution=raw/pq-abc-00.parquet"
 	if key != want {
 		t.Fatalf("key: %q want %q", key, want)
+	}
+}
+
+func TestPQContainsBlockID(t *testing.T) {
+	key := "continuous/v2/default/date=2026-08-23/hour=10/signal=cpu/resolution=raw/pq-abc-00.parquet"
+	if !containsBlockID(key, "pq-abc") {
+		t.Fatal("expected block id match")
+	}
+	if containsBlockID(key, "pq-ab") || containsBlockID(key, "abc") {
+		t.Fatal("partial block id must not match")
+	}
+}
+
+func TestPQSealedHourRetriesMissingSignalAndLateWindow(t *testing.T) {
+	s := pqTestServer(t)
+	ctx := context.Background()
+	hour := time.Date(2026, 8, 23, 8, 0, 0, 0, time.UTC)
+	created := hour.Add(time.Hour)
+	for i, signal := range []string{"cpu_profile", "metrics"} {
+		if err := s.DB.Create(&model.ProfileWindow{
+			SessionSID: "s1", BatchBID: fmt.Sprintf("b%d", i), WindowStart: hour.Add(time.Minute),
+			WindowEnd: hour.Add(2 * time.Minute), ObjectKey: fmt.Sprintf("k%d", i), SignalType: signal, CreatedAt: created,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.DB.Create(&model.ContinuousParquetBlock{
+		BlockID: "cpu-only", Tenant: "default", BucketStart: hour, BucketEnd: hour.Add(time.Hour),
+		SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw,
+		Status: model.ContinuousParquetStatusActive, Validation: model.ContinuousParquetValidationPassed,
+		CreatedAt: created.Add(time.Minute), UpdatedAt: created.Add(time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	hours := s.pqSealedRawHours(ctx, "default", hour.Add(3*time.Hour), 12)
+	if len(hours) != 1 || !hours[0].Equal(hour) {
+		t.Fatalf("missing metrics block must retry hour: %v", hours)
+	}
+	if err := s.DB.Create(&model.ContinuousParquetBlock{
+		BlockID: "metrics-ready", Tenant: "default", BucketStart: hour, BucketEnd: hour.Add(time.Hour),
+		SignalType: model.ContinuousParquetSignalMetrics, Resolution: model.ContinuousParquetResolutionRaw,
+		Status: model.ContinuousParquetStatusActive, Validation: model.ContinuousParquetValidationPassed,
+		CreatedAt: created.Add(time.Minute), UpdatedAt: created.Add(time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if hours := s.pqSealedRawHours(ctx, "default", hour.Add(3*time.Hour), 12); len(hours) != 0 {
+		t.Fatalf("fully covered unchanged hour should not rebuild: %v", hours)
+	}
+	if err := s.DB.Create(&model.ProfileWindow{
+		SessionSID: "s1", BatchBID: "late", WindowStart: hour.Add(3 * time.Minute),
+		WindowEnd: hour.Add(4 * time.Minute), ObjectKey: "late", SignalType: "cpu_profile",
+		CreatedAt: created.Add(2 * time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if hours := s.pqSealedRawHours(ctx, "default", hour.Add(3*time.Hour), 12); len(hours) != 1 {
+		t.Fatalf("late window must trigger rewrite: %v", hours)
+	}
+}
+
+type immediatePutFailureStorage struct{ *continuousMemoryStorage }
+
+func (s *immediatePutFailureStorage) PutObject(context.Context, string, string, io.Reader, int64, string) error {
+	return errors.New("injected upload failure")
+}
+
+func TestPQWriterDoesNotDeadlockWhenUploadFailsWithoutReading(t *testing.T) {
+	s := pqTestServer(t)
+	s.Storage = &immediatePutFailureStorage{continuousMemoryStorage: newContinuousMemoryStorage()}
+	done := make(chan error, 1)
+	go func() {
+		_, err := writeParquetPartGeneric(s, context.Background(), "continuous/v2/fail.parquet", []pqCPURow{{
+			Timestamp: time.Now().UnixMilli(), SessionSID: "s1", Value: 1,
+		}})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected upload error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer deadlocked after early upload failure")
+	}
+}
+
+func TestPQShadowMismatchNeverBecomesActive(t *testing.T) {
+	s := pqTestServer(t)
+	s.Config.ContinuousParquet.Mode = "shadow"
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	if err := s.DB.Create(&model.ProfileWindow{
+		SessionSID: "s1", BatchBID: "b1", WindowStart: hour.Add(time.Minute), WindowEnd: hour.Add(2 * time.Minute),
+		ObjectKey: "source", SignalType: "cpu_profile", SampleCount: 9, CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.pqWriteSignalBlock(context.Background(), "default", hour, hour.Add(time.Hour),
+		model.ContinuousParquetSignalCPU, model.ContinuousParquetResolutionRaw, "",
+		[]pqCPURow{{Timestamp: hour.Add(time.Minute).UnixMilli(), SessionSID: "s1", Value: 2, ProfileType: "cpu_profile"}},
+		nil, nil, nil, map[string]bool{"s1": true}, nil,
+		map[string]map[string]bool{"b1": {"batch": true}})
+	if err == nil {
+		t.Fatal("shadow source mismatch must fail the block")
+	}
+	key := pqBlockKey{Tenant: "default", BucketStart: hour, SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw}
+	if active, findErr := s.pqFindActiveBlock(context.Background(), key); findErr != nil || active != nil {
+		t.Fatalf("mismatched shadow block became active: active=%+v err=%v", active, findErr)
+	}
+}
+
+func TestPQQueryRequiresFullCoverageAndAuthorizedSession(t *testing.T) {
+	s := pqTestServer(t)
+	s.Config.ContinuousParquet.Mode = "prefer"
+	ctx := context.Background()
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	for _, session := range []model.ContinuousSession{
+		{SID: "s-owned", TargetIP: "10.0.0.1", UID: "owner", ServiceName: "svc", CreatedAt: hour, UpdatedAt: hour},
+		{SID: "s-other", TargetIP: "10.0.0.1", UID: "other", ServiceName: "svc", CreatedAt: hour, UpdatedAt: hour},
+	} {
+		if err := s.DB.Create(&session).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := []pqCPURow{
+		{Timestamp: hour.Add(time.Minute).UnixMilli(), SessionSID: "s-owned", Frames: []pqCPUFrame{{Function: "owned"}}, Value: 2, ProfileType: "cpu_profile"},
+		{Timestamp: hour.Add(time.Minute).UnixMilli(), SessionSID: "s-other", Frames: []pqCPUFrame{{Function: "other"}}, Value: 100, ProfileType: "cpu_profile"},
+	}
+	result, err := writeParquetPartGeneric(s, ctx, parquetObjectKeyV2("default", hour, "cpu", "raw", "pq-query", 0), rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := pqBlockKey{Tenant: "default", BucketStart: hour, SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw}
+	if _, err := s.pqCreateBuildingBlock(ctx, key, "pq-query", hour.Add(time.Hour), 1); err != nil {
+		t.Fatal(err)
+	}
+	stats := pqBlockStats{RowCount: 2, SampleTotal: 102, ValueTotal: 102, BytesTotal: result.SizeBytes}
+	if err := s.pqRegisterActiveBlock(ctx, key, "pq-query", hour.Add(time.Hour), 1, result, stats, nil); err != nil {
+		t.Fatal(err)
+	}
+	q := ProfileQuery{SessionSID: "s-owned", Host: "10.0.0.1", OwnerUIDs: []string{"owner"},
+		From: hour, To: hour.Add(30 * time.Minute), ProfileType: "cpu"}
+	agg, found, err := s.pqQueryAggregateV2(ctx, q)
+	if err != nil || !found {
+		t.Fatalf("authorized v2 query failed: found=%v err=%v", found, err)
+	}
+	if agg.Total != 2 {
+		t.Fatalf("cross-session data leaked into aggregate: total=%v", agg.Total)
+	}
+
+	q.To = hour.Add(time.Hour + 30*time.Minute)
+	if _, found, err := s.pqQueryAggregateV2(ctx, q); err != nil || found {
+		t.Fatalf("partial coverage must fall back entirely: found=%v err=%v", found, err)
 	}
 }
 

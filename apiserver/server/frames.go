@@ -81,8 +81,10 @@ func normalizedSampleFrames(sample ContinuousStackSample) []ContinuousStackFrame
 	if len(sample.Frames) > 0 {
 		return sample.Frames
 	}
-	if len(sample.Stack) > 0 {
-		return framesFromLegacyStack(sample.Stack)
+	// continuousSampleStack 同时兼容旧版 stack_string，避免历史 batch
+	// 回填到 v2 时被写成空栈。
+	if stack := continuousSampleStack(sample); len(stack) > 0 {
+		return framesFromLegacyStack(stack)
 	}
 	return nil
 }

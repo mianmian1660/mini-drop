@@ -1,5 +1,5 @@
 // ============================================================
-// server/migration_pg_test.go — 阶段五 016/017 迁移幂等测试（PostgreSQL）
+// server/migration_pg_test.go — 阶段五 016/017/018 迁移幂等测试（PostgreSQL）
 // ============================================================
 // 仅在设置了 TEST_PG_DSN 时运行（服务器 E2E）：对真实 PG 数据库应用
 // 016/017 两次，验证首次应用与重复应用都幂等成功；并验证部分唯一索引
@@ -30,10 +30,14 @@ func pgTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-func TestMigrations016017Idempotent(t *testing.T) {
+func TestMigrations016018Idempotent(t *testing.T) {
 	db := pgTestDB(t)
 	if err := db.Exec("CREATE SCHEMA IF NOT EXISTS public").Error; err != nil {
 		t.Fatal(err)
+	}
+	// 生产升级库已有业务表；独立临时库先构造同等基线，再验证 SQL 迁移。
+	if err := AutoMigrate(db); err != nil {
+		t.Fatalf("构造迁移前 schema 失败: %v", err)
 	}
 	// 首次应用全部迁移（含 016/017）
 	if err := RunMigrations(db); err != nil {
@@ -79,12 +83,35 @@ func TestMigrations016017Idempotent(t *testing.T) {
 	if err == nil {
 		t.Fatal("同一分区第二个 active 应被部分唯一索引拒绝")
 	}
+	// active 但 validation!=passed 必须由数据库 CHECK 拒绝。
+	err = db.Exec(`
+		INSERT INTO continuous_parquet_blocks
+		(block_id, tenant, bucket_start, bucket_end, signal_type, resolution, version, status, validation)
+		VALUES ('pg-test-invalid', 'default', '2026-08-23T12:00:00Z', '2026-08-23T13:00:00Z', 'cpu', 'raw', 1, 'active', 'pending')`).Error
+	if err == nil {
+		t.Fatal("active/pending 应被数据库约束拒绝")
+	}
 	// 清理测试行
 	_ = db.Exec("DELETE FROM continuous_parquet_blocks WHERE block_id IN ('pg-test-a','pg-test-b')").Error
 }
 
 func TestMigrations016ObjectKeyUnique(t *testing.T) {
 	db := pgTestDB(t)
+	if err := AutoMigrate(db); err != nil {
+		t.Fatalf("构造 schema 失败: %v", err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("应用迁移失败: %v", err)
+	}
+	for _, id := range []string{"pg-file-a", "pg-file-b"} {
+		if err := db.Exec(`
+			INSERT INTO continuous_parquet_blocks
+			(block_id, tenant, bucket_start, bucket_end, signal_type, resolution, version, status, validation)
+			VALUES (?, 'default', '2026-08-24T10:00:00Z', '2026-08-24T11:00:00Z', 'cpu', 'raw', 1, 'failed', 'failed')
+			ON CONFLICT (block_id) DO NOTHING`, id).Error; err != nil {
+			t.Fatalf("插入父 block 失败: %v", err)
+		}
+	}
 	err := db.Exec(`
 		INSERT INTO continuous_parquet_block_files (block_id, part_index, object_key)
 		VALUES ('pg-file-a', 0, 'continuous/v2/default/date=2026-08-23/hour=10/signal=cpu/resolution=raw/pg-file-a-00.parquet')`).Error
@@ -98,6 +125,7 @@ func TestMigrations016ObjectKeyUnique(t *testing.T) {
 		t.Fatal("重复 object_key 应被唯一索引拒绝")
 	}
 	_ = db.Exec("DELETE FROM continuous_parquet_block_files WHERE block_id IN ('pg-file-a','pg-file-b')").Error
+	_ = db.Exec("DELETE FROM continuous_parquet_blocks WHERE block_id IN ('pg-file-a','pg-file-b')").Error
 }
 
 var _ = fmt.Sprintf

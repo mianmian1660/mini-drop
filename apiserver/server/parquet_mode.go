@@ -41,7 +41,9 @@ func pqMode(raw string) string {
 }
 
 // pqModeEnabled v2 是否写入（shadow/prefer/enforce）。
-func pqModeEnabled(mode string) bool { return mode == "shadow" || mode == "prefer" || mode == "enforce" }
+func pqModeEnabled(mode string) bool {
+	return mode == "shadow" || mode == "prefer" || mode == "enforce"
+}
 
 // pqModeQueryV2 v2 是否参与查询（prefer/enforce）。
 func pqModeQueryV2(mode string) bool { return mode == "prefer" || mode == "enforce" }
@@ -107,7 +109,7 @@ func (s *APIServer) runParquetCycle(ctx context.Context, mode string) {
 	s.pqSweepCleanup(ctx, 200)
 }
 
-// pqSealedHours 需要构建的封存小时列表（已封存、未过期、尚无 active raw）。
+// pqSealedHours 返回需要首次构建或因迟到窗口/部分信号失败而重写的小时。
 func (s *APIServer) pqSealedRawHours(ctx context.Context, tenant string, now time.Time, limit int) []time.Time {
 	delay := time.Duration(s.Config.ContinuousBlock.CompactionDelaySec) * time.Second
 	if delay <= 0 {
@@ -115,43 +117,93 @@ func (s *APIServer) pqSealedRawHours(ctx context.Context, tenant string, now tim
 	}
 	sealedCutoff := now.Add(-delay)
 
-	// 已存在 active raw 的分区（避免重复构建）
-	var existingBuckets []time.Time
+	// active 必须按 bucket+signal 追踪，不能只要任意信号成功就把整个小时
+	// 标成 covered。CreatedAt 用于发现 active 之后才到达的迟到窗口。
+	var activeBlocks []model.ContinuousParquetBlock
 	if err := s.DB.WithContext(ctx).
 		Model(&model.ContinuousParquetBlock{}).
 		Where("tenant = ? AND resolution = ? AND status = ?",
 			tenant, model.ContinuousParquetResolutionRaw, model.ContinuousParquetStatusActive).
-		Pluck("bucket_start", &existingBuckets).Error; err != nil {
+		Select("bucket_start, signal_type, created_at").Find(&activeBlocks).Error; err != nil {
 		return nil
 	}
-	covered := map[int64]bool{}
-	for _, bucket := range existingBuckets {
-		covered[bucket.Unix()] = true
+	active := map[int64]map[string]time.Time{}
+	for _, block := range activeBlocks {
+		if active[block.BucketStart.Unix()] == nil {
+			active[block.BucketStart.Unix()] = map[string]time.Time{}
+		}
+		active[block.BucketStart.Unix()][block.SignalType] = block.CreatedAt
 	}
 
 	// 有窗口数据但尚无 raw 块的小时
-	type hourRow struct {
-		Bucket time.Time
-	}
-	var hours []hourRow
 	trunc := pqHourTruncExpr(s.DB.Dialector.Name(), "window_start")
-	if err := s.DB.WithContext(ctx).
-		Model(&model.ProfileWindow{}).
+	bucketTimes := make([]time.Time, 0, limit)
+	query := s.DB.WithContext(ctx).Model(&model.ProfileWindow{}).
 		Select(fmt.Sprintf("%s AS bucket", trunc)).
 		Where("window_start < ?", sealedCutoff).
-		Group("bucket").
-		Order("bucket DESC").
-		Limit(limit).Scan(&hours).Error; err != nil {
-		return nil
+		Group("bucket").Order("bucket DESC").Limit(limit)
+	if s.DB.Dialector.Name() == "postgres" {
+		var rows []struct{ Bucket time.Time }
+		if err := query.Scan(&rows).Error; err != nil {
+			return nil
+		}
+		for _, row := range rows {
+			bucketTimes = append(bucketTimes, row.Bucket.UTC())
+		}
+	} else {
+		var rows []struct{ Bucket string }
+		if err := query.Scan(&rows).Error; err != nil {
+			return nil
+		}
+		for _, row := range rows {
+			bucket, err := time.ParseInLocation("2006-01-02 15:04:05", row.Bucket, time.UTC)
+			if err != nil {
+				continue
+			}
+			bucketTimes = append(bucketTimes, bucket)
+		}
 	}
-	out := make([]time.Time, 0, len(hours))
-	for _, hour := range hours {
-		if covered[hour.Bucket.Unix()] {
+	out := make([]time.Time, 0, len(bucketTimes))
+	for _, hour := range bucketTimes {
+		var windows []model.ProfileWindow
+		if err := s.DB.WithContext(ctx).
+			Select("signal_type, created_at").
+			Where("window_start >= ? AND window_start < ?", hour, hour.Add(time.Hour)).
+			Find(&windows).Error; err != nil {
 			continue
 		}
-		out = append(out, hour.Bucket)
+		needsBuild := false
+		for _, window := range windows {
+			signal := pqLedgerSignalForWindow(window.SignalType)
+			if signal == "" {
+				continue
+			}
+			builtAt, ok := active[hour.Unix()][signal]
+			if !ok || window.CreatedAt.After(builtAt) {
+				needsBuild = true
+				break
+			}
+		}
+		if needsBuild {
+			out = append(out, hour)
+		}
 	}
 	return out
+}
+
+func pqLedgerSignalForWindow(signalType string) string {
+	switch signalType {
+	case "cpu_profile", "cpu", "python_memory", "memory":
+		return model.ContinuousParquetSignalCPU
+	case "metrics":
+		return model.ContinuousParquetSignalMetrics
+	case "io_latency", "io_syscall_latency", "sched_latency":
+		return model.ContinuousParquetSignalHistogram
+	case "db", "db_snapshot":
+		return model.ContinuousParquetSignalDB
+	default:
+		return ""
+	}
 }
 
 // pqBuildSealedRawHours 构建所有待建 raw 小时块。
@@ -187,11 +239,11 @@ func (s *APIServer) pqDownsampleAndRetain(ctx context.Context, tenant string) {
 			block := &rawBlocks[i]
 			// 已有 5m 则跳过构建（进入删除判定）
 			hasTarget := false
-			var count int64
-			if err := s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
+			var target model.ContinuousParquetBlock
+			if err := s.DB.WithContext(ctx).
 				Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND resolution = ? AND status = ?",
 					tenant, block.BucketStart, block.SignalType, model.ContinuousParquetResolution5m, model.ContinuousParquetStatusActive).
-				Count(&count).Error; err == nil && count > 0 {
+				First(&target).Error; err == nil && target.SourceBlockID == block.BlockID {
 				hasTarget = true
 			}
 			if !hasTarget {
@@ -214,11 +266,11 @@ func (s *APIServer) pqDownsampleAndRetain(ctx context.Context, tenant string) {
 		Order("bucket_start ASC").Limit(50).Find(&fiveMinBlocks).Error; err == nil {
 		for i := range fiveMinBlocks {
 			block := &fiveMinBlocks[i]
-			var count int64
-			if err := s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
+			var target model.ContinuousParquetBlock
+			if err := s.DB.WithContext(ctx).
 				Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND resolution = ? AND status = ?",
 					tenant, block.BucketStart, block.SignalType, model.ContinuousParquetResolution1h, model.ContinuousParquetStatusActive).
-				Count(&count).Error; err == nil && count == 0 {
+				First(&target).Error; err != nil || target.SourceBlockID != block.BlockID {
 				if _, err := s.pqBuildDownsample(ctx, tenant, block.BucketStart,
 					model.ContinuousParquetResolution5m, model.ContinuousParquetResolution1h); err != nil {
 					s.Logger.Warn("v2 1h 降采样失败", zap.String("block_id", block.BlockID), zap.Error(err))
@@ -240,9 +292,9 @@ func (s *APIServer) pqDeleteLayerAfterGrace(ctx context.Context, source *model.C
 	}
 	var count int64
 	if err := s.DB.WithContext(ctx).Model(&model.ContinuousParquetBlock{}).
-		Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND resolution = ? AND status = ? AND validation = ?",
+		Where("tenant = ? AND bucket_start = ? AND signal_type = ? AND resolution = ? AND status = ? AND validation = ? AND source_block_id = ?",
 			source.Tenant, source.BucketStart, source.SignalType, targetResolution,
-			model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed).
+			model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed, source.BlockID).
 		Count(&count).Error; err != nil || count == 0 {
 		return
 	}
@@ -259,7 +311,9 @@ func (s *APIServer) pqDeleteLayerAfterGrace(ctx context.Context, source *model.C
 func (s *APIServer) pqReconcileHours(ctx context.Context) {
 	var blocks []model.ContinuousParquetBlock
 	if err := s.DB.WithContext(ctx).
-		Where("status = ? AND validation = ?", model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed).
+		Where("status = ? AND validation = ? AND resolution = ? AND signal_type = ?",
+			model.ContinuousParquetStatusActive, model.ContinuousParquetValidationPassed,
+			model.ContinuousParquetResolutionRaw, model.ContinuousParquetSignalCPU).
 		Order("bucket_start DESC").Limit(100).Find(&blocks).Error; err != nil {
 		return
 	}
@@ -310,18 +364,38 @@ func (s *APIServer) pqReclaimV1Blocks(ctx context.Context) {
 	}
 	for i := range blocks {
 		blk := &blocks[i]
+		if !s.pqV1BlockCoveredByValidatedRaw(ctx, blk.BlockID) {
+			s.Logger.Warn("保留 v1 回滚块：v2 lineage 尚未完整覆盖", zap.String("block_id", blk.BlockID))
+			continue
+		}
 		s.deleteContinuousBlock(ctx, blk, nil)
 	}
 }
 
+func (s *APIServer) pqV1BlockCoveredByValidatedRaw(ctx context.Context, blockID string) bool {
+	if blockID == "" {
+		return false
+	}
+	var batches []model.ProfileBatch
+	if err := s.DB.WithContext(ctx).Where("block_id = ?", blockID).Find(&batches).Error; err != nil || len(batches) == 0 {
+		return false
+	}
+	for i := range batches {
+		if !s.pqBatchCoveredByValidatedRaw(ctx, &batches[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 // pqCoverageSnapshot v2 覆盖情况（/storage/status 用）。
 type pqCoverageSnapshot struct {
-	ByResolution map[string]int `json:"by_resolution"`
-	ActiveBlocks int            `json:"active_blocks"`
-	FailedBlocks int            `json:"failed_blocks"`
-	ValidationBacklog int       `json:"validation_backlog"`
-	ShadowFailures   int64      `json:"shadow_failures"`
-	EarliestActiveAt *time.Time `json:"earliest_active_at"`
+	ByResolution      map[string]int `json:"by_resolution"`
+	ActiveBlocks      int            `json:"active_blocks"`
+	FailedBlocks      int            `json:"failed_blocks"`
+	ValidationBacklog int            `json:"validation_backlog"`
+	ShadowFailures    int64          `json:"shadow_failures"`
+	EarliestActiveAt  *time.Time     `json:"earliest_active_at"`
 }
 
 func (s *APIServer) pqCoverageSnapshot(ctx context.Context) pqCoverageSnapshot {

@@ -15,21 +15,21 @@ import (
 
 // Config 是全局配置结构体，包含所有运行时配置
 type Config struct {
-	Server           ServerConfig             `mapstructure:"server"`
-	Database         DatabaseConfig           `mapstructure:"database"`
-	GRPC             GRPCConfig               `mapstructure:"grpc"`
-	Storage          StorageConfig            `mapstructure:"storage"`
-	Retention        RetentionConfig          `mapstructure:"retention"`
-	ContinuousBlock  ContinuousBlockConfig    `mapstructure:"continuous_block"`
+	Server            ServerConfig            `mapstructure:"server"`
+	Database          DatabaseConfig          `mapstructure:"database"`
+	GRPC              GRPCConfig              `mapstructure:"grpc"`
+	Storage           StorageConfig           `mapstructure:"storage"`
+	Retention         RetentionConfig         `mapstructure:"retention"`
+	ContinuousBlock   ContinuousBlockConfig   `mapstructure:"continuous_block"`
 	ContinuousParquet ContinuousParquetConfig `mapstructure:"continuous_parquet"`
-	Blob             BlobConfig               `mapstructure:"blob"`
-	StorageDisk      StorageDiskConfig        `mapstructure:"storage_disk"`
-	Log              LogConfig                `mapstructure:"log"`
-	Security         SecurityConfig           `mapstructure:"security"`
-	Observability    ObservabilityConfig      `mapstructure:"observability"`
-	Profile          ProfileConfig            `mapstructure:"profile"`
-	AgentDiscovery   AgentDiscoveryConfig     `mapstructure:"agent_discovery"`
-	SingleShot       SingleShotConfig         `mapstructure:"single_shot"`
+	Blob              BlobConfig              `mapstructure:"blob"`
+	StorageDisk       StorageDiskConfig       `mapstructure:"storage_disk"`
+	Log               LogConfig               `mapstructure:"log"`
+	Security          SecurityConfig          `mapstructure:"security"`
+	Observability     ObservabilityConfig     `mapstructure:"observability"`
+	Profile           ProfileConfig           `mapstructure:"profile"`
+	AgentDiscovery    AgentDiscoveryConfig    `mapstructure:"agent_discovery"`
+	SingleShot        SingleShotConfig        `mapstructure:"single_shot"`
 }
 
 // SingleShotConfig 阶段 4：单次采样最终存储模型的发布开关。
@@ -207,7 +207,7 @@ type ContinuousParquetConfig struct {
 	Tenant string `mapstructure:"tenant"`
 	// RawRetentionHours / Res5mRetentionHours / Res1hRetentionHours：
 	// raw/5m/1h 分区保留时长（小时），默认 24 / 168 / 720。
-	RawRetentionHours  int `mapstructure:"raw_retention_hours"`
+	RawRetentionHours   int `mapstructure:"raw_retention_hours"`
 	Res5mRetentionHours int `mapstructure:"res5m_retention_hours"`
 	Res1hRetentionHours int `mapstructure:"res1h_retention_hours"`
 	// QuotaBytes Continuous 全部存储（staging + v1 fallback + v2）硬配额，
@@ -705,6 +705,71 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.ContinuousBlock.CompactionIntervalSec <= 0 {
 		cfg.ContinuousBlock.CompactionIntervalSec = 300
+	}
+	parquetMode := strings.ToLower(strings.TrimSpace(cfg.ContinuousParquet.Mode))
+	switch parquetMode {
+	case "off", "shadow", "prefer", "enforce":
+	default:
+		parquetMode = "off"
+	}
+	cfg.ContinuousParquet.Mode = parquetMode
+	if strings.TrimSpace(cfg.ContinuousParquet.Tenant) == "" {
+		cfg.ContinuousParquet.Tenant = "default"
+	}
+	if cfg.ContinuousParquet.RawRetentionHours <= 0 {
+		cfg.ContinuousParquet.RawRetentionHours = 24
+	}
+	if cfg.ContinuousParquet.Res5mRetentionHours <= 0 {
+		cfg.ContinuousParquet.Res5mRetentionHours = 168
+	}
+	if cfg.ContinuousParquet.Res1hRetentionHours <= 0 {
+		cfg.ContinuousParquet.Res1hRetentionHours = 720
+	}
+	if cfg.ContinuousParquet.RawRetentionHours >= cfg.ContinuousParquet.Res5mRetentionHours ||
+		cfg.ContinuousParquet.Res5mRetentionHours >= cfg.ContinuousParquet.Res1hRetentionHours {
+		return fmt.Errorf("Continuous Parquet 保留期必须满足 raw < 5m < 1h")
+	}
+	if cfg.ContinuousParquet.QuotaBytes <= 0 {
+		cfg.ContinuousParquet.QuotaBytes = 4 << 30
+	}
+	if cfg.ContinuousParquet.QuotaTargetBytes <= 0 {
+		cfg.ContinuousParquet.QuotaTargetBytes = cfg.ContinuousParquet.QuotaBytes * 9 / 10
+	}
+	if cfg.ContinuousParquet.QuotaTargetBytes >= cfg.ContinuousParquet.QuotaBytes {
+		return fmt.Errorf("Continuous Parquet 目标水位必须小于硬配额")
+	}
+	if cfg.ContinuousParquet.StagingMinutesRetention <= 0 {
+		cfg.ContinuousParquet.StagingMinutesRetention = 120
+	}
+	if cfg.ContinuousParquet.RowGroupTargetBytes <= 0 {
+		cfg.ContinuousParquet.RowGroupTargetBytes = 16 << 20
+	}
+	if cfg.ContinuousParquet.MaxPartBytes <= 0 {
+		cfg.ContinuousParquet.MaxPartBytes = 128 << 20
+	}
+	if cfg.ContinuousParquet.MaxPartBytes < cfg.ContinuousParquet.RowGroupTargetBytes {
+		return fmt.Errorf("Continuous Parquet max_part_bytes 必须不小于 row_group_target_bytes")
+	}
+	if cfg.ContinuousParquet.ShadowBackfillHours <= 0 {
+		cfg.ContinuousParquet.ShadowBackfillHours = 1
+	}
+	if cfg.ContinuousParquet.ReconcileIntervalSec <= 0 {
+		cfg.ContinuousParquet.ReconcileIntervalSec = 300
+	}
+	if cfg.ContinuousParquet.BlockIntervalSec <= 0 {
+		cfg.ContinuousParquet.BlockIntervalSec = 300
+	}
+	if cfg.ContinuousParquet.V1RollbackWindowHours <= 0 {
+		cfg.ContinuousParquet.V1RollbackWindowHours = 24
+	}
+	if cfg.ContinuousParquet.V1DeleteBatch <= 0 {
+		cfg.ContinuousParquet.V1DeleteBatch = 200
+	}
+	if cfg.ContinuousParquet.ForecastWindowHours <= 0 {
+		cfg.ContinuousParquet.ForecastWindowHours = 2
+	}
+	if cfg.ContinuousParquet.RecoveryChecks <= 0 {
+		cfg.ContinuousParquet.RecoveryChecks = 2
 	}
 	if cfg.Blob.MinCompressBytes <= 0 {
 		cfg.Blob.MinCompressBytes = 4096

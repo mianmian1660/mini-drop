@@ -20,12 +20,13 @@ import (
 // objectReaderAt 把 Storage 的 range-read 包装成 io.ReaderAt（parquet-go
 // OpenFile 要求）。每次 ReadAt 发一个 Range 请求。
 type objectReaderAt struct {
-	store  interface {
+	store interface {
 		GetObjectRange(ctx context.Context, bucket, key string, offset, length int64) (io.ReadCloser, error)
 	}
 	bucket string
 	key    string
 	size   int64
+	ctx    context.Context
 }
 
 func (o *objectReaderAt) ReadAt(p []byte, off int64) (int, error) {
@@ -42,7 +43,11 @@ func (o *objectReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	if length <= 0 {
 		return 0, io.EOF
 	}
-	rc, err := o.store.GetObjectRange(context.Background(), o.bucket, o.key, off, length)
+	ctx := o.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rc, err := o.store.GetObjectRange(ctx, o.bucket, o.key, off, length)
 	if err != nil {
 		return 0, err
 	}
@@ -78,6 +83,7 @@ func (s *APIServer) openParquetPart(ctx context.Context, objectKey string) (*par
 		bucket: s.Config.Storage.Bucket,
 		key:    objectKey,
 		size:   size,
+		ctx:    ctx,
 	}
 	f, err := parquet.OpenFile(ra, size, parquet.SkipBloomFilters(true))
 	if err != nil {

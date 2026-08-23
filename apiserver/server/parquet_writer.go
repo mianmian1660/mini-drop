@@ -154,6 +154,11 @@ func writeParquetPartGeneric[T pqRow](s *APIServer, ctx context.Context, objectK
 	hasher := sha256.New()
 	counted := &countingReader{reader: io.TeeReader(pr, hasher)}
 	putErr := s.Storage.PutObject(ctx, s.Config.Storage.Bucket, objectKey, counted, -1, "application/octet-stream")
+	if putErr != nil {
+		// 某些对象存储客户端会在未消费完 reader 时提前失败。主动关闭读端，
+		// 让被 io.Pipe 背压阻塞的 Parquet writer 立即退出后再等待结果。
+		_ = pr.CloseWithError(putErr)
+	}
 
 	res := <-outcome
 	if putErr != nil {

@@ -22,6 +22,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -134,20 +136,20 @@ func (s *APIServer) pqRegisterActiveBlock(ctx context.Context, key pqBlockKey, b
 			return err
 		}
 		updates := map[string]interface{}{
-			"bucket_end":          bucketEnd,
-			"status":              model.ContinuousParquetStatusActive,
-			"validation":          model.ContinuousParquetValidationPassed,
-			"member_count":        len(members),
-			"row_count":           stats.RowCount,
-			"value_total":         stats.ValueTotal,
-			"sample_total":        stats.SampleTotal,
-			"session_count":       stats.SessionCount,
-			"process_count":       stats.ProcessCount,
-			"bytes_total":         stats.BytesTotal,
-			"first_row_time":      stats.FirstRowTime,
-			"last_row_time":       stats.LastRowTime,
+			"bucket_end":           bucketEnd,
+			"status":               model.ContinuousParquetStatusActive,
+			"validation":           model.ContinuousParquetValidationPassed,
+			"member_count":         len(members),
+			"row_count":            stats.RowCount,
+			"value_total":          stats.ValueTotal,
+			"sample_total":         stats.SampleTotal,
+			"session_count":        stats.SessionCount,
+			"process_count":        stats.ProcessCount,
+			"bytes_total":          stats.BytesTotal,
+			"first_row_time":       stats.FirstRowTime,
+			"last_row_time":        stats.LastRowTime,
 			"row_group_boundaries": boundaries,
-			"updated_at":          now,
+			"updated_at":           now,
 		}
 		rowResult := tx.Model(&model.ContinuousParquetBlock{}).
 			Where("block_id = ? AND status = ?", blockID, model.ContinuousParquetStatusBuilding).
@@ -376,8 +378,8 @@ func (s *APIServer) pqDeleteBlockObjectsByPrefix(ctx context.Context, blk *model
 
 func containsBlockID(objectKey, blockID string) bool {
 	// 对象 key 形如 .../{block-id}-{part}.parquet
-	return len(blockID) > 0 && len(objectKey) > len(blockID)+3 &&
-		objectKey[len(objectKey)-len(blockID)-3:len(objectKey)-3] == blockID
+	base := path.Base(objectKey)
+	return blockID != "" && strings.HasPrefix(base, blockID+"-") && strings.HasSuffix(base, ".parquet")
 }
 
 // pqTombstoneBlock 墓碑化：status=deleted + tombstone_at + 删除 members/files。

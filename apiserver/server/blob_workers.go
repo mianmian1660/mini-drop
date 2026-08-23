@@ -1029,12 +1029,16 @@ func (s *APIServer) runGCOnce(ctx context.Context) error {
 		return errors.New("database or object storage not connected")
 	}
 	now := time.Now()
+	batch := s.Config.Blob.MigrationBatch
+	if batch <= 0 {
+		batch = 50
+	}
 	var rows []model.StorageObjectGC
 	if err := s.DB.WithContext(ctx).
 		Where("deleted_at IS NULL AND not_before IS NOT NULL AND not_before <= ?", now).
 		Where("(next_delete_attempt_at IS NULL OR next_delete_attempt_at <= ?)", now).
 		Order("not_before ASC, id ASC").
-		Limit(50).Find(&rows).Error; err != nil {
+		Limit(batch).Find(&rows).Error; err != nil {
 		return err
 	}
 	for i := range rows {

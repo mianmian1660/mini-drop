@@ -124,8 +124,8 @@ func (s *APIServer) largestPendingCompactionInput(ctx context.Context) int64 {
 		return 0
 	}
 	type pendingBatch struct {
-		SessionSID string
-		StartTime  time.Time
+		SessionSID   string
+		StartTime    time.Time
 		PayloadBytes uint64
 	}
 	var batches []pendingBatch
@@ -156,16 +156,23 @@ func (s *APIServer) p95HourlyIngestBytes(ctx context.Context) int64 {
 	if s.DB == nil {
 		return 0
 	}
-	var values []int64
+	type hourlyIngest struct {
+		Total int64 `gorm:"column:total"`
+	}
+	var buckets []hourlyIngest
 	cutoff := time.Now().Add(-7 * 24 * time.Hour)
 	trunc := pqHourTruncExpr(s.DB.Dialector.Name(), "start_time")
 	if err := s.DB.WithContext(ctx).Model(&model.ProfileBatch{}).
-		Select(fmt.Sprintf("%s AS bucket, COALESCE(SUM(payload_bytes),0) AS total", trunc)).
+		Select("COALESCE(SUM(payload_bytes),0) AS total").
 		Where("start_time >= ?", cutoff).
-		Group("bucket").
-		Order("bucket ASC").
-		Scan(&values).Error; err != nil {
+		Group(trunc).
+		Order(trunc + " ASC").
+		Scan(&buckets).Error; err != nil {
 		return 0
+	}
+	values := make([]int64, 0, len(buckets))
+	for _, bucket := range buckets {
+		values = append(values, bucket.Total)
 	}
 	if len(values) == 0 {
 		return 0
@@ -233,11 +240,20 @@ func (s *APIServer) collectionCapacityOK(source string) (bool, string, StorageDi
 	state.mu.Lock()
 	state.lastRequiredFree = required
 	state.lastCheckedAt = time.Now()
+	if snap.AvailableBytes < required {
+		state.halted = true
+		state.consecutiveOK = 0
+	}
+	halted := state.halted
 	state.mu.Unlock()
 
 	if snap.AvailableBytes < required {
 		incCollectionRejectedLowDisk(source)
 		return false, "采集被拒绝：可用空间低于动态 required_free 门槛", snap
+	}
+	if halted {
+		incCollectionRejectedLowDisk(source)
+		return false, "采集仍处于磁盘恢复观察期", snap
 	}
 	return true, "", snap
 }

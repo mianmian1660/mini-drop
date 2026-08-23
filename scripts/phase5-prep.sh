@@ -23,7 +23,11 @@ docker compose -f "${ROOT}/docker-compose.yml" exec -T postgres rm -f /tmp/phase
 echo "    备份完成: ${BACKUP_DIR}/postgres-${STAMP}.dump"
 
 echo "==> [2/4] 记录 MinIO 前缀统计"
-mc_cmd() { docker run --rm --network mini-drop_default minio/mc:latest "$@"; }
+MC_CONFIG_DIR="$(mktemp -d)"
+cleanup_mc_config() { rm -rf "${MC_CONFIG_DIR}"; }
+trap cleanup_mc_config EXIT
+# 所有 mc 调用挂载同一配置目录；否则 alias set 所在的临时容器退出后配置丢失。
+mc_cmd() { docker run --rm --network mini-drop_default -v "${MC_CONFIG_DIR}:/root/.mc" minio/mc:latest "$@"; }
 # 使用宿主机直连（容器网络名可能不同，退化用 minio 服务名）
 if ! mc_cmd alias set myminio http://127.0.0.1:9000 drop dropdrop >/dev/null 2>&1; then
   echo "    mc 直连失败，尝试容器网络"
@@ -54,6 +58,17 @@ DB_TABLES=$(docker compose -f "${ROOT}/docker-compose.yml" exec -T postgres psql
 
 echo "==> [4/4] 记录镜像 ID"
 IMAGES=$(docker compose -f "${ROOT}/docker-compose.yml" images --format json 2>/dev/null || true)
+IMAGES_JSON=$(echo "${IMAGES}" | python3 -c '
+import json,sys
+items=[]
+for line in sys.stdin:
+    line=line.strip()
+    if not line:
+        continue
+    value=json.loads(line)
+    items.extend(value if isinstance(value,list) else [value])
+print(json.dumps(items))
+' 2>/dev/null || echo '[]')
 
 cat > "${BASELINE}" <<EOF
 {
@@ -70,7 +85,7 @@ for line in sys.stdin:
     t,s=line.split('|')[:2]
     rows.append({'table':t,'bytes':int(s)})
 print(json.dumps(rows))" 2>/dev/null || echo '[]'),
-  "images": $(echo "${IMAGES}" | head -c 4000)
+  "images": ${IMAGES_JSON}
 }
 EOF
 echo "==> 基线已记录: ${BASELINE}"

@@ -104,10 +104,25 @@ func (s *APIServer) pqQueryAggregateV2(ctx context.Context, q ProfileQuery) (con
 	fromMS := q.From.UnixMilli()
 	toMS := q.To.UnixMilli()
 
+	// v2 块跨 Session；只有查询区间每个小时都有可用块时才能整段走 v2，
+	// 否则让调用方整段回退 v1，防止部分覆盖造成静默缺数。
+	_, _, fullyCovered := s.pqV2CPUCoverage(ctx, q)
+	if !fullyCovered {
+		return continuousAggregate{}, false, nil
+	}
+	var authorizedSIDs []string
+	if err := s.continuousSessionSelection(q).Pluck("sid", &authorizedSIDs).Error; err != nil {
+		return continuousAggregate{}, false, err
+	}
+	authorized := make(map[string]struct{}, len(authorizedSIDs))
+	for _, sid := range authorizedSIDs {
+		authorized[sid] = struct{}{}
+	}
+
 	agg := continuousAggregate{
-		Top:            map[string]*ProfileTopItem{},
-		Root:           &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
-		LabelValue:     map[string]map[string]bool{
+		Top:  map[string]*ProfileTopItem{},
+		Root: &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
+		LabelValue: map[string]map[string]bool{
 			"comm": {}, "pid": {}, "process_start_ms": {}, "process_instance": {},
 			"exe": {}, "runtime": {},
 		},
@@ -120,16 +135,15 @@ func (s *APIServer) pqQueryAggregateV2(ctx context.Context, q ProfileQuery) (con
 	}
 
 	hours := pqHourlyRange(q.From, q.To)
-	foundAny := false
 	for _, hour := range hours {
 		block, err := s.pqFindBestBlock(ctx, tenant, hour, model.ContinuousParquetSignalCPU)
 		if err != nil {
 			return continuousAggregate{}, false, err
 		}
 		if block == nil {
-			continue
+			// 覆盖可能在前置检查后并发变化；仍然整段回退，绝不返回半段。
+			return continuousAggregate{}, false, nil
 		}
-		foundAny = true
 		agg.ObjectKeys = append(agg.ObjectKeys, block.BlockID)
 		files, err := s.pqLoadBlockFiles(ctx, block.BlockID)
 		if err != nil {
@@ -142,6 +156,9 @@ func (s *APIServer) pqQueryAggregateV2(ctx context.Context, q ProfileQuery) (con
 			}
 			for i := range rows {
 				row := &rows[i]
+				if _, ok := authorized[row.SessionSID]; !ok {
+					continue
+				}
 				if row.Timestamp < fromMS || row.Timestamp > toMS {
 					continue
 				}
@@ -157,19 +174,16 @@ func (s *APIServer) pqQueryAggregateV2(ctx context.Context, q ProfileQuery) (con
 			}
 		}
 	}
-	if !foundAny {
-		return continuousAggregate{}, false, nil
-	}
 	continuousFinalizeSymbolStatus(&agg)
 	return agg, true, nil
 }
 
 // pqResolveStorageSource 返回查询使用的存储来源与分辨率（响应兼容字段）。
 type pqResolveStorageSource struct {
-	ResolutionSeconds  int    `json:"resolution_seconds"`
-	MixedResolution    bool   `json:"mixed_resolution"`
-	StorageSource      string `json:"storage_source"`
-	EarliestAvailable  *time.Time `json:"earliest_available_at"`
+	ResolutionSeconds int        `json:"resolution_seconds"`
+	MixedResolution   bool       `json:"mixed_resolution"`
+	StorageSource     string     `json:"storage_source"`
+	EarliestAvailable *time.Time `json:"earliest_available_at"`
 }
 
 // pqStorageSourceFor 计算查询的存储来源描述。
@@ -212,8 +226,10 @@ func (s *APIServer) pqStorageSourceFor(ctx context.Context, q ProfileQuery) pqRe
 		if len(resolutions) > 1 {
 			out.MixedResolution = true
 		}
-		if covered == 0 {
+		if covered != len(hours) {
 			out.StorageSource = "parquet_v1"
+			out.ResolutionSeconds = 0
+			out.MixedResolution = false
 		}
 	}
 	out.EarliestAvailable = s.pqEarliestAvailableAt(ctx)
