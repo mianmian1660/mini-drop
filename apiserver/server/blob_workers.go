@@ -66,23 +66,23 @@ func (s *APIServer) startBlobWorkers() {
 	}
 }
 
-// runBlobCycle 单轮：回填 → 迁移 → GC → 统计。
+// runBlobCycle 单轮：迁移（磁盘收益优先）→ 回填 → GC → 统计。
 func (s *APIServer) runBlobCycle(ctx context.Context) {
 	if s == nil || s.DB == nil || s.Config == nil {
 		return
 	}
 	now := time.Now()
 	s.setBlobLastRun(&now)
-	if s.Config.Blob.BackfillEnabled {
-		if err := s.runBackfillOnce(ctx); err != nil {
-			s.setBlobError("backfill: " + err.Error())
-			s.logBlobWarn("backfill failed", zap.Error(err))
-		}
-	}
 	if s.Config.Blob.MigrationEnabled {
 		if err := s.runMigrationOnce(ctx); err != nil {
 			s.setBlobError("migration: " + err.Error())
 			s.logBlobWarn("migration failed", zap.Error(err))
+		}
+	}
+	if s.Config.Blob.BackfillEnabled {
+		if err := s.runBackfillOnce(ctx); err != nil {
+			s.setBlobError("backfill: " + err.Error())
+			s.logBlobWarn("backfill failed", zap.Error(err))
 		}
 	}
 	if s.Config.Blob.GCEnabled {
@@ -110,9 +110,9 @@ type backfillKeyState struct {
 //   - 每个 distinct object_key 只 Stat 一次；Stat 失败记错误跳过。
 //   - 同一 key 在本轮内出现多种 stat 大小 → conflict，跳过自动关联。
 func (s *APIServer) runBackfillOnce(ctx context.Context) error {
-	batch := s.Config.Blob.MigrationBatch
+	batch := s.Config.Blob.MigrationBatch * 4 // 回填每轮可处理更多（仍串行）
 	if batch <= 0 {
-		batch = 50
+		batch = 200
 	}
 	keyStates := map[string]*backfillKeyState{}
 
@@ -306,7 +306,8 @@ func (s *APIServer) linkBackfillRefs(ctx context.Context, key string, blobID uin
 // ------------------------------------------------------------
 
 // runMigrationOnce 单轮迁移。候选顺序：kallsyms → ELF → 历史结果。
-// 每次只处理一个对象（并发固定 1），失败保留旧引用。
+// 并发固定 1（单 goroutine 串行），但每轮可连续处理最多 MigrationBatch 个
+// 对象（在周期上下文中带 ctx 超时，不会无限阻塞）。失败保留旧引用。
 func (s *APIServer) runMigrationOnce(ctx context.Context) error {
 	if !s.blobMaintenanceAllowed() {
 		incMaintenanceSkip("format_migration")
@@ -317,35 +318,51 @@ func (s *APIServer) runMigrationOnce(ctx context.Context) error {
 	if s.Storage == nil {
 		return errors.New("object storage not connected")
 	}
-	// 2.1 旧未压缩 kallsyms
-	if s.Config.Blob.MigrateKallsyms {
-		done, err := s.migrateNextKallsyms(ctx)
-		if err != nil {
-			return err
-		}
-		if done {
-			return nil
-		}
+	budget := s.Config.Blob.MigrationBatch
+	if budget <= 0 {
+		budget = 10
 	}
-	// 2.2 用户态 ELF 符号
-	if s.Config.Blob.MigrateELF {
-		done, err := s.migrateNextELF(ctx)
-		if err != nil {
-			return err
+	processed := 0
+	for processed < budget {
+		if ctx.Err() != nil {
+			break
 		}
-		if done {
-			return nil
+		var done bool
+		var err error
+		// 2.1 旧未压缩 kallsyms（优先，磁盘收益最大）
+		if s.Config.Blob.MigrateKallsyms {
+			done, err = s.migrateNextKallsyms(ctx)
+			if err != nil {
+				return err
+			}
+			if done {
+				processed++
+				continue
+			}
 		}
-	}
-	// 2.3 历史 SVG/folded/≥4KiB 文本结果
-	if s.Config.Blob.MigrateResults {
-		done, err := s.migrateNextResult(ctx)
-		if err != nil {
-			return err
+		// 2.2 用户态 ELF 符号
+		if s.Config.Blob.MigrateELF {
+			done, err = s.migrateNextELF(ctx)
+			if err != nil {
+				return err
+			}
+			if done {
+				processed++
+				continue
+			}
 		}
-		if done {
-			return nil
+		// 2.3 历史 SVG/folded/≥4KiB 文本结果
+		if s.Config.Blob.MigrateResults {
+			done, err = s.migrateNextResult(ctx)
+			if err != nil {
+				return err
+			}
+			if done {
+				processed++
+				continue
+			}
 		}
+		break // 无候选
 	}
 	return nil
 }
