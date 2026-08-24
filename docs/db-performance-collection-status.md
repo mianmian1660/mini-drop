@@ -109,9 +109,9 @@
 
 **当前状态(2026-08-23 01:30)**:背压已解除、db 采集已恢复运行(日志出现 `db target=orders-mysql lock wait query failed` 证明 dbTargets 解析、密码读取、采集循环全部正常,仅 lock_wait 单独失败)。**digest/标量落库待最终确认**(见 3.4)。
 
-### 3.2 联调阶段顺带发现的新问题(不阻塞,但要记录)
+### 3.2 联调阶段顺带发现的新问题(已修复)
 
-**坏批次会被重试到天荒地老。** [ContinuousSampler.cpp:2309-2347](../drop/common/ContinuousSampler.cpp:2309) `drain_one_spooled_batch` 只区分 `Acknowledged`/`BatchIDConflict` 两种结果,其余一律进入指数退避重试,不读服务端返回的 `"retryable":false`。一个结构性错误(如 `start==end`)的批次,不管重试多少次结果都一样,会以 `retryMaxSec`(默认 300s)封顶后每 5 分钟重发一次、无限期占用 spool 和刷日志,没有任何"永久失败,丢弃"的路径。是否要修、怎么修(读 `retryable` 字段主动丢弃 vs 加个最大重试次数)还没讨论过,不属于本次范围。
+**坏批次会被重试到天荒地老 —— 已修复(合并自组员分支,commit 见 `cd58268` 附近的 merge)。** `drain_one_spooled_batch` 曾经只区分 `Acknowledged`/`BatchIDConflict` 两种结果,其余一律无限期指数退避重试。现在已经加了第三种结果 `SpoolPostResult::PermanentlyRejected`([ContinuousSampler.cpp:2412-2470](../drop/common/ContinuousSampler.cpp:2412)):`response_is_permanent_rejection()` 读 4xx + 响应体里的 `"retryable":false`,命中后 `quarantine_rejected_spooled_batch()`([2472](../drop/common/ContinuousSampler.cpp:2472))把批次隔离掉,不再重试。两处调用点(`drain_one_spooled_batch` 内、约 2634/3212 行)都已接上。这条不用再跟进。
 
 ### 3.3 阶段二 lock_wait 采集的 MySQL 权限问题(2026-08-23 定位,已修复)
 
@@ -150,6 +150,16 @@ for i in $(seq 1 300); do docker exec fault-mysql mysql -uroot -proot orders -N 
 **结果**:修复后 `profile_windows` 出现 `db_snapshot|8|2026-08-23 01:03:02+00|01:04:22+00`,**链路打通**。
 
 **踩坑记录**:排查时先用 `LIKE '%COUNT(*) FROM%'` 查 digest 表返回空,误以为 SELECT 没进表——实际是 MySQL 归一化文本带空格(`SELECT COUNT ( * ) FROM ...`),LIKE 模式不匹配,需放宽条件(`LIKE '%COUNT%'`)。
+
+### 3.4.5 三处代码缺陷修复(2026-08-24)
+
+上一轮代码审查发现的三条,今天修完:
+
+1. **digest 假尖峰**([ContinuousSampler.cpp:3711-3727](../drop/common/ContinuousSampler.cpp:3711) `compute_digest_delta`)——digest 查询只取 `LIMIT 50`,某条 digest 掉出前 50 又重新进来时,旧代码会把缺席期间攒的全部调用当成一个窗口的增量。修法:`DigestCounterState` 加 `lastSeenMs`,距上次刷新超过 `1.5 × aggregationWindowSec` 就强制重新计基线(`DigestDeltaKind::Reset`),不当增量上报。思路借鉴 Prometheus `rate()`/`increase()` 处理累计计数器的方式——先判断采样间隔是否正常连续,不是无脑做减法。
+2. **`g_digestState` 内存泄漏**——复用上面新加的 `lastSeenMs`:`DBSnapshotSampler::Stop()`([3948](../drop/common/ContinuousSampler.cpp:3948))里按 `sessionSID` 前缀确定性清理(`clear_digest_state_for_session`);另外每次 digest 采集顺手做一次兜底扫描(`sweep_stale_digest_state_locked`,阈值 20 倍窗口时长),覆盖 Session 没走正常 Stop 路径的情况。
+3. **临时密码配置文件命名碰撞 / 路径穿越 / ini 注入**——三处 `"/tmp/mini_drop_db_" + instanceLabel + 毫秒时间戳` 的拼接方式统一收敛成 `stage_mysql_defaults_file()`([3483](../drop/common/ContinuousSampler.cpp:3483)),用 POSIX 标准的 `mkstemp()` 生成唯一文件名(不再依赖 `instanceLabel` 拼路径,天然消除路径穿越和撞名风险),并且写入前校验 `user`/`password` 不含换行符,含了就拒绝该目标(防止 ini 配置注入)。
+
+**未编译验证**(本地无 Linux 工具链),需要 `docker compose build drop_agent` 确认;g_digestState 相关改动涉及锁的使用需要重点复核(`sweep_stale_digest_state_locked`/`clear_digest_state_for_session_locked` 都要求调用方已持锁,已在代码里用 `_locked` 后缀标注调用约定,但没有单测覆盖这个约定)。
 
 ### 3.5 已知未做的功能缺口(设计上明确推迟,不是 bug)
 

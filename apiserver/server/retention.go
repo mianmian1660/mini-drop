@@ -46,6 +46,7 @@ func (s *APIServer) runRetentionCleanup(ctx context.Context) {
 		s.cleanupHistoricalUnreferencedObjects(ctx)
 	}
 	s.cleanupAllContinuousRetention(ctx, limit)
+	s.cleanupDetectionEvents(ctx)
 }
 
 // cleanupHistoricalUnreferencedObjects is a deliberately narrow migration
@@ -260,5 +261,20 @@ func (s *APIServer) cleanupContinuousSummaries(ctx context.Context) {
 	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
 	if err := s.DB.WithContext(ctx).Where("bucket_start < ?", cutoff).Delete(&model.ContinuousWindowSummary{}).Error; err != nil {
 		s.Logger.Warn("Native Continuous Profiling 冷层摘要清理失败", zap.Error(err))
+	}
+}
+
+// cleanupDetectionEvents 清理过期的哨兵判异审计记录（见
+// docs/detection-trigger-pipeline-design.md §10.4）。DetectionEvent 只是一张单纯的
+// 审计表，不像 Artifact/ProfileBatch 那样关联对象存储里的数据，直接按 cutoff 批量硬删
+// 即可，不需要 cleanupContinuousRetention 那种"先降采样再删"的两步处理。
+func (s *APIServer) cleanupDetectionEvents(ctx context.Context) {
+	hours := s.Config.Retention.DetectionEventRetentionHours
+	if hours <= 0 {
+		hours = 24 * 90
+	}
+	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
+	if err := s.DB.WithContext(ctx).Where("evaluated_at < ?", cutoff).Delete(&model.DetectionEvent{}).Error; err != nil {
+		s.Logger.Warn("哨兵判异审计记录清理失败", zap.Error(err))
 	}
 }

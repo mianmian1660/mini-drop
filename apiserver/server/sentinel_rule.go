@@ -29,9 +29,20 @@ type CreateSentinelRuleReq struct {
 	Metric          string  `json:"metric" binding:"required"`
 	FloorValue      float64 `json:"floor_value" binding:"required"`
 	CooldownSeconds int     `json:"cooldown_seconds"`
+	// KFactor 滚动基线判异灵敏度（§10.2），不传或传 <=0 时用 SentinelRule 的 GORM 默认值（5）。
+	KFactor float64 `json:"k_factor"`
+	// PersistenceWindows/PersistenceMinHits 持续性判断（§10.3），不传或传 <=0 时默认 1/1
+	// （等价于只看最新一个窗口）。PersistenceMinHits 不能大于 PersistenceWindows，
+	// 否则这条规则永远不可能触发（最多命中 PersistenceWindows 次）。
+	PersistenceWindows int `json:"persistence_windows"`
+	PersistenceMinHits int `json:"persistence_min_hits"`
 }
 
 var sentinelValidMetrics = map[string]bool{"p50": true, "p95": true, "p99": true}
+
+// sentinelValidDBSnapshotMetrics db_snapshot 信号专用的 metric 取值（见 §10.1），
+// 语义和 histogram 类的 p50/p95/p99 完全不同，不能共用同一张校验表。
+var sentinelValidDBSnapshotMetrics = map[string]bool{"lock_wait": true, "digest": true}
 
 // ----------------------------------------------------------
 // CreateSentinelRule 创建哨兵规则
@@ -48,11 +59,18 @@ func (s *APIServer) CreateSentinelRule(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误: "+err.Error())
 		return
 	}
-	if _, ok := detectionSignalTaskKind[req.Signal]; !ok {
+	// db_snapshot 不在 detectionSignalTaskKind 里——它判异命中后不建诊断任务（§10.1：
+	// script_diagnostic 的 Runner 未接入，见 evaluateDBSnapshotRule 注释），所以单独放行。
+	if _, ok := detectionSignalTaskKind[req.Signal]; !ok && req.Signal != "db_snapshot" {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "signal 暂不支持自动判异: "+req.Signal)
 		return
 	}
-	if !sentinelValidMetrics[req.Metric] {
+	if req.Signal == "db_snapshot" {
+		if !sentinelValidDBSnapshotMetrics[req.Metric] {
+			s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "db_snapshot 的 metric 仅支持 lock_wait/digest")
+			return
+		}
+	} else if !sentinelValidMetrics[req.Metric] {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "metric 仅支持 p50/p95/p99")
 		return
 	}
@@ -63,21 +81,38 @@ func (s *APIServer) CreateSentinelRule(c *gin.Context) {
 	if req.CooldownSeconds <= 0 {
 		req.CooldownSeconds = 900
 	}
+	if req.KFactor <= 0 {
+		req.KFactor = detectionDefaultKFactor
+	}
+	if req.PersistenceWindows <= 0 {
+		req.PersistenceWindows = 1
+	}
+	if req.PersistenceMinHits <= 0 {
+		req.PersistenceMinHits = 1
+	}
+	if req.PersistenceMinHits > req.PersistenceWindows {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
+			"persistence_min_hits 不能大于 persistence_windows，否则规则永远不会触发")
+		return
+	}
 
 	now := time.Now()
 	rule := &model.SentinelRule{
-		SID:             "sr-" + util.GenTID()[4:],
-		Name:            req.Name,
-		TargetIP:        req.TargetIP,
-		Signal:          req.Signal,
-		Metric:          req.Metric,
-		FloorValue:      req.FloorValue,
-		CooldownSeconds: req.CooldownSeconds,
-		Enabled:         true,
-		UID:             auth.UID,
-		UserName:        auth.Name,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		SID:                "sr-" + util.GenTID()[4:],
+		Name:               req.Name,
+		TargetIP:           req.TargetIP,
+		Signal:             req.Signal,
+		Metric:             req.Metric,
+		FloorValue:         req.FloorValue,
+		KFactor:            req.KFactor,
+		CooldownSeconds:    req.CooldownSeconds,
+		PersistenceWindows: req.PersistenceWindows,
+		PersistenceMinHits: req.PersistenceMinHits,
+		Enabled:            true,
+		UID:                auth.UID,
+		UserName:           auth.Name,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if err := s.DB.Create(rule).Error; err != nil {
 		s.Logger.Error("创建哨兵规则失败", zap.Error(err))
@@ -160,7 +195,9 @@ func (s *APIServer) ListDetectionEvents(c *gin.Context) {
 	if ruleSID != "" {
 		query = query.Where("rule_sid = ?", ruleSID)
 	} else {
-		ruleQuery := s.DB.Model(&model.SentinelRule{}).Select("sid").Where("target_ip = ?", targetIP)
+		// Unscoped：规则被删除（软删除）后审计记录仍要留痕（见 DeleteSentinelRule 注释），
+		// 默认作用域会把软删除规则的 sid 过滤掉，导致按 target_ip 查询时历史事件"消失"。
+		ruleQuery := s.DB.Unscoped().Model(&model.SentinelRule{}).Select("sid").Where("target_ip = ?", targetIP)
 		if signal != "" {
 			ruleQuery = ruleQuery.Where("signal = ?", signal)
 		}
@@ -200,4 +237,30 @@ func (s *APIServer) ListDetectionEvents(c *gin.Context) {
 		events = []model.DetectionEvent{}
 	}
 	s.RespondOK(c, gin.H{"events": events, "total": len(events)})
+}
+
+// ----------------------------------------------------------
+// GetDetectionHealth 哨兵判异循环自检
+// GET /api/v1/sentinel-rules/health
+// 数据库持续故障时判异循环会静默跳过触发（保守处理，见 detectionHasActiveTask 注释），
+// 这个端点把"哨兵是不是还活着"暴露成一个可轮询的信号，配合 evaluateSentinelRules 里
+// 连续失败升级为 Error 日志的机制，运维不需要盯着日志也能发现哨兵已经失效（见 §10.6）。
+// ----------------------------------------------------------
+func (s *APIServer) GetDetectionHealth(c *gin.Context) {
+	lastEvalAt, lastSuccessAt, consecutiveFailures, lastError := s.detectionHealthSnapshot()
+	healthy := consecutiveFailures < detectionHealthFailureAlertThreshold
+	resp := gin.H{
+		"healthy":              healthy,
+		"consecutive_failures": consecutiveFailures,
+		"last_eval_at":         lastEvalAt,
+		"last_success_at":      lastSuccessAt,
+	}
+	if lastError != "" {
+		resp["last_error"] = lastError
+	}
+	if lastEvalAt.IsZero() {
+		// 判异循环还没跑过第一轮（进程刚启动），不算不健康，只是还没数据。
+		resp["healthy"] = true
+	}
+	s.RespondOK(c, resp)
 }

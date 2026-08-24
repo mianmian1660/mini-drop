@@ -2679,6 +2679,35 @@ static bool write_mysql_defaults_file(const std::string &path, const std::string
     return ok;
 }
 
+// 生成安全的临时 mysql defaults 文件并写入内容。之前是拼
+// "/tmp/mini_drop_db_" + instanceLabel + "_" + 毫秒时间戳，有两个隐患：
+// (1) instanceLabel 直接拼进文件路径，没做路径穿越校验；(2) 同一毫秒内两
+// 个线程轮询同一 instanceLabel 可能撞名互相覆盖。mkstemp 是 POSIX 标准的
+// "安全创建临时文件"方案，文件名由内核保证唯一、原子创建（O_CREAT|O_EXCL
+// 语义），不依赖任何外部输入拼路径。
+// user/password 若含换行符，理论上能在 [client] 这段 ini 文本里注入额外
+// 配置指令——比设计转义规则更简单可靠的做法是直接拒绝这类输入，正常账号
+// 密码不该含换行。
+static bool stage_mysql_defaults_file(const DBTargetConfig &target, const std::string &password,
+                                      std::string *outPath)
+{
+    if (target.user.find('\n') != std::string::npos || target.user.find('\r') != std::string::npos ||
+        password.find('\n') != std::string::npos || password.find('\r') != std::string::npos)
+        return false;
+    char pathTemplate[] = "/tmp/mini_drop_db_XXXXXX";
+    int fd = ::mkstemp(pathTemplate);
+    if (fd < 0)
+        return false;
+    ::close(fd);
+    if (!write_mysql_defaults_file(pathTemplate, target.user, password))
+    {
+        ::unlink(pathTemplate);
+        return false;
+    }
+    *outPath = pathTemplate;
+    return true;
+}
+
 // 单个 MySQL 目标的一次标量指标轮询：SHOW GLOBAL STATUS 一次性拿全量
 // 计数器，本地过滤出关心的几项，换算成 MetricPayload。查询超时/失败只
 // 标记 unavailable，不能拖垮整个采集循环（沿用 HistogramPayload 已有的
@@ -2693,8 +2722,8 @@ static void collect_mysql_target_metrics(const ContinuousSamplerConfig &cfg, con
                   << " failed to read password_ref=" << target.passwordRef << std::endl;
         return;
     }
-    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
-    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+    std::string defaultsPath;
+    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
     {
         std::cout << "[native-cp] db target=" << target.instanceLabel << " failed to stage mysql defaults file"
                   << std::endl;
@@ -2769,9 +2798,49 @@ struct DigestCounterState
     uint64_t countStar = 0;
     uint64_t sumTimerWaitPs = 0;
     uint64_t sumRowsExamined = 0;
+    int64_t lastSeenMs = 0; // 上一次刷新这条状态的时间，驱动过期判定和清理
 };
 static std::mutex g_digestStateMutex;
 static std::unordered_map<std::string, DigestCounterState> g_digestState;
+
+// _locked 后缀 = 调用方必须已经持有 g_digestStateMutex，不再自己加锁（避免
+// 和 collect_mysql_target_digests 里已经持有的 lock_guard 重复加锁死锁）。
+
+static void clear_digest_state_for_session_locked(const std::string &sessionSID)
+{
+    if (sessionSID.empty())
+        return;
+    const std::string prefix = sessionSID + "|";
+    for (auto it = g_digestState.begin(); it != g_digestState.end();)
+    {
+        if (it->first.compare(0, prefix.size(), prefix) == 0)
+            it = g_digestState.erase(it);
+        else
+            ++it;
+    }
+}
+
+// Session 停止时按 sessionSID 前缀精确清理（确定性路径），供 DBSnapshotSampler::Stop() 调用。
+static void clear_digest_state_for_session(const std::string &sessionSID)
+{
+    std::lock_guard<std::mutex> lock(g_digestStateMutex);
+    clear_digest_state_for_session_locked(sessionSID);
+}
+
+// 兜底清理：Session 没有走正常 Stop 路径（比如进程被杀）时，上面那个精确
+// 清理捡不到残留状态。每次采集顺手扫一遍，删掉太久没刷新的条目（阈值给得
+// 比"跌出 TOP 50 又重新进来"要宽松得多，只为回收内存，不影响
+// compute_digest_delta 的过期判定——那个判定用的是更短的窗口级阈值）。
+static void sweep_stale_digest_state_locked(int64_t nowMs, int64_t staleAfterMs)
+{
+    for (auto it = g_digestState.begin(); it != g_digestState.end();)
+    {
+        if (nowMs - it->second.lastSeenMs > staleAfterMs)
+            it = g_digestState.erase(it);
+        else
+            ++it;
+    }
+}
 
 // ---- digest 增量状态的纯逻辑（与 mysql 命令行解耦，便于单测） ----
 
@@ -2840,10 +2909,20 @@ struct DigestDeltaResult
 // 纯函数：由上一轮状态与当前计数计算窗口增量。prev 为空指针表示首轮
 // （FirstSeen，只建立基线）。任一累计计数器回退都视为新基线（Reset），
 // 避免无符号整数下溢把 (cur - prev) 变成一个天文数字。
-static DigestDeltaResult compute_digest_delta(const DigestCounterState *prev, const DigestCounterState &cur)
+//
+// maxGapMs 处理另一类问题：digest 查询只取 ORDER BY SUM_TIMER_WAIT DESC
+// LIMIT 50，某个 digest 可能这一轮排进前 50、下一轮被挤出去、再下一轮又
+// 冲回来——如果只按"数值有没有回退"判断，回来的时候会把它缺席期间累积的
+// 全部调用当成这一个窗口的增量，产生虚假尖峰。这里借鉴 Prometheus 处理累
+// 计计数器（rate()/increase()）的思路：不是无脑做减法，而是先看采样点之
+// 间的间隔是否正常连续，间隔太大就当成需要重新计基线，不当增量上报。
+static DigestDeltaResult compute_digest_delta(const DigestCounterState *prev, const DigestCounterState &cur,
+                                              int64_t nowMs, int64_t maxGapMs)
 {
     if (prev == nullptr)
         return DigestDeltaResult{};
+    if (prev->lastSeenMs > 0 && nowMs - prev->lastSeenMs > maxGapMs)
+        return DigestDeltaResult{DigestDeltaKind::Reset, 0, 0, 0};
     if (cur.countStar < prev->countStar || cur.sumTimerWaitPs < prev->sumTimerWaitPs ||
         cur.sumRowsExamined < prev->sumRowsExamined)
         return DigestDeltaResult{DigestDeltaKind::Reset, 0, 0, 0};
@@ -2874,8 +2953,8 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
     std::string password;
     if (!read_db_target_password(target, &password))
         return;
-    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
-    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+    std::string defaultsPath;
+    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
         return;
     const std::string query =
         "SELECT SCHEMA_NAME, DIGEST, "
@@ -2917,15 +2996,18 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
         {
             // 第一次见到这个 digest：只记基线，不上报（否则会把"自服务器启动
             // 以来的全部历史调用"当成本窗口发生的调用，数字会失真）。
-            g_digestState[stateKey] = {row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
+            g_digestState[stateKey] = {row.countStar, row.sumTimerWaitPs, row.sumRowsExamined, nowMillis};
             continue;
         }
         DigestCounterState prev = it->second;
-        const DigestCounterState cur{row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
+        const DigestCounterState cur{row.countStar, row.sumTimerWaitPs, row.sumRowsExamined, nowMillis};
         it->second = cur;
-        DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+        // 1.5x 窗口时长：正常相邻两轮之间的间隔应该约等于 aggregationWindowSec，
+        // 给 50% 冗余容忍单次调度抖动，超过这个还判定为"缺席过久，重新计基线"。
+        const int64_t maxGapMs = static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1500;
+        DigestDeltaResult delta = compute_digest_delta(&prev, cur, nowMillis, maxGapMs);
         if (delta.kind != DigestDeltaKind::Increment)
-            continue; // 首轮基线或任一计数器回退（TRUNCATE/重启）：本轮不上报
+            continue; // 首轮基线、计数器回退（TRUNCATE/重启）或缺席过久：本轮不上报
         if (delta.deltaCalls == 0)
             continue; // 零增量：不上报，但状态已更新为当前累计值
 
@@ -2940,6 +3022,12 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
         sample.rowsExaminedTotal = delta.deltaRows;
         window->dbSnapshots.push_back(std::move(sample));
     }
+
+    // 兜底清理：非正常停止路径下（进程被杀等）不会经过 Stop() 里的确定性
+    // 清理，这里顺手扫一遍过期条目回收内存。阈值给得很宽松（20 倍窗口时
+    // 长），不会跟上面 1.5 倍窗口时长的过期判定冲突——那个是"这一条要不要
+    // 当增量上报"，这个纯粹是"要不要把这条状态从内存里删掉"。
+    sweep_stale_digest_state_locked(nowMillis, static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 20000);
 }
 
 // 锁等待链：直接查 MySQL 内置的 sys.innodb_lock_waits 视图（5.7.7+ 默认启
@@ -2953,8 +3041,8 @@ static void collect_mysql_target_lock_waits(const ContinuousSamplerConfig &cfg, 
     std::string password;
     if (!read_db_target_password(target, &password))
         return;
-    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
-    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+    std::string defaultsPath;
+    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
         return;
     const std::string query =
         "SELECT waiting_pid, "
@@ -3104,6 +3192,8 @@ void DBSnapshotSampler::Stop()
     running_ = false;
     if (worker_.joinable())
         worker_.join();
+    // 确定性清理这个 Session 名下的 digest 增量状态，不用等兜底的过期扫描。
+    clear_digest_state_for_session(config_.sessionSID);
 }
 
 bool DBSnapshotSampler::Running() const

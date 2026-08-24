@@ -109,6 +109,12 @@ type RetentionConfig struct {
 	// 保留期长一个数量级（7 天），因为摘要体积小很多。
 	ContinuousSummaryRetentionHours int `mapstructure:"continuous_summary_retention_hours"`
 
+	// DetectionEventRetentionHours 控制哨兵判异审计记录（DetectionEvent）的保留时长。
+	// 只增不删会导致这张表随判异循环（默认30秒一次）无限增长（见
+	// docs/detection-trigger-pipeline-design.md §10.4）。默认90天——审计记录本身
+	// 体积小，不需要像原始 profile 数据那样激进过期。
+	DetectionEventRetentionHours int `mapstructure:"detection_event_retention_hours"`
+
 	// ---- 存储阶段一：Artifact 生命周期闭环 ----
 	// LifecycleMode 运行模式：observe（回填/重算/统计/候选日志，不做自动
 	// 到期删除；用户主动删除任务仍正常执行）或 enforce（完整自动删除状态机）。
@@ -706,6 +712,9 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Retention.ContinuousSummaryRetentionHours <= 0 {
 		cfg.Retention.ContinuousSummaryRetentionHours = 168
+	}
+	if cfg.Retention.DetectionEventRetentionHours <= 0 {
+		cfg.Retention.DetectionEventRetentionHours = 24 * 90
 	}
 	// 生命周期模式归一化（observe / enforce；其它值按 observe 处理，安全回滚）。
 	mode := strings.ToLower(strings.TrimSpace(cfg.Retention.LifecycleMode))

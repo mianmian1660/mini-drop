@@ -162,13 +162,17 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 const state = session.observed_state || 'pending';
                 const [background, color] = continuousStateColor(state);
                 const signals = decodeJSONField(session.signals, ['cpu_profile']);
+                // db_targets 不在 session.signals 里（那四个是 perf/eBPF 固定信号集），
+                // 单独从 labels 里判断，决定要不要在信号列多显示一个"数据库"chip。
+                const dbTargets = decodeJSONField(session.labels, {}).db_targets;
+                const hasDB = Array.isArray(dbTargets) && dbTargets.length > 0;
                 const active = decodeJSONField(session.active_processes, []);
                 const running = session.desired_state === 'running';
                 return <tr key={session.sid}>
                     <td style={S.td}><div style={S.name}>{session.name}</div><span style={S.subtle}>{shortSID(session.sid)}</span></td>
                     <td style={S.td}>{normalizedScope(session) === 'process' ? <><strong>进程 · {active.length} 个活动实例</strong><div style={S.mono} title={session.selector_exe}>{session.selector_exe}</div></> : <strong>整机</strong>}<div style={S.subtle}>样本 {formatCount(session.sample_count)}</div></td>
                     <td style={S.td}><span style={{ ...S.badge, background, color }}>{continuousStateLabel(state)}</span>{session.continuity_mode === 'degraded' && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }}>降级连续性</div>}</td>
-                    <td style={S.td}><div style={S.chips}>{signals.map(signal => <span key={signal} style={S.chip}>{signalLabel(signal)}</span>)}</div></td>
+                    <td style={S.td}><div style={S.chips}>{signals.map(signal => <span key={signal} style={S.chip}>{signalLabel(signal)}</span>)}{hasDB && <span style={{ ...S.chip, background: '#eef2ff', color: '#315efb' }} title={`已配置 ${dbTargets.length} 个数据库巡检目标`}>数据库 · {dbTargets.length}</span>}</div></td>
                     <td style={S.td}>{formatRelativeTime(session.last_upload_at)}</td>
                     <td style={S.td}>{duration(session.started_at, session.stopped_at)}<div style={S.subtle}>{session.user_name || 'system'}</div></td>
                     <td style={S.td}><Link style={S.link} to={`/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(session.sid)}`}>查看</Link>{running && session.can_manage && <button style={S.stop} disabled={stopping === session.sid} onClick={() => stop(session)}>{stopping === session.sid ? '停止中' : '停止'}</button>}{isCleanableTestSession(session) && <button style={S.stop} disabled={cleaning} onClick={() => cleanupOne(session)}>清理</button>}</td>

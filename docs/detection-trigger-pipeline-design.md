@@ -294,3 +294,131 @@ func (s *APIServer) startAnomalyDetector() {
 
 整条链路是否算落地成功，看能不能做到一件事：**从"持续采集看到异常"到"拿到一份带触发原因的
 高保真诊断报告"，中间不需要人手动点一次按钮。**
+
+## 10. 优化方向清单（2026-08-24 对照 MVP 代码现状核对）
+
+MVP（§9 第一行）已落地，但只覆盖 `sched_latency`/`io_latency`/`io_syscall_latency` 三个信号、
+固定阈值判异。下面六条是逐个读 `apiserver/server/detection.go`、`apiserver/model/detection.go`、
+`apiserver/server/sentinel_rule.go` 现状后找出的缺口，按"能不能真正抓住数据库偶发问题"这条
+评审维度排序，取代原 §9 迭代1/2 的粗粒度描述。
+
+### 10.1 补齐 `db_snapshot` 判异（唯一完全空白的信号，优先级最高）
+
+> **状态：已实现（2026-08-24）。** `evaluateDBSnapshotRule`（detection.go），`Metric` 支持
+> `lock_wait`（静态下限）/`digest`（环比上一等长窗口，复用 `KFactor` 字段）。命中只写
+> `DetectionEvent{status: fired_no_action}`，不建诊断任务——`TaskKindScriptDiagnostic`
+> 现状是"仅声明契约，Runner 未接入"（task_kind.go:199-205），建出来的任务永远跑不完，
+> 不做一个"能触发但触发了也没用"的假功能，等 Runner 接入后再补上建任务这一步。
+
+`evaluateSentinelRule`（detection.go:79-82）查不到 `db_snapshot` 的 TaskKind 映射直接
+`return`——数据库锁等待/慢查询这类"凌晨偶发、事后不可复现、最需要自动报警"的场景，恰恰是
+哨兵目前完全覆盖不到的一类。判异方式不能照抄 histogram 类信号的分位数思路：
+- 锁等待：没有"分位数"概念，更接近"单次超过静态下限即触发"（长事务阻塞不需要看基线，
+  超过几秒本身就是问题）。
+- 慢 SQL digest：适合"某条 digest 的总耗时环比上一窗口暴涨"，而不是绝对阈值——不同 digest
+  正常耗时水位天差地别，共用一个 `floor_value` 没有意义。
+
+对应 `queryNativeContinuousDBSnapshot`（continuous.go:2463-2596）现成的数据结构（§3.2），
+接入方式是新增一组判异分支，不需要改数据源。
+
+### 10.2 固定阈值升级为滚动基线（`RecentValues` 列已建未用）
+
+> **状态：已实现（2026-08-24）。** `detectionUpdateBaseline`/`detectionMedianMAD`
+> （detection.go），`SentinelRule.KFactor` 已接入判异流程，`DetectionEvent.status =
+> skipped_low_deviation` 对应"超过静态下限但未偏离滚动基线"这一分支。测试覆盖已补齐两个
+> 方向（`TestDetectionSkipsLowDeviationFromBaseline`/`TestDetectionFiresWhenDeviatesFromBaseline`）。
+
+`FloorValue` 现在是运维手填的绝对值，同一阈值在不同负载水位下会一边误报一边漏报。不用
+一步到位做 §4.1 提到的"三层阈值模型"（`detection-trigger-design-positioning.md` §13.3 的
+独立提案，本文档不采用），先落地本文档 §4.1/§4.2 已经设计好但尚未写代码的"滚动中位数+MAD"，
+把 `model.SentinelRule.RecentValues`/`DetectionState` 的滚动窗口真正用起来。
+
+### 10.3 单点触发太敏感（只看最新一个窗口）
+
+> **状态：已实现（2026-08-24）。** `detectionPersistentEnough`（detection.go），
+> `SentinelRule.PersistenceWindows`/`PersistenceMinHits` 两个字段已接入，
+> `DetectionEvent.status = skipped_low_persistence` 对应这一分支。
+
+`evaluateSentinelRule` 里 `latest := trend[len(trend)-1]`——只要最新一个窗口（默认10s量级）
+超阈值就触发，不判断是不是持续性异常。一次网络抖动、一次 GC 停顿都可能造成单点误触发。
+`detectionCoverageMinRatio`（采样覆盖率闸门）和 `CooldownSeconds`（冷却期）都是防"重复触发
+刷屏"，没有一层专门过滤"这一个点本身是不是噪声"。方案：加一条"最近 N 个窗口里至少 K 个
+超阈值才算命中"的持续性判断，作为触发前的第五道闸门。
+
+### 10.4 `DetectionEvent` 表只增不删
+
+`sentinel_rule.go:123` 明确写"只停止未来判异，不级联删除 detection_events：审计记录要留痕"——
+这个设计初衷是对的，但翻遍代码没有找到任何清理逻辑，长期运行这张表会无限增长。
+`continuous.go`（约1296-1373行）已经有现成的 `retentionHours` + `cutoff` 批量删除模式，
+`DetectionEvent` 照抄这个模式（比如默认保留90天，超期批量删除）即可，不需要重新设计。
+
+### 10.5 触发时的采集器选择太单一
+
+`sched_latency` 异常只触发 `ebpf_sched`，`io_latency` 只触发 `ebpf_io`——但调度延迟往往是
+CPU 争抢导致的，只抓调度事件可能看不到根因（"调度确实变慢了"这个事实知道了，但"谁在抢CPU"
+没抓到）。可以考虑触发时同时带一个短时 CPU 火焰图采集辅助定位根因。这一条改动量最大（涉及
+同时创建两个诊断任务、前端展示两份关联结果），建议放最后单独评估要不要做，不与前四条一起排期。
+
+### 10.6 判异循环失败时的可观测性缺失
+
+`detectionHasActiveTask` 查询失败时保守返回 `true`（当作"有活跃任务"，跳过触发）——这个保守
+方向是对的，但如果数据库持续故障，规则会静默永远不触发，没有任何信号提示"哨兵已经失效"。
+方案：加一个"规则连续 N 次评估失败"的自检，写进日志或专门的健康检查端点，工作量小、可以
+和 10.4 一起顺手做。
+
+### 10.7 排期建议
+
+| 优先级 | 条目 | 状态 | 理由 |
+|---|---|---|---|
+| 高 | 10.1 db_snapshot 判异、10.2 滚动基线、10.3 持续性判断 | **已完成（2026-08-24）** | 直接影响"哨兵能不能真正抓住数据库偶发问题"这个评审维度 |
+| 中 | 10.4 事件保留清理、10.6 失败自检 | 进行中 | 运维健壮性，工作量小，可顺手做 |
+| 低（需单独评估） | 10.5 联动 CPU 火焰图采集 | 待评估 | 改动量最大，建议先验证前几条落地后的效果，再决定要不要做 |
+
+> 注：本节不包含"哨兵触发升级为周期性采集"这个方向——已在
+> `docs/detection-periodic-promotion-design.md` 单独设计、评估后判断暂不实施，理由见该文档
+> 开头的状态说明，这里不重复。
+
+## 11. 验收步骤（对应 §10.1-10.3，2026-08-24）
+
+哨兵目前覆盖四个信号：`sched_latency`/`io_latency`/`io_syscall_latency`（滚动基线+持续性
+判断+静态下限，命中建一次性诊断任务）、`db_snapshot`（锁等待/慢SQL环比，命中只写审计事件，
+不建任务，见 §10.1）。验收分两层，缺一不能算通过。
+
+### 11.1 第一层：单元测试（验证判异逻辑本身没写错）
+
+```bash
+go test ./apiserver/server/... -run TestDetection -v
+```
+
+覆盖范围：
+- 4 个信号各自的"触发"与"不触发"两面。
+- 4 道闸门各自独立验证：采样覆盖率不足跳过（`skipped_low_coverage`）、冷却期内跳过
+  （`skipped_cooldown`）、持续性不足跳过（`skipped_low_persistence`）、偏离基线不足跳过
+  （`skipped_low_deviation`）。
+- `db_snapshot` 的两个子分支（锁等待、慢SQL环比）各自的触发/不触发。
+
+本机（Windows）因 `disk_guard.go` 用了 Linux-only 的 `syscall.Statfs`（既有平台限制，与
+本次改动无关）无法原生跑，需要在 Linux 构建环境执行。
+
+### 11.2 第二层：真实环境人工验证（验证"真的能抓到异常"）
+
+第一层只证明代码逻辑没 bug，回答不了"对生产真的有用吗"，必须实际造异常验证：
+
+1. **调度延迟**：`stress-ng --cpu $(nproc) --timeout 120s` 制造 CPU 争抢，配合一条阈值
+   设置得比正常水平低的 `sched_latency` 规则。
+2. **IO 延迟**：`fio` 或 `dd if=/dev/zero of=testfile bs=1M count=1000 oflag=direct`
+   制造块 IO 压力。
+3. **数据库**：手动开一个长事务不提交（制造锁等待），或跑一条故意不走索引的慢查询
+   （制造 digest 环比暴涨）。
+
+每种场景造完后查 `GET /api/v1/sentinel-rules/events?rule_sid=<对应规则sid>`，确认：
+- 事件状态是 `fired`（延迟类）或 `fired_no_action`（`db_snapshot`），不是被某道闸门跳过。
+- 延迟类信号：`child_tid` 非空，能在 `GetTimeline?master_tid=<rule_sid>` 看到对应诊断
+  任务，任务正常跑完出结果。
+- 异常消退后，后续判异不再触发。
+
+4. **负向验证同样必须做**：正常运行期间（不制造异常）观察数小时，确认 `detection_events`
+   里没有意外的 `fired`/`fired_no_action`——如果正常波动也频繁触发，说明阈值/`k_factor`
+   设置有问题，是误报，不算"有效"。
+
+三者（单元测试、正向人工验证、负向人工验证）都通过才算 §10.1-10.3 验收完成。
