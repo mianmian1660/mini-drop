@@ -15,12 +15,22 @@ jest.mock('../api', () => ({
         timeseries: jest.fn(),
         heapTasks: jest.fn(),
     },
+    sentinelRules: {
+        events: jest.fn(() => Promise.resolve({ code: 0, data: { events: [] } })),
+    },
 }));
 
 jest.mock('./InteractiveFlamegraph', () => ({
     __esModule: true,
     default: () => null,
     countProfileNodes: () => 0,
+}));
+
+// HistogramTrendChart 内部用真实 d3 画 SVG 时间轴，和 TimelineChart.js 一样不在 jest 里跑真实 d3
+// （见 TimelineChart.test.js / ScheduleDetailPage.test.js 的同款处理），这里只关心它被正确调用。
+jest.mock('./HistogramTrendChart', () => ({
+    __esModule: true,
+    default: () => null,
 }));
 
 import {

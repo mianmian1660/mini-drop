@@ -6,7 +6,7 @@
 // 哨兵、加一个、删一个"，判异事件的时间轴呈现见 ContinuousProfilingPanel。
 // ============================================================
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { sentinelRules } from '../api';
 import { SENTINEL_SIGNALS, signalLabel } from '../utils/continuous';
 
@@ -30,7 +30,8 @@ const S = {
 };
 
 export default function SentinelCard({ targetIP, signals = [] }) {
-    const eligibleSignals = signals.filter(signal => SENTINEL_SIGNALS.includes(signal));
+    const eligibleKey = signals.filter(signal => SENTINEL_SIGNALS.includes(signal)).join(',');
+    const eligibleSignals = useMemo(() => (eligibleKey ? eligibleKey.split(',') : []), [eligibleKey]);
     const [rules, setRules] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -51,8 +52,7 @@ export default function SentinelCard({ targetIP, signals = [] }) {
         } finally {
             setLoading(false);
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [targetIP, eligibleSignals.join(',')]);
+    }, [targetIP, eligibleSignals]);
 
     useEffect(() => { load(); }, [load]);
 
