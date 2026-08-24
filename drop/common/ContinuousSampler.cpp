@@ -3945,7 +3945,7 @@ struct SharedDualTrackContinuousSampler::Impl
             degradationReason = core.DegradationReason();
         }
         std::cout << "[native-cp] strict engine started backend=perf_rolling,libbpf-co-re"
-                  << " unwind=" << unwindMode << std::endl;
+                  << " unwind=" << unwind_mode_from_env() << std::endl;
 
         std::vector<CoreHistogramSample> pendingCoreSamples;
         uint64_t pendingCoreLost = 0;
