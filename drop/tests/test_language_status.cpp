@@ -4,6 +4,8 @@
 
 #include "common/LanguageStatus.h"
 
+#include <nlohmann/json.hpp>
+
 #include <gtest/gtest.h>
 
 namespace drop
@@ -257,6 +259,15 @@ TEST(LanguageStatusFragment, InjectedIntoSymbolRefs)
     EXPECT_NE(refs.find("\"runtime_maps\""), std::string::npos);
     EXPECT_NE(refs.find("\"native_go\""), std::string::npos);
     EXPECT_NE(refs.find("\"python_fallback\""), std::string::npos);
+
+    // 回归：注入 v2 片段后整体必须是合法 JSON（曾因少一个闭合大括号
+    // 导致服务端 400 拒收整批数据）。
+    ASSERT_NO_THROW({
+        auto parsed = nlohmann::json::parse(refs);
+        EXPECT_EQ(parsed["python_memory"]["ready"].is_array(), true);
+        EXPECT_EQ(parsed["language_status"]["native"]["collector_status"], "ready");
+        EXPECT_EQ(parsed["diagnostics_version"], 2);
+    });
 }
 
 TEST(LanguageStatusPySpyMerge, StaleCaptureDoesNotReplacePerfSamples)

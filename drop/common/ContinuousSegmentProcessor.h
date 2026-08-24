@@ -1361,7 +1361,8 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
                 ",\"exe\":\"" + json_escape(result.exe) +
                 "\",\"reason\":\"" + json_escape(result.reason) + "\"}";
     }
-    body += "]}";
+    // "]}" 关闭 failed 数组 + python_memory 对象（v2 片段之后还有根对象闭合）。
+    body += "]}}";
     // 阶段四：v2 语言诊断契约。旧字段（runtime_maps/native_go/python_fallback）
     // 原样保留一个兼容周期。
     body += "," + language_status_fragment_for_symbol_refs(

@@ -516,7 +516,8 @@ static std::string rebuild_filtered_symbol_refs_for_targets(
                 std::to_string(item.processStartMs) + ",\"exe\":\"" + json_escape(item.exe) +
                 "\",\"reason\":\"" + json_escape(item.reason) + "\"}";
     }
-    body += "]}";
+    // "]}" 关闭 failed 数组 + python_memory 对象（v2 片段之后还有根对象闭合）。
+    body += "]}}";
     // 阶段四：build-id 预热报告按本 Session 引用的 DSO/build-id 过滤。
     std::vector<BuildIdWarmEntry> sessionWarmEntries;
     for (const auto &entry : diagnostics.buildIdWarmReport)
