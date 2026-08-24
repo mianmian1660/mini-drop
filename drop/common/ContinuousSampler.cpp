@@ -9,6 +9,8 @@
 #include "common/MemrayProfileIngest.h"
 #include "common/RuntimeSymbolMap.h"
 #include "common/CoreEbpfCollector.h"
+#include "common/SymbolCollector.h"
+#include "common/KernelSymbols.h"
 #include "common/Utils.h"
 
 #include <algorithm>
@@ -1386,7 +1388,9 @@ static std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
                                              const std::vector<drop::PythonFallbackResult> &pythonFallback,
                                              size_t pythonLimitedCount,
                                              const std::vector<drop::MemrayProfileResult> &memrayResults,
-                                             const std::vector<AggregatedSample> &samples)
+                                             const std::vector<AggregatedSample> &samples,
+                                             const std::vector<drop::BuildIdEntry> &buildIds,
+                                             const std::string &kallsymsSha256)
 {
     uint64_t totalFrames = 0;
     uint64_t unresolvedFrames = 0;
@@ -1406,6 +1410,20 @@ static std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
     body += "\"symbol_status\":\"" + status + "\",";
     body += "\"frame_stats\":{\"total_frame_weight\":" + std::to_string(totalFrames) +
             ",\"unresolved_frame_weight\":" + std::to_string(unresolvedFrames) + "},";
+    // 本次窗口引用的全部用户态 build-id 清单（warm_build_id_cache +
+    // discover_sampled_go_build_ids 合并结果）。后端 collectContinuousSymbolRefs
+    // 递归扫 key 含 "build_id" 的字段时能捡到这里，使"重新检查符号"对非 Go
+    // 原生二进制（如 PostgreSQL/libc）也能做真实存在性检查，而不是空集恒真。
+    body += "\"build_ids\":[";
+    for (size_t i = 0; i < buildIds.size(); ++i)
+    {
+        if (i)
+            body += ",";
+        body += "\"" + json_escape(buildIds[i].buildId) + "\"";
+    }
+    body += "],";
+    if (!kallsymsSha256.empty())
+        body += "\"kallsyms_sha256\":\"" + json_escape(kallsymsSha256) + "\",";
     body += "\"runtime_maps\":" + drop::runtime_maps_to_json(runtimeReport) + ",";
     body += "\"native_go\":" + drop::go_symbol_report_json(goReport) + ",";
     body += "\"python_fallback\":" + python_fallback_json(pythonFallback, pythonLimitedCount) + ",";
@@ -1430,6 +1448,30 @@ static std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
     body += "]}";
     body += "}";
     return body;
+}
+
+// 内核符号快照：低频（每 10 分钟）快照并去重上传一次 /proc/kallsyms，把
+// sha256 写进后续窗口的 symbol_refs，供"重新检查符号"诊断 kallsyms 是否入库。
+// 持续采集的内核帧本就靠 perf script 当场读本机 /proc/kallsyms 解析，快照
+// 上传只服务于符号库口径与事后审计，不阻塞当次解析。
+static std::mutex g_kallsymsSnapshotMutex;
+static std::string g_lastKallsymsSha256;
+static int64_t g_lastKallsymsSnapshotMs = 0;
+static constexpr int64_t kKallsymsSnapshotIntervalMs = 10 * 60 * 1000;
+
+static std::string ensure_kallsyms_snapshot(const ContinuousSamplerConfig &cfg)
+{
+    std::lock_guard<std::mutex> lock(g_kallsymsSnapshotMutex);
+    int64_t now = now_ms();
+    if (now - g_lastKallsymsSnapshotMs < kKallsymsSnapshotIntervalMs)
+        return g_lastKallsymsSha256;
+    g_lastKallsymsSnapshotMs = now;
+    std::string path = "/tmp/mini_drop_cp_kallsyms_" + cfg.sessionSID + ".txt";
+    if (!drop::snapshot_kallsyms(path))
+        return g_lastKallsymsSha256; // 快照失败（权限受限等），复用上次结果
+    g_lastKallsymsSha256 = drop::ensure_kernel_symbol_uploaded(cfg.apiBaseURL, cfg.sessionSID, path);
+    ::remove(path.c_str());
+    return g_lastKallsymsSha256;
 }
 
 static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
@@ -1655,7 +1697,11 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
 			return profile.samples.empty();
 		}), window.profiles.end());
 	}
-    window.symbolRefsJson = combined_symbol_refs_json(runtimeReport, goReport, pythonResults, pythonLimitedCount, memrayResults, window.samples);
+    // 低频内核符号快照上传，sha256 写入 symbol_refs 供诊断接口判断入库状态。
+    std::string kallsymsSha256 = ensure_kallsyms_snapshot(cfg);
+    window.symbolRefsJson = combined_symbol_refs_json(runtimeReport, goReport, pythonResults, pythonLimitedCount, memrayResults, window.samples, buildIds, kallsymsSha256);
+    // 异步上报本次窗口引用的 build-id 到服务端符号库（不阻塞当次解析）。
+    drop::upload_build_ids_async(buildIds, cfg.apiBaseURL);
     std::cout << "[native-cp] Go symbols ready=" << goReport.ready.size()
               << " pending=" << goReport.pending.size()
               << " failed=" << goReport.failed.size()

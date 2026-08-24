@@ -237,7 +237,12 @@ type continuousAggregate struct {
 	SymbolStatus          string
 	TotalFrameWeight      float64
 	UnresolvedFrameWeight float64
-	GoSymbolReady         bool
+	// 未解析帧拆分：模块已知（0x<addr> [module] / [module]，符号库可补）与
+	// 无模块（裸地址 / [unknown]，多为 JIT 匿名内存，本质无解）分开统计，
+	// 供前端分别展示成因。
+	ModuleUnresolvedFrameWeight float64
+	NoModuleFrameWeight         float64
+	GoSymbolReady               bool
 	GoSymbolPending       bool
 	GoSymbolFailed        bool
 	SymbolReasons         map[string]bool
@@ -2209,7 +2214,9 @@ func continuousSymbolDiagnostics(agg continuousAggregate) ProfileSymbolDiagnosti
 	}
 	return ProfileSymbolDiagnostics{
 		TotalFrameWeight: agg.TotalFrameWeight, UnresolvedFrameWeight: agg.UnresolvedFrameWeight,
-		UnresolvedPercent: percent, GoSymbolState: state, Reasons: reasons,
+		ModuleUnresolvedFrameWeight: agg.ModuleUnresolvedFrameWeight,
+		NoModuleFrameWeight:         agg.NoModuleFrameWeight,
+		UnresolvedPercent:           percent, GoSymbolState: state, Reasons: reasons,
 	}
 }
 
@@ -2865,6 +2872,11 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 		agg.TotalFrameWeight += count
 		if continuousFrameLooksUnresolved(frame) {
 			agg.UnresolvedFrameWeight += count
+			if continuousUnresolvedFrameModule(frame) != "" {
+				agg.ModuleUnresolvedFrameWeight += count
+			} else {
+				agg.NoModuleFrameWeight += count
+			}
 		}
 		topKey, displayName, unresolved := continuousTopFrameKey(frame)
 		item := agg.Top[topKey]
@@ -2933,11 +2945,10 @@ func continuousTopFrameKey(frame string) (string, string, bool) {
 	if !continuousFrameLooksUnresolved(frame) {
 		return frame, frame, false
 	}
-	module := continuousUnresolvedFrameModule(frame)
-	if module != "" {
-		display := "[未解析] " + module
-		return display, display, true
-	}
+	// 未解析帧统一保留原始 frame（含地址），不再按模块折叠丢失地址——
+	// 模块已知的 "0x<addr> [module]" 与模块未知的裸地址 "0x<addr>" 都各自
+	// 成条，方便事后用 addr2line/objdump 核对具体是哪个地址没解析。两类
+	// 的成因和修法不同，聚合到一起反而会掩盖差异。
 	display := "[未解析] " + frame
 	return frame, display, true
 }

@@ -81,7 +81,8 @@ func (s *APIServer) evaluateSentinelRule(rule model.SentinelRule) {
 		return // 信号类型暂未接入判异逻辑（如 db_snapshot，见迭代2），跳过
 	}
 
-	now := time.Now()
+	// 用 UTC 与窗口写入的时区保持一致，否则 SQLite 按字符串比较时间会错位（CST vs UTC）。
+	now := time.Now().UTC()
 	q := ProfileQuery{
 		Host:       rule.TargetIP,
 		From:       now.Add(-detectionLookback),

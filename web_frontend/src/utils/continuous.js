@@ -1,5 +1,8 @@
 export const CONTINUOUS_SIGNALS = ['cpu_profile', 'io_latency', 'io_syscall_latency', 'sched_latency'];
 export const DEFAULT_CONTINUOUS_SIGNALS = ['cpu_profile'];
+// 哨兵规则目前只支持 eBPF histogram 类信号的固定阈值判异，与后端
+// detectionSignalTaskKind（apiserver/server/detection.go）保持一致。
+export const SENTINEL_SIGNALS = ['sched_latency', 'io_latency', 'io_syscall_latency'];
 
 export function decodeJSONField(value, fallback = []) {
     if (value == null || value === '') return fallback;

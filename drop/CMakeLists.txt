@@ -80,6 +80,7 @@ set(COMMON_SRCS
     common/Utils.cpp
     common/BuildId.cpp
     common/SymbolCollector.cpp
+    common/KernelSymbols.cpp
     common/Log.cpp
     common/ProcessExecutor.cpp
     common/ObjectStore.cpp
@@ -222,6 +223,8 @@ if(GTest_FOUND)
         common/Process.cpp
         common/Utils.cpp
         common/BuildId.cpp
+        common/SymbolCollector.cpp
+        common/KernelSymbols.cpp
         common/PidRegistry.cpp
         common/RuntimeSymbolMap.cpp
         common/PythonRuntimeProfiler.cpp

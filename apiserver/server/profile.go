@@ -104,11 +104,13 @@ type ProfileNode struct {
 }
 
 type ProfileSymbolDiagnostics struct {
-	TotalFrameWeight      float64  `json:"total_frame_weight"`
-	UnresolvedFrameWeight float64  `json:"unresolved_frame_weight"`
-	UnresolvedPercent     float64  `json:"unresolved_percent"`
-	GoSymbolState         string   `json:"go_symbol_state"`
-	Reasons               []string `json:"reasons"`
+	TotalFrameWeight             float64  `json:"total_frame_weight"`
+	UnresolvedFrameWeight        float64  `json:"unresolved_frame_weight"`
+	ModuleUnresolvedFrameWeight  float64  `json:"module_unresolved_frame_weight"`
+	NoModuleFrameWeight          float64  `json:"no_module_frame_weight"`
+	UnresolvedPercent            float64  `json:"unresolved_percent"`
+	GoSymbolState                string   `json:"go_symbol_state"`
+	Reasons                      []string `json:"reasons"`
 }
 
 type ProfileRuntimeProcessDiagnostic struct {

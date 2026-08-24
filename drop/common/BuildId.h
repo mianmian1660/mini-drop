@@ -37,6 +37,11 @@ namespace drop
     /// （~/.debug/.build-id/<id[:2]>/<id[2:]>/elf）。
     bool build_id_cached_locally(const std::string &buildId);
 
+    /// 本地 build-id 缓存文件的绝对路径（~/.debug/.build-id/<id[:2]>/
+    /// <id[2:]>/elf）；buildId 太短时返回空串。供持续采集上报符号时读
+    /// 已经预热进缓存的二进制，避免重复走 /proc 路径解析。
+    std::string build_id_local_cache_path(const std::string &buildId);
+
     /// 把 srcPath 指向的文件内容拷贝进本地 build-id 缓存目录，供 perf
     /// script 自身的 build-id 缓存回退机制命中。srcPath 可以是字面路径，
     /// 也可以是 /proc/<pid>/root/... 这类跨命名空间路径。

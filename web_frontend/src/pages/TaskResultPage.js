@@ -5,6 +5,7 @@
 // ============================================================
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { tasks, cosfiles } from '../api';
 import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
 import InteractiveFlamegraph, { foldedTextToFlamegraph } from '../components/InteractiveFlamegraph';
@@ -83,6 +84,13 @@ const stageDefinitions = [
 export default function TaskResultPage() {
     const params = new URLSearchParams(window.location.search);
     const tid = params.get('tid');
+    const navigate = useNavigate();
+    // 精确回退到点进来的那个位置（哨兵时间轴 / 周期任务时间轴 / 任务列表等来源不止一种，
+    // 不用每个来源页面手动传 from 参数）；只有直接粘贴链接打开、没有真实历史记录时才兜底到任务列表。
+    const goBack = useCallback(() => {
+        if (window.history.state?.idx > 0) navigate(-1);
+        else navigate('/tasks');
+    }, [navigate]);
 
     const [task, setTask] = useState(null);
     const [files, setFiles] = useState([]);
@@ -524,9 +532,12 @@ export default function TaskResultPage() {
                     <p style={styles.subtitle}>{tid}</p>
                     <p style={styles.streamState}>{streamState === 'live' ? '实时事件流已连接' : streamState === 'connecting' ? '正在连接实时事件流' : '实时事件流不可用，已回退轮询'}</p>
                 </div>
-                <button style={styles.button} onClick={manualRefresh} disabled={polling}>
-                    {polling ? '刷新中...' : '刷新'}
-                </button>
+                <div style={{ display: 'flex', gap: 10 }}>
+                    <button style={styles.button} onClick={goBack}>← 返回</button>
+                    <button style={styles.button} onClick={manualRefresh} disabled={polling}>
+                        {polling ? '刷新中...' : '刷新'}
+                    </button>
+                </div>
             </div>
 
             {shouldPoll && (

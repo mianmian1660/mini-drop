@@ -11,7 +11,11 @@
 
 package model
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 // SentinelRule 哨兵规则：持续采集某个信号超过固定阈值时，自动触发一次深度诊断。
 type SentinelRule struct {
@@ -29,12 +33,15 @@ type SentinelRule struct {
 	// CooldownSeconds 冷却期：同一条规则再次触发前必须间隔的秒数，避免持续异常刷屏。
 	// 不属于文档 MVP 范围内明确要求的能力，但没有它会导致单次异常在每个检测 tick
 	// 都新建一个诊断任务；作为最基本的安全闸门提前实现，见设计文档 §5.1"单飞/去重"。
-	CooldownSeconds int       `gorm:"column:cooldown_seconds;default:900" json:"cooldown_seconds"`
-	Enabled         bool      `gorm:"column:enabled;default:true" json:"enabled"`
-	UID             string    `gorm:"column:uid;size:64" json:"uid"`
-	UserName        string    `gorm:"column:user_name;size:128" json:"user_name"`
-	CreatedAt       time.Time `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt       time.Time `gorm:"column:updated_at" json:"updated_at"`
+	CooldownSeconds int            `gorm:"column:cooldown_seconds;default:900" json:"cooldown_seconds"`
+	Enabled         bool           `gorm:"column:enabled;default:true" json:"enabled"`
+	UID             string         `gorm:"column:uid;size:64" json:"uid"`
+	UserName        string         `gorm:"column:user_name;size:128" json:"user_name"`
+	CreatedAt       time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt       time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	// CanManage 非落库字段：当前请求方是否有权限删除/管理该规则，见 canManageOwner。
+	CanManage bool `gorm:"-" json:"can_manage"`
 }
 
 // DetectionState 按规则缓存的滚动状态：目前只用 LastFiredAt 做冷却期判断；

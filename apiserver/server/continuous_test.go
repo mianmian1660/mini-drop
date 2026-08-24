@@ -37,10 +37,16 @@ func TestContinuousTimelineCoverageUsesFiveSecondTolerance(t *testing.T) {
 	}
 }
 
-func TestContinuousTopFrameKeyGroupsUnresolvedModuleAddresses(t *testing.T) {
+func TestContinuousTopFrameKeyKeepsUnresolvedModuleAddress(t *testing.T) {
 	key, display, unresolved := continuousTopFrameKey("0x57f4c5123456 [postgres]")
-	if !unresolved || key != "[未解析] postgres" || display != "[未解析] postgres" {
-		t.Fatalf("unexpected unresolved frame grouping: key=%q display=%q unresolved=%v", key, display, unresolved)
+	if !unresolved || key != "0x57f4c5123456 [postgres]" || display != "[未解析] 0x57f4c5123456 [postgres]" {
+		t.Fatalf("unexpected unresolved frame keying: key=%q display=%q unresolved=%v", key, display, unresolved)
+	}
+
+	// 同一模块的不同地址不再合并，各自成条，便于事后 addr2line/objdump 核对。
+	key2, _, _ := continuousTopFrameKey("0x57f4c5123457 [postgres]")
+	if key2 == key {
+		t.Fatalf("distinct unresolved addresses should not be merged: %q", key)
 	}
 
 	item := &ProfileTopItem{Name: key, DisplayName: display, Value: 2, Self: 1, Unit: "samples", Unresolved: unresolved}

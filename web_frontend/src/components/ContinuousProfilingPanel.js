@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { continuous, profiles } from '../api';
+import { continuous, profiles, sentinelRules } from '../api';
 import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
+import HistogramTrendChart from './HistogramTrendChart';
 import { localDateTimeToISO } from '../utils/time';
-import { decodeJSONField } from '../utils/continuous';
+import { SENTINEL_SIGNALS, decodeJSONField } from '../utils/continuous';
 import {
     formatMetricValue,
     formatRawMetric,
@@ -860,7 +861,13 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 {sampleNotice && <div style={{ ...S.info, marginTop: 12 }}>{sampleNotice}</div>}
                 {coverageAlert && <CoverageAlert alert={coverageAlert} />}
 			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} />
-                : <HistogramPanel data={histogram} loading={querying} title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} />}
+                : <HistogramPanel
+                    data={histogram} loading={querying}
+                    title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'}
+                    targetIP={target?.ip}
+                    signal={SIGNAL_TAB_OPTIONS.find(option => option.tab === signalTab)?.signal}
+                    timeWindow={timeWindow}
+                />}
 
             {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
                 <div style={{ ...S.warn, marginTop: 10 }}>
@@ -1444,10 +1451,12 @@ function symbolCheckSummary(check = {}) {
     const missing = Array.isArray(check.missing) ? check.missing : [];
     const buildIDs = Object.keys(check.build_ids || {});
     const presentCount = buildIDs.filter(key => check.build_ids[key]).length;
+    const reasons = Array.isArray(check.reasons) ? check.reasons : [];
     const parts = [`符号存储状态：${symbolStatusLabel(check.symbol_status || 'unknown', {})}`];
     if (buildIDs.length > 0) parts.push(`build-id ${presentCount}/${buildIDs.length} 可用`);
     if (check.kallsyms !== undefined) parts.push(`kallsyms ${check.kallsyms ? '可用' : '缺失'}`);
     if (missing.length > 0) parts.push(`缺失：${missing.slice(0, 3).join(', ')}${missing.length > 3 ? '…' : ''}`);
+    if (reasons.length > 0) parts.push(`原因：${reasons.slice(0, 3).join('；')}${reasons.length > 3 ? '…' : ''}`);
     return parts.join(' · ');
 }
 
@@ -1653,7 +1662,19 @@ function ProfileEmpty({ message, url }) {
     );
 }
 
-export function HistogramPanel({ data, loading, title }) {
+export function HistogramPanel({ data, loading, title, targetIP, signal, timeWindow }) {
+    const [events, setEvents] = useState([]);
+    const supportsSentinel = SENTINEL_SIGNALS.includes(signal);
+
+    useEffect(() => {
+        if (!supportsSentinel || !targetIP || !timeWindow?.from || !timeWindow?.to) { setEvents([]); return; }
+        let cancelled = false;
+        sentinelRules.events({ target_ip: targetIP, signal, from: timeWindow.from, to: timeWindow.to })
+            .then(response => { if (!cancelled && response.code === 0) setEvents(response.data?.events || []); })
+            .catch(() => { if (!cancelled) setEvents([]); });
+        return () => { cancelled = true; };
+    }, [supportsSentinel, targetIP, signal, timeWindow?.from, timeWindow?.to]);
+
     if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询 {title} histogram...</div></section>;
     const buckets = data?.buckets || [];
     const trend = data?.trend || [];
@@ -1711,8 +1732,9 @@ export function HistogramPanel({ data, loading, title }) {
                     <div style={{ marginTop: 16 }}>
                         <div style={S.sectionHead}>
                             <h3 style={S.title}>P95/P99 趋势</h3>
-                            <span style={S.subtle}>{trend.length} 个窗口</span>
+                            <span style={S.subtle}>{trend.length} 个窗口{supportsSentinel ? '；红点为哨兵触发点，悬停查看详情，点击跳转诊断结果' : ''}</span>
                         </div>
+                        {supportsSentinel && <HistogramTrendChart trend={trend} events={events} unit={data?.unit} metric="p99" />}
                         <div className="table-scroll" style={S.tableWrap}>
                             <table style={S.table}>
                                 <thead>
@@ -1997,16 +2019,32 @@ export function diagnosticText({ target, flamegraph, topn, timeWindow, profileTy
 function symbolStatusLabel(status, diagnostics = {}) {
     const percent = Number(diagnostics?.unresolved_percent || 0);
     const unresolved = Number(diagnostics?.unresolved_frame_weight || 0);
+    const totalWeight = Number(diagnostics?.total_frame_weight || 0);
+    const moduleUnresolved = Number(diagnostics?.module_unresolved_frame_weight || 0);
+    const noModule = Number(diagnostics?.no_module_frame_weight || 0);
     const goState = diagnostics?.go_symbol_state;
     const suffix = goState === 'pending'
         ? ' · Go 符号正在后台预热'
         : goState === 'failed'
             ? ` · Go 符号提取失败${diagnostics?.reasons?.length ? `：${diagnostics.reasons[0]}` : ''}`
             : '';
+    // 未解析帧拆两类：模块未解析（符号库可补 build-id）与无模块（疑似 JIT/
+    // 匿名内存，本质无解），成因和修法不同，混称"裸地址帧"会误导。
+    // 仅在 total_weight 存在时展示占比，避免符号存储检查（空 diagnostics）
+    // 场景下误报 0%。
+    const hasBreakdown = totalWeight > 0;
+    const modulePct = hasBreakdown ? moduleUnresolved * 100 / totalWeight : 0;
+    const noModulePct = hasBreakdown ? noModule * 100 / totalWeight : 0;
     switch (status) {
-        case 'complete': return `完整（当前范围未检测到裸地址帧）${suffix}`;
-        case 'partial': return `部分解析（裸地址帧 ${percent.toFixed(1)}%，权重 ${formatNum(unresolved)}）${suffix}`;
-        case 'missing': return `缺失（当前范围主要为裸地址帧，权重 ${formatNum(unresolved)}）${suffix}`;
+        case 'complete': return `完整（当前范围未检测到未解析帧）${suffix}`;
+        case 'partial':
+            return hasBreakdown
+                ? `部分解析（未解析 ${percent.toFixed(1)}%：模块未解析 ${modulePct.toFixed(1)}%、无模块 ${noModulePct.toFixed(1)}%，权重 ${formatNum(unresolved)}）${suffix}`
+                : `部分解析${suffix}`;
+        case 'missing':
+            return hasBreakdown
+                ? `缺失（未解析权重 ${formatNum(unresolved)}：模块未解析 ${modulePct.toFixed(1)}%、无模块 ${noModulePct.toFixed(1)}%）${suffix}`
+                : `缺失${suffix}`;
         case 'not_applicable': return '不适用';
         default: return status || '未知';
     }

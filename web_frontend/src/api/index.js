@@ -152,6 +152,16 @@ export const schedules = {
     toggle: (sid) => client.post(`/api/v1/schedule/${sid}/toggle`),
 };
 
+// ---------- 哨兵规则（检测→触发深度诊断） ----------
+export const sentinelRules = {
+    create: (data) => client.post('/api/v1/sentinel-rules', data),
+    // 列表：支持 target_ip / signal
+    list: (params = {}) => client.get('/api/v1/sentinel-rules', { params }),
+    delete: (sid) => client.delete(`/api/v1/sentinel-rules/${encodeURIComponent(sid)}`),
+    // 判异事件：传 rule_sid，或退化为 target_ip(+signal)
+    events: (params = {}) => client.get('/api/v1/sentinel-rules/events', { params }),
+};
+
 // ---------- 文件（W4: 火焰图等产物） ----------
 export const cosfiles = {
     list: (tid) => client.get('/api/v1/cosfiles', { params: { tid } }),

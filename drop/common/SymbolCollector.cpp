@@ -10,7 +10,11 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <set>
 #include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace std;
@@ -159,7 +163,115 @@ namespace drop
             return rc == 0;
         }
 
+        // ---- 持续采集链路的 build-id 上报（无 tid，异步去重） ----
+        // 跨窗口去重：同一个 build-id 一旦确认服务端已有/已上传成功，就不再
+        // 每窗口重复 check+upload。进程重启即清空，代价只是重启后重查一次。
+        std::mutex g_uploadedBuildIdsMutex;
+        std::set<string> g_uploadedBuildIds;
+
+        string build_ids_check_request(const vector<BuildIdEntry> &entries)
+        {
+            string body = "{\"build_ids\":[";
+            for (size_t i = 0; i < entries.size(); ++i)
+            {
+                if (i)
+                    body += ",";
+                body += "\"" + json_escape(entries[i].buildId) + "\"";
+            }
+            body += "]}";
+            return body;
+        }
+
+        void mark_build_ids_uploaded(const vector<BuildIdEntry> &entries)
+        {
+            std::lock_guard<std::mutex> lock(g_uploadedBuildIdsMutex);
+            for (const auto &e : entries)
+                g_uploadedBuildIds.insert(e.buildId);
+        }
+
+        // 同步执行一次"检查缺失 -> 上传缺失"的往返。只从本地 build-id 缓存读
+        // 二进制（warm_build_id_cache 已把能读到的预热进去），读不到就跳过，
+        // 下个窗口预热成功后自然重试。整个函数失败只降级，不影响采集。
+        void upload_build_ids_sync(const vector<BuildIdEntry> &entries, const string &apiBaseURL)
+        {
+            string reqPath = "/tmp/mini_drop_cp_symcheck_" + std::to_string(::getpid()) + ".json";
+            {
+                ofstream out(reqPath, ios::binary);
+                if (!out.is_open())
+                    return;
+                out << build_ids_check_request(entries);
+            }
+
+            string checkResp;
+            bool checkOk = http_post_json(apiBaseURL + "/api/v1/internal/continuous/symbol-check", reqPath, &checkResp);
+            ::remove(reqPath.c_str());
+            if (!checkOk)
+            {
+                cout << "[cp-symbols] continuous symbol-check 调用失败，符号上报降级" << endl;
+                return;
+            }
+
+            vector<string> missing = extract_missing(checkResp);
+            if (missing.empty())
+            {
+                // 服务端已有全部 build-id，标记为已上报，避免下个窗口重复查询。
+                mark_build_ids_uploaded(entries);
+                return;
+            }
+
+            map<string, string> cacheByBuildId;
+            for (const auto &e : entries)
+                cacheByBuildId[e.buildId] = drop::build_id_local_cache_path(e.buildId);
+
+            int uploaded = 0;
+            vector<BuildIdEntry> uploadedEntries;
+            for (const auto &buildId : missing)
+            {
+                auto it = cacheByBuildId.find(buildId);
+                if (it == cacheByBuildId.end())
+                    continue;
+                const string &cachedPath = it->second;
+                if (cachedPath.empty() || !file_readable(cachedPath))
+                    continue; // 本地缓存尚未预热好，下个窗口重试
+                string putResp;
+                if (http_put_file(apiBaseURL + "/api/v1/symbols/" + buildId, cachedPath, &putResp))
+                {
+                    ++uploaded;
+                    uploadedEntries.push_back({buildId, cachedPath});
+                    cout << "[cp-symbols] 上传成功 build_id=" << buildId << endl;
+                }
+            }
+            // 只标记成功上传的；失败的保留待下个窗口重试。
+            if (uploaded > 0)
+                mark_build_ids_uploaded(uploadedEntries);
+        }
+
     } // namespace
+
+    void upload_build_ids_async(vector<BuildIdEntry> entries, const string &apiBaseURL)
+    {
+        if (entries.empty() || apiBaseURL.empty())
+            return;
+
+        vector<BuildIdEntry> pending;
+        {
+            std::lock_guard<std::mutex> lock(g_uploadedBuildIdsMutex);
+            for (const auto &e : entries)
+            {
+                if (g_uploadedBuildIds.count(e.buildId))
+                    continue;
+                pending.push_back(e);
+            }
+        }
+        if (pending.empty())
+            return;
+
+        // detach 后台线程，不阻塞当次 perf script 解析。entries/pending 是
+        // 值拷贝，detach 后生命周期独立。
+        std::thread([pending, apiBaseURL]() {
+            upload_build_ids_sync(pending, apiBaseURL);
+        }).detach();
+    }
 
     bool collect_and_upload_symbols(const string &perfDataPath,
                                      const string &tid,

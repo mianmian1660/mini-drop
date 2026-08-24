@@ -9,6 +9,9 @@
 #pragma once
 
 #include <string>
+#include <vector>
+
+#include "common/BuildId.h"
 
 namespace drop
 {
@@ -23,5 +26,16 @@ namespace drop
                                      const std::string &tid,
                                      int targetPid,
                                      const std::string &apiBaseURL);
+
+    /// 持续采集链路的上报入口：把本次窗口引用的 build-id 异步上报到服务端
+    /// 符号库。与 collect_and_upload_symbols（一次性任务）的区别：
+    /// - 不需要 tid（走 /internal/continuous/symbol-check，请求体只有
+    ///   build_ids 数组，与持续采集没有任务 ID 的概念对齐）
+    /// - 已经拿到 buildid-list 结果，不重新解析 perf.data
+    /// - 异步 detach，不阻塞当次 perf script 解析；失败只降级不影响采集
+    /// - 二进制源优先读本地 build-id 缓存（warm_build_id_cache 已预热），
+    ///   读不到就跳过（下个窗口预热成功后重试）
+    void upload_build_ids_async(std::vector<BuildIdEntry> entries,
+                                const std::string &apiBaseURL);
 
 } // namespace drop

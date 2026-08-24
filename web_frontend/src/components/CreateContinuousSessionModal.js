@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { continuous } from '../api';
-import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, formatBytes, signalLabel } from '../utils/continuous';
+import { continuous, sentinelRules } from '../api';
+import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, SENTINEL_SIGNALS, formatBytes, signalLabel } from '../utils/continuous';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(16,24,40,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
@@ -24,6 +24,9 @@ const S = {
     chip: { background: '#f2f4f7', color: '#344054', borderRadius: 999, padding: '4px 8px', fontSize: 12, fontWeight: 700 },
     warn: { marginTop: 14, color: '#b54708', background: '#fffaeb', border: '1px solid #fedf89', borderRadius: 6, padding: 12, fontSize: 13, lineHeight: 1.5 },
     error: { marginTop: 12, color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: 10, fontSize: 13 },
+    sentinelToggle: { display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 13, fontWeight: 700, color: '#344054', cursor: 'pointer' },
+    sentinelFields: { marginTop: 12, padding: 14, border: '1px solid #c7d2fe', background: '#eef2ff', borderRadius: 8, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 },
+    sentinelHint: { gridColumn: '1/-1', color: '#475467', fontSize: 12, margin: 0 },
     actions: { display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 },
     cancel: { background: '#fff', color: '#475467', border: '1px solid #d0d5dd', borderRadius: 6, padding: '8px 14px', fontWeight: 700, cursor: 'pointer' },
     submit: disabled => ({ background: disabled ? '#e5e7eb' : '#315efb', color: disabled ? '#98a2b3' : '#fff', border: 0, borderRadius: 6, padding: '9px 14px', fontWeight: 700, cursor: disabled ? 'not-allowed' : 'pointer' }),
@@ -48,6 +51,14 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
     const [uploadBatch, setUploadBatch] = useState(60);
     const [retentionHours, setRetentionHours] = useState(24);
     const [conflictSession, setConflictSession] = useState(null);
+    const [sentinelEnabled, setSentinelEnabled] = useState(false);
+    const [sentinelSignal, setSentinelSignal] = useState('');
+    const [sentinelFloor, setSentinelFloor] = useState('5');
+    const [sentinelCooldownMin, setSentinelCooldownMin] = useState(15);
+    const [sentinelError, setSentinelError] = useState('');
+    // 会话已创建成功后缓存下来：如果哨兵规则创建失败，重试只重发哨兵请求，
+    // 不会重新创建一次持续采集会话。
+    const [createdSession, setCreatedSession] = useState(null);
 
     const loadProcesses = useCallback(async () => {
         setLoading(true);
@@ -87,8 +98,23 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
         && Number(aggregationWindow) >= 5 && Number(aggregationWindow) <= 300
         && Number(uploadBatch) >= Number(aggregationWindow) && Number(uploadBatch) <= 3600
         && Number(retentionHours) >= 1 && Number(retentionHours) <= 720;
+    const eligibleSentinelSignals = useMemo(
+        () => selectedSignals.filter(signal => SENTINEL_SIGNALS.includes(signal)),
+        [selectedSignals],
+    );
+    // 已选信号变化后，如果当前哨兵信号不再可选（或还没选），自动落到第一个可选项；
+    // 一个可选信号都没有时关闭哨兵栏，避免用户对着一个提交了也不会生效的选项瞎填。
+    useEffect(() => {
+        if (eligibleSentinelSignals.length === 0) {
+            setSentinelEnabled(false);
+            setSentinelSignal('');
+            return;
+        }
+        if (!eligibleSentinelSignals.includes(sentinelSignal)) setSentinelSignal(eligibleSentinelSignals[0]);
+    }, [eligibleSentinelSignals, sentinelSignal]);
+    const sentinelFieldsValid = !sentinelEnabled || (sentinelSignal && Number(sentinelFloor) > 0 && Number(sentinelCooldownMin) > 0);
     const valid = agentFresh && numericSettingsValid && name.trim() && selectedSignals.length > 0 && (scope === 'host' || selectedExe)
-        && (!needsDegradedConfirmation || allowDegraded);
+        && (!needsDegradedConfirmation || allowDegraded) && sentinelFieldsValid;
 
     const toggleSignal = useCallback((signal) => {
         setSelectedSignals(current => {
@@ -104,17 +130,37 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
         if (!valid || submitting) return;
         setSubmitting(true);
         setError('');
+        setSentinelError('');
         setConflictSession(null);
         try {
-            const response = await continuous.createSession({
-                name: name.trim(), target_ip: target.ip, hostname: target.hostname || '', service_name: target.service_name || 'hotmethod',
-                scope, selector_exe: scope === 'process' ? selectedExe : '', selector_mode: 'all_instances',
-                signals: selectedSignals, continuity_mode: 'strict', allow_degraded: allowDegraded,
-                sample_rate_hz: Number(sampleRate), aggregation_window_sec: Number(aggregationWindow),
-                upload_batch_sec: Number(uploadBatch), retention_hours: Number(retentionHours),
-            });
-            if (response.code !== 0) throw new Error(response.message || '创建持续采集失败');
-            onSuccess?.(response.data?.session);
+            // 会话已经建好（上一次提交时创建成功，这次只是在重试哨兵规则）：跳过重复建会话。
+            let session = createdSession;
+            if (!session) {
+                const response = await continuous.createSession({
+                    name: name.trim(), target_ip: target.ip, hostname: target.hostname || '', service_name: target.service_name || 'hotmethod',
+                    scope, selector_exe: scope === 'process' ? selectedExe : '', selector_mode: 'all_instances',
+                    signals: selectedSignals, continuity_mode: 'strict', allow_degraded: allowDegraded,
+                    sample_rate_hz: Number(sampleRate), aggregation_window_sec: Number(aggregationWindow),
+                    upload_batch_sec: Number(uploadBatch), retention_hours: Number(retentionHours),
+                });
+                if (response.code !== 0) throw new Error(response.message || '创建持续采集失败');
+                session = response.data?.session;
+                setCreatedSession(session);
+            }
+            if (sentinelEnabled) {
+                try {
+                    await sentinelRules.create({
+                        name: `${name.trim()}（哨兵）`, target_ip: session.target_ip || target.ip,
+                        signal: sentinelSignal, metric: 'p99',
+                        floor_value: Number(sentinelFloor), cooldown_seconds: Math.round(Number(sentinelCooldownMin) * 60),
+                    });
+                } catch (sentinelErr) {
+                    // 会话本身已经创建成功，不因为哨兵规则失败而丢弃：只提示、留给用户选择重试或直接进入详情页处理。
+                    setSentinelError(sentinelErr?.response?.data?.message || sentinelErr?.message || '哨兵规则创建失败');
+                    return;
+                }
+            }
+            onSuccess?.(session);
         } catch (err) {
             const payload = err?.response?.data;
             const existing = payload?.data?.existing_session;
@@ -176,6 +222,29 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                 <div style={{ ...S.subtle, marginTop: 8 }}>只会创建你勾选的信号；CPU 是最常用的默认项。</div>
             </div>
 
+            <div style={S.section}>
+                {eligibleSentinelSignals.length === 0
+                    ? <div style={S.subtle}>当前勾选的信号暂不支持自动告警（仅调度延迟 / IO 延迟支持哨兵规则）。</div>
+                    : <>
+                        <label style={S.sentinelToggle}>
+                            <input type="checkbox" checked={sentinelEnabled} disabled={Boolean(createdSession)}
+                                onChange={event => setSentinelEnabled(event.target.checked)} style={{ marginTop: 2 }} />
+                            <span>创建后台哨兵，超过阈值自动触发一次深度诊断</span>
+                        </label>
+                        {sentinelEnabled && <div style={S.sentinelFields}>
+                            <label><span style={S.label}>监控信号</span>
+                                <select style={S.input} value={sentinelSignal} disabled={Boolean(createdSession)}
+                                    onChange={event => setSentinelSignal(event.target.value)}>
+                                    {eligibleSentinelSignals.map(signal => <option key={signal} value={signal}>{signalLabel(signal)} · p99</option>)}
+                                </select>
+                            </label>
+                            <NumberField label="告警阈值 ms" value={sentinelFloor} onChange={setSentinelFloor} min={0.1} max={100000} disabled={Boolean(createdSession)} />
+                            <NumberField label="冷却期（分钟）" value={sentinelCooldownMin} onChange={setSentinelCooldownMin} min={1} max={1440} disabled={Boolean(createdSession)} />
+                            <p style={S.sentinelHint}>触发的是一次 60 秒短时深度诊断，不会常驻运行；冷却期内不会重复触发。</p>
+                        </div>}
+                    </>}
+            </div>
+
             <details style={S.section}>
                 <summary style={{ cursor: 'pointer', color: '#344054', fontSize: 13, fontWeight: 700 }}>高级设置</summary>
                 <div style={S.grid}>
@@ -192,12 +261,15 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                 <label style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'flex-start', fontWeight: 700 }}><input type="checkbox" checked={allowDegraded} onChange={event => setAllowDegraded(event.target.checked)} />我已了解并允许降级运行</label>
             </div>}
             {error && <div style={S.error}>{error}</div>}
+            {createdSession && sentinelError && <div style={S.warn}>持续采集已创建，但哨兵规则创建失败：{sentinelError}。可以重试，也可以先关闭，之后在详情页补建哨兵。
+                <div style={{ marginTop: 8 }}><button style={S.cancel} onClick={() => onSuccess?.(createdSession)}>先关闭，跳过哨兵</button></div>
+            </div>}
             {conflictSession?.sid && <div style={S.warn}>已有活动会话由 {conflictSession.user_name || '系统'} 创建。<Link to={`/hosts/${encodeURIComponent(target.id)}/continuous/${encodeURIComponent(conflictSession.sid)}`} onClick={onClose}>查看已有会话</Link></div>}
-            <div style={S.actions}><button style={S.cancel} onClick={onClose} disabled={submitting}>取消</button><button style={S.submit(!valid || submitting)} onClick={submit} disabled={!valid || submitting}>{submitting ? '创建中...' : '创建并开始采集'}</button></div>
+            <div style={S.actions}><button style={S.cancel} onClick={onClose} disabled={submitting}>取消</button><button style={S.submit(!valid || submitting)} onClick={submit} disabled={!valid || submitting}>{submitting ? '创建中...' : createdSession ? '重试创建哨兵规则' : '创建并开始采集'}</button></div>
         </div>
     </div>;
 }
 
-function NumberField({ label, value, onChange, min, max }) {
-    return <label><span style={S.label}>{label}</span><input type="number" style={S.input} min={min} max={max} value={value} onChange={event => onChange(event.target.value)} /></label>;
+function NumberField({ label, value, onChange, min, max, disabled }) {
+    return <label><span style={S.label}>{label}</span><input type="number" style={S.input} min={min} max={max} value={value} disabled={disabled} onChange={event => onChange(event.target.value)} /></label>;
 }

@@ -104,6 +104,11 @@ namespace drop
         return !path.empty() && file_readable(path);
     }
 
+    string build_id_local_cache_path(const string &buildId)
+    {
+        return build_id_cache_path(buildId);
+    }
+
     bool cache_build_id_locally(const string &buildId, const string &srcPath)
     {
         string dest = build_id_cache_path(buildId);

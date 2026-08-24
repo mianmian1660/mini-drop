@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { continuous, profiles } from '../api';
 import ContinuousProfilingPanel from '../components/ContinuousProfilingPanel';
+import SentinelCard from '../components/SentinelCard';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime } from '../utils/continuous';
 
 const S = {
@@ -76,6 +77,7 @@ export default function ContinuousSessionDetailPage() {
     }, [load]);
 
     const activeProcesses = useMemo(() => decodeJSONField(session?.active_processes, []), [session?.active_processes]);
+    const sessionSignals = useMemo(() => decodeJSONField(session?.signals, ['cpu_profile']), [session?.signals]);
 
     const stop = async () => {
         if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
@@ -123,6 +125,7 @@ export default function ContinuousSessionDetailPage() {
                 <div style={S.instances}>{activeProcesses.length ? activeProcesses.map(process => <span key={`${process.pid}-${process.process_start_ms}`} style={S.instance}>PID {process.pid} · {formatStart(process.process_start_ms)}</span>) : <span style={S.instance}>等待匹配进程</span>}</div>
             </details>}
         </section>
+        <section style={S.card}><SentinelCard targetIP={session.target_ip} signals={sessionSignals} /></section>
         <ContinuousProfilingPanel target={target} fixedSession={session} initialQuery={initialQuery} />
     </div>;
 }

@@ -793,6 +793,12 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/schedule/:sid", s.GetScheduleDetail)
 		api.DELETE("/schedule/:sid", s.DeleteSchedule)
 		api.POST("/schedule/:sid/toggle", s.ToggleSchedule)
+
+		// 哨兵规则（检测→触发深度诊断，见 docs/sentinel-rule-frontend-design.md）
+		api.POST("/sentinel-rules", s.CreateSentinelRule)
+		api.GET("/sentinel-rules", s.ListSentinelRules)
+		api.DELETE("/sentinel-rules/:sid", s.DeleteSentinelRule)
+		api.GET("/sentinel-rules/events", s.ListDetectionEvents)
 	}
 
 	s.Logger.Info("路由注册完成",

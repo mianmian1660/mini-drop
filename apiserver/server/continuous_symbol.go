@@ -42,6 +42,7 @@ type ContinuousSymbolCheckResp struct {
 	Kallsyms     bool            `json:"kallsyms"`
 	Missing      []string        `json:"missing"`
 	SymbolStatus string          `json:"symbol_status"`
+	Reasons      []string        `json:"reasons,omitempty"`
 }
 
 func (s *APIServer) ContinuousSymbolCheck(c *gin.Context) {
@@ -149,6 +150,7 @@ func (s *APIServer) CheckContinuousSessionSymbols(c *gin.Context) {
 	}
 	buildIDs := map[string]bool{}
 	kallsyms := ""
+	reasons := map[string]bool{}
 	seenObjects := map[string]bool{}
 	objectOrder, _ := continuousGroupWindowsByObject(windows)
 	for _, objectKey := range objectOrder {
@@ -163,10 +165,10 @@ func (s *APIServer) CheckContinuousSessionSymbols(c *gin.Context) {
 		}
 		for i := range batches {
 			batch := &batches[i]
-			collectContinuousSymbolRefs(batch.SymbolRefs, buildIDs, &kallsyms)
+			collectContinuousSymbolRefs(batch.SymbolRefs, buildIDs, &kallsyms, reasons)
 			for _, window := range batch.Windows {
 				if windowOverlaps(window.WindowStart, window.WindowEnd, from, to) {
-					collectContinuousSymbolRefs(window.SymbolRefs, buildIDs, &kallsyms)
+					collectContinuousSymbolRefs(window.SymbolRefs, buildIDs, &kallsyms, reasons)
 				}
 			}
 		}
@@ -177,6 +179,13 @@ func (s *APIServer) CheckContinuousSessionSymbols(c *gin.Context) {
 	}
 	sort.Strings(buildIDList)
 	resp := s.checkContinuousSymbols(c.Request.Context(), buildIDList, kallsyms)
+	if len(reasons) > 0 {
+		resp.Reasons = make([]string, 0, len(reasons))
+		for reason := range reasons {
+			resp.Reasons = append(resp.Reasons, reason)
+		}
+		sort.Strings(resp.Reasons)
+	}
 	s.RespondOK(c, gin.H{
 		"symbol_check": resp,
 		"session_sid":  session.SID,
@@ -237,7 +246,7 @@ func (s *APIServer) checkContinuousSymbols(ctx context.Context, buildIDs []strin
 	return resp
 }
 
-func collectContinuousSymbolRefs(value interface{}, buildIDs map[string]bool, kallsyms *string) {
+func collectContinuousSymbolRefs(value interface{}, buildIDs map[string]bool, kallsyms *string, reasons map[string]bool) {
 	var walk func(interface{}, string)
 	walk = func(raw interface{}, key string) {
 		switch item := raw.(type) {
@@ -259,6 +268,12 @@ func collectContinuousSymbolRefs(value interface{}, buildIDs map[string]bool, ka
 				buildIDs[text] = true
 			case strings.Contains(key, "kallsyms") && *kallsyms == "":
 				*kallsyms = text
+			case key == "reason" && reasons != nil:
+				// runtime_maps / python_fallback / python_memory / native_go
+				// 里已经采集好的失败原因（perf-map 未生成、权限不足、进程退出
+				// 等），key 名不带 build_id/kallsyms，此前递归扫不到。这里单独
+				// 捡出来，让诊断接口能直接给出根因文案。
+				reasons[text] = true
 			}
 		}
 	}
