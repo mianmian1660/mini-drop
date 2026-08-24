@@ -321,6 +321,9 @@ SegmentProcessResult ProcessScript(
     result.diagnostics.pythonFallbackLimitedCount = pythonLimitedCount;
     result.diagnostics.memrayResults = memrayResults;
     result.diagnostics.unwindMode = capabilities.unwindMode.empty() ? "fp" : capabilities.unwindMode;
+    // 阶段四：栈回溯模式（临时诊断日志，定位 unwind 模式断链用）
+    std::cout << "[native-cp][dbg] ProcessScript unwind=[" << capabilities.unwindMode
+              << "] -> diag=[" << result.diagnostics.unwindMode << "]" << std::endl;
     result.diagnostics.buildIdWarmReport = buildIdWarmReport;
     result.diagnostics.kallsymsSha256 = ensure_kallsyms_snapshot(physicalConfig);
 

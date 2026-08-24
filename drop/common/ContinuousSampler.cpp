@@ -3657,6 +3657,8 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
     }
     if (!found)
         return {};
+    std::cout << "[native-cp][dbg] merge_physical_diagnostics merged unwind=["
+              << merged->unwindMode << "]" << std::endl;
     merged->runtimeReport.status = drop::runtime_aggregate_status(merged->runtimeReport);
     for (auto &entry : python) merged->pythonFallback.push_back(std::move(entry.second));
     for (auto &entry : memray) merged->memrayResults.push_back(std::move(entry.second));
