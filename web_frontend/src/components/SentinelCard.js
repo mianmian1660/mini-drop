@@ -80,7 +80,7 @@ export default function SentinelCard({ targetIP, signals = [] }) {
                     : <div style={{ display: 'grid', gap: 8 }}>{rules.map(rule => (
                         <div key={rule.sid} style={S.row}>
                             <div>
-                                <div style={S.rowTitle}>{signalLabel(rule.signal)} · {rule.metric} &gt; {rule.floor_value} ms</div>
+                                <div style={S.rowTitle}>{signalLabel(rule.signal)} · {rule.metric} &gt; {rule.floor_value / 1000} ms</div>
                                 <span style={S.subtle}>冷却期 {Math.round(rule.cooldown_seconds / 60)} 分钟</span>
                                 <div><span style={S.badge}>已启用</span></div>
                             </div>
@@ -107,7 +107,8 @@ function AddSentinelForm({ targetIP, signals, onCancel, onCreated }) {
         try {
             const response = await sentinelRules.create({
                 name: `${signalLabel(signal)} 哨兵`, target_ip: targetIP, signal, metric: 'p99',
-                floor_value: Number(floor), cooldown_seconds: Math.round(Number(cooldownMin) * 60),
+                // 后端 floor_value 单位是微秒(us)，前端输入框单位是毫秒(ms)，提交时 ×1000 换算。
+                floor_value: Number(floor) * 1000, cooldown_seconds: Math.round(Number(cooldownMin) * 60),
             });
             if (response.code !== 0) throw new Error(response.message || '创建哨兵规则失败');
             onCreated();

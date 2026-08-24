@@ -734,6 +734,46 @@ func (s *APIServer) StopContinuousSession(c *gin.Context) {
 	s.RespondOK(c, gin.H{"session": session, "already_stopped": alreadyStopped})
 }
 
+// UpdateContinuousSessionLabels 只更新 Labels 字段（承载 db_targets 等自由格式
+// 配置），不改任何其它会话状态。给"数据库账号"页面用——db_targets 变化不会
+// 热更新到正在跑的 Runtime（见 ReconcileDBSampler 的已知限制），前端要提示
+// 用户改完需要停止并重建 Session 才生效。
+type UpdateContinuousSessionLabelsReq struct {
+	Labels map[string]interface{} `json:"labels"`
+}
+
+func (s *APIServer) UpdateContinuousSessionLabels(c *gin.Context) {
+	auth := s.AuthContext(c)
+	if !auth.CanWrite() {
+		s.forbid(c)
+		return
+	}
+	sid := strings.TrimSpace(c.Param("sid"))
+	session, ok := s.loadManageableContinuousSession(c, sid, auth)
+	if !ok {
+		return
+	}
+	var req UpdateContinuousSessionLabelsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "参数错误: "+err.Error())
+		return
+	}
+	labels, err := util.MarshalJSONB(req.Labels)
+	if err != nil {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "labels 序列化失败: "+err.Error())
+		return
+	}
+	now := time.Now()
+	if err := s.DB.Model(&model.ContinuousSession{}).Where("id = ?", session.ID).
+		Updates(map[string]interface{}{"labels": labels, "updated_at": now}).Error; err != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "更新 labels 失败")
+		return
+	}
+	session.Labels = labels
+	session.UpdatedAt = now
+	s.RespondOK(c, gin.H{"session": session})
+}
+
 func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	var req ContinuousBatchIngestReq
 	if err := c.ShouldBindJSON(&req); err != nil {
