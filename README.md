@@ -327,18 +327,19 @@ make verify
 
 ## 测试环境部署（服务器）
 
-服务器测试环境唯一部署流程（rsync 直传已废弃，禁止在服务器改代码或提交）：
+服务器只作为远程 Git 分支的测试环境。rsync 直传已废弃，禁止在服务器修改、提交或推送源码：
 
 ```text
-本地修改 -> commit -> push origin/test -> ./sync.sh -> 服务器自动测试/构建/启动/验证 -> PR 合入 main
+本地修改 -> commit -> push 指定分支 -> ./deploy.sh <branch> -> 服务器拉取该远程分支并测试
 ```
 
-- `test` 是长期测试分支；服务器固定跟踪 `origin/test` 并只做快进更新。
-- `./sync.sh` 前置校验：本地在 `test`、工作树干净、HEAD 已推送 `origin/test`；脚本不会代替你 commit/push。
-- 服务器端按顺序执行：快进更新并校验 HEAD == `origin/test` -> `make test` + 覆盖率 -> 镜像构建 -> Compose 启动等待 healthy -> 健康检查 -> `scripts/e2e_smoke.sh`；任一步失败立即终止并打印 `[STAGE:*]` 与目标 SHA。UP 之前失败不影响旧容器；UP 之后失败请本地 revert/fix 后重新 push 部署。
-- 服务器参数在本地 `sync.env`（仅 `SYNC_REMOTE_HOST` / `SYNC_REMOTE_PATH`，不入库）；服务器只持有只读 deploy key。
+- `./deploy.sh main`、`./deploy.sh feature/<name>` 和 `./deploy.sh fix/<name>` 均从真正的 `origin/<branch>` 部署；不上传本地源码或 Git bundle。
+- 切换前同时检查本地与服务器工作树；服务器存在任何未提交或未跟踪源码时立即停止，不自动 stash、clean 或修改。
+- 服务器端按顺序执行：fetch origin -> 精确切换指定分支并校验 SHA -> `make test` + 覆盖率 -> 镜像构建 -> Compose 启动等待 healthy -> 健康检查 -> `scripts/e2e_smoke.sh`。
+- 测试发现问题后，回到本地创建并 push `fix/*` 或 `feature/*`，再部署该分支；通过后在本地合入 `main`，最后重新部署 `main`。
+- 服务器参数保存在本地 `sync.env`（`SYNC_REMOTE_HOST` / `SYNC_REMOTE_PATH`，不入库）；服务器 Git 禁止 commit/push。
 - 可用环境变量：`DEPLOY_TEST_SCOPE=full|smoke|none` 控制测试范围；模拟测试见 `bash scripts/tests/deploy_test.sh`。
-- 分支保护：远程 `main` 禁止直接 push 与 force-push，改动一律经 PR 合入。
+- `sync.sh` 仅为兼容旧命令的转发入口，也必须显式传入分支；推荐统一使用 `deploy.sh`。
 
 ## 安全、可观测性与部署
 
