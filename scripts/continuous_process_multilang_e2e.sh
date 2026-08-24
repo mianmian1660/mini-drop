@@ -152,18 +152,6 @@ get_session_json() {
     curl -fsS "$BASE/api/v1/continuous/sessions/$1" "${api_headers[@]}"
 }
 
-wait_for_assignments() {
-    local deadline=$((SECONDS + 30))
-    while (( SECONDS < deadline )); do
-        sessions_attached && return 0
-        sleep 2
-    done
-    return 1
-}
-
-wait_for_assignments || fail "Agent did not attach all process Sessions"
-pass "Agent attached all selected exe instances"
-
 # 阶段四修复：把"所有 Session 已 attach（running/degraded 且带 PID）"的判定
 # 提取为单一函数，消除启动等待与 Agent 重启恢复两处重复嵌套的循环体。
 sessions_attached() {
@@ -179,6 +167,18 @@ sessions_attached() {
     done
     return "$ready"
 }
+
+wait_for_assignments() {
+    local deadline=$((SECONDS + 30))
+    while (( SECONDS < deadline )); do
+        sessions_attached && return 0
+        sleep 2
+    done
+    return 1
+}
+
+wait_for_assignments || fail "Agent did not attach all process Sessions"
+pass "Agent attached all selected exe instances"
 
 for ((elapsed=0; elapsed<WAIT_DATA_SEC; elapsed+=4)); do
     if (( elapsed % 8 == 0 )); then
