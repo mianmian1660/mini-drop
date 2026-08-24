@@ -58,7 +58,7 @@ for k in ["parquet_mode","fine_gc_mode","migration_receipt_count","migration_rec
   if [ -n "${TID}" ]; then
     echo "  task: $(PG "SELECT 'tid='||tid||' name='||name||' kind='||task_kind||' status='||status||' analysis_status='||analysis_status||' create='||create_time||' end='||COALESCE(end_time::text,'NULL') FROM hotmethod_tasks WHERE tid='${TID}'")"
     echo "  attempts: $(PG "SELECT 'count='||count(*)||' exit_codes='||string_agg(COALESCE(exit_code::text,'')||':'||COALESCE(error_code,'-'),',') FROM task_attempts WHERE task_tid='${TID}'")"
-    echo "  artifacts: $(PG "SELECT 'count='||count(*)||' by_status='||string_agg(status||':'||count(*)::text,',') FROM artifacts WHERE task_tid='${TID}' GROUP BY task_tid")"
+    echo "  artifacts: $(PG "SELECT 'count='||COALESCE(sum(cnt),0)||' by_status='||COALESCE(string_agg(status||':'||cnt,',' ORDER BY status),'') FROM (SELECT status,count(*) cnt FROM artifacts WHERE task_tid='${TID}' GROUP BY status) s")"
     echo "  artifacts_blob: $(PG "SELECT 'with_blob='||count(*) FILTER (WHERE blob_id IS NOT NULL)||' without_blob='||count(*) FILTER (WHERE blob_id IS NULL) FROM artifacts WHERE task_tid='${TID}'")"
     echo "  analysis_jobs: $(PG "SELECT 'count='||count(*)||' by_status='||string_agg(status||'g'||generation,',') FROM analysis_jobs WHERE task_tid='${TID}' GROUP BY task_tid")"
   else

@@ -193,6 +193,78 @@ func TestPQCoverageSegmentMerge(t *testing.T) {
 	}
 }
 
+// TestPQCoverageRebuildFromMembersWhenWindowsGCCd 窗口被细粒度 GC 删除后，
+// 重建 coverage 应退化为从持久 block members 恢复（而非把覆盖区间清成 0）。
+func TestPQCoverageRebuildFromMembersWhenWindowsGCCd(t *testing.T) {
+	s := pqTestServer(t)
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	members := []model.ContinuousParquetBlockMember{
+		{BlockID: "pq-cov-m1", SourceKind: "batch", SourceRef: "b1", SessionSID: "s1",
+			StartTime: hour.Add(time.Minute), EndTime: hour.Add(2 * time.Minute), SampleCount: 2, RowCount: 1},
+		{BlockID: "pq-cov-m1", SourceKind: "batch", SourceRef: "b2", SessionSID: "s1",
+			StartTime: hour.Add(2*time.Minute + 4*time.Second), EndTime: hour.Add(3 * time.Minute), SampleCount: 3, RowCount: 1},
+	}
+	for _, m := range members {
+		if err := s.DB.Create(&m).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx := s.DB.Begin()
+	if err := s.pqRebuildCoverageSegmentsTx(tx, "default", hour, model.ContinuousParquetSignalCPU, "pq-cov-m1", 1); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	tx.Commit()
+
+	var segments []model.ContinuousCoverageSegment
+	if err := s.DB.Where("session_sid = ? AND signal_type = ?", "s1", "cpu_profile").
+		Order("segment_start ASC").Find(&segments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("expected 1 merged segment rebuilt from members, got %d", len(segments))
+	}
+	if segments[0].SampleCount != 5 {
+		t.Fatalf("sample_count = %d, want 5", segments[0].SampleCount)
+	}
+	if segments[0].SourceBlock != "pq-cov-m1" {
+		t.Fatalf("source_block = %s, want pq-cov-m1", segments[0].SourceBlock)
+	}
+}
+
+// TestPQCoveragePreservedWhenNoSource 无 window 且无 member 时，重建不得清空
+// 已有 coverage（防止启动重建把真实覆盖区间误删成 0）。
+func TestPQCoveragePreservedWhenNoSource(t *testing.T) {
+	s := pqTestServer(t)
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	existing := model.ContinuousCoverageSegment{
+		Tenant: "default", SessionSID: "s1", SignalType: "cpu_profile",
+		SegmentStart: hour.Add(time.Minute), SegmentEnd: hour.Add(2 * time.Minute),
+		SampleCount: 5, SourceBlock: "pq-cov-old", SourceVersion: 1,
+		Resolution: model.ContinuousParquetResolutionRaw,
+	}
+	if err := s.DB.Create(&existing).Error; err != nil {
+		t.Fatal(err)
+	}
+	tx := s.DB.Begin()
+	if err := s.pqRebuildCoverageSegmentsTx(tx, "default", hour, model.ContinuousParquetSignalCPU, "pq-cov-new", 2); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	tx.Commit()
+
+	var segments []model.ContinuousCoverageSegment
+	if err := s.DB.Where("session_sid = ? AND signal_type = ?", "s1", "cpu_profile").Find(&segments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("existing coverage must be preserved when no source, got %d", len(segments))
+	}
+	if segments[0].SourceBlock != "pq-cov-old" {
+		t.Fatalf("source_block = %s, want preserved pq-cov-old", segments[0].SourceBlock)
+	}
+}
+
 // TestPQFineGCObserveAndEnforce 细粒度 GC：observe 不删，enforce 只删完整覆盖。
 func TestPQFineGCObserveAndEnforce(t *testing.T) {
 	s := pqTestServer(t)

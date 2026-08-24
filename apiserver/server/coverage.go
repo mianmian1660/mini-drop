@@ -40,48 +40,90 @@ func (s *APIServer) pqRebuildCoverageSegmentsTx(tx *gorm.DB, tenant string, hour
 		Order("session_sid ASC, window_start ASC").Find(&windows).Error; err != nil {
 		return err
 	}
-	bySeries := map[string][]model.ProfileWindow{}
+	// 统一数据源（均裁剪到当前小时）：
+	//   1. 优先热 window（激活事务内窗口尚在，含精确 signal subtype）；
+	//   2. 若 window 已被细粒度 GC 清理，退化为该 block 的持久 lineage
+	//      members（continuous_parquet_block_members 不随 window 清理删除，
+	//      含 session/时间/样本），按 block 的 canonical 信号归属；
+	//   3. 两者皆无时保留已有 coverage 不清空（防止启动重建把真实覆盖区间
+	//      误删成 0，导致 Timeline 出现新增缺口）。
+	type coverageSource struct {
+		sessionSID  string
+		signalType  string
+		start, end  time.Time
+		sampleCount uint64
+	}
+	var sources []coverageSource
 	for _, w := range windows {
 		if w.SessionSID == "" || w.WindowStart.IsZero() || w.WindowEnd.IsZero() || !w.WindowStart.Before(w.WindowEnd) {
 			continue
 		}
-		if w.WindowStart.Before(from) {
-			w.WindowStart = from
+		st, en := w.WindowStart, w.WindowEnd
+		if st.Before(from) {
+			st = from
 		}
-		if w.WindowEnd.After(to) {
-			w.WindowEnd = to
+		if en.After(to) {
+			en = to
 		}
-		key := w.SessionSID + "\x00" + w.SignalType
-		bySeries[key] = append(bySeries[key], w)
+		sources = append(sources, coverageSource{w.SessionSID, w.SignalType, st, en, w.SampleCount})
+	}
+	if len(sources) == 0 {
+		var members []model.ContinuousParquetBlockMember
+		if err := tx.Where("block_id = ?", sourceBlock).Order("start_time ASC").Find(&members).Error; err != nil {
+			return err
+		}
+		for _, m := range members {
+			if m.SessionSID == "" || m.StartTime.IsZero() || m.EndTime.IsZero() || !m.StartTime.Before(m.EndTime) {
+				continue
+			}
+			st, en := m.StartTime, m.EndTime
+			if st.Before(from) {
+				st = from
+			}
+			if en.After(to) {
+				en = to
+			}
+			// members 不存信号归属，raw 块每个 block 是单一 canonical 信号
+			// （cpu/histogram/metrics/db），用其首个 v1 signal subtype 标记。
+			sources = append(sources, coverageSource{m.SessionSID, types[0], st, en, m.SampleCount})
+		}
+	}
+	if len(sources) == 0 {
+		return nil
 	}
 
-	// 无论本轮是否仍有 session，都清掉该 canonical signal 当前小时的旧段，
-	// 防止迟到重写后已消失的 session 留下陈旧 coverage。
+	// 有数据源才清掉该 canonical signal 当前小时的旧段并重建；
+	// 无数据源（window 与 member 均缺失）时保留已有 coverage。
 	deleteTypes := append(append([]string{}, types...), signalType)
 	if err := tx.Where("tenant = ? AND signal_type IN ? AND segment_start >= ? AND segment_start < ?",
 		tenant, deleteTypes, from, to).Delete(&model.ContinuousCoverageSegment{}).Error; err != nil {
 		return err
 	}
 
-	// 合并 window → segment
-	for _, ws := range bySeries {
+	// 按 (session, signal) 分组合并 → segment
+	bySeries := map[string][]coverageSource{}
+	for _, sg := range sources {
+		key := sg.sessionSID + "\x00" + sg.signalType
+		bySeries[key] = append(bySeries[key], sg)
+	}
+	for _, series := range bySeries {
 		var segs []model.ContinuousCoverageSegment
-		for _, w := range ws {
+		for _, sg := range series {
 			last := len(segs) - 1
-			if last >= 0 && w.WindowStart.Sub(segs[last].SegmentEnd) <= pqCoverageMergeTolerance {
-				if w.WindowEnd.After(segs[last].SegmentEnd) {
-					segs[last].SegmentEnd = w.WindowEnd
+			if last >= 0 && sg.start.Sub(segs[last].SegmentEnd) <= pqCoverageMergeTolerance {
+				if sg.end.After(segs[last].SegmentEnd) {
+					segs[last].SegmentEnd = sg.end
 				}
-				segs[last].SampleCount = addContinuousCount(segs[last].SampleCount, w.SampleCount)
+				segs[last].SampleCount = addContinuousCount(segs[last].SampleCount, sg.sampleCount)
 				continue
 			}
 			segs = append(segs, model.ContinuousCoverageSegment{
 				Tenant:        tenant,
-				SessionSID:    w.SessionSID,
-				SignalType:    w.SignalType,
-				SegmentStart:  w.WindowStart,
-				SegmentEnd:    w.WindowEnd,
-				SampleCount:   w.SampleCount,
+				SessionSID:    sg.sessionSID,
+				SignalType:    sg.signalType,
+				SegmentStart:  sg.start,
+				SegmentEnd:    sg.end,
+				SampleCount:   sg.sampleCount,
 				SourceBlock:   sourceBlock,
 				SourceVersion: sourceVersion,
 				Resolution:    model.ContinuousParquetResolutionRaw,
