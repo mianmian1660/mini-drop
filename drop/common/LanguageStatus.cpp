@@ -615,7 +615,12 @@ std::string language_status_fragment_for_symbol_refs(
     diagnostics.unwindMode = unwindMode.empty() ? "fp" : unwindMode;
     LanguageStatusReport report =
         build_language_status(samples, diagnostics, targets, diagnostics.unwindMode);
-    return language_status_to_json(report);
+    // 去掉外层大括号：片段以 "diagnostics_version":...,"language_status":{...}
+    // 的成员形式拼进 symbol_refs 根对象。
+    const std::string full = language_status_to_json(report);
+    if (full.size() >= 2 && full.front() == '{' && full.back() == '}')
+        return full.substr(1, full.size() - 2);
+    return full;
 }
 
 } // namespace drop
