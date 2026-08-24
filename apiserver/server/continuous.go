@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -314,6 +315,15 @@ type runtimeDiagnosticAccumulator struct {
 	Missing  map[string]ProfileRuntimeProcessDiagnostic
 	Limited  int
 	Reasons  map[string]bool
+	// 阶段四：v2 语言诊断（language_status）。任一窗口携带 v2 时 HasV2 置位，
+	// 输出优先采用 v2 口径；历史窗口继续走旧字段推导（兼容一个周期）。
+	HasV2               bool
+	RuntimeDetection    string
+	CollectorStatus     string
+	SymbolStatusV2      string
+	SemanticFrameWeight float64 // 按 sample_count 加权的语义覆盖累计
+	UnresolvedFrameWeight float64
+	V2SampleCount       float64
 }
 
 type continuousTreeNode struct {
@@ -2646,6 +2656,8 @@ func continuousRuntimeAccumulator(agg *continuousAggregate, runtimeName string) 
 }
 
 func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[string]interface{}) {
+	// 阶段四：优先读取 v2 language_status（diagnostics_version>=2）。
+	continuousAggregateLanguageStatusV2(agg, refs)
 	runtimeMaps, _ := refs["runtime_maps"].(map[string]interface{})
 	for _, runtimeName := range []string{"java", "node", "python"} {
 		raw, _ := runtimeMaps[runtimeName].(map[string]interface{})
@@ -2680,41 +2692,61 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 		}
 	}
 	fallback, _ := refs["python_fallback"].(map[string]interface{})
-	python := continuousRuntimeAccumulator(agg, "python")
-	python.Limited += int(numberAsFloat64(fallback["limited_count"]))
-	for _, field := range []string{"ready", "failed"} {
-		items, _ := fallback[field].([]interface{})
-		for _, value := range items {
-			item, _ := value.(map[string]interface{})
-			pid := int(numberAsFloat64(item["pid"]))
-			// 阶段三：py-spy 诊断用完整实例键（pid|start|exe）去重，PID
-			// 复用显示为两个实例。
-			startMs := int64(numberAsFloat64(item["process_start_ms"]))
-			exe, _ := item["exe"].(string)
-			key := "pid|" + strconv.Itoa(pid) + "|" + strconv.FormatInt(startMs, 10) + "|" + exe
-			reason, _ := item["reason"].(string)
-			status := "ready"
-			if field == "failed" {
-				status = "missing"
-				if reason != "" {
-					python.Reasons[reason] = true
+	// 阶段四修复：不再无条件创建 Python 诊断行——只有确实存在 py-spy 结果
+	// （或 v2 已标记 detected）时才登记，杜绝"没有检测到 Python 也显示
+	// Python 行"的虚假状态。
+	fallbackReady, _ := fallback["ready"].([]interface{})
+	fallbackFailed, _ := fallback["failed"].([]interface{})
+	fallbackLimited := int(numberAsFloat64(fallback["limited_count"]))
+	pythonHasSidecar := len(fallbackReady) > 0 || len(fallbackFailed) > 0 || fallbackLimited > 0
+	var python *runtimeDiagnosticAccumulator
+	getPython := func() *runtimeDiagnosticAccumulator {
+		if python == nil {
+			python = continuousRuntimeAccumulator(agg, "python")
+		}
+		return python
+	}
+	if pythonHasSidecar {
+		py := getPython()
+		py.Limited += fallbackLimited
+		for _, field := range []string{"ready", "failed"} {
+			items, _ := fallback[field].([]interface{})
+			for _, value := range items {
+				item, _ := value.(map[string]interface{})
+				pid := int(numberAsFloat64(item["pid"]))
+				// 阶段三：py-spy 诊断用完整实例键（pid|start|exe）去重，PID
+				// 复用显示为两个实例。
+				startMs := int64(numberAsFloat64(item["process_start_ms"]))
+				exe, _ := item["exe"].(string)
+				key := "pid|" + strconv.Itoa(pid) + "|" + strconv.FormatInt(startMs, 10) + "|" + exe
+				reason, _ := item["reason"].(string)
+				status := "ready"
+				if field == "failed" {
+					status = "missing"
+					if reason != "" {
+						py.Reasons[reason] = true
+					}
 				}
-			}
-			process := ProfileRuntimeProcessDiagnostic{PID: pid, ProcessStartMs: startMs, Exe: exe, Mode: "py-spy", Status: status, Reason: reason}
-			python.Detected[key] = process
-			python.Modes["py-spy"] = true
-			if status == "ready" {
-				python.Ready[key] = process
-			} else {
-				python.Missing[key] = process
+				process := ProfileRuntimeProcessDiagnostic{PID: pid, ProcessStartMs: startMs, Exe: exe, Mode: "py-spy", Status: status, Reason: reason}
+				py.Detected[key] = process
+				py.Modes["py-spy"] = true
+				if status == "ready" {
+					py.Ready[key] = process
+				} else {
+					py.Missing[key] = process
+				}
 			}
 		}
 	}
 	memory, _ := refs["python_memory"].(map[string]interface{})
+	var memoryPython *runtimeDiagnosticAccumulator
 	for _, field := range []string{"ready", "failed"} {
 		items, _ := memory[field].([]interface{})
 		for _, value := range items {
 			item, _ := value.(map[string]interface{})
+			if memoryPython == nil {
+				memoryPython = continuousRuntimeAccumulator(agg, "python")
+			}
 			pid := int(numberAsFloat64(item["pid"]))
 			// 阶段三：Memray 诊断用完整实例键去重。
 			startMs := int64(numberAsFloat64(item["process_start_ms"]))
@@ -2725,18 +2757,130 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 			if field == "failed" {
 				status = "missing"
 				if reason != "" {
-					python.Reasons[reason] = true
+					memoryPython.Reasons[reason] = true
 				}
 			}
 			process := ProfileRuntimeProcessDiagnostic{PID: pid, ProcessStartMs: startMs, Exe: exe, Mode: "memray", Status: status, Reason: reason}
-			python.Detected[key] = process
-			python.Modes["memray"] = true
+			memoryPython.Detected[key] = process
+			memoryPython.Modes["memray"] = true
 			if status == "ready" {
-				python.Ready[key] = process
+				memoryPython.Ready[key] = process
 			} else {
-				python.Missing[key] = process
+				memoryPython.Missing[key] = process
 			}
 		}
+	}
+}
+
+// 阶段四：解析 Agent symbol_refs.language_status（v2 语言诊断契约）。
+// 任一窗口携带 v2 时该语言的聚合优先采用 v2 口径；进程列表仍与旧字段并集。
+func continuousAggregateLanguageStatusV2(agg *continuousAggregate, refs map[string]interface{}) {
+	if len(refs) == 0 {
+		return
+	}
+	version := int(numberAsFloat64(refs["diagnostics_version"]))
+	if version < 2 {
+		return
+	}
+	statusMap, _ := refs["language_status"].(map[string]interface{})
+	for _, name := range []string{"go", "java", "node", "python", "native", "kernel"} {
+		raw, _ := statusMap[name].(map[string]interface{})
+		if len(raw) == 0 {
+			continue
+		}
+		acc := continuousRuntimeAccumulator(agg, name)
+		detection, _ := raw["runtime_detection"].(string)
+		collectorStatus, _ := raw["collector_status"].(string)
+		symbolStatus, _ := raw["symbol_status"].(string)
+		sampleCount := numberAsFloat64(raw["sample_count"])
+		semanticPercent := numberAsFloat64(raw["semantic_frame_percent"])
+		unresolvedPercent := numberAsFloat64(raw["unresolved_frame_percent"])
+
+		if detection == "detected" || acc.RuntimeDetection == "" {
+			acc.RuntimeDetection = detection
+		} else if detection == "not_detected" && acc.RuntimeDetection == "unknown" {
+			acc.RuntimeDetection = detection
+		}
+		if collectorStatus != "" {
+			switch collectorStatus {
+			case "ready":
+				acc.CollectorStatus = "ready"
+			case "partial":
+				if acc.CollectorStatus != "ready" {
+					acc.CollectorStatus = "partial"
+				}
+			case "failed":
+				if acc.CollectorStatus == "" || acc.CollectorStatus == "missing" ||
+					acc.CollectorStatus == "pending" || acc.CollectorStatus == "not_applicable" {
+					acc.CollectorStatus = "failed"
+				}
+			case "pending":
+				if acc.CollectorStatus == "" || acc.CollectorStatus == "missing" ||
+					acc.CollectorStatus == "not_applicable" {
+					acc.CollectorStatus = "pending"
+				}
+			case "missing":
+				if acc.CollectorStatus == "" || acc.CollectorStatus == "not_applicable" {
+					acc.CollectorStatus = "missing"
+				}
+			case "not_applicable":
+				if acc.CollectorStatus == "" {
+					acc.CollectorStatus = "not_applicable"
+				}
+			default:
+				if acc.CollectorStatus == "" {
+					acc.CollectorStatus = collectorStatus
+				}
+			}
+		}
+		if symbolStatus != "" {
+			// symbol_status 聚合取最差（complete>partial>missing>unknown）。
+			rank := map[string]int{"": -1, "complete": 0, "partial": 1, "missing": 2, "unknown": 3, "not_applicable": -1}
+			if rank[symbolStatus] > rank[acc.SymbolStatusV2] {
+				acc.SymbolStatusV2 = symbolStatus
+			}
+		}
+		if modes, ok := raw["collector_modes"].([]interface{}); ok {
+			for _, mode := range modes {
+				if text, ok := mode.(string); ok && text != "" {
+					acc.Modes[text] = true
+				}
+			}
+		}
+		if reasons, ok := raw["reasons"].([]interface{}); ok {
+			for _, reason := range reasons {
+				if text, ok := reason.(string); ok && text != "" && len(acc.Reasons) < 8 {
+					acc.Reasons[text] = true
+				}
+			}
+		}
+		if processes, ok := raw["processes"].([]interface{}); ok {
+			for _, value := range processes {
+				item, _ := value.(map[string]interface{})
+				pid := int(numberAsFloat64(item["pid"]))
+				startMs := int64(numberAsFloat64(item["process_start_ms"]))
+				exe, _ := item["exe"].(string)
+				mode, _ := item["mode"].(string)
+				processStatus, _ := item["status"].(string)
+				reason, _ := item["reason"].(string)
+				key := "pid|" + strconv.Itoa(pid) + "|" + strconv.FormatInt(startMs, 10) + "|" + exe
+				process := ProfileRuntimeProcessDiagnostic{PID: pid, ProcessStartMs: startMs, Exe: exe, Mode: mode, Status: processStatus, Reason: reason}
+				acc.Detected[key] = process
+				switch processStatus {
+				case "ready":
+					acc.Ready[key] = process
+				case "missing":
+					acc.Missing[key] = process
+				case "failed", "pending":
+					acc.Missing[key] = process
+				}
+			}
+		}
+		// 百分比按 sample_count 加权跨窗合并。
+		acc.SemanticFrameWeight += semanticPercent * sampleCount
+		acc.UnresolvedFrameWeight += unresolvedPercent * sampleCount
+		acc.V2SampleCount += sampleCount
+		acc.HasV2 = true
 	}
 }
 
@@ -2762,12 +2906,55 @@ func continuousRuntimeDiagnostics(agg continuousAggregate) map[string]ProfileRun
 		} else if len(item.Ready) > 0 {
 			status = "partial"
 		}
-		out[runtimeName] = ProfileRuntimeDiagnostic{
+		diag := ProfileRuntimeDiagnostic{
 			Status: status, Modes: modes, DetectedCount: len(item.Detected), ReadyCount: len(item.Ready),
 			MissingCount: len(item.Missing), LimitedCount: item.Limited, Reasons: reasons, Processes: processes,
 		}
+		// 阶段四：优先输出 v2 口径（语义覆盖/未解析率/样本数按窗口样本量加权）。
+		if item.HasV2 {
+			diag.DiagnosticsVersion = 2
+			if item.RuntimeDetection != "" {
+				diag.RuntimeDetection = item.RuntimeDetection
+			}
+			if item.CollectorStatus != "" {
+				diag.CollectorStatus = item.CollectorStatus
+				diag.Status = v2CollectorToLegacyStatus(item.CollectorStatus)
+			}
+			if item.SymbolStatusV2 != "" {
+				diag.SymbolStatusV2 = item.SymbolStatusV2
+			}
+			if item.V2SampleCount > 0 {
+				diag.SemanticFramePercent = round2(item.SemanticFrameWeight / item.V2SampleCount)
+				diag.UnresolvedFramePercent = round2(item.UnresolvedFrameWeight / item.V2SampleCount)
+			}
+			diag.SampleCount = item.V2SampleCount
+		} else if len(item.Detected) == 0 && len(modes) == 0 && len(reasons) == 0 &&
+			item.Limited == 0 {
+			// 阶段四修复：没有检测到任何进程、没有任何模式与原因时不生成
+			// 虚假语言行（历史问题：每个窗口都显示 python/java/node 行）。
+			continue
+		}
+		out[runtimeName] = diag
 	}
 	return out
+}
+
+// v2 collector_status → 旧 status 字段映射（一个兼容周期内保持旧字段可用）。
+func v2CollectorToLegacyStatus(collector string) string {
+	switch collector {
+	case "ready":
+		return "ready"
+	case "partial", "pending":
+		return "partial"
+	case "missing", "failed", "not_applicable":
+		return "missing"
+	default:
+		return "missing"
+	}
+}
+
+func round2(value float64) float64 {
+	return math.Round(value*100) / 100
 }
 
 func boolMapKeys(values map[string]bool) []string {

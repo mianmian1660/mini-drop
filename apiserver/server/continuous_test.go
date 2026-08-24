@@ -351,3 +351,88 @@ func TestContinuousFrameLooksUnresolved(t *testing.T) {
 		}
 	}
 }
+
+func TestContinuousLanguageStatusV2PreferredOverLegacy(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+	refs := map[string]interface{}{
+		"diagnostics_version": 2,
+		"language_status": map[string]interface{}{
+			"java": map[string]interface{}{
+				"runtime_detection":        "detected",
+				"collector_modes":          []interface{}{"perf-map"},
+				"collector_status":         "ready",
+				"symbol_status":            "complete",
+				"semantic_frame_percent":   92.4,
+				"unresolved_frame_percent": 4.1,
+				"sample_count":             1234,
+				"reasons":                  []interface{}{},
+				"processes": []interface{}{map[string]interface{}{
+					"pid": 7, "process_start_ms": 1000, "exe": "/usr/bin/java",
+					"mode": "perf-map", "status": "ready",
+				}},
+			},
+			"python": map[string]interface{}{
+				"runtime_detection": "not_detected",
+				"collector_status":  "not_applicable",
+			},
+		},
+	}
+	continuousAggregateRuntimeMetadata(agg, refs)
+	diag := continuousRuntimeDiagnostics(*agg)
+
+	java, ok := diag["java"]
+	if !ok {
+		t.Fatalf("expected java diagnostics, got %#v", diag)
+	}
+	if java.DiagnosticsVersion != 2 || java.CollectorStatus != "ready" {
+		t.Fatalf("unexpected v2 java fields: %#v", java)
+	}
+	if java.RuntimeDetection != "detected" || java.SymbolStatusV2 != "complete" {
+		t.Fatalf("unexpected v2 java detection/symbol: %#v", java)
+	}
+	if java.SemanticFramePercent != 92.4 || java.UnresolvedFramePercent != 4.1 ||
+		java.SampleCount != 1234 {
+		t.Fatalf("unexpected v2 java metrics: %#v", java)
+	}
+	if len(java.Processes) != 1 || java.Processes[0].PID != 7 || java.ReadyCount != 1 {
+		t.Fatalf("unexpected v2 java processes: %#v", java)
+	}
+
+	// 未检测到 Python 时不得生成虚假 Python 行。
+	if python, exists := diag["python"]; exists && python.SampleCount > 0 {
+		t.Fatalf("expected no fake python row, got %#v", python)
+	} else if exists && python.DetectedCount != 0 {
+		t.Fatalf("python row should be empty for not_detected: %#v", python)
+	}
+}
+
+func TestContinuousLanguageStatusLegacyWindowsKeepOldDerivation(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+	refs := map[string]interface{}{
+		// 没有 diagnostics_version → 历史窗口走 v1 推导
+		"runtime_maps": map[string]interface{}{
+			"node": map[string]interface{}{
+				"detected": true, "ready": false,
+				"missing": []interface{}{3}, "ready_pids": []interface{}{},
+				"reason": "missing --perf-basic-prof flag",
+			},
+		},
+	}
+	continuousAggregateRuntimeMetadata(agg, refs)
+	diag := continuousRuntimeDiagnostics(*agg)
+	node, ok := diag["node"]
+	if !ok {
+		t.Fatalf("expected node diagnostics from legacy fields, got %#v", diag)
+	}
+	if node.DiagnosticsVersion != 0 {
+		t.Fatalf("legacy windows must not claim v2: %#v", node)
+	}
+	if node.Status != "missing" || node.MissingCount != 1 {
+		t.Fatalf("unexpected legacy node status: %#v", node)
+	}
+	if len(node.Reasons) != 1 || node.Reasons[0] != "missing --perf-basic-prof flag" {
+		t.Fatalf("unexpected legacy reasons: %#v", node.Reasons)
+	}
+}

@@ -132,6 +132,15 @@ type ProfileRuntimeDiagnostic struct {
 	LimitedCount  int                               `json:"limited_count"`
 	Reasons       []string                          `json:"reasons"`
 	Processes     []ProfileRuntimeProcessDiagnostic `json:"processes"`
+	// 阶段四：v2 语言诊断契约字段（Agent language_status）。历史窗口没有
+	// v2 数据时保持零值，前端按 diagnostics_version 判断展示口径。
+	DiagnosticsVersion     int     `json:"diagnostics_version,omitempty"`
+	RuntimeDetection       string  `json:"runtime_detection,omitempty"`
+	CollectorStatus        string  `json:"collector_status,omitempty"`
+	SymbolStatusV2         string  `json:"symbol_status_v2,omitempty"`
+	SemanticFramePercent   float64 `json:"semantic_frame_percent"`
+	UnresolvedFramePercent float64 `json:"unresolved_frame_percent"`
+	SampleCount            float64 `json:"sample_count"`
 }
 
 type ProfileFlamegraph struct {
