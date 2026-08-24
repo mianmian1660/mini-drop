@@ -186,15 +186,24 @@ TEST(LanguageStatusReport, GoPendingReportsPendingState)
 {
     PhysicalDiagnostics diagnostics;
     diagnostics.goReport.pending.push_back({"abc123", "/usr/bin/dockerd", "background extraction"});
-    std::vector<AggregatedSample> samples = {
-        makeSample("go", 20, 3, {"main.handler"})};
-    LanguageStatusReport report = build_language_status(samples, diagnostics, nullptr, "fp");
+    // 质量不足（未解析帧为主）时 GoReSym pending 才作为 collector 状态呈现；
+    // 质量达标（原生符号足够）时应直接 ready。
+    std::vector<AggregatedSample> lowQuality = {
+        makeSample("go", 20, 3, {"0xa1 [unknown]"}), makeSample("go", 20, 1, {"0xa2 [unknown]"})};
+    LanguageStatusReport report =
+        build_language_status(lowQuality, diagnostics, nullptr, "fp");
     const LanguageStatusEntry *go = report.find("go");
     ASSERT_NE(go, nullptr);
     EXPECT_EQ(go->collectorStatus, "pending");
     EXPECT_NE(std::find(go->reasons.begin(), go->reasons.end(),
                         "GoReSym background extraction in progress"),
               go->reasons.end());
+
+    std::vector<AggregatedSample> highQuality = {
+        makeSample("go", 20, 3, {"main.handler"})};
+    LanguageStatusReport readyReport =
+        build_language_status(highQuality, diagnostics, nullptr, "fp");
+    EXPECT_EQ(readyReport.find("go")->collectorStatus, "ready");
 }
 
 TEST(LanguageStatusReport, GoreSymDisabledIsMissingNotFailed)
