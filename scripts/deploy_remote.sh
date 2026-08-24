@@ -120,5 +120,11 @@ health_check() {
 
 run_stage HEALTH health_check
 run_stage E2E bash scripts/e2e_smoke.sh
+# 阶段四：TEST_SCOPE=full 时在健康检查后运行多语言持续采集 E2E
+# （Native/Go/Java/Node/Python 业务热点、v2 语言状态、runtime 筛选一致性、
+# 窗口幂等）。任何质量门槛失败都使部署失败。
+if [[ "${TEST_SCOPE}" == "full" ]]; then
+  run_stage E2E_MULTILANG bash scripts/continuous_process_multilang_e2e.sh
+fi
 check_clean_tree
 printf '[STAGE:ALL] PASS branch=%s sha=%s\n' "${DEPLOY_BRANCH}" "${TARGET_SHA:0:12}"

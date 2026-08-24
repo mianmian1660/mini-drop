@@ -99,7 +99,13 @@ start_workload() {
 
 start_workload c /home/ubuntu/profiling_test/test_c_profiling
 start_workload go /home/ubuntu/profiling_test/test_go_profiling
-start_workload node node /home/ubuntu/profiling_test/test_node_profiling.js
+# 阶段四：带 --perf-basic-prof 的 Node（ready 场景）；无 flag 场景由
+# node-plain Session 覆盖（复制的解释器路径，避免与 ready Session 选择器重叠）。
+start_workload node node --perf-basic-prof /home/ubuntu/profiling_test/test_node_profiling.js
+NODE_PLAIN_EXE="$TEST_ROOT/node3-e2e"
+cp "$(readlink -f "$(command -v node)")" "$NODE_PLAIN_EXE"
+chmod 0755 "$NODE_PLAIN_EXE"
+start_workload node-plain "$NODE_PLAIN_EXE" /home/ubuntu/profiling_test/test_node_profiling.js
 start_workload python "$PYTHON_WORKLOAD_EXE" /home/ubuntu/profiling_test/test_python_profiling.py
 start_workload java java -cp /home/ubuntu/profiling_test TestJavaProfiling
 
@@ -149,17 +155,7 @@ get_session_json() {
 wait_for_assignments() {
     local deadline=$((SECONDS + 30))
     while (( SECONDS < deadline )); do
-        local ready=1
-        for index in "${!SIDS[@]}"; do
-            local payload state active
-            payload="$(get_session_json "${SIDS[$index]}")"
-            state="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["session"].get("observed_state",""))')"
-            active="$(printf '%s' "$payload" | python3 -c 'import base64,json,sys; x=json.load(sys.stdin)["data"]["session"].get("active_processes",""); print(base64.b64decode(x).decode() if isinstance(x,str) else json.dumps(x))')"
-            [[ "$state" == "running" || "$state" == "degraded" ]] || ready=0
-            grep -q '"pid":' <<<"$active" || ready=0
-            printf '[state] %s sid=%s observed=%s active=%s\n' "${NAMES[$index]}" "${SIDS[$index]}" "$state" "$active" >&2
-        done
-        (( ready == 1 )) && return 0
+        sessions_attached && return 0
         sleep 2
     done
     return 1
@@ -167,6 +163,22 @@ wait_for_assignments() {
 
 wait_for_assignments || fail "Agent did not attach all process Sessions"
 pass "Agent attached all selected exe instances"
+
+# 阶段四修复：把"所有 Session 已 attach（running/degraded 且带 PID）"的判定
+# 提取为单一函数，消除启动等待与 Agent 重启恢复两处重复嵌套的循环体。
+sessions_attached() {
+    local ready=1
+    local index payload state active
+    for index in "${!SIDS[@]}"; do
+        payload="$(get_session_json "${SIDS[$index]}")"
+        state="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["session"].get("observed_state",""))')"
+        active="$(printf '%s' "$payload" | python3 -c 'import base64,json,sys; x=json.load(sys.stdin)["data"]["session"].get("active_processes",""); print(base64.b64decode(x).decode() if isinstance(x,str) else json.dumps(x))')"
+        [[ "$state" == "running" || "$state" == "degraded" ]] || ready=0
+        grep -q '"pid":' <<<"$active" || ready=0
+        printf '[state] %s sid=%s observed=%s active=%s\n' "${NAMES[$index]}" "${SIDS[$index]}" "$state" "$active" >&2
+    done
+    return "$ready"
+}
 
 for ((elapsed=0; elapsed<WAIT_DATA_SEC; elapsed+=4)); do
     if (( elapsed % 8 == 0 )); then
@@ -260,6 +272,163 @@ PY
 for index in "${!SIDS[@]}"; do validate_session_data "$index"; done
 pass "all Session objects contain only their selected executable"
 
+# ============================================================
+# 阶段 4 质量门禁：真实业务函数、v2 语言状态、runtime 筛选一致性、
+# 窗口幂等。任何一条失败都阻止验收（部署 TEST_SCOPE=full 时阻断部署）。
+# ============================================================
+
+# 每个 Session 期望的 runtime 分类与业务热点函数。
+EXPECT_RUNTIMES=(native go node node python java)
+HOT_FUNCS=("hot_a|hot_b" "main.hotA|main.hotB" "hotA|hotB" "-" "hot_a|hot_b" "TestJavaProfiling.hotA|hotA")
+NODE_PLAIN_INDEX=3
+
+api_from_to() {
+    API_FROM="$(date -u -d "15 minutes ago" +%Y-%m-%dT%H:%M:%SZ)"
+    API_TO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+fetch_topn() {
+    local sid="$1"; shift
+    curl -fsS -G "$BASE/api/v1/profile/topn" "${api_headers[@]}" \
+        --data-urlencode "session_sid=$sid" \
+        --data-urlencode "profile_type=cpu" \
+        --data-urlencode "from=$API_FROM" --data-urlencode "to=$API_TO" "$@"
+}
+
+phase4_wait_for_hot_function() {
+    local index="$1"
+    local sid="${SIDS[$index]}"
+    local deadline=$((SECONDS + WAIT_VALID_DATA_SEC))
+    while (( SECONDS < deadline )); do
+        api_from_to
+        local topn
+        if topn="$(fetch_topn "$sid")"; then
+            if python3 - "$topn" "${HOT_FUNCS[$index]}" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1]).get("data") or {}
+patterns = [p for p in sys.argv[2].split("|") if p != "-"]
+names = []
+def walk(nodes):
+    for node in nodes:
+        names.append(node.get("name", ""))
+        walk(node.get("children") or [])
+walk(data.get("items") or [])
+ok = any(any(p in n for p in patterns) for n in names)
+raise SystemExit(0 if ok else 1)
+PY
+            then
+                return 0
+            fi
+        fi
+        sleep 4
+    done
+    return 1
+}
+
+for index in "${!SIDS[@]}"; do
+    [[ "${HOT_FUNCS[$index]}" == "-" ]] && continue
+    if phase4_wait_for_hot_function "$index"; then
+        pass "${NAMES[$index]} TopN shows real business hot function (${HOT_FUNCS[$index]})"
+    else
+        fail "${NAMES[$index]} TopN never showed business hot function (${HOT_FUNCS[$index]})"
+    fi
+done
+
+assert_language_status() {
+    local index="$1"
+    local sid="${SIDS[$index]}"
+    local expect_runtime="${EXPECT_RUNTIMES[$index]}"
+    api_from_to
+    local topn
+    topn="$(fetch_topn "$sid" || true)"
+    RUNTIME_JSON="$topn" EXPECT_RUNTIME="$expect_runtime" SESSION_NAME="${NAMES[$index]}" python3 <<'PY'
+import json, os, sys
+data = (json.loads(os.environ["RUNTIME_JSON"]) or {}).get("data") or {}
+expected = os.environ["EXPECT_RUNTIME"]
+name = os.environ["SESSION_NAME"]
+diagnostics = data.get("runtime_diagnostics") or {}
+entry = diagnostics.get(expected)
+if entry is None:
+    print(f"FAIL {name}: runtime_diagnostics has no '{expected}' row: keys={list(diagnostics)}")
+    raise SystemExit(1)
+version = entry.get("diagnostics_version", 0)
+if version < 2:
+    print(f"FAIL {name}: {expected} diagnostics missing v2 contract (diagnostics_version={version})")
+    raise SystemExit(1)
+collector = entry.get("collector_status", "")
+if collector in ("failed",):
+    print(f"FAIL {name}: {expected} collector_status=failed reasons={entry.get('reasons')}")
+    raise SystemExit(1)
+if expected in ("java", "node", "python", "go"):
+    if collector not in ("ready", "partial", "pending"):
+        # node-plain 场景允许 missing（缺 --perf-basic-prof）
+        if name == "node-plain" and collector == "missing":
+            pass
+        else:
+            print(f"FAIL {name}: {expected} collector_status={collector} (want ready/partial/pending) reasons={entry.get('reasons')}")
+            raise SystemExit(1)
+if name == "node-plain":
+    reasons = " ".join(entry.get("reasons") or [])
+    if collector not in ("missing", "not_applicable") and "--perf-basic-prof" not in reasons:
+        print(f"FAIL node-plain must report missing --perf-basic-prof, got status={collector} reasons={entry.get('reasons')}")
+        raise SystemExit(1)
+if name != "node-plain":
+    print(f"OK {name}: {expected} v2 status={collector} semantic={entry.get('semantic_frame_percent')}% unresolved={entry.get('unresolved_frame_percent')}% samples={entry.get('sample_count')}")
+else:
+    print(f"OK node-plain: {expected} v2 status={collector} reasons={entry.get('reasons')}")
+PY
+    [[ $? -eq 0 ]] || fail "${NAMES[$index]} language status gate failed"
+}
+for index in "${!SIDS[@]}"; do assert_language_status "$index"; done
+pass "all Sessions expose truthful v2 language status"
+
+assert_runtime_filter_consistency() {
+    local index="$1"
+    local sid="${SIDS[$index]}"
+    local expect_runtime="${EXPECT_RUNTIMES[$index]}"
+    api_from_to
+    # runtime filter 命中样本
+    local filtered
+    filtered="$(curl -fsS -G "$BASE/api/v1/profile/topn" "${api_headers[@]}" \
+        --data-urlencode "session_sid=$sid" --data-urlencode "profile_type=cpu" \
+        --data-urlencode "from=$API_FROM" --data-urlencode "to=$API_TO" \
+        --data-urlencode 'filters={"runtime":"'"$expect_runtime"'"}' || true)"
+    # label-values 与 filter 口径一致
+    local label_values
+    label_values="$(curl -fsS -G "$BASE/api/v1/profile/label-values" "${api_headers[@]}" \
+        --data-urlencode "session_sid=$sid" --data-urlencode "label=runtime" \
+        --data-urlencode "from=$API_FROM" --data-urlencode "to=$API_TO" || true)"
+    FILTERED_JSON="$filtered" LABEL_JSON="$label_values" EXPECT_RUNTIME="$expect_runtime" SESSION_NAME="${NAMES[$index]}" python3 <<'PY'
+import json, os, sys
+filtered = (json.loads(os.environ["FILTERED_JSON"]) or {}).get("data") or {}
+label = (json.loads(os.environ["LABEL_JSON"]) or {}).get("data") or {}
+expected = os.environ["EXPECT_RUNTIME"]
+name = os.environ["SESSION_NAME"]
+if float(filtered.get("total") or 0) <= 0:
+    print(f"FAIL {name}: runtime filter runtime={expected} matched no samples")
+    raise SystemExit(1)
+values = label.get("values") or []
+if expected not in values:
+    print(f"FAIL {name}: label-values runtime={values} missing {expected} (filter/label mismatch)")
+    raise SystemExit(1)
+print(f"OK {name}: runtime={expected} filter total={filtered.get('total')} matches label-values {values}")
+PY
+    [[ $? -eq 0 ]] || fail "${NAMES[$index]} runtime filter gate failed"
+}
+for index in "${!SIDS[@]}"; do assert_runtime_filter_consistency "$index"; done
+pass "runtime filters agree with label-values for every Session"
+
+assert_window_idempotency() {
+    local index="$1"
+    local sid="${SIDS[$index]}"
+    local row
+    row="$("${PSQL[@]}" -F '|' -c "select count(*), count(distinct window_id) from profile_windows where session_sid='$sid' and signal_type='cpu_profile';")"
+    IFS='|' read -r total distinct <<<"$row"
+    [[ "${total:-0}" -eq "${distinct:-0}" ]] || fail "${NAMES[$index]} has duplicate windows ($total rows vs $distinct window_ids)"
+}
+for index in "${!SIDS[@]}"; do assert_window_idempotency "$index"; done
+pass "no duplicate windows for any Session"
+
 # Optional recovery gate used by server acceptance runs. Restarting only the
 # Agent container must not create replacement SIDs or turn the user's desired
 # running Sessions into stopped tasks; the cached assignments should reattach
@@ -276,16 +445,10 @@ if [[ "${RESTART_AGENT:-0}" == "1" ]]; then
     recovery_deadline=$((SECONDS + 45))
     recovered=0
     while (( SECONDS < recovery_deadline )); do
-        recovered=1
-        for index in "${!SIDS[@]}"; do
-            payload="$(get_session_json "${SIDS[$index]}")"
-            state="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["session"].get("observed_state",""))')"
-            active="$(printf '%s' "$payload" | python3 -c 'import base64,json,sys; x=json.load(sys.stdin)["data"]["session"].get("active_processes",""); print(base64.b64decode(x).decode() if isinstance(x,str) else json.dumps(x))')"
-            [[ "$state" == "running" || "$state" == "degraded" ]] || recovered=0
-            grep -q '"pid":' <<<"$active" || recovered=0
-            printf '[recovery-state] %s sid=%s observed=%s active=%s\n' "${NAMES[$index]}" "${SIDS[$index]}" "$state" "$active" >&2
-        done
-        (( recovered == 1 )) && break
+        if sessions_attached; then
+            recovered=1
+            break
+        fi
         sleep 2
     done
     [[ "$recovered" -eq 1 ]] || fail "Agent restart did not reattach all existing process Sessions"
