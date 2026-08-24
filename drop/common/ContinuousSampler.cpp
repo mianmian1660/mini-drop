@@ -3579,6 +3579,7 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
 {
     auto merged = std::make_shared<PhysicalDiagnostics>();
     bool found = false;
+    bool sliceUnwindAssigned = false;
     std::set<std::string> buildIDs;
     std::set<std::string> buildEntries;
     std::map<std::string, drop::PythonFallbackResult> python;
@@ -3615,8 +3616,6 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
             continue;
         found = true;
         const auto &source = *slice.physicalDiagnostics;
-        std::cout << "[native-cp][dbg] merge slice unwind=[" << source.unwindMode << "]"
-                  << " totalWeight=" << source.totalFrameWeight << std::endl;
         for (const auto &id : source.buildIds)
             if (buildIDs.insert(id).second) merged->buildIds.push_back(id);
         for (const auto &entry : source.buildIdEntries)
@@ -3626,9 +3625,13 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
         }
         if (!source.kallsymsSha256.empty()) merged->kallsymsSha256 = source.kallsymsSha256;
         // 阶段四：栈回溯模式与 build-id 预热报告必须随合并保留，否则
-        // persist_shared_aggregate 重建 symbol_refs 时会退化成默认 fp。
-        if (merged->unwindMode.empty())
+        // persist_shared_aggregate 重建 symbol_refs 时会退化成默认值。
+        // 注意 unwindMode 字段默认值为 "fp"（非空），不能用 empty() 判断。
+        if (!sliceUnwindAssigned && !source.unwindMode.empty())
+        {
             merged->unwindMode = source.unwindMode;
+            sliceUnwindAssigned = true;
+        }
         std::map<std::string, bool> warmSeen;
         for (const auto &warm : merged->buildIdWarmReport)
             warmSeen[warm.buildId + "|" + warm.dsoPath] = true;
@@ -3659,8 +3662,6 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
     }
     if (!found)
         return {};
-    std::cout << "[native-cp][dbg] merge_physical_diagnostics merged unwind=["
-              << merged->unwindMode << "]" << std::endl;
     merged->runtimeReport.status = drop::runtime_aggregate_status(merged->runtimeReport);
     for (auto &entry : python) merged->pythonFallback.push_back(std::move(entry.second));
     for (auto &entry : memray) merged->memrayResults.push_back(std::move(entry.second));
