@@ -79,7 +79,8 @@ run_stage() {
   local name="$1"
   shift
   printf '==> [%s] 开始\n' "${name}"
-  if "$@"; then
+  # 子进程关闭锁 FD；若 SSH/父 shell 被取消，锁会立即释放，不会被孤儿构建继承。
+  if "$@" 9>&-; then
     printf '[STAGE:%s] PASS\n' "${name}"
   else
     fail "${name}" "阶段失败，branch=${DEPLOY_BRANCH} sha=${TARGET_SHA:0:12}" 20
