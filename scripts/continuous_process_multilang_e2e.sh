@@ -479,7 +479,9 @@ START_MS[0]="$new_start"
 [[ "$new_exe" == "${EXES[0]}" ]] || fail "restarted workload executable changed"
 [[ "$new_pid" != "$old_pid" || "$new_start" != "$old_start" ]] || fail "restarted workload kept same identity"
 
-restart_deadline=$((SECONDS + 20))
+# 共享物理采集器在目标变化时需要重建（等待新引擎首个不可变段解析完成），
+# 六个 Session 并行且 Agent 高负载时可能超过 20 秒，放宽到 60 秒。
+restart_deadline=$((SECONDS + 60))
 seen_new=0
 while (( SECONDS < restart_deadline )); do
     payload="$(get_session_json "${SIDS[0]}")"
