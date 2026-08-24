@@ -292,6 +292,7 @@ fetch_topn() {
     curl -fsS -G "$BASE/api/v1/profile/topn" "${api_headers[@]}" \
         --data-urlencode "session_sid=$sid" \
         --data-urlencode "profile_type=cpu" \
+        --data-urlencode "host=$TARGET_IP" \
         --data-urlencode "from=$API_FROM" --data-urlencode "to=$API_TO" "$@"
 }
 
@@ -391,12 +392,14 @@ assert_runtime_filter_consistency() {
     local filtered
     filtered="$(curl -fsS -G "$BASE/api/v1/profile/topn" "${api_headers[@]}" \
         --data-urlencode "session_sid=$sid" --data-urlencode "profile_type=cpu" \
+        --data-urlencode "host=$TARGET_IP" \
         --data-urlencode "from=$API_FROM" --data-urlencode "to=$API_TO" \
         --data-urlencode 'filters={"runtime":"'"$expect_runtime"'"}' || true)"
     # label-values 与 filter 口径一致
     local label_values
     label_values="$(curl -fsS -G "$BASE/api/v1/profile/label-values" "${api_headers[@]}" \
         --data-urlencode "session_sid=$sid" --data-urlencode "label=runtime" \
+        --data-urlencode "host=$TARGET_IP" \
         --data-urlencode "from=$API_FROM" --data-urlencode "to=$API_TO" || true)"
     FILTERED_JSON="$filtered" LABEL_JSON="$label_values" EXPECT_RUNTIME="$expect_runtime" SESSION_NAME="${NAMES[$index]}" python3 <<'PY'
 import json, os, sys
