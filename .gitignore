@@ -99,3 +99,6 @@ skills-lock.json
 
 # ----- opencode 本地配置（个人工具，不入库）-----
 opencode.json
+
+# ----- 服务器部署参数（仅含 SSH 主机与路径，不入库）-----
+sync.env
