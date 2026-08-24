@@ -20,6 +20,7 @@ STALE_SECS=1800
 HEALTH_URL="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8191}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-30}"
 HEALTH_INTERVAL="${DEPLOY_HEALTH_INTERVAL:-2}"
+UP_TIMEOUT="${DEPLOY_UP_TIMEOUT:-600}"
 
 tag_fail() { echo "[STAGE:$1] FAIL $2"; }
 die() { tag_fail "$1" "$2"; exit "${3:-1}"; }
@@ -144,7 +145,7 @@ case "${TEST_SCOPE}" in
 esac
 
 run_stage BUILD docker compose build
-run_stage UP docker compose up -d --wait --wait-timeout 300
+run_stage UP docker compose up -d --wait --wait-timeout "${UP_TIMEOUT}"
 
 health_check() {
   local i
