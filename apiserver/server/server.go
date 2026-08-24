@@ -134,6 +134,9 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// W3: 启动 Agent 自动发现（每 30 秒同步一次）
 	go s.startAgentDiscoverer()
 
+	// 检测→触发深度诊断 MVP：哨兵规则判异循环（docs/detection-trigger-pipeline-design.md）。
+	go s.startAnomalyDetector()
+
 	// 初始化定时任务调度器（W5：恢复 DB 中的 cron 任务并启动）
 	s.initCron()
 

@@ -94,23 +94,27 @@ type HotmethodTask struct {
 	// 重复请求会命中已有任务而不是新建一条（新复刻指南 4.2 节）。
 	IdempotencyKey *string `gorm:"column:idempotency_key;size:128;uniqueIndex:idx_task_uid_idempotency" json:"idempotency_key,omitempty"`
 	// CreateTime 同时是 idx_tasks_uid_created 和 idx_tasks_target_status 两个联合索引的最后一列。
-	CreateTime      time.Time  `gorm:"column:create_time;index:idx_tasks_uid_created,priority:2;index:idx_tasks_target_status,priority:3" json:"create_time"`
-	BeginTime       *time.Time `gorm:"column:begin_time" json:"begin_time"`
-	EndTime         *time.Time `gorm:"column:end_time" json:"end_time"`
-	MasterTaskTID   string     `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
-	DeadlineUnixMS  int64      `gorm:"column:deadline_unix_ms" json:"deadline_unix_ms"`
-	ResourceBudget  []byte     `gorm:"column:resource_budget;type:jsonb" json:"resource_budget"`
+	CreateTime     time.Time  `gorm:"column:create_time;index:idx_tasks_uid_created,priority:2;index:idx_tasks_target_status,priority:3" json:"create_time"`
+	BeginTime      *time.Time `gorm:"column:begin_time" json:"begin_time"`
+	EndTime        *time.Time `gorm:"column:end_time" json:"end_time"`
+	MasterTaskTID  string     `gorm:"column:master_task_tid;size:64" json:"master_task_tid"`
+	DeadlineUnixMS int64      `gorm:"column:deadline_unix_ms" json:"deadline_unix_ms"`
+	ResourceBudget []byte     `gorm:"column:resource_budget;type:jsonb" json:"resource_budget"`
+	// TriggerContext 记录任务是被谁/为什么创建的（见 docs/detection-trigger-pipeline-design.md §5.2）。
+	// 手动/定时创建的任务留空；哨兵规则触发时写入 {trigger_source, rule_sid, signal, metric,
+	// observed_value, floor_value}，供诊断结果页展示触发原因，而不是黑盒任务。
+	TriggerContext  []byte     `gorm:"column:trigger_context;type:jsonb" json:"trigger_context,omitempty"`
 	CancelRequested bool       `gorm:"column:cancel_requested;default:false;index" json:"cancel_requested"`
 	CanceledAt      *time.Time `gorm:"column:canceled_at" json:"canceled_at"`
 	// 存储阶段一：任务级 Artifact 固定（pin）。任务字段是 pin 的唯一当前状态来源：
 	// 任务固定后新产生的 Artifact 自动受保护，无需批量复制 pin 状态。
-	ArtifactsPinned    bool           `gorm:"column:artifacts_pinned;default:false" json:"artifacts_pinned"`
-	ArtifactsPinnedAt  *time.Time     `gorm:"column:artifacts_pinned_at" json:"artifacts_pinned_at"`
-	ArtifactsPinnedBy  string         `gorm:"column:artifacts_pinned_by;size:128" json:"artifacts_pinned_by"`
-	ArtifactsPinReason string         `gorm:"column:artifacts_pin_reason;size:256" json:"artifacts_pin_reason"`
+	ArtifactsPinned    bool       `gorm:"column:artifacts_pinned;default:false" json:"artifacts_pinned"`
+	ArtifactsPinnedAt  *time.Time `gorm:"column:artifacts_pinned_at" json:"artifacts_pinned_at"`
+	ArtifactsPinnedBy  string     `gorm:"column:artifacts_pinned_by;size:128" json:"artifacts_pinned_by"`
+	ArtifactsPinReason string     `gorm:"column:artifacts_pin_reason;size:256" json:"artifacts_pin_reason"`
 	// ActiveAnalysisJobID 当前对用户展示的成功 AnalysisJob（阶段 4：多代结果）。
 	// 为 NULL 时表示无 active job（旧任务继续走 {tid}/... 旧逻辑路径兼容读取）。
-	ActiveAnalysisJobID *uint `gorm:"column:active_analysis_job_id;index:idx_tasks_active_analysis_job" json:"active_analysis_job_id"`
+	ActiveAnalysisJobID *uint          `gorm:"column:active_analysis_job_id;index:idx_tasks_active_analysis_job" json:"active_analysis_job_id"`
 	DeletedAt           gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
 	CanManage           bool           `gorm:"-" json:"can_manage"`
 }
@@ -267,5 +271,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&ContinuousParquetBlock{},
 		&ContinuousParquetBlockFile{},
 		&ContinuousParquetBlockMember{},
+		&SentinelRule{},
+		&DetectionState{},
+		&DetectionEvent{},
 	)
 }
