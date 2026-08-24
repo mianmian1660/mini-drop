@@ -152,7 +152,8 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                     await sentinelRules.create({
                         name: `${name.trim()}（哨兵）`, target_ip: session.target_ip || target.ip,
                         signal: sentinelSignal, metric: 'p99',
-                        floor_value: Number(sentinelFloor), cooldown_seconds: Math.round(Number(sentinelCooldownMin) * 60),
+                        // 后端 floor_value 单位是微秒(us)，前端输入框单位是毫秒(ms)，提交时 ×1000 换算。
+                        floor_value: Number(sentinelFloor) * 1000, cooldown_seconds: Math.round(Number(sentinelCooldownMin) * 60),
                     });
                 } catch (sentinelErr) {
                     // 会话本身已经创建成功，不因为哨兵规则失败而丢弃：只提示、留给用户选择重试或直接进入详情页处理。
