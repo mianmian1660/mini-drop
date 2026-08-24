@@ -62,7 +62,7 @@ func TestDetectionFiresWhenObservedExceedsFloor(t *testing.T) {
 	blockSeedSession(t, s, sid, ip)
 
 	now := time.Now().UTC()
-	windowStart, windowEnd := now.Add(-90*time.Second), now.Add(-30*time.Second)
+	windowStart, windowEnd := now.Add(-290*time.Second), now.Add(-5*time.Second)
 	blockSeedBatch(t, s, sid, ip, "cpb-detect-fire", windowStart.Add(-10*time.Second), windowEnd.Add(10*time.Second),
 		[]ContinuousWindowIngest{detectionSeedSchedWindow(windowStart, windowEnd, 41000)}) // P99=41ms，远超阈值
 
@@ -120,7 +120,7 @@ func TestDetectionDoesNotFireBelowFloor(t *testing.T) {
 	blockSeedSession(t, s, sid, ip)
 
 	now := time.Now().UTC()
-	windowStart, windowEnd := now.Add(-90*time.Second), now.Add(-30*time.Second)
+	windowStart, windowEnd := now.Add(-290*time.Second), now.Add(-5*time.Second)
 	blockSeedBatch(t, s, sid, ip, "cpb-detect-normal", windowStart.Add(-10*time.Second), windowEnd.Add(10*time.Second),
 		[]ContinuousWindowIngest{detectionSeedSchedWindow(windowStart, windowEnd, 2000)}) // P99=2ms，低于阈值
 
