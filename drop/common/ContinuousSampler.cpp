@@ -3615,6 +3615,8 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
             continue;
         found = true;
         const auto &source = *slice.physicalDiagnostics;
+        std::cout << "[native-cp][dbg] merge slice unwind=[" << source.unwindMode << "]"
+                  << " totalWeight=" << source.totalFrameWeight << std::endl;
         for (const auto &id : source.buildIds)
             if (buildIDs.insert(id).second) merged->buildIds.push_back(id);
         for (const auto &entry : source.buildIdEntries)
