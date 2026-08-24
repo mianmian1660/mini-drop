@@ -3623,6 +3623,16 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
             if (buildEntries.insert(key).second) merged->buildIdEntries.push_back(entry);
         }
         if (!source.kallsymsSha256.empty()) merged->kallsymsSha256 = source.kallsymsSha256;
+        // 阶段四：栈回溯模式与 build-id 预热报告必须随合并保留，否则
+        // persist_shared_aggregate 重建 symbol_refs 时会退化成默认 fp。
+        if (merged->unwindMode.empty())
+            merged->unwindMode = source.unwindMode;
+        std::map<std::string, bool> warmSeen;
+        for (const auto &warm : merged->buildIdWarmReport)
+            warmSeen[warm.buildId + "|" + warm.dsoPath] = true;
+        for (const auto &warm : source.buildIdWarmReport)
+            if (!warmSeen[warm.buildId + "|" + warm.dsoPath])
+                merged->buildIdWarmReport.push_back(warm);
         mergeRuntimeInfo(&merged->runtimeReport.java, source.runtimeReport.java);
         mergeRuntimeInfo(&merged->runtimeReport.node, source.runtimeReport.node);
         mergeRuntimeInfo(&merged->runtimeReport.python, source.runtimeReport.python);
@@ -3632,6 +3642,8 @@ static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
         mergeGoItems(&merged->goReport.ready, source.goReport.ready);
         mergeGoItems(&merged->goReport.pending, source.goReport.pending);
         mergeGoItems(&merged->goReport.failed, source.goReport.failed);
+        if (!source.goReport.disabled.empty())
+            merged->goReport.disabled = source.goReport.disabled;
         for (const auto &item : source.pythonFallback)
             python[std::to_string(item.pid) + "|" + std::to_string(item.startMs) + "|" + item.exe] = item;
         for (const auto &item : source.memrayResults)
