@@ -67,6 +67,32 @@ inline uint64_t add_count(uint64_t total, uint64_t value)
     return total + value;
 }
 
+inline std::string json_escape(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+    {
+        switch (c)
+        {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            break;
+        default:
+            out += c;
+        }
+    }
+    return out;
+}
+
 inline bool env_enabled_default(const char *name, bool fallback)
 {
     const char *value = std::getenv(name);
@@ -275,6 +301,41 @@ struct SessionContract
 // ============================================================
 // 物理层符号化诊断（结构化，供 Session 分流后重新计算，不提前固化为 JSON）
 // ============================================================
+
+// 阶段四：build-id 预热报告条目（每个 DSO 的 ready/missing/failed、解析
+// 路径与失败原因），随 symbol_refs.build_id_report 上报。
+struct BuildIdWarmEntry
+{
+    std::string buildId;
+    std::string dsoPath;
+    std::string status;       // ready | missing | failed
+    std::string resolvedPath;
+    std::string reason;
+    bool cached = false;      // 命中本地缓存，无需重新解析
+};
+
+inline std::string build_id_report_to_json(const std::vector<BuildIdWarmEntry> &entries)
+{
+    if (entries.empty())
+        return "";
+    std::string body = "{\"dsos\":[";
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        const auto &e = entries[i];
+        if (i)
+            body += ",";
+        body += "{\"dso\":\"" + json_escape(e.dsoPath) + "\",\"build_id\":\"" +
+                json_escape(e.buildId) + "\",\"status\":\"" + json_escape(e.status) + "\"";
+        if (!e.resolvedPath.empty())
+            body += ",\"resolved_path\":\"" + json_escape(e.resolvedPath) + "\"";
+        if (!e.reason.empty())
+            body += ",\"reason\":\"" + json_escape(e.reason) + "\"";
+        body += "}";
+    }
+    body += "]}";
+    return body;
+}
+
 struct PhysicalDiagnostics
 {
     // 基于本段实际样本计算的 frame 权重与 symbol_status
@@ -298,8 +359,15 @@ struct PhysicalDiagnostics
     bool runtimeEnrichmentDisabled = false;
     std::string enrichmentDisabledReason;
 
+    // 阶段四：物理采集栈回溯模式（fp|dwarf，DROP_NATIVE_CP_CALL_GRAPH）。
+    // 进入 symbol_refs.language_status 的 native 行模式与诊断建议。
+    std::string unwindMode = "fp";
+
     // 物理层是否执行过 enrich 步骤（关闭时 combined symbol_refs 缺 runtime 数据）。
     bool enrichmentApplied = true;
+
+    // 阶段四：build-id 预热报告（结构化，Session 分流按 DSO 过滤）。
+    std::vector<BuildIdWarmEntry> buildIdWarmReport;
 };
 
 // 不可变 perf.data 段。strict 滚动轮转（perf_rolling）与 degraded 单窗录制
@@ -314,13 +382,21 @@ struct PerfSegment
     int64_t monotonicStartMs = 0; // 录制启动锚点（monotonic）
 };
 
-// 物理层 enrichment 能力集：哪些子步骤本次可用。
+// 物理层 enrichment 能力集：哪些子步骤本次可用。阶段四起按语言独立开关
+//（DROP_CONTINUOUS_GORESYM / _JAVA_PERFMAP / _NODE_PERFMAP / _PYTHON_PERF /
+//  _PYSPY_FALLBACK），不再用统一的 goSymbols=true 代表全部 enrichment。
 struct RuntimeCapabilitySet
 {
     bool pythonFallback = true;
     bool pythonRss = true;
     bool memray = true;
-    bool goSymbols = true;
+    bool goSymbols = true; // 兼容旧开关语义：GoReSym 总门
+    // 阶段四：逐语言能力（默认全部开启，可单独关闭单语言）。
+    bool goReSym = true;
+    bool javaPerfMap = true;
+    bool nodePerfMap = true;
+    bool pythonPerf = true;
+    std::string unwindMode = "fp"; // "fp" | "dwarf"
 };
 
 struct WindowPayload;
@@ -406,32 +482,6 @@ inline std::string rfc3339_from_ms(int64_t ms)
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                   tm.tm_hour, tm.tm_min, tm.tm_sec, milliseconds);
     return std::string(buf);
-}
-
-inline std::string json_escape(const std::string &s)
-{
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s)
-    {
-        switch (c)
-        {
-        case '"':
-            out += "\\\"";
-            break;
-        case '\\':
-            out += "\\\\";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            break;
-        default:
-            out += c;
-        }
-    }
-    return out;
 }
 
 inline bool file_exists_local(const std::string &path)
@@ -976,8 +1026,14 @@ inline bool looks_like_elf(const std::string &path)
 
 // 任务1核心：perf script 之前，把能拿到的用户态二进制预热进本地 build-id
 // 缓存，让 perf script 自带的缓存回退机制命中，当场生效不依赖网络往返。
-inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &perf, const std::string &dataPath)
+// 阶段四：report 非空时输出逐 DSO 诊断（ready/missing/failed + 原因）；
+// 容器 DSO 用 resolve_dso_deep（宿主路径 → /proc/<pid>/root → deleted
+// mapping），并在缓存前校验 ELF magic 与 build-id 匹配。
+inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &perf, const std::string &dataPath,
+                                                           std::vector<BuildIdWarmEntry> *report = nullptr)
 {
+    if (report)
+        report->clear();
     std::string listOutput;
     int rc = drop::exec_capture({perf, "buildid-list", "-i", dataPath}, &listOutput, 65536);
     if (rc != 0)
@@ -992,9 +1048,19 @@ inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &pe
     for (auto &e : entries)
     {
         if (drop::build_id_cached_locally(e.buildId))
+        {
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "ready",
+                                   drop::build_id_local_cache_path(e.buildId), "", true});
             continue;
+        }
         if (should_skip_build_id_attempt(e.buildId, nowMs))
+        {
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "missing", "",
+                                   "previous resolution failed; backing off", false});
             continue;
+        }
         pending.push_back(e);
     }
     if (pending.empty())
@@ -1008,23 +1074,60 @@ inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &pe
         if (it == dsoIndex.end())
         {
             record_build_id_transient_fail(e.buildId, nowMs);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "missing", "",
+                                   "no live process maps this DSO", false});
             continue;
         }
-        std::string resolved = drop::resolve_via_pid(e.dsoPath, it->second);
+        // 阶段四：宿主路径 → /proc/<pid>/root → deleted mapping 深度解析。
+        std::string resolved = drop::resolve_dso_deep(it->second, e.dsoPath);
         if (resolved.empty())
         {
             record_build_id_transient_fail(e.buildId, nowMs);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "failed", "",
+                                   "DSO unreadable in host and container views", false});
             continue;
         }
         if (!looks_like_elf(resolved))
         {
             record_build_id_permanent_fail(e.buildId);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "failed", resolved,
+                                   "not a valid ELF file", false});
             continue;
         }
+        // 缓存前校验 build-id：不匹配的文件不能进缓存（防 PID 复用后旧文件
+        // 冒充新 build-id 的符号源）。
+        std::string actualBuildId;
+        bool buildIdMatches = true;
+        if (!e.buildId.empty() && drop::elf_gnu_build_id(resolved, &actualBuildId))
+        {
+            if (!actualBuildId.empty() && actualBuildId != e.buildId)
+            {
+                buildIdMatches = false;
+                record_build_id_permanent_fail(e.buildId);
+                if (report)
+                    report->push_back({e.buildId, e.dsoPath, "failed", resolved,
+                                       "build-id mismatch: ELF has " + actualBuildId, false});
+            }
+        }
+        if (!buildIdMatches)
+            continue;
         if (drop::cache_build_id_locally(e.buildId, resolved))
+        {
             clear_build_id_attempt(e.buildId);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "ready",
+                                   drop::build_id_local_cache_path(e.buildId), "", false});
+        }
         else
+        {
             record_build_id_transient_fail(e.buildId, nowMs);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "failed", resolved,
+                                   "cannot write local build-id cache", false});
+        }
     }
     return entries;
 }
@@ -1072,9 +1175,23 @@ inline std::string sanitize_python_perf_frame(const std::string &frame)
     return frame.substr(0, pathStart) + frame.substr(slash + 1);
 }
 
+// 阶段四：Go runtime 识别顺序（禁止依赖 exe 名称）：
+//   1. Go build-info 标记；
+//   2. .gopclntab 段（stripped / 重命名 ELF 仍可识别，含 dockerd）；
+//   3. GoReSym 结果（goReport 中已登记的 DSO）；
+//   4. 最后才允许用 runtime.* 等栈帧作结果级辅助判断。
+inline bool stack_frames_hint_go(const std::vector<std::string> &stack)
+{
+    for (const auto &frame : stack)
+        if (frame.rfind("runtime.", 0) == 0)
+            return true;
+    return false;
+}
+
 inline std::string sample_runtime_with_go_hint(const AggregatedSample &sample,
                                                const drop::GoSymbolReport &goReport,
-                                               bool hasGoBuildInfo)
+                                               bool hasGoBuildInfo,
+                                               bool hasGoPclntab = false)
 {
     std::string base = path_basename(sample.exe);
     if (base.rfind("python", 0) == 0)
@@ -1088,7 +1205,11 @@ inline std::string sample_runtime_with_go_hint(const AggregatedSample &sample,
             return item.dsoPath == sample.exe;
         });
     };
-    if (hasGoBuildInfo || isGo(goReport.ready) || isGo(goReport.pending) || isGo(goReport.failed))
+    if (hasGoBuildInfo || hasGoPclntab || isGo(goReport.ready) || isGo(goReport.pending) ||
+        isGo(goReport.failed))
+        return "go";
+    // 结果级辅助判断：栈里出现 runtime.* 帧（仅在更强证据缺失时兜底）。
+    if (!sample.exe.empty() && stack_frames_hint_go(sample.stack))
         return "go";
     if (sample.exe.empty())
         return sample.pid <= 2 || sample.comm.rfind("kworker", 0) == 0 ? "kernel" : "unknown";
@@ -1100,21 +1221,26 @@ inline std::string sample_runtime(const AggregatedSample &sample,
                                   std::map<int, bool> *goBuildInfoCache)
 {
     bool hasGoBuildInfo = false;
+    bool hasGoPclntab = false;
     if (sample.pid > 0 && !sample.exe.empty())
     {
-        auto cached = goBuildInfoCache->find(sample.pid);
-        if (cached == goBuildInfoCache->end())
+        static thread_local std::map<int, std::pair<bool, bool>> tlsDetectionCache;
+        auto cached = tlsDetectionCache.find(sample.pid);
+        if (cached == tlsDetectionCache.end())
         {
             std::string procExe = "/proc/" + std::to_string(sample.pid) + "/exe";
             hasGoBuildInfo = drop::go_binary_has_build_info(procExe);
-            (*goBuildInfoCache)[sample.pid] = hasGoBuildInfo;
+            // build-info 已确认时无需再扫段表。
+            hasGoPclntab = hasGoBuildInfo ? true : drop::go_binary_has_pclntab(procExe);
+            cached = tlsDetectionCache.emplace(sample.pid, std::make_pair(hasGoBuildInfo, hasGoPclntab)).first;
         }
         else
         {
-            hasGoBuildInfo = cached->second;
+            hasGoBuildInfo = cached->second.first;
+            hasGoPclntab = cached->second.second;
         }
     }
-    return sample_runtime_with_go_hint(sample, goReport, hasGoBuildInfo);
+    return sample_runtime_with_go_hint(sample, goReport, hasGoBuildInfo, hasGoPclntab);
 }
 
 inline std::string python_fallback_json(const std::vector<drop::PythonFallbackResult> &results, size_t limitedCount)
@@ -1132,7 +1258,9 @@ inline std::string python_fallback_json(const std::vector<drop::PythonFallbackRe
         body += "{\"pid\":" + std::to_string(result.pid) +
                 ",\"process_start_ms\":" + std::to_string(result.startMs) +
                 ",\"exe\":\"" + json_escape(result.exe) +
-                "\",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) + "}";
+                "\",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) +
+                ",\"capture_start_ms\":" + std::to_string(result.captureStartMs) +
+                ",\"capture_end_ms\":" + std::to_string(result.captureEndMs) + "}";
     }
     body += "],\"failed\":[";
     bool firstFailed = true;
@@ -1152,6 +1280,18 @@ inline std::string python_fallback_json(const std::vector<drop::PythonFallbackRe
     return body;
 }
 
+// 阶段四：language_status v2 片段（实现位于 LanguageStatus.cpp，避免头文件
+// 循环依赖）。返回 "{\"diagnostics_version\":2,\"language_status\":{...}}"。
+// targets 非空时按 Session 身份过滤进程实例；unwindMode 进入 native 行。
+std::string language_status_fragment_for_symbol_refs(
+    const std::vector<AggregatedSample> &samples,
+    const drop::RuntimeSymbolReport &runtimeReport,
+    const drop::GoSymbolReport &goReport,
+    const std::vector<drop::PythonFallbackResult> &pythonFallback,
+    size_t pythonLimitedCount,
+    const std::vector<ContinuousTargetProcess> *targets,
+    const std::string &unwindMode);
+
 inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &runtimeReport,
                                              const drop::GoSymbolReport &goReport,
                                              const std::vector<drop::PythonFallbackResult> &pythonFallback,
@@ -1159,7 +1299,10 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
                                              const std::vector<drop::MemrayProfileResult> &memrayResults,
                                              const std::vector<AggregatedSample> &samples,
                                              const std::vector<drop::BuildIdEntry> &buildIds,
-                                             const std::string &kallsymsSha256)
+                                             const std::string &kallsymsSha256,
+                                             const std::vector<ContinuousTargetProcess> *sessionTargets = nullptr,
+                                             const std::string &unwindMode = "fp",
+                                             const std::string &buildIdReport = "")
 {
     uint64_t totalFrames = 0;
     uint64_t unresolvedFrames = 0;
@@ -1219,6 +1362,13 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
                 "\",\"reason\":\"" + json_escape(result.reason) + "\"}";
     }
     body += "]}";
+    // 阶段四：v2 语言诊断契约。旧字段（runtime_maps/native_go/python_fallback）
+    // 原样保留一个兼容周期。
+    body += "," + language_status_fragment_for_symbol_refs(
+                       samples, runtimeReport, goReport, pythonFallback, pythonLimitedCount,
+                       sessionTargets, unwindMode);
+    if (!buildIdReport.empty())
+        body += ",\"build_id_report\":" + buildIdReport;
     body += "}";
     return body;
 }
@@ -1290,14 +1440,19 @@ SegmentProcessResult ProcessScript(
     const std::vector<drop::BuildIdEntry> &buildIds,
     const std::vector<drop::PythonFallbackResult> &pythonResults,
     size_t pythonLimitedCount,
-    const std::vector<drop::MemrayProfileResult> &memrayResults);
+    const std::vector<drop::MemrayProfileResult> &memrayResults,
+    const std::vector<BuildIdWarmEntry> &buildIdWarmReport = {});
 
 /// 把物理级 py-spy sidecar 结果合并进 CPU samples（纯函数，供测试与处理器
 /// 共用）：py-spy 就绪 → 删除该 PID 的 perf Python 样本并追加 py-spy 样本
-/// （不双计数）；失败/PID 复用 → 保留原 perf 样本。
+/// （不双计数）；失败/PID 复用 → 保留原 perf 样本。阶段四：结果只能替换
+/// capture 区间与窗口时间重叠且身份一致的 perf 样本；capture 区间缺失时按
+/// 兼容口径处理（视为重叠）。
 void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
                                   const std::vector<drop::PythonFallbackResult> &pythonResults,
-                                  bool *anyReplaced = nullptr);
+                                  bool *anyReplaced = nullptr,
+                                  int64_t windowStartMs = 0,
+                                  int64_t windowEndMs = 0);
 
 /// 阶段二：Session 分流后重算 symbol_refs。physicalJson 为物理 symbol_refs
 /// （host Session 直接复用）；process Session 用 filteredSamples 重新计算

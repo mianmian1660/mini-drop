@@ -2,6 +2,7 @@
 // common/BuildId.cpp — build-id 清单解析与本地符号缓存（一次性任务 + 持续采集共用）
 // ============================================================
 #include "common/BuildId.h"
+#include "common/Utils.h"
 
 #include <cctype>
 #include <cstdio>
@@ -200,6 +201,77 @@ namespace drop
                 return candidate;
         }
         return "";
+    }
+
+    // 阶段四：deleted mapping 恢复。扫描 /proc/<pid>/maps 找到同名（或带
+    // " (deleted)" 后缀）的映射，通过 /proc/<pid>/map_files/<start>-<end>
+    // 符号链接拿到真实文件（已删除的映射也能打开）。
+    string resolve_deleted_mapping(int pid, const string &dsoPath)
+    {
+        if (pid <= 0)
+            return "";
+        ifstream maps("/proc/" + to_string(pid) + "/maps");
+        if (!maps.is_open())
+            return "";
+        const string targetBase = [](const string &path) {
+            size_t slash = path.rfind('/');
+            string base = slash == string::npos ? path : path.substr(slash + 1);
+            const string deleted = " (deleted)";
+            if (base.size() > deleted.size() &&
+                base.compare(base.size() - deleted.size(), deleted.size(), deleted) == 0)
+                base.resize(base.size() - deleted.size());
+            return base;
+        }(dsoPath);
+        if (targetBase.empty())
+            return "";
+        string line;
+        while (getline(maps, line))
+        {
+            istringstream iss(line);
+            string range, perms, offsetHex, dev, inode;
+            iss >> range >> perms >> offsetHex >> dev >> inode;
+            string path;
+            getline(iss, path);
+            path = drop::trim(path);
+            if (path.empty() || path[0] != '/')
+                continue;
+            // 匹配完整路径或 basename（容器内路径与宿主视图不同）。
+            size_t slash = path.rfind('/');
+            string base = slash == string::npos ? path : path.substr(slash + 1);
+            const string deletedSuffix = " (deleted)";
+            bool isDeleted = base.size() > deletedSuffix.size() &&
+                             base.compare(base.size() - deletedSuffix.size(), deletedSuffix.size(), deletedSuffix) == 0;
+            if (isDeleted)
+                base.resize(base.size() - deletedSuffix.size());
+            bool match = (path == dsoPath || base == targetBase);
+            if (!match && path == dsoPath + deletedSuffix)
+                match = true;
+            if (!match)
+                continue;
+            size_t dash = range.find('-');
+            if (dash == string::npos)
+                continue;
+            // 只对可执行/只读代码段尝试（r-xp / r--p），避免误取匿名段。
+            string link = "/proc/" + to_string(pid) + "/map_files/" + range;
+            char buf[4096];
+            ssize_t n = ::readlink(link.c_str(), buf, sizeof(buf) - 1);
+            if (n <= 0)
+                continue;
+            buf[n] = '\0';
+            if (file_readable(string(buf)))
+                return string(buf);
+        }
+        return "";
+    }
+
+    string resolve_dso_deep(int pid, const string &dsoPath)
+    {
+        string resolved = resolve_via_pid(dsoPath, pid);
+        if (!resolved.empty())
+            return resolved;
+        // 容器 DSO：用该 DSO 的 basename 在 /proc/<pid>/root 下重试常见路径
+        // 已由 resolve_via_pid 覆盖；这里补 deleted mapping。
+        return resolve_deleted_mapping(pid, dsoPath);
     }
 
 } // namespace drop

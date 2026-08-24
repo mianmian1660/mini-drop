@@ -19,6 +19,7 @@
 #include <sstream>
 #include <set>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace drop
@@ -36,7 +37,37 @@ static constexpr int64_t kJavaRefreshBudgetMs = 5000;
 // Java 刷新：每 PID 冷却（ms）
 static constexpr int64_t kJavaRefreshCooldownMs = 60 * 1000;
 
-static std::map<int, int64_t> g_javaLastRefreshMap;
+bool env_flag_default_on(const char *name)
+{
+    const char *value = std::getenv(name);
+    if (!value || !*value)
+        return true;
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return !(text == "0" || text == "false" || text == "no" || text == "off");
+}
+
+// 阶段四：Java map 刷新状态从裸 PID 改为完整进程身份键，避免 PID 复用
+// 继承冷却或旧 map。
+struct JavaRefreshKey
+{
+    int pid = 0;
+    int64_t startMs = 0;
+    std::string exe;
+
+    bool operator<(const JavaRefreshKey &other) const
+    {
+        if (pid != other.pid)
+            return pid < other.pid;
+        if (startMs != other.startMs)
+            return startMs < other.startMs;
+        return exe < other.exe;
+    }
+};
+
+static std::map<JavaRefreshKey, int64_t> g_javaLastRefreshMap;
 static std::mutex g_javaRefreshMutex;
 
 std::string read_exe_symlink(int pid)
@@ -255,7 +286,11 @@ bool runtime_copy_map_atomic(const std::string &src, const std::string &dst)
         return true;
     if (runtime_same_file(src, dst))
         return true;
-    std::string tmp = dst + ".tmp" + std::to_string(::getpid());
+    // 阶段四：临时文件带 pid+tid，避免同进程多线程同时复制同一 map 时
+    // 互相覆盖半成品。
+    std::ostringstream tmpSuffix;
+    tmpSuffix << ".tmp" << ::getpid() << "." << std::this_thread::get_id();
+    std::string tmp = dst + tmpSuffix.str();
     {
         std::ifstream in(src, std::ios::binary);
         if (!in.is_open())
@@ -279,10 +314,42 @@ bool runtime_copy_map_atomic(const std::string &src, const std::string &dst)
     return true;
 }
 
+// 阶段四：map 源的 mtime+size 变化检测。JVM/V8 会持续追加 JIT 方法，
+// 只有源文件变化时才重新复制，保证新 JIT 函数在后续窗口可见。
+bool runtime_map_source_changed(const std::string &src,
+                                const std::string &dst,
+                                int64_t *srcMtimeMs = nullptr,
+                                int64_t *srcSize = nullptr)
+{
+    struct stat ss, ds;
+    if (::stat(src.c_str(), &ss) != 0)
+        return false;
+    if (srcMtimeMs)
+        *srcMtimeMs = static_cast<int64_t>(ss.st_mtime) * 1000;
+    if (srcSize)
+        *srcSize = static_cast<int64_t>(ss.st_size);
+    if (::stat(dst.c_str(), &ds) != 0)
+        return true; // 目标不存在 → 需要复制
+    return ss.st_mtime != ds.st_mtime || ss.st_size != ds.st_size;
+}
+
+JavaRefreshKey java_key_for(int pid)
+{
+    JavaRefreshKey key;
+    key.pid = pid;
+    runtime_process_start_ms(pid, &key.startMs);
+    char buf[4096];
+    ssize_t n = readlink(("/proc/" + std::to_string(pid) + "/exe").c_str(), buf, sizeof(buf) - 1);
+    if (n > 0)
+        key.exe.assign(buf, static_cast<size_t>(n));
+    return key;
+}
+
 bool runtime_java_refresh_allowed(int pid, int64_t nowMs)
 {
+    const JavaRefreshKey key = java_key_for(pid);
     std::lock_guard<std::mutex> lock(g_javaRefreshMutex);
-    auto it = g_javaLastRefreshMap.find(pid);
+    auto it = g_javaLastRefreshMap.find(key);
     if (it == g_javaLastRefreshMap.end())
         return true;
     return nowMs - it->second >= kJavaRefreshCooldownMs;
@@ -290,23 +357,17 @@ bool runtime_java_refresh_allowed(int pid, int64_t nowMs)
 
 void runtime_java_refresh_record(int pid, int64_t nowMs)
 {
+    const JavaRefreshKey key = java_key_for(pid);
     std::lock_guard<std::mutex> lock(g_javaRefreshMutex);
-    g_javaLastRefreshMap[pid] = nowMs;
+    g_javaLastRefreshMap[key] = nowMs;
     // 防 map 无限增长：超过一定数量清理最旧的
     if (g_javaLastRefreshMap.size() > 4096)
     {
-        int64_t oldest = INT64_MAX;
-        int oldestPid = 0;
-        for (const auto &kv : g_javaLastRefreshMap)
-        {
-            if (kv.second < oldest)
-            {
-                oldest = kv.second;
-                oldestPid = kv.first;
-            }
-        }
-        if (oldestPid)
-            g_javaLastRefreshMap.erase(oldestPid);
+        auto oldest = g_javaLastRefreshMap.begin();
+        for (auto it = g_javaLastRefreshMap.begin(); it != g_javaLastRefreshMap.end(); ++it)
+            if (it->second < oldest->second)
+                oldest = it;
+        g_javaLastRefreshMap.erase(oldest);
     }
 }
 
@@ -435,6 +496,12 @@ RuntimeSymbolReport collect_runtime_maps(const std::string &perfBin, const std::
     report.node.detected = !nodePids.empty();
     report.python.detected = !pythonPids.empty();
 
+    // 记录就绪（幂等：Java 刷新会对同一 PID 调两次 ensureReady）。
+    auto markReady = [](RuntimeMapInfo *info, int pid) {
+        if (std::find(info->readyPids.begin(), info->readyPids.end(), pid) == info->readyPids.end())
+            info->readyPids.push_back(pid);
+        return true;
+    };
     auto ensureReady = [&](int pid, RuntimeMapInfo *info) {
         std::string rootPath = runtime_perf_map_pid_root_path(pid, runtime_pid_namespace_pid(pid));
         std::string hostPath = runtime_perf_map_host_path(pid);
@@ -445,20 +512,50 @@ RuntimeSymbolReport collect_runtime_maps(const std::string &perfBin, const std::
                                      : (runtime_map_ready(hostPath, haveStart ? procStart : 0) ? hostPath : "");
         if (src.empty())
             return false;
-        if (runtime_same_file(src, hostPath) || runtime_copy_map_atomic(src, hostPath))
-        {
-            info->ready = true;
-            info->readyPids.push_back(pid);
-            return true;
-        }
+        // 源 mtime/size 未变化且已同文件 → 无需重复复制；变化（新 JIT 方法）
+        // 时重新原子复制，保证后续窗口可见。
+        if (runtime_same_file(src, hostPath))
+            return markReady(info, pid);
+        if (!runtime_map_source_changed(src, hostPath))
+            return markReady(info, pid);
+        if (runtime_copy_map_atomic(src, hostPath))
+            return markReady(info, pid);
         return false;
     };
 
+    // asprof attach 失败原因分类（阶段四：不能把所有失败都归为泛化 missing）。
+    auto classify_asprof_failure = [](int rc, const std::string &output) -> std::string {
+        const std::string trimmed = drop::trim(output);
+        if (rc == 127 || trimmed.find("not found") != std::string::npos)
+            return "asprof not available";
+        if (trimmed.find("Permission denied") != std::string::npos ||
+            trimmed.find("Operation not permitted") != std::string::npos)
+            return "asprof attach permission denied";
+        if (trimmed.find("no such process") != std::string::npos ||
+            trimmed.find("process exited") != std::string::npos)
+            return "target JVM exited during attach";
+        if (trimmed.find("namespace") != std::string::npos)
+            return "target JVM namespace unreachable";
+        if (rc == 124)
+            return "asprof attach timed out";
+        return "asprof jcmd refresh failed rc=" + std::to_string(rc);
+    };
+
     // 3. Java：周期性刷新 perf map（asprof），冷却 + 预算控制。
+    //    阶段四：DROP_CONTINUOUS_JAVA_PERFMAP=0 时整体关闭并给出明确原因，
+    //    不再显示 ready。
+    const bool javaPerfMapEnabled = env_flag_default_on("DROP_CONTINUOUS_JAVA_PERFMAP");
     int jvmProcessed = 0;
     int64_t refreshBudgetMs = kJavaRefreshBudgetMs;
     for (int pid : javaPids)
     {
+        if (!javaPerfMapEnabled)
+        {
+            report.java.missingPids.push_back(pid);
+            if (report.java.reason.empty())
+                report.java.reason = "DROP_CONTINUOUS_JAVA_PERFMAP disabled";
+            continue;
+        }
         if (jvmProcessed >= kMaxJvmRefreshPerRound)
         {
             report.skippedRefresh++;
@@ -480,17 +577,24 @@ RuntimeSymbolReport collect_runtime_maps(const std::string &perfBin, const std::
                 jvmProcessed++;
                 continue;
             }
-            if (rc != 0)
+            const std::string failureReason = classify_asprof_failure(rc, out);
+            if (!hadReadyMap)
             {
+                // 首次 attach 失败属于确定性失败，不能把该 JVM 标成 ready。
+                report.java.failedAttachPids.push_back(pid);
+                report.java.missingPids.push_back(pid);
                 if (report.java.reason.empty())
-                    report.java.reason = "asprof jcmd refresh failed rc=" + std::to_string(rc);
+                    report.java.reason = failureReason;
             }
+            else if (report.java.reason.empty())
+                report.java.reason = "map refresh deferred: " + failureReason;
         }
         else
         {
             report.skippedRefresh++;
         }
-        if (!hadReadyMap)
+        if (!hadReadyMap &&
+            std::find(report.java.missingPids.begin(), report.java.missingPids.end(), pid) == report.java.missingPids.end())
         {
             report.java.missingPids.push_back(pid);
             if (report.java.reason.empty())
@@ -499,10 +603,20 @@ RuntimeSymbolReport collect_runtime_maps(const std::string &perfBin, const std::
         jvmProcessed++;
     }
 
-    // 4. Node / Python：不注入，只标记 required_flag
+    // 4. Node：不注入。带 --perf-basic-prof 时 map 就绪；未带参数明确返回
+    //    missing --perf-basic-prof，不能显示 ready。阶段四：
+    //    DROP_CONTINUOUS_NODE_PERFMAP=0 整体关闭。
+    const bool nodePerfMapEnabled = env_flag_default_on("DROP_CONTINUOUS_NODE_PERFMAP");
     report.node.requiredFlag = "--perf-basic-prof";
     for (int pid : nodePids)
     {
+        if (!nodePerfMapEnabled)
+        {
+            report.node.missingPids.push_back(pid);
+            if (report.node.reason.empty())
+                report.node.reason = "DROP_CONTINUOUS_NODE_PERFMAP disabled";
+            continue;
+        }
         if (ensureReady(pid, &report.node))
             continue;
         report.node.missingPids.push_back(pid);
@@ -510,9 +624,20 @@ RuntimeSymbolReport collect_runtime_maps(const std::string &perfBin, const std::
             report.node.reason = "missing --perf-basic-prof flag";
     }
 
+    // 5. Python：不注入运行时；真实 -X perf map 就绪即用。阶段四：
+    //    DROP_CONTINUOUS_PYTHON_PERF=0 时跳过 perf-map 路径，统一交给
+    //    py-spy fallback。
+    const bool pythonPerfEnabled = env_flag_default_on("DROP_CONTINUOUS_PYTHON_PERF");
     report.python.requiredFlag = "-X perf";
     for (int pid : pythonPids)
     {
+        if (!pythonPerfEnabled)
+        {
+            report.python.missingPids.push_back(pid);
+            if (report.python.reason.empty())
+                report.python.reason = "DROP_CONTINUOUS_PYTHON_PERF disabled; py-spy fallback applies";
+            continue;
+        }
         if (ensureReady(pid, &report.python))
             continue;
         report.python.missingPids.push_back(pid);
@@ -527,7 +652,7 @@ RuntimeSymbolReport collect_runtime_maps(const std::string &perfBin, const std::
     finalizeRuntimeInfo(&report.node);
     finalizeRuntimeInfo(&report.python);
 
-    // 5. 聚合 symbol_status
+    // 6. 聚合 symbol_status
     report.status = runtime_aggregate_status(report);
 
     std::cout << "[native-cp] runtime_maps status=" << report.status

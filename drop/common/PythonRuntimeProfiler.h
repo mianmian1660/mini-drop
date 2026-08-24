@@ -34,6 +34,10 @@ struct PythonFallbackResult
     bool ready = false;
     std::string reason;
     std::vector<PythonStackSample> samples;
+    // 阶段四：py-spy 真实 capture 区间（wall clock）。结果只能替换时间重叠
+    // 且身份一致的 perf 样本；过期结果不得应用到后续 PID 或窗口。
+    int64_t captureStartMs = 0;
+    int64_t captureEndMs = 0;
 };
 
 struct PythonRSSMetric
@@ -86,6 +90,27 @@ PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSI
                                                     int durationSec,
                                                     int rateHz,
                                                     int maxProcesses);
+
+/// 阶段四：首窗预检。读取进程身份、cmdline 中的 -X perf、libpython 版本
+/// 与真实 perf map 存在性，供两级策略（perf-map → py-spy）在第一窗决策。
+struct PythonRuntimeProbe
+{
+    bool valid = false;
+    std::string exe;
+    std::string cmdline;
+    int pythonMinor = 0;      // libpython3.<minor>；未知为 0
+    bool hasPerfFlag = false; // 命令行包含 -X perf
+    bool hasPerfMap = false;  // 真实 map 存在且非 stale
+};
+PythonRuntimeProbe probe_python_runtime(int pid);
+
+/// 阶段四：host Session 的短周期 CPU ticks 增量排序采样（默认只 attach
+/// 最热 limit 个 Python 实例）。返回按热度降序的候选。
+std::vector<PythonCandidate> hottest_python_candidates_by_cpu_ticks(size_t limit);
+
+/// 是否启用 py-spy native 栈（C 扩展调用链）。DROP_NATIVE_CP_PYSPY_NATIVE，
+/// 默认开启。
+bool pyspy_native_enabled();
 
 /// Parses py-spy folded/raw output. Frames remain root-to-leaf.
 std::vector<PythonStackSample> parse_pyspy_raw(const std::string &raw);

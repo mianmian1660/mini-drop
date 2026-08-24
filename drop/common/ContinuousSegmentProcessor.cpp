@@ -6,6 +6,7 @@
 // ============================================================
 
 #include "common/ContinuousSegmentProcessor.h"
+#include "common/LanguageStatus.h"
 
 #include <iostream>
 #include <set>
@@ -19,20 +20,33 @@ namespace drop
 //     追加带真实计数的 py-spy sidecar 样本（backend=py-spy）。
 //   - py-spy 失败（ready=false，含超时/PID 复用被上游 capture_one 判定）：
 //     保留原 perf 样本，fallback 诊断标记失败。
-// 注：PID 复用/已退出的判定由上游 capture_one（采集前后各校验一次）与
-// degraded collector 完成，这里只做纯合并，保证可单测且不重复读 /proc。
+// 阶段四：结果只能替换"capture 区间与窗口时间重叠 + 身份一致"的 perf 样本；
+// 过期 capture（与窗口完全不重叠）不得应用，防止把旧结果套到后续窗口/PID。
+// 注：PID 复用/已退出的判定由上游 capture_one（采集前后各校验一次）完成，
+// 这里只做纯合并，保证可单测且不重复读 /proc。
 void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
                                   const std::vector<drop::PythonFallbackResult> &pythonResults,
-                                  bool *anyReplaced)
+                                  bool *anyReplaced,
+                                  int64_t windowStartMs,
+                                  int64_t windowEndMs)
 {
     if (!samples || pythonResults.empty())
         return;
+    auto overlapsWindow = [&](const drop::PythonFallbackResult &result) {
+        if (result.captureStartMs <= 0 || result.captureEndMs <= 0)
+            return true; // 历史数据无区间：保持旧行为
+        if (windowStartMs <= 0 || windowEndMs <= 0)
+            return true;
+        return result.captureStartMs <= windowEndMs && result.captureEndMs >= windowStartMs;
+    };
     std::set<int> replacedPythonPids;
     std::vector<AggregatedSample> appended;
     for (const auto &result : pythonResults)
     {
         if (!result.ready || result.pid <= 0 || result.startMs <= 0 || result.exe.empty())
             continue;
+        if (!overlapsWindow(result))
+            continue; // 过期结果不得替换当前窗口样本
         replacedPythonPids.insert(result.pid);
         for (const auto &raw : result.samples)
         {
@@ -58,7 +72,8 @@ void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
                                   candidate.startMs > 0 && sample.processStartMs > 0 &&
                                   candidate.startMs == sample.processStartMs &&
                                   !candidate.exe.empty() && !sample.exe.empty() &&
-                                  candidate.exe == sample.exe;
+                                  candidate.exe == sample.exe &&
+                                  overlapsWindow(candidate);
                        });
                        return result != pythonResults.end();
                    }),
@@ -91,15 +106,51 @@ SegmentProcessResult ContinuousSegmentProcessor::Process(
     const bool runtimeEnrichment = env_enabled_default("DROP_CONTINUOUS_RUNTIME_ENRICHMENT", true) &&
                                    capabilities.goSymbols;
 
-    // 2. warm_build_id_cache（perf script 自带缓存回退命中所需，始终执行）
-    std::vector<drop::BuildIdEntry> buildIds = warm_build_id_cache(perf, dataPath);
+    // 2. warm_build_id_cache（perf script 自带缓存回退命中所需，始终执行）。
+    // 阶段四：输出逐 DSO 预热诊断。
+    std::vector<BuildIdWarmEntry> buildIdWarmReport;
+    std::vector<drop::BuildIdEntry> buildIds =
+        warm_build_id_cache(perf, dataPath, &buildIdWarmReport);
+    const std::string buildIdReportJson = build_id_report_to_json(buildIdWarmReport);
 
     // 3-5. runtime maps / Go symbols（enrichment 关闭时跳过，仍走统一解析器）
     drop::RuntimeSymbolReport runtimeReport;
     drop::GoSymbolReport goReport;
     if (runtimeEnrichment)
     {
-        runtimeReport = drop::collect_runtime_maps(perf, dataPath);
+        drop::RuntimeSymbolReport fullReport = drop::collect_runtime_maps(perf, dataPath);
+        // 阶段四：逐语言开关过滤（关闭的语言不产出 ready 状态与 map 复制）。
+        if (!capabilities.javaPerfMap)
+        {
+            fullReport.java.missingPids.insert(fullReport.java.missingPids.end(),
+                                               fullReport.java.readyPids.begin(),
+                                               fullReport.java.readyPids.end());
+            fullReport.java.readyPids.clear();
+            fullReport.java.ready = false;
+            if (fullReport.java.detected && fullReport.java.reason.empty())
+                fullReport.java.reason = "DROP_CONTINUOUS_JAVA_PERFMAP disabled";
+        }
+        if (!capabilities.nodePerfMap)
+        {
+            fullReport.node.missingPids.insert(fullReport.node.missingPids.end(),
+                                               fullReport.node.readyPids.begin(),
+                                               fullReport.node.readyPids.end());
+            fullReport.node.readyPids.clear();
+            fullReport.node.ready = false;
+            if (fullReport.node.detected && fullReport.node.reason.empty())
+                fullReport.node.reason = "DROP_CONTINUOUS_NODE_PERFMAP disabled";
+        }
+        if (!capabilities.pythonPerf)
+        {
+            fullReport.python.missingPids.insert(fullReport.python.missingPids.end(),
+                                                 fullReport.python.readyPids.begin(),
+                                                 fullReport.python.readyPids.end());
+            fullReport.python.readyPids.clear();
+            fullReport.python.ready = false;
+            if (fullReport.python.detected && fullReport.python.reason.empty())
+                fullReport.python.reason = "DROP_CONTINUOUS_PYTHON_PERF disabled; py-spy fallback applies";
+        }
+        runtimeReport = std::move(fullReport);
         std::set<std::string> knownDsoPaths;
         for (const auto &entry : buildIds)
             knownDsoPaths.insert(entry.dsoPath);
@@ -124,7 +175,8 @@ SegmentProcessResult ContinuousSegmentProcessor::Process(
     // 7-12：解析/规范化/合并/诊断/symbol_refs（纯逻辑，与测试共用同一套实现）
     SegmentProcessResult pure = ProcessScript(scriptOutput, segment, physicalConfig, capabilities,
                                               runtimeReport, goReport, buildIds,
-                                              pythonResults, pythonLimitedCount, memrayResults);
+                                              pythonResults, pythonLimitedCount, memrayResults,
+                                              buildIdWarmReport);
     if (!pure.success)
         return pure;
     pure.diagnostics.enrichmentApplied = runtimeEnrichment;
@@ -167,7 +219,8 @@ SegmentProcessResult ProcessScript(
     const std::vector<drop::BuildIdEntry> &buildIds,
     const std::vector<drop::PythonFallbackResult> &pythonResults,
     size_t pythonLimitedCount,
-    const std::vector<drop::MemrayProfileResult> &memrayResults)
+    const std::vector<drop::MemrayProfileResult> &memrayResults,
+    const std::vector<BuildIdWarmEntry> &buildIdWarmReport)
 {
     (void)capabilities;
     SegmentProcessResult result;
@@ -226,9 +279,11 @@ SegmentProcessResult ProcessScript(
                              window.samples.end());
     }
 
-    // py-spy sidecar 合并（成功替换 perf Python 样本，失败保留 perf fallback）
+    // py-spy sidecar 合并（成功替换 perf Python 样本，失败保留 perf fallback）。
+    // 阶段四：capture 区间与窗口时间重叠才替换，过期结果不应用。
     bool pythonReplaced = false;
-    merge_python_sidecar_samples(&window.samples, pythonResults, &pythonReplaced);
+    merge_python_sidecar_samples(&window.samples, pythonResults, &pythonReplaced,
+                                 window.startMs, window.endMs);
 
     // 10. unresolved/frame 诊断
     uint64_t totalFrames = 0;
@@ -257,12 +312,15 @@ SegmentProcessResult ProcessScript(
     result.diagnostics.pythonFallback = pythonResults;
     result.diagnostics.pythonFallbackLimitedCount = pythonLimitedCount;
     result.diagnostics.memrayResults = memrayResults;
+    result.diagnostics.unwindMode = capabilities.unwindMode.empty() ? "fp" : capabilities.unwindMode;
+    result.diagnostics.buildIdWarmReport = buildIdWarmReport;
     result.diagnostics.kallsymsSha256 = ensure_kallsyms_snapshot(physicalConfig);
 
-    // 11. 结构化物理 symbol_refs（含 py-spy/Memray sidecar 诊断）
+    // 11. 结构化物理 symbol_refs（含 py-spy/Memray sidecar 诊断与 v2 language_status）
     window.symbolRefsJson = combined_symbol_refs_json(
         runtimeReport, goReport, pythonResults, pythonLimitedCount, memrayResults,
-        window.samples, buildIds, result.diagnostics.kallsymsSha256);
+        window.samples, buildIds, result.diagnostics.kallsymsSha256,
+        nullptr, result.diagnostics.unwindMode, build_id_report_to_json(buildIdWarmReport));
     window.physicalDiagnostics = std::make_shared<const PhysicalDiagnostics>(result.diagnostics);
     result.windows.push_back(std::move(window));
 
@@ -389,9 +447,10 @@ static std::string rebuild_filtered_symbol_refs_for_targets(
     body += "],";
     if (!diagnostics.kallsymsSha256.empty())
         body += "\"kallsyms_sha256\":\"" + json_escape(diagnostics.kallsymsSha256) + "\",";
-    body += "\"runtime_maps\":" + drop::runtime_maps_to_json(
-                                      filter_runtime_report_to_session(diagnostics.runtimeReport, targets)) + ",";
     // 阶段三：Go 诊断按 DSO 归属——只保留本 Session 引用的 DSO 条目。
+    drop::RuntimeSymbolReport filteredRuntimeReport =
+        filter_runtime_report_to_session(diagnostics.runtimeReport, targets);
+    body += "\"runtime_maps\":" + drop::runtime_maps_to_json(filteredRuntimeReport) + ",";
     drop::GoSymbolReport filteredGo;
     auto filterGo = [&](const std::vector<drop::GoSymbolItem> &source,
                         std::vector<drop::GoSymbolItem> *target) {
@@ -450,6 +509,19 @@ static std::string rebuild_filtered_symbol_refs_for_targets(
                 "\",\"reason\":\"" + json_escape(item.reason) + "\"}";
     }
     body += "]}";
+    // 阶段四：build-id 预热报告按本 Session 引用的 DSO/build-id 过滤。
+    std::vector<BuildIdWarmEntry> sessionWarmEntries;
+    for (const auto &entry : diagnostics.buildIdWarmReport)
+        if (sessionMappings.count(entry.dsoPath) > 0 || sessionBuildIds.count(entry.buildId) > 0)
+            sessionWarmEntries.push_back(entry);
+    const std::string sessionBuildIdReport = build_id_report_to_json(sessionWarmEntries);
+    if (!sessionBuildIdReport.empty())
+        body += ",\"build_id_report\":" + sessionBuildIdReport;
+    // 阶段四：v2 language_status 按本 Session 身份过滤后重建。
+    body += "," + language_status_fragment_for_symbol_refs(
+                       filteredSamples, filteredRuntimeReport, filteredGo, filteredPython,
+                       filteredPython.empty() ? 0 : diagnostics.pythonFallbackLimitedCount,
+                       &targets, diagnostics.unwindMode);
     if (diagnostics.runtimeEnrichmentDisabled)
         body += ",\"runtime_enrichment\":{\"enabled\":false,\"reason\":\"" +
                 json_escape(diagnostics.enrichmentDisabledReason) + "\"}";
@@ -490,7 +562,8 @@ std::string build_session_symbol_refs(const PhysicalDiagnostics &diagnostics,
     return combined_symbol_refs_json(
         filtered.runtimeReport, filtered.goReport, filtered.pythonFallback,
         filtered.pythonFallbackLimitedCount, filtered.memrayResults, samples,
-        filtered.buildIdEntries, filtered.kallsymsSha256);
+        filtered.buildIdEntries, filtered.kallsymsSha256,
+        nullptr, filtered.unwindMode, build_id_report_to_json(filtered.buildIdWarmReport));
 }
 
 // ============================================================

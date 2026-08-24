@@ -16,6 +16,7 @@
 // ContinuousSegmentProcessor）。连续采样器的 strict/degraded 引擎都通过它处理
 // 不可变 perf.data 段，共享符号准备、解析、runtime 分类与诊断生成。
 #include "common/ContinuousSegmentProcessor.h"
+#include "common/LanguageStatus.h"
 
 #include <algorithm>
 #include <chrono>
@@ -729,10 +730,32 @@ static std::string target_pid_csv(const ContinuousSamplerConfig &cfg)
     return out.str();
 }
 
+// 阶段四：栈回溯模式。默认 Frame Pointer（-g）；DROP_NATIVE_CP_CALL_GRAPH=dwarf
+// 时统一为 --call-graph dwarf,8192。
+static std::string unwind_mode_from_env()
+{
+    const char *env = std::getenv("DROP_NATIVE_CP_CALL_GRAPH");
+    if (!env || !*env)
+        return "fp";
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value == "dwarf" ? "dwarf" : "fp";
+}
+
+static std::vector<std::string> call_graph_args(const std::string &unwindMode)
+{
+    if (unwindMode == "dwarf")
+        return {"--call-graph", "dwarf,8192"};
+    return {"-g"};
+}
+
 static std::vector<std::string> perf_record_args(const ContinuousSamplerConfig &cfg,
                                                  const std::string &perf,
                                                  const std::string &perfEvent,
-                                                 const std::string &dataPath)
+                                                 const std::string &dataPath,
+                                                 const std::string &unwindMode = "fp")
 {
     std::vector<std::string> args{perf, "record", "--no-buildid-cache", "-q"};
     if (cfg.scope == "process")
@@ -746,8 +769,10 @@ static std::vector<std::string> perf_record_args(const ContinuousSamplerConfig &
     {
         args.push_back("-a");
     }
-    args.insert(args.end(), {"-e", perfEvent, "-F", std::to_string(cfg.sampleRateHz),
-                             "-g", "-o", dataPath, "--", "sleep",
+    args.insert(args.end(), {"-e", perfEvent, "-F", std::to_string(cfg.sampleRateHz)});
+    for (auto &arg : call_graph_args(unwindMode))
+        args.push_back(std::move(arg));
+    args.insert(args.end(), {"-o", dataPath, "--", "sleep",
                              std::to_string(cfg.aggregationWindowSec)});
     return args;
 }
@@ -771,6 +796,138 @@ static std::string bpftrace_target_predicate(const ContinuousSamplerConfig &cfg,
 // 前向声明（定义在 collect_window 之后）。
 static bool signal_enabled(const std::string &signals, const std::string &name);
 
+// ============================================================
+// 阶段四：Python 两级策略（perf-map → py-spy）候选构建
+// ============================================================
+
+// 单 PID 的 Python 语义帧覆盖率（%）。只统计 perf backend 的 python 样本
+// （py-spy 样本本身即语义帧），排除内核帧。
+static double python_semantic_percent_for_pid(const std::vector<AggregatedSample> &samples, int pid)
+{
+    uint64_t total = 0;
+    uint64_t semantic = 0;
+    for (const auto &sample : samples)
+    {
+        if (sample.pid != pid || sample.runtime != "python" || sample.backend == "py-spy")
+            continue;
+        size_t index = 0;
+        for (const auto &frame : sample.stack)
+        {
+            const drop::ContinuousStackFrame structured =
+                index < sample.frames.size() ? sample.frames[index] : drop::ContinuousStackFrame{};
+            ++index;
+            if (drop::is_kernel_frame(structured) || drop::is_kernel_frame_text(frame))
+                continue;
+            total = add_count(total, sample.count);
+            if (drop::is_python_semantic_frame(structured) || drop::is_python_semantic_frame_text(frame))
+                semantic = add_count(semantic, sample.count);
+        }
+    }
+    if (total == 0)
+        return 100.0; // 无 perf Python 样本时不用覆盖率触发 fallback
+    return static_cast<double>(semantic) * 100.0 / static_cast<double>(total);
+}
+
+// 候选构建规则见 collect_window 内注释。firstWindowDetected=false 时（首窗
+// runtime map 尚未识别出 Python）用进程预检兜底，保证第一窗就能决定 fallback。
+static std::vector<drop::PythonCandidate> build_python_candidates(
+    const ContinuousSamplerConfig &cfg,
+    const drop::RuntimeSymbolReport &runtimeReport,
+    const std::vector<AggregatedSample> &samples,
+    bool firstWindowDetected)
+{
+    std::map<int, drop::PythonCandidate> chosen;
+
+    auto addCandidate = [&](int pid) {
+        int64_t startMs = 0;
+        if (!drop::python_process_start_ms(pid, &startMs))
+            return;
+        auto it = chosen.find(pid);
+        if (it != chosen.end())
+        {
+            it->second.startMs = startMs;
+            return;
+        }
+        drop::PythonCandidate candidate;
+        candidate.pid = pid;
+        candidate.startMs = startMs;
+        candidate.samples = 0;
+        for (const auto &sample : samples)
+            if (sample.pid == pid && !sample.comm.empty())
+            {
+                candidate.comm = sample.comm;
+                break;
+            }
+        if (candidate.comm.empty())
+            candidate.comm = "python";
+        candidate.exe = read_exe(pid);
+        chosen.emplace(pid, std::move(candidate));
+    };
+
+    // 1) perf-map 缺失的采样进程
+    for (int pid : runtimeReport.python.missingPids)
+        addCandidate(pid);
+
+    // 2) 有 map 但语义覆盖 <70%（perf-map 模式质量不足）
+    std::set<int> checkedPids;
+    for (const auto &sample : samples)
+    {
+        if (sample.runtime != "python" || sample.backend == "py-spy")
+            continue;
+        if (!checkedPids.insert(sample.pid).second)
+            continue;
+        if (runtimeReport.python.readyPids.empty() ||
+            std::find(runtimeReport.python.readyPids.begin(), runtimeReport.python.readyPids.end(),
+                      sample.pid) != runtimeReport.python.readyPids.end())
+        {
+            if (python_semantic_percent_for_pid(samples, sample.pid) < 70.0)
+                addCandidate(sample.pid);
+        }
+    }
+
+    // 3) 首窗预检兜底：runtime map 未识别到 Python 时主动探测目标。
+    //    节流：探测含短周期 CPU ticks 采样（约 200ms）与全 /proc 扫描，
+    //    全局最多每 5 秒一次，避免空跑机器上每个段都付这笔开销。
+    if (chosen.empty() && !firstWindowDetected)
+    {
+        static std::atomic<int64_t> lastProbeMonoMs{0};
+        const int64_t nowMono = monotonic_ms();
+        int64_t last = lastProbeMonoMs.load();
+        if (nowMono - last >= 5000 && lastProbeMonoMs.compare_exchange_strong(last, nowMono))
+        {
+            if (cfg.scope == "process")
+            {
+                for (const auto &target : cfg.targetProcesses)
+                {
+                    drop::PythonRuntimeProbe probe = drop::probe_python_runtime(target.pid);
+                    // 无 -X perf 真实 map 的解释器直接进入 py-spy；带 flag 且
+                    // map 就绪的交给 perf-map 路径。
+                    if (probe.valid && !probe.hasPerfMap)
+                        addCandidate(target.pid);
+                }
+            }
+            else
+            {
+                // host Session：短周期 CPU ticks 增量排序，默认只 attach 最热实例。
+                for (auto &candidate :
+                     drop::hottest_python_candidates_by_cpu_ticks(8))
+                {
+                    drop::PythonRuntimeProbe probe = drop::probe_python_runtime(candidate.pid);
+                    if (probe.valid && !probe.hasPerfMap)
+                        chosen.emplace(candidate.pid, std::move(candidate));
+                }
+            }
+        }
+    }
+
+    std::vector<drop::PythonCandidate> out;
+    out.reserve(chosen.size());
+    for (auto &kv : chosen)
+        out.push_back(std::move(kv.second));
+    return out;
+}
+
+
 static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
 {
     WindowPayload window;
@@ -786,9 +943,17 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     // sidecar 数据（py-spy / RSS / Memray）；perf.data 交给统一的
     // ContinuousSegmentProcessor 解析（符号准备/解析/runtime 分类/诊断）。
     // 阶段三：py-spy 是 CPU fallback，只有请求 cpu_profile 才启用。
-    const bool pythonFallbackEnabled = logical_signal_requested(cfg.requestedSignals, "cpu_profile") &&
-                                       env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
-    const int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+    // 阶段四：独立开关 DROP_CONTINUOUS_PYSPY_FALLBACK（默认开启，可与旧
+    // 开关 DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED 单独关闭）。
+    const bool pythonFallbackEnabled =
+        logical_signal_requested(cfg.requestedSignals, "cpu_profile") &&
+        env_enabled_default("DROP_CONTINUOUS_PYSPY_FALLBACK", true) &&
+        env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
+    // 阶段四：host Session 默认只 attach 最热 2 个 Python 实例（CPU ticks
+    // 增量排序）；process Session 精确目标最多 4 个。
+    int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+    if (cfg.scope != "process")
+        pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_HOST_MAX_PROCESSES", 2);
     const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
     drop::PythonFallbackCapture pythonCapture;
     if (pythonFallbackEnabled)
@@ -801,12 +966,14 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     if (const char *env = std::getenv("DROP_NATIVE_CP_PERF_EVENT"))
         if (*env)
             perfEvent = env;
+    // 阶段四：栈回溯模式 DROP_NATIVE_CP_CALL_GRAPH=fp|dwarf（默认 fp）。
+    const std::string unwindMode = unwind_mode_from_env();
     std::string recordOutput;
     // 阶段三：纯 python/db 请求（signals 为空）不启动 CPU perf record。
     const bool cpuRequested = signal_enabled(cfg.signals, "cpu");
     std::vector<std::string> recordArgs;
     if (cpuRequested)
-        recordArgs = perf_record_args(cfg, perf, perfEvent, dataPath);
+        recordArgs = perf_record_args(cfg, perf, perfEvent, dataPath, unwindMode);
     int rc = 0;
     if (!recordArgs.empty())
     {
@@ -855,7 +1022,13 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     capabilities.pythonRss = rssRequested &&
                              env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true);
     capabilities.memray = memrayEnabled;
-    capabilities.goSymbols = true;
+    // 阶段四：逐语言能力开关（默认全开，可单独关闭单语言）。
+    capabilities.goReSym = env_enabled_default("DROP_CONTINUOUS_GORESYM", true);
+    capabilities.goSymbols = capabilities.goReSym;
+    capabilities.javaPerfMap = env_enabled_default("DROP_CONTINUOUS_JAVA_PERFMAP", true);
+    capabilities.nodePerfMap = env_enabled_default("DROP_CONTINUOUS_NODE_PERFMAP", true);
+    capabilities.pythonPerf = env_enabled_default("DROP_CONTINUOUS_PYTHON_PERF", true);
+    capabilities.unwindMode = unwindMode;
 
     // 阶段三：CPU 未请求时无 perf.data 段，跳过 processor（窗口只承载
     // RSS/Memray sidecar）。
@@ -952,30 +1125,18 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
                               window.profiles.end());
     }
 
-    // 用上一批已发现候选调度下一窗 py-spy（物理级异步 sidecar，不阻塞解析）。
-    // 阶段三：CPU 未请求时无 processed 诊断，跳过 py-spy 调度。
-    std::map<int, AggregatedSample> metadata;
-    for (const auto &sample : window.samples)
-        metadata.emplace(sample.pid, sample);
-    std::vector<drop::PythonCandidate> nextCandidates;
+    // 阶段四：两级 Python 策略的候选调度（物理级异步 sidecar，不阻塞解析）。
+    //   1) perf-map 缺失 PID；
+    //   2) 有 perf 样本但 Python 语义覆盖 <70% 的 PID（解释器/native 帧占比过高）；
+    //   3) 首窗预检：process Session 对目标逐个探测（身份/-X perf/真实 map），
+    //      host Session 按 CPU ticks 增量排序只取最热实例。
     if (pythonFallbackEnabled && cpuRequested)
     {
-        for (int pid : processed.diagnostics.runtimeReport.python.missingPids)
-        {
-            int64_t startMs = 0;
-            if (!drop::python_process_start_ms(pid, &startMs))
-                continue;
-            drop::PythonCandidate candidate;
-            candidate.pid = pid;
-            candidate.startMs = startMs;
-            candidate.samples = processed.diagnostics.runtimeReport.sampledPids[pid];
-            auto it = metadata.find(pid);
-            candidate.comm = it == metadata.end() ? "python" : it->second.comm;
-            candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
-            nextCandidates.push_back(std::move(candidate));
-        }
+        drop::schedule_python_fallback(
+            cfg.sessionSID,
+            build_python_candidates(cfg, processed.diagnostics.runtimeReport, window.samples,
+                                    processed.diagnostics.runtimeReport.python.detected));
     }
-    drop::schedule_python_fallback(cfg.sessionSID, nextCandidates);
     return window;
 }
 
@@ -2244,8 +2405,11 @@ bool RollingPerfRecorder::Start(const ContinuousSamplerConfig &cfg, std::string 
     else
         args.push_back("-a");
     args.insert(args.end(), {"-e", env_string_local("DROP_NATIVE_CP_PERF_EVENT", "cpu-clock"),
-                             "-F", std::to_string(cfg.sampleRateHz), "-g", "-T",
-                             "--timestamp-boundary", "--switch-output=2s", "--timestamp-filename",
+                             "-F", std::to_string(cfg.sampleRateHz), "-T"});
+    // 阶段四：FP（默认）或 DWARF（--call-graph dwarf,8192）统一入口。
+    for (auto &arg : call_graph_args(unwind_mode_from_env()))
+        args.push_back(std::move(arg));
+    args.insert(args.end(), {"--timestamp-boundary", "--switch-output=2s", "--timestamp-filename",
                              "-o", directory + "/perf.data", "--", "sleep", "86400"});
     pid = ::fork();
     if (pid < 0)
@@ -3794,17 +3958,30 @@ struct SharedDualTrackContinuousSampler::Impl
             return logical_signal_requested(session.requestedSignals, "python_memory");
         });
         const bool pythonFallbackEnabled = anyCpuRequested &&
+                                           env_enabled_default("DROP_CONTINUOUS_PYSPY_FALLBACK", true) &&
                                            env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
         const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
-        const int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+        // 阶段四：host Session 默认只 attach 最热 2 个 Python 实例；process
+        // Session 精确目标最多 4 个。
+        const int pythonMaxProcesses =
+            physical.scope == "process"
+                ? env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4)
+                : env_positive_int("DROP_NATIVE_CP_PYTHON_HOST_MAX_PROCESSES", 2);
         const int pythonSidecarPollMs = std::max(0, env_positive_int("DROP_STRICT_PYTHON_SIDECAR_POLL_MS", 350));
+        // 阶段四：栈回溯模式与逐语言能力开关。
+        const std::string unwindMode = unwind_mode_from_env();
         RuntimeCapabilitySet caps;
         caps.pythonFallback = pythonFallbackEnabled;
         caps.pythonRss = anyRssRequested &&
                          env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true);
         caps.memray = anyMemrayRequested &&
                       env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true);
-        caps.goSymbols = true;
+        caps.goReSym = env_enabled_default("DROP_CONTINUOUS_GORESYM", true);
+        caps.goSymbols = caps.goReSym;
+        caps.javaPerfMap = env_enabled_default("DROP_CONTINUOUS_JAVA_PERFMAP", true);
+        caps.nodePerfMap = env_enabled_default("DROP_CONTINUOUS_NODE_PERFMAP", true);
+        caps.pythonPerf = env_enabled_default("DROP_CONTINUOUS_PYTHON_PERF", true);
+        caps.unwindMode = unwindMode;
         bool sidecarInFlight = false;
         drop::PythonFallbackCapture sidecarCapture;
         std::vector<drop::PythonFallbackResult> pendingSidecarResults;
@@ -4007,36 +4184,34 @@ struct SharedDualTrackContinuousSampler::Impl
                               << processedSegments << " processed segment(s)" << std::endl;
                 }
 
+                // 阶段四修复：必须在把 windows move 进 iterationWindows 之前
+                // 收集 py-spy 候选元数据——move 之后 processed.windows 的样本
+                // 已被搬空，旧实现读到空 metadata 导致 py-spy 候选为空。
+                if (pythonFallbackEnabled)
+                {
+                    std::vector<AggregatedSample> allSamples;
+                    for (const auto &w : processed.windows)
+                        allSamples.insert(allSamples.end(), w.samples.begin(), w.samples.end());
+                    bool pythonDetected = false;
+                    for (const auto &w : processed.windows)
+                        if (w.physicalDiagnostics &&
+                            w.physicalDiagnostics->runtimeReport.python.detected)
+                        {
+                            pythonDetected = true;
+                            break;
+                        }
+                    drop::schedule_python_fallback(
+                        physical.sessionSID,
+                        build_python_candidates(physical, processed.diagnostics.runtimeReport,
+                                                allSamples, pythonDetected));
+                }
+
                 for (auto &physicalWindow : processed.windows)
                 {
                     physicalWindow.attemptedBackends.push_back("libbpf-co-re");
                     physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
                     physicalWindow.backendStatus = "ok";
                     iterationWindows.push_back(std::move(physicalWindow));
-                }
-                // 调度下一窗 py-spy 候选（物理级身份去重由单 coordinator 保证）。
-                if (pythonFallbackEnabled)
-                {
-                    std::map<int, AggregatedSample> metadata;
-                    for (const auto &w : processed.windows)
-                        for (const auto &sample : w.samples)
-                            metadata.emplace(sample.pid, sample);
-                    std::vector<drop::PythonCandidate> nextCandidates;
-                    for (int pid : processed.diagnostics.runtimeReport.python.missingPids)
-                    {
-                        int64_t startMs = 0;
-                        if (!drop::python_process_start_ms(pid, &startMs))
-                            continue;
-                        drop::PythonCandidate candidate;
-                        candidate.pid = pid;
-                        candidate.startMs = startMs;
-                        candidate.samples = processed.diagnostics.runtimeReport.sampledPids[pid];
-                        auto it = metadata.find(pid);
-                        candidate.comm = it == metadata.end() ? "python" : it->second.comm;
-                        candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
-                        nextCandidates.push_back(std::move(candidate));
-                    }
-                    drop::schedule_python_fallback(physical.sessionSID, nextCandidates);
                 }
             }
             // 本迭代 CO-RE 直方图附加到首个物理窗口（与旧行为一致）。
