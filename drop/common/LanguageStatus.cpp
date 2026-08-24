@@ -97,7 +97,8 @@ struct FrameCounts
 FrameCounts accumulate_sample_frames(
     const AggregatedSample &sample,
     const std::function<bool(const ContinuousStackFrame &, const std::string &)> &isSemantic,
-    const std::vector<ContinuousStackFrame> *frames)
+    const std::vector<ContinuousStackFrame> *frames,
+    bool excludeInfrastructure)
 {
     FrameCounts counts;
     size_t index = 0;
@@ -109,6 +110,8 @@ FrameCounts accumulate_sample_frames(
         const uint64_t weight = clamp_count(sample.count);
         if (is_kernel_frame(structured) || is_kernel_frame_text(frameText))
             continue; // 先排除内核帧再计算语言语义覆盖率
+        if (excludeInfrastructure && is_runtime_infrastructure_frame(structured))
+            continue; // 解释器/系统库内部帧不计入托管语言分母
         counts.total = add_count(counts.total, weight);
         if (unresolved_frame(frameText))
         {
@@ -203,6 +206,24 @@ bool is_kernel_frame(const ContinuousStackFrame &frame)
 bool is_kernel_frame_text(const std::string &frameText)
 {
     return text_starts(drop::trim(frameText), "[kernel");
+}
+
+bool is_runtime_infrastructure_frame(const ContinuousStackFrame &frame)
+{
+    const std::string &mapping = frame.mappingFile;
+    if (mapping.empty() || mapping.front() == '[')
+        return false;
+    const std::string base = path_basename(mapping);
+    auto starts = [&base](const char *prefix) { return text_starts(base, prefix); };
+    // 解释器/JVM/V8 运行时库与基础系统库：业务语义覆盖的分母不含它们。
+    if (starts("libpython") || starts("libjvm") || starts("libnode"))
+        return true;
+    if (starts("libc.so") || starts("libc-") || starts("ld-linux") || starts("ld-musl"))
+        return true;
+    if (starts("libpthread") || starts("libm.so") || starts("librt.so") || starts("libdl.so") ||
+        starts("libstdc++") || starts("libgcc_s"))
+        return true;
+    return false;
 }
 
 bool is_python_semantic_frame(const ContinuousStackFrame &frame)
@@ -315,6 +336,10 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         // native/kernel：排除内核后的已解析帧即语义帧。
         return [](const ContinuousStackFrame &, const std::string &) { return true; };
     };
+    // 托管语言排除运行时基础设施帧；native 行保留（它们就是 native 的本体）。
+    auto infrastructureExcluded = [](const std::string &lang) {
+        return lang == "java" || lang == "node" || lang == "python" || lang == "go";
+    };
 
     for (const auto &sample : samples)
     {
@@ -325,7 +350,8 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         entry.sampleWeight = add_count(entry.sampleWeight, sample.count);
         const std::vector<ContinuousStackFrame> *frames =
             sample.frames.size() == sample.stack.size() ? &sample.frames : nullptr;
-        FrameCounts counts = accumulate_sample_frames(sample, semanticPredicate(runtime), frames);
+        FrameCounts counts = accumulate_sample_frames(sample, semanticPredicate(runtime), frames,
+                                                      infrastructureExcluded(runtime));
         entry.counts.total = add_count(entry.counts.total, counts.total);
         entry.counts.unresolved = add_count(entry.counts.unresolved, counts.unresolved);
         entry.counts.semantic = add_count(entry.counts.semantic, counts.semantic);
@@ -388,12 +414,27 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         }
         if (!go.disabled.empty())
             append_reason(&entry.reasons, go.disabled);
-        if (anyPending)
+        if (anyPending && !anyReady)
             append_reason(&entry.reasons, "GoReSym background extraction in progress");
-        entry.collectorStatus = aggregate_collector_status(
-            detected, anyReady, false, anyFailed, anyPending,
-            entry.semanticFramePercent >= 70.0, entry.unresolvedFramePercent <= 20.0);
-        if (detected && lang.counts.total > 0 && lang.counts.semantic == 0)
+
+        // 阶段四：Go 的 ready 以质量为准——perf 原生符号（非 stripped 程序）
+        // 已达到覆盖门槛时，不要求 GoReSym 产物；GoReSym 只是 stripped 兜底。
+        const bool qualityOk = entry.semanticFramePercent >= 70.0 &&
+                               entry.unresolvedFramePercent <= 20.0;
+        if (!detected)
+            entry.collectorStatus = "not_applicable";
+        else if (qualityOk)
+            entry.collectorStatus = "ready";
+        else if (anyFailed && !anyReady)
+            entry.collectorStatus = "failed";
+        else if (anyPending)
+            entry.collectorStatus = "pending";
+        else if (anyReady)
+            entry.collectorStatus = "partial";
+        else
+            entry.collectorStatus = "missing";
+        if (detected && lang.counts.total > 0 && lang.counts.semantic == 0 &&
+            entry.collectorStatus != "ready")
             append_reason(&entry.reasons, "no Go function names resolved from samples");
     }
 

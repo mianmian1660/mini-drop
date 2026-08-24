@@ -279,7 +279,7 @@ pass "all Session objects contain only their selected executable"
 
 # 每个 Session 期望的 runtime 分类与业务热点函数。
 EXPECT_RUNTIMES=(native go node node python java)
-HOT_FUNCS=("hot_a|hot_b" "main.hotA|main.hotB" "hotA|hotB" "-" "hot_a|hot_b" "TestJavaProfiling.hotA|hotA")
+HOT_FUNCS=("hot_a|hot_b" "main.hotA|main.hotB|main.main" "hotA|hotB" "-" "hot_a|hot_b" "TestJavaProfiling.hotA|hotA")
 NODE_PLAIN_INDEX=3
 
 api_from_to() {

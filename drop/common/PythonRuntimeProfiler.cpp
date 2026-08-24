@@ -117,27 +117,41 @@ PythonFallbackResult capture_one(PythonCandidate candidate, int durationSec, int
     result.captureStartMs = wall_now_ms();
     std::string path = "/tmp/mini_drop_pyspy_" + std::to_string(candidate.pid) + "_" +
                        std::to_string(result.captureStartMs) + ".raw";
-    std::vector<std::string> args{"timeout", "-s", "INT", "-k", "2", std::to_string(durationSec + 2),
-                                  "/usr/local/bin/py-spy", "record", "--pid", std::to_string(candidate.pid),
-                                  "--duration", std::to_string(durationSec), "--rate", std::to_string(rateHz),
-                                  "--format", "raw", "--function"};
-    // 阶段四：--native 采集 C 扩展调用链（保留 Python 入口与 native C 热点）。
-    if (pyspy_native_enabled())
-        args.push_back("--native");
-    args.insert(args.end(), {"--output", path});
     std::string output;
-    int rc = exec_capture(args, &output, 16384);
+    auto runPySpy = [&](bool native) -> int {
+        std::vector<std::string> args{"timeout", "-s", "INT", "-k", "2", std::to_string(durationSec + 2),
+                                      "/usr/local/bin/py-spy", "record", "--pid", std::to_string(candidate.pid),
+                                      "--duration", std::to_string(durationSec), "--rate", std::to_string(rateHz),
+                                      "--format", "raw", "--function"};
+        if (native)
+            args.push_back("--native");
+        args.insert(args.end(), {"--output", path});
+        return exec_capture(args, &output, 16384);
+    };
+    const bool nativeWanted = pyspy_native_enabled();
+    int rc = runPySpy(nativeWanted);
     result.captureEndMs = wall_now_ms();
-    if (!python_process_is_same(candidate.pid, candidate.startMs))
+    std::ifstream inFirst(path, std::ios::binary);
+    std::string raw((std::istreambuf_iterator<char>(inFirst)), std::istreambuf_iterator<char>());
+    result.samples = parse_pyspy_raw(raw);
+    // 阶段四：--native 展开失败（如 UNW_EINVAL）时自动退回纯 Python 栈重试，
+    // 不让 C 扩展展开能力缺陷拖垮整个 fallback。
+    if (result.samples.empty() && nativeWanted)
     {
         ::remove(path.c_str());
+        result.captureStartMs = wall_now_ms();
+        rc = runPySpy(false);
+        result.captureEndMs = wall_now_ms();
+        std::ifstream inRetry(path, std::ios::binary);
+        raw.assign((std::istreambuf_iterator<char>(inRetry)), std::istreambuf_iterator<char>());
+        result.samples = parse_pyspy_raw(raw);
+    }
+    ::remove(path.c_str());
+    if (!python_process_is_same(candidate.pid, candidate.startMs))
+    {
         result.reason = "process exited or PID was reused during capture";
         return result;
     }
-    std::ifstream in(path, std::ios::binary);
-    std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    ::remove(path.c_str());
-    result.samples = parse_pyspy_raw(raw);
     result.ready = !result.samples.empty();
     // GNU timeout can return 124 after py-spy has already flushed a complete
     // raw profile. Valid samples are authoritative; use rc only to diagnose

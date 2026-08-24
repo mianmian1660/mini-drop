@@ -81,6 +81,12 @@ struct LanguageStatusReport
 bool is_kernel_frame(const ContinuousStackFrame &frame);
 bool is_kernel_frame_text(const std::string &frameText);
 
+/// 阶段四：运行时基础设施帧（libjvm/libnode/libpython/libc 等解释器与
+/// 系统库内部实现帧）。这些帧不属于业务代码，也不计入托管语言的语义
+/// 覆盖分母——否则 Node/Java 栈里的 V8/JVM/libc 内部未解析帧会把覆盖率
+/// 永远压到门槛以下。业务 DSO 与 JIT map（perf-<pid>.map）不受影响。
+bool is_runtime_infrastructure_frame(const ContinuousStackFrame &frame);
+
 /// Python 语义帧：CPython -X perf 的 "py::func:path.py+off"、py-spy 的
 /// "func (file.py:line)"。libpython/libc 原生帧不会被误判。
 bool is_python_semantic_frame(const ContinuousStackFrame &frame);
