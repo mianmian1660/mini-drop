@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <set>
 
@@ -47,8 +48,12 @@ bool text_is_js_frame(const std::string &frame)
     if (text_starts(frame, "LazyCompile:") || text_starts(frame, "Script:") ||
         text_starts(frame, "Builtin:"))
         return true;
+    auto endsWith = [&frame](const char *suffix) {
+        const size_t len = std::strlen(suffix);
+        return frame.size() >= len && frame.compare(frame.size() - len, len, suffix) == 0;
+    };
     return frame.find(".js:") != std::string::npos || frame.find(".js ") != std::string::npos ||
-           frame.find(".mjs:") != std::string::npos;
+           endsWith(".js") || frame.find(".mjs:") != std::string::npos || endsWith(".mjs");
 }
 
 // JVM 方法名：com.foo.Bar.baz / java/lang/Thread.run / lambda$main$0

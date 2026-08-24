@@ -21,9 +21,8 @@ namespace drop
 //   - py-spy 失败（ready=false，含超时/PID 复用被上游 capture_one 判定）：
 //     保留原 perf 样本，fallback 诊断标记失败。
 // 阶段四：结果只能替换"capture 区间与窗口时间重叠 + 身份一致"的 perf 样本；
-// 过期 capture（与窗口完全不重叠）不得应用，防止把旧结果套到后续窗口/PID。
-// 注：PID 复用/已退出的判定由上游 capture_one（采集前后各校验一次）完成，
-// 这里只做纯合并，保证可单测且不重复读 /proc。
+// 过期 capture（与窗口完全不重叠）不得应用；窗口内不存在同身份 perf 样本时
+// 也不得凭空追加 py-spy 样本（防 PID 复用后把旧进程数据算进新进程窗口）。
 void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
                                   const std::vector<drop::PythonFallbackResult> &pythonResults,
                                   bool *anyReplaced,
@@ -39,43 +38,52 @@ void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
             return true;
         return result.captureStartMs <= windowEndMs && result.captureEndMs >= windowStartMs;
     };
-    std::set<int> replacedPythonPids;
-    std::vector<AggregatedSample> appended;
+    // 只有"时间重叠且身份能在本窗 perf 样本中找到"的结果才会替换；
+    // 其余（过期 / 身份不一致 / 窗口无该进程样本）一律忽略，不删除也不追加。
+    std::set<const drop::PythonFallbackResult *> replacing;
     for (const auto &result : pythonResults)
     {
         if (!result.ready || result.pid <= 0 || result.startMs <= 0 || result.exe.empty())
             continue;
         if (!overlapsWindow(result))
             continue; // 过期结果不得替换当前窗口样本
-        replacedPythonPids.insert(result.pid);
-        for (const auto &raw : result.samples)
+        const bool present = std::any_of(samples->begin(), samples->end(), [&](const auto &sample) {
+            return sample.pid == result.pid && sample.processStartMs > 0 &&
+                   sample.processStartMs == result.startMs && !sample.exe.empty() &&
+                   sample.exe == result.exe;
+        });
+        if (present)
+            replacing.insert(&result);
+    }
+    if (replacing.empty())
+        return;
+    std::vector<AggregatedSample> appended;
+    for (const auto *result : replacing)
+    {
+        for (const auto &raw : result->samples)
         {
             AggregatedSample sample;
             sample.stack = raw.stack;
-            sample.comm = result.comm.empty() ? "python" : result.comm;
-            sample.pid = result.pid;
-            sample.processStartMs = result.startMs;
-            sample.exe = result.exe;
+            sample.comm = result->comm.empty() ? "python" : result->comm;
+            sample.pid = result->pid;
+            sample.processStartMs = result->startMs;
+            sample.exe = result->exe;
             sample.backend = "py-spy";
             sample.runtime = "python";
             sample.count = clamp_count(raw.count);
             appended.push_back(std::move(sample));
         }
     }
-    if (replacedPythonPids.empty())
-        return;
-    // 阶段三：删除 perf Python 样本必须按 pid + start time 匹配——PID 复用
+    // 删除被替换的 perf Python 样本：按 pid + start time + exe 匹配——PID 复用
     // 时（同 PID 不同 start time）不得删除新进程的 perf 样本。
     samples->erase(std::remove_if(samples->begin(), samples->end(), [&](const auto &sample) {
-                       auto result = std::find_if(pythonResults.begin(), pythonResults.end(), [&](const auto &candidate) {
-                           return candidate.ready && candidate.pid == sample.pid &&
-                                  candidate.startMs > 0 && sample.processStartMs > 0 &&
-                                  candidate.startMs == sample.processStartMs &&
-                                  !candidate.exe.empty() && !sample.exe.empty() &&
-                                  candidate.exe == sample.exe &&
-                                  overlapsWindow(candidate);
+                       return std::any_of(replacing.begin(), replacing.end(), [&](const auto *candidate) {
+                           return candidate->pid == sample.pid &&
+                                  candidate->startMs > 0 && sample.processStartMs > 0 &&
+                                  candidate->startMs == sample.processStartMs &&
+                                  !candidate->exe.empty() && !sample.exe.empty() &&
+                                  candidate->exe == sample.exe;
                        });
-                       return result != pythonResults.end();
                    }),
                    samples->end());
     samples->insert(samples->end(), appended.begin(), appended.end());
