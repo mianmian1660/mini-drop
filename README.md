@@ -325,6 +325,21 @@ make test
 make verify
 ```
 
+## 测试环境部署（服务器）
+
+服务器测试环境唯一部署流程（rsync 直传已废弃，禁止在服务器改代码或提交）：
+
+```text
+本地修改 -> commit -> push origin/test -> ./sync.sh -> 服务器自动测试/构建/启动/验证 -> PR 合入 main
+```
+
+- `test` 是长期测试分支；服务器固定跟踪 `origin/test` 并只做快进更新。
+- `./sync.sh` 前置校验：本地在 `test`、工作树干净、HEAD 已推送 `origin/test`；脚本不会代替你 commit/push。
+- 服务器端按顺序执行：快进更新并校验 HEAD == `origin/test` -> `make test` + 覆盖率 -> 镜像构建 -> Compose 启动等待 healthy -> 健康检查 -> `scripts/e2e_smoke.sh`；任一步失败立即终止并打印 `[STAGE:*]` 与目标 SHA。UP 之前失败不影响旧容器；UP 之后失败请本地 revert/fix 后重新 push 部署。
+- 服务器参数在本地 `sync.env`（仅 `SYNC_REMOTE_HOST` / `SYNC_REMOTE_PATH`，不入库）；服务器只持有只读 deploy key。
+- 可用环境变量：`DEPLOY_TEST_SCOPE=full|smoke|none` 控制测试范围；模拟测试见 `bash scripts/tests/deploy_test.sh`。
+- 分支保护：远程 `main` 禁止直接 push 与 force-push，改动一律经 PR 合入。
+
 ## 安全、可观测性与部署
 
 阶段 7 增加了生产配置边界和运行可观测性：
