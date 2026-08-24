@@ -48,6 +48,9 @@ type APIServer struct {
 	// 存储压力后台检测状态（阶段 0：磁盘止血）
 	storageState storageMonitorState
 
+	// 哨兵判异循环自检状态（§10.6，detection.go）
+	detectionHealth detectionHealthState
+
 	// 阶段五：容量前置门禁（required_free + Continuous 配额 + 恢复滞后）。
 	parquetDisk *parquetDiskState
 }
@@ -800,6 +803,7 @@ func (s *APIServer) registerRoutes() {
 		api.GET("/sentinel-rules", s.ListSentinelRules)
 		api.DELETE("/sentinel-rules/:sid", s.DeleteSentinelRule)
 		api.GET("/sentinel-rules/events", s.ListDetectionEvents)
+		api.GET("/sentinel-rules/health", s.GetDetectionHealth) // 判异循环自检，见 §10.6
 	}
 
 	s.Logger.Info("路由注册完成",
