@@ -269,8 +269,36 @@ func TestPQHistogramEventCountDeduplicatesBucketRows(t *testing.T) {
 		{Timestamp: base.UnixMilli(), SessionSID: "s2", SignalType: "io_latency", Backend: "ebpf", BucketLow: 0, BucketHigh: 10, EventCount: 3},
 	}
 	authorized := map[string]struct{}{"s1": {}, "s2": {}}
-	if got := pqHistogramEventTotal(rows, "io_latency", base, base.Add(time.Minute), authorized); got != 10 {
+	if got := pqHistogramEventTotal(rows, "io_latency", base, base.Add(time.Minute), authorized, nil); got != 10 {
 		t.Fatalf("event_count must count histograms, not buckets: got=%d want=10", got)
+	}
+}
+
+func TestPQHistogramEventCountHonorsProcessIdentityFilters(t *testing.T) {
+	base := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	rows := []pqHistogramRow{
+		{Timestamp: base.UnixMilli(), SessionSID: "s1", SignalType: "io_latency", Backend: "ebpf", PID: 42, ProcessStartMs: 1000, Exe: "/opt/a", EventCount: 7},
+		{Timestamp: base.UnixMilli(), SessionSID: "s1", SignalType: "io_latency", Backend: "ebpf", PID: 42, ProcessStartMs: 2000, Exe: "/opt/b", EventCount: 3},
+	}
+	authorized := map[string]struct{}{"s1": {}}
+	if got := pqHistogramEventTotal(rows, "io_latency", base, base.Add(time.Minute), authorized, nil); got != 10 {
+		t.Fatalf("all instances event_count=%d want=10", got)
+	}
+	filters := map[string]interface{}{"pid": "42", "process_start_ms": "1000"}
+	if got := pqHistogramEventTotal(rows, "io_latency", base, base.Add(time.Minute), authorized, filters); got != 7 {
+		t.Fatalf("filtered event_count=%d want=7", got)
+	}
+}
+
+func TestPQDownsampleHistogramPreservesProcessIdentity(t *testing.T) {
+	base := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC).UnixMilli()
+	rows := []pqHistogramRow{
+		{Timestamp: base, SessionSID: "s1", SignalType: "io_latency", Backend: "ebpf", PID: 42, ProcessStartMs: 1000, Exe: "/opt/a", BucketLow: 0, BucketHigh: 10, Count: 7},
+		{Timestamp: base, SessionSID: "s1", SignalType: "io_latency", Backend: "ebpf", PID: 42, ProcessStartMs: 2000, Exe: "/opt/b", BucketLow: 0, BucketHigh: 10, Count: 3},
+	}
+	out := downsampleHistogramRows(rows, model.ContinuousParquetResolution5m)
+	if len(out) != 2 {
+		t.Fatalf("PID reused identities merged during downsample: rows=%d want=2", len(out))
 	}
 }
 

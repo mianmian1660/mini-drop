@@ -26,7 +26,11 @@ var (
 	errContinuousAgentUnavailable  = errors.New("目标 Agent 尚未连接持续采集控制面")
 )
 
+// 阶段三：可创建信号固定扩展为七类。空 signals 为兼容旧客户端继续映射到
+// 四类核心默认值；新 UI 明确显示完整七类选项。
 var continuousDefaultSignals = []string{"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"}
+var continuousAllSignals = []string{"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency",
+	"python_rss", "python_memory", "db_snapshot"}
 
 // normalizeContinuousRequestedSignals 阶段一信号控制面：
 //   - 空 signals → 四类默认值（按固定顺序）；
@@ -36,7 +40,7 @@ var continuousDefaultSignals = []string{"cpu_profile", "io_latency", "io_syscall
 // 返回的切片是去重后的副本，不持有入参引用。
 func normalizeContinuousRequestedSignals(signals []string) ([]string, error) {
 	allowed := map[string]bool{}
-	for _, signal := range continuousDefaultSignals {
+	for _, signal := range continuousAllSignals {
 		allowed[signal] = true
 	}
 	if len(signals) == 0 {
@@ -50,7 +54,7 @@ func normalizeContinuousRequestedSignals(signals []string) ([]string, error) {
 			continue
 		}
 		if !allowed[signal] {
-			return nil, fmt.Errorf("未知信号类型: %s（支持 %s）", signal, strings.Join(continuousDefaultSignals, ", "))
+			return nil, fmt.Errorf("未知信号类型: %s（支持 %s）", signal, strings.Join(continuousAllSignals, ", "))
 		}
 		if seen[signal] {
 			continue
@@ -90,8 +94,10 @@ func continuousSessionSignalSet(session model.ContinuousSession) map[string]bool
 }
 
 // continuousCoreSignal 判断是否为四类核心选择器信号（cpu_profile/io_latency/
-// io_syscall_latency/sched_latency）。python_rss/db_snapshot 是独立数据通道，
-// 不受 signals 选择器约束。
+// io_syscall_latency/sched_latency）。python_rss/python_memory/db_snapshot 是
+// 独立数据通道（python 运行时指标 / memray profile / db_targets 巡检），
+// 不受 signals 选择器约束（阶段三：python_rss/python_memory 已纳入显式信号
+// 合同，但为兼容旧 Agent 的隐式通道行为，ingest 校验仍放行）。
 func continuousCoreSignal(signal string) bool {
 	for _, core := range continuousDefaultSignals {
 		if signal == core {

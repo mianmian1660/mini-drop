@@ -43,6 +43,8 @@ struct CoreEbpfCollector::Impl
 #endif
     bool running = false;
     bool blockAvailable = false;
+    // 阶段三：host/process 混合共享时同时写 key 0（整机 wildcard）与 TGID。
+    bool hostWildcard = false;
     std::string degradationReason;
     std::vector<uint32_t> targetIds;
     std::vector<uint32_t> targetTids;
@@ -260,7 +262,10 @@ bool CoreEbpfCollector::UpdateTargets(const std::vector<ContinuousTargetProcess>
     for (const auto &target : targets)
         if (target.pid > 0)
             next.push_back(static_cast<uint32_t>(target.pid));
-    if (next.empty())
+    // 阶段三：host/process 混合共享。hostWildcard=true 时同时保留 key 0
+    //（整机 wildcard）与目标 TGID，使 host Session 拿到整机直方图、process
+    // Session 的 sched histogram 仍能按 TGID 归属。
+    if (next.empty() || impl_->hostWildcard)
         next.push_back(0); // host scope wildcard; the BPF program checks this key
     std::sort(next.begin(), next.end());
     next.erase(std::unique(next.begin(), next.end()), next.end());
@@ -308,6 +313,11 @@ bool CoreEbpfCollector::UpdateTargets(const std::vector<ContinuousTargetProcess>
     impl_->targetTids = std::move(nextTids);
     return true;
 #endif
+}
+
+void CoreEbpfCollector::SetHostWildcard(bool hostWildcard)
+{
+    impl_->hostWildcard = hostWildcard;
 }
 
 std::vector<CoreHistogramSample> CoreEbpfCollector::Drain(uint64_t *lost)

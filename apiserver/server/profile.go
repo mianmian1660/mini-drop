@@ -114,12 +114,13 @@ type ProfileSymbolDiagnostics struct {
 }
 
 type ProfileRuntimeProcessDiagnostic struct {
-	PID    int    `json:"pid"`
-	Comm   string `json:"comm,omitempty"`
-	Exe    string `json:"exe,omitempty"`
-	Mode   string `json:"mode,omitempty"`
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	PID            int    `json:"pid"`
+	ProcessStartMs int64  `json:"process_start_ms,omitempty"`
+	Comm           string `json:"comm,omitempty"`
+	Exe            string `json:"exe,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	Status         string `json:"status"`
+	Reason         string `json:"reason,omitempty"`
 }
 
 type ProfileRuntimeDiagnostic struct {

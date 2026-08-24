@@ -34,7 +34,13 @@ var errContinuousConflict = errors.New("continuous batch/window content conflict
 
 // continuousSchemaVersionV3 是阶段一协议版本：v3 起启用窗口级 window_id 幂等、
 // content_sha256 冲突检测与分信号 signal_counts；v1/v2 走兼容旧路径。
+// continuousSchemaVersionV4 是阶段三协议版本：v4 在 v3 基础上新增窗口级
+// signal_statuses（每信号采集状态）、physical/effective_sample_rate_hz、
+// identity_unavailable_count，histogram 携带完整进程身份
+// （pid/process_start_ms/exe/comm）。v4 结构按 v3 规则解析（字段增量），
+// 旧 Agent 的 v3 批次继续按旧规则入库。
 const continuousSchemaVersionV3 = uint32(3)
+const continuousSchemaVersionV4 = uint32(4)
 
 // continuousSummaryBucketDuration 冷层摘要按 1 小时对齐分桶，和原始数据
 // 10s 窗口/60s batch 的粒度差好几个数量级——冷层本来就是拿精度换存储。
@@ -125,6 +131,20 @@ type ContinuousWindowIngest struct {
 	Metrics             []ContinuousMetricIngest     `json:"metrics"`
 	DBSnapshots         []ContinuousDBSnapshotIngest `json:"db_snapshots"`
 	RSSTruncated        int                          `json:"rss_truncated"`
+	// 阶段三（协议 v4）：每信号采集状态（collected/target_idle/no_events/
+	// unavailable/failed + reason + lost_events）、物理/生效采样率、身份不
+	// 完整被丢弃的样本数。v3 批次这些字段为零值，查询按旧规则推断。
+	SignalStatuses        map[string]ContinuousSignalStatus `json:"signal_statuses"`
+	PhysicalSampleRateHz  int                               `json:"physical_sample_rate_hz"`
+	EffectiveSampleRateHz int                               `json:"effective_sample_rate_hz"`
+	IdentityUnavailable   uint64                            `json:"identity_unavailable_count"`
+}
+
+// ContinuousSignalStatus 对应 Agent 侧 SignalStatus（阶段三 v4）。
+type ContinuousSignalStatus struct {
+	Status     string `json:"status"`
+	Reason     string `json:"reason"`
+	LostEvents uint64 `json:"lost_events"`
 }
 
 // ContinuousDBSnapshotIngest 对应 Agent 侧的 DBSnapshotSample（阶段二）。
@@ -216,6 +236,13 @@ type ContinuousHistogramIngest struct {
 	Labels      map[string]interface{}      `json:"labels"`
 	Unavailable bool                        `json:"unavailable"`
 	Reason      string                      `json:"reason"`
+	// 阶段三（协议 v4）：histogram 完整进程身份（strict CO-RE 按 TGID 归属；
+	// degraded 无法安全归属时 pid=0 且 unavailable）。v3 批次 pid 可能非零
+	// 但无 start/exe，查询按旧规则处理。
+	PID            int    `json:"pid"`
+	ProcessStartMs int64  `json:"process_start_ms"`
+	Exe            string `json:"exe"`
+	Comm           string `json:"comm"`
 }
 
 type ContinuousHistogramBucket struct {
@@ -794,12 +821,13 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	}
 	// 阶段一：schema_version 白名单。v1/v2 走兼容旧路径（升级过渡期遗留
 	// spool 仍可排空），v3 起启用窗口级 window_id 幂等、content_sha256 冲突
-	// 检测与分信号 signal_counts。未知版本一律拒绝（不可重试）。
+	// 检测与分信号 signal_counts；v4 在 v3 基础上增加信号状态/采样率/身份
+	// 字段（增量，解析规则与 v3 相同）。未知版本一律拒绝（不可重试）。
 	if req.SchemaVersion == 0 {
 		req.SchemaVersion = 1
 	}
-	if req.SchemaVersion > continuousSchemaVersionV3 {
-		s.respondContinuousConflict(c, req, "不支持的 schema_version，仅接受 v3 及以下")
+	if req.SchemaVersion > continuousSchemaVersionV4 {
+		s.respondContinuousConflict(c, req, "不支持的 schema_version，仅接受 v4 及以下")
 		return
 	}
 	isV3 := req.SchemaVersion >= continuousSchemaVersionV3
@@ -818,18 +846,22 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		s.forbid(c)
 		return
 	}
-	// 阶段一 v3：Session 只保存其请求的信号。batch 内出现 Session 未请求的
-	// 四类核心信号（CPU/IO/SCHED，协议违规，如 CPU-only Session 携带 IO/sched
-	// 直方图）→ 拒绝入库。python_rss/db_snapshot 是独立数据通道（python 运行时
-	// 指标 / db_targets 巡检），不受 signals 选择器约束，允许照常入库。
+	// v3 为兼容旧 Agent 只强制四类核心信号；v4 的七类信号均为显式合同，
+	// payload 和零计数 signal_statuses 都不得越过 Session 请求集合。
 	if isV3 {
 		signalSet := continuousSessionSignalSet(session)
 		for signal := range continuousBatchSignalSet(req.Windows) {
-			if !continuousCoreSignal(signal) {
+			if req.SchemaVersion < continuousSchemaVersionV4 && !continuousCoreSignal(signal) {
 				continue
 			}
 			if !signalSet[signal] {
 				s.respondContinuousConflict(c, req, "窗口包含 Session 未请求的信号: "+signal)
+				return
+			}
+		}
+		if req.SchemaVersion >= continuousSchemaVersionV4 {
+			if message := validateContinuousV4Windows(req.Windows); message != "" {
+				s.respondContinuousConflict(c, req, message)
 				return
 			}
 		}
@@ -956,29 +988,49 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 				signalRows = continuousWindowSignalRowsV3(in)
 			}
 			for _, signal := range signalRows {
+				// 阶段三（协议 v4）：每信号采集状态。v3 批次无 signal_statuses
+				// 字段，按旧规则推断（有样本 → collected，否则 unknown）。
+				signalStatus := "unknown"
+				signalStatusReason := ""
+				signalLostEvents := uint64(0)
+				if status, ok := in.SignalStatuses[signal.SignalType]; ok && status.Status != "" {
+					signalStatus = status.Status
+					signalStatusReason = status.Reason
+					signalLostEvents = status.LostEvents
+				} else if isV3 {
+					if continuousWindowSignalHasData(in, signal.SignalType) {
+						signalStatus = "collected"
+					}
+				}
 				window := model.ProfileWindow{
-					SessionSID:          req.SessionSID,
-					BatchBID:            req.BatchID,
-					WindowStart:         in.WindowStart,
-					WindowEnd:           in.WindowEnd,
-					ObjectKey:           firstNonEmpty(in.ObjectKey, req.ObjectKey),
-					SampleCount:         clampContinuousCount(continuousWindowSampleCount(in, signal.SignalType)),
-					SignalType:          signal.SignalType,
-					SchemaVersion:       firstNonZeroUint32(in.SchemaVersion, req.SchemaVersion),
-					WindowID:            in.WindowID,
-					CollectorGeneration: firstNonEmpty(in.CollectorGeneration, req.CollectorGeneration),
-					TargetFingerprint:   in.TargetFingerprint,
-					ContentSHA256:       in.ContentSHA256,
-					SignalCounts:        continuousSignalCountsJSON(windowSignalCounts[wi]),
-					Backend:             signal.Backend,
-					Labels:              labels,
-					ProfileFormat:       firstNonEmpty(in.ProfileFormat, req.ProfileFormat, "json"),
-					BackendStatus:       firstNonEmpty(in.BackendStatus, req.BackendStatus, "ok"),
-					BackendReason:       firstNonEmpty(in.BackendReason, req.BackendReason),
-					AttemptedBackends:   mustJSONBytes(firstNonEmptySlice(in.AttemptedBackends, req.AttemptedBackends)),
-					SelectedBackend:     firstNonEmpty(in.SelectedBackend, req.SelectedBackend),
-					SymbolRefs:          symbolRefs,
-					CreatedAt:           now,
+					SessionSID:            req.SessionSID,
+					BatchBID:              req.BatchID,
+					WindowStart:           in.WindowStart,
+					WindowEnd:             in.WindowEnd,
+					ObjectKey:             firstNonEmpty(in.ObjectKey, req.ObjectKey),
+					SampleCount:           clampContinuousCount(continuousWindowSampleCount(in, signal.SignalType)),
+					SignalType:            signal.SignalType,
+					SchemaVersion:         firstNonZeroUint32(in.SchemaVersion, req.SchemaVersion),
+					WindowID:              in.WindowID,
+					CollectorGeneration:   firstNonEmpty(in.CollectorGeneration, req.CollectorGeneration),
+					TargetFingerprint:     in.TargetFingerprint,
+					ContentSHA256:         in.ContentSHA256,
+					SignalCounts:          continuousSignalCountsJSON(windowSignalCounts[wi]),
+					Backend:               signal.Backend,
+					Labels:                labels,
+					ProfileFormat:         firstNonEmpty(in.ProfileFormat, req.ProfileFormat, "json"),
+					BackendStatus:         firstNonEmpty(in.BackendStatus, req.BackendStatus, "ok"),
+					BackendReason:         firstNonEmpty(in.BackendReason, req.BackendReason),
+					AttemptedBackends:     mustJSONBytes(firstNonEmptySlice(in.AttemptedBackends, req.AttemptedBackends)),
+					SelectedBackend:       firstNonEmpty(in.SelectedBackend, req.SelectedBackend),
+					SymbolRefs:            symbolRefs,
+					SignalStatus:          signalStatus,
+					SignalStatusReason:    signalStatusReason,
+					SignalLostEvents:      signalLostEvents,
+					PhysicalSampleRateHz:  in.PhysicalSampleRateHz,
+					EffectiveSampleRateHz: in.EffectiveSampleRateHz,
+					IdentityUnavailable:   in.IdentityUnavailable,
+					CreatedAt:             now,
 				}
 				// 阶段一 v3：窗口级幂等/冲突。同一 (session, window_id, signal_type)
 				// 已存在时：内容摘要相同 → 跳过（不重复计数）；不同 → 内容冲突。
@@ -2611,7 +2663,9 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 		missing, _ := raw["missing"].([]interface{})
 		for _, value := range missing {
 			pid := int(numberAsFloat64(value))
-			key := strconv.Itoa(pid)
+			// 阶段三：runtime map 诊断只有裸 PID（无 start/exe），用
+			// "pid|" 前缀键避免与 py-spy/Memray 的完整实例键冲突。
+			key := "pid|" + strconv.Itoa(pid)
 			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "perf-map", Status: "missing", Reason: reason}
 			diag.Detected[key] = process
 			diag.Missing[key] = process
@@ -2619,7 +2673,7 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 		readyPIDs, _ := raw["ready_pids"].([]interface{})
 		for _, value := range readyPIDs {
 			pid := int(numberAsFloat64(value))
-			key := strconv.Itoa(pid)
+			key := "pid|" + strconv.Itoa(pid)
 			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "perf-map", Status: "ready"}
 			diag.Detected[key] = process
 			diag.Ready[key] = process
@@ -2633,7 +2687,11 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 		for _, value := range items {
 			item, _ := value.(map[string]interface{})
 			pid := int(numberAsFloat64(item["pid"]))
-			key := strconv.Itoa(pid)
+			// 阶段三：py-spy 诊断用完整实例键（pid|start|exe）去重，PID
+			// 复用显示为两个实例。
+			startMs := int64(numberAsFloat64(item["process_start_ms"]))
+			exe, _ := item["exe"].(string)
+			key := "pid|" + strconv.Itoa(pid) + "|" + strconv.FormatInt(startMs, 10) + "|" + exe
 			reason, _ := item["reason"].(string)
 			status := "ready"
 			if field == "failed" {
@@ -2642,7 +2700,7 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 					python.Reasons[reason] = true
 				}
 			}
-			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "py-spy", Status: status, Reason: reason}
+			process := ProfileRuntimeProcessDiagnostic{PID: pid, ProcessStartMs: startMs, Exe: exe, Mode: "py-spy", Status: status, Reason: reason}
 			python.Detected[key] = process
 			python.Modes["py-spy"] = true
 			if status == "ready" {
@@ -2658,7 +2716,10 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 		for _, value := range items {
 			item, _ := value.(map[string]interface{})
 			pid := int(numberAsFloat64(item["pid"]))
-			key := "memory|" + strconv.Itoa(pid)
+			// 阶段三：Memray 诊断用完整实例键去重。
+			startMs := int64(numberAsFloat64(item["process_start_ms"]))
+			exe, _ := item["exe"].(string)
+			key := "memory|" + strconv.Itoa(pid) + "|" + strconv.FormatInt(startMs, 10) + "|" + exe
 			reason, _ := item["reason"].(string)
 			status := "ready"
 			if field == "failed" {
@@ -2667,7 +2728,7 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 					python.Reasons[reason] = true
 				}
 			}
-			process := ProfileRuntimeProcessDiagnostic{PID: pid, Mode: "memray", Status: status, Reason: reason}
+			process := ProfileRuntimeProcessDiagnostic{PID: pid, ProcessStartMs: startMs, Exe: exe, Mode: "memray", Status: status, Reason: reason}
 			python.Detected[key] = process
 			python.Modes["memray"] = true
 			if status == "ready" {
@@ -2738,11 +2799,9 @@ func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if len(q.Filters) > 0 {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
-			"当前延迟 histogram 不支持 PID/进程标签过滤，请在 CPU 视图使用实例筛选")
-		return
-	}
+	// 阶段三：histogram 支持实例过滤（pid/process_start_ms/process_instance/
+	// exe），与 CPU 查询共用同一过滤语义。strict CO-RE 直方图带完整进程身份
+	// 可按实例查询；degraded 无法安全归属的直方图（pid=0）在查询层被排除。
 	signalType := strings.ToLower(strings.TrimSpace(c.Query("signal_type")))
 	if signalType == "" {
 		signalType = strings.ToLower(strings.TrimSpace(c.Query("profile_type")))
@@ -2836,6 +2895,12 @@ func (s *APIServer) queryNativeContinuousHistogram(ctx context.Context, q Profil
 				}
 				for _, hist := range window.Histograms {
 					if strings.ToLower(strings.TrimSpace(hist.SignalType)) != signalType {
+						continue
+					}
+					// 阶段三：实例过滤。strict CO-RE 直方图带完整进程身份
+					// 可按实例查询；pid=0 的整机直方图（degraded 无法安全
+					// 归属）在实例过滤查询中被排除，不静默混入。
+					if !continuousHistogramMatchesFilters(hist, q.Filters) {
 						continue
 					}
 					if hist.Backend != "" {
@@ -3102,6 +3167,38 @@ func continuousSampleMatches(sample ContinuousStackSample, windowLabels map[stri
 			continue
 		}
 		if continuousSampleLabel(sample, windowLabels, key) != want {
+			return false
+		}
+	}
+	return true
+}
+
+// 阶段三：histogram 实例过滤（与 CPU 查询共用同一过滤语义）。strict CO-RE
+// 直方图带完整进程身份可按实例查询；pid=0 的整机直方图（degraded 无法安全
+// 归属）在实例过滤查询中被排除，不静默混入。
+func continuousHistogramMatchesFilters(hist ContinuousHistogramIngest, filters map[string]interface{}) bool {
+	if len(filters) == 0 {
+		return true
+	}
+	// 实例过滤：pid/process_start_ms/process_instance/exe。
+	if want := labelString(filters, "pid"); want != "" {
+		if hist.PID <= 0 || strconv.Itoa(hist.PID) != want {
+			return false
+		}
+	}
+	if want := labelString(filters, "process_start_ms"); want != "" {
+		if hist.ProcessStartMs <= 0 || strconv.FormatInt(hist.ProcessStartMs, 10) != want {
+			return false
+		}
+	}
+	if want := labelString(filters, "process_instance"); want != "" {
+		if hist.PID <= 0 || hist.ProcessStartMs <= 0 ||
+			strconv.Itoa(hist.PID)+"|"+strconv.FormatInt(hist.ProcessStartMs, 10) != want {
+			return false
+		}
+	}
+	if want := labelString(filters, "exe"); want != "" {
+		if hist.Exe == "" || hist.Exe != want {
 			return false
 		}
 	}
@@ -3840,10 +3937,98 @@ func continuousWindowSignalRowsV3(window ContinuousWindowIngest) []continuousSig
 	if len(window.DBSnapshots) > 0 {
 		add("db_snapshot", "db_system_views")
 	}
+	for signal := range window.SignalStatuses {
+		add(signal, "")
+	}
 	if len(rows) == 0 {
 		add(firstNonEmpty(window.SignalType, "cpu_profile"), window.Backend)
 	}
 	return rows
+}
+
+func validateContinuousV4Windows(windows []ContinuousWindowIngest) string {
+	allowedStatus := map[string]bool{
+		"collected": true, "target_idle": true, "no_events": true,
+		"unavailable": true, "failed": true, "unknown": true,
+	}
+	allowedSignal := map[string]bool{}
+	for _, signal := range continuousAllSignals {
+		allowedSignal[signal] = true
+	}
+	for _, window := range windows {
+		if window.PhysicalSampleRateHz < 0 || window.EffectiveSampleRateHz < 0 {
+			return "v4 窗口采样率不能为负数"
+		}
+		if window.IdentityUnavailable > continuousMaxDBCount {
+			return "v4 窗口 identity_unavailable_count 超出范围"
+		}
+		for signal, status := range window.SignalStatuses {
+			normalized := strings.ToLower(strings.TrimSpace(signal))
+			if normalized != signal || !allowedSignal[normalized] {
+				return "v4 窗口包含未知 signal_statuses 信号: " + signal
+			}
+			if !allowedStatus[status.Status] {
+				return "v4 窗口包含未知采集状态: " + status.Status
+			}
+			if len(status.Reason) > 512 {
+				return "v4 窗口采集状态原因超过 512 字节"
+			}
+			if status.LostEvents > continuousMaxDBCount {
+				return "v4 窗口 lost_events 超出范围"
+			}
+			hasData := continuousWindowSignalHasData(window, normalized)
+			if status.Status == "collected" && !hasData {
+				return "v4 窗口将零数据信号标记为 collected: " + normalized
+			}
+			if (status.Status == "target_idle" || status.Status == "no_events") && hasData {
+				return "v4 窗口的空闲状态与实际数据冲突: " + normalized
+			}
+		}
+		for _, signal := range continuousAllSignals {
+			if continuousWindowSignalHasData(window, signal) {
+				if _, ok := window.SignalStatuses[signal]; !ok {
+					return "v4 窗口数据缺少 signal_statuses: " + signal
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// 阶段三：窗口是否包含某信号的真实数据（v3 批次无 signal_statuses 时按
+// 内容推断状态：有样本 → collected，否则 unknown）。
+func continuousWindowSignalHasData(window ContinuousWindowIngest, signalType string) bool {
+	signalType = strings.ToLower(strings.TrimSpace(signalType))
+	switch signalType {
+	case "cpu_profile":
+		if len(window.Samples) > 0 {
+			return true
+		}
+		for _, profile := range window.Profiles {
+			if strings.ToLower(strings.TrimSpace(firstNonEmpty(profile.SignalType, "cpu_profile"))) == "cpu_profile" &&
+				len(profile.Samples) > 0 {
+				return true
+			}
+		}
+	case "python_memory":
+		for _, profile := range window.Profiles {
+			if strings.ToLower(strings.TrimSpace(firstNonEmpty(profile.SignalType, "cpu_profile"))) == "python_memory" &&
+				len(profile.Samples) > 0 {
+				return true
+			}
+		}
+	case "python_rss":
+		return len(window.Metrics) > 0
+	case "db_snapshot":
+		return len(window.DBSnapshots) > 0
+	default:
+		for _, hist := range window.Histograms {
+			if strings.ToLower(strings.TrimSpace(hist.SignalType)) == signalType && !hist.Unavailable {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func continuousWindowSampleCount(window ContinuousWindowIngest, signalType string) uint64 {

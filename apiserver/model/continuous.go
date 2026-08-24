@@ -233,7 +233,16 @@ type ProfileWindow struct {
 	AttemptedBackends   []byte    `gorm:"column:attempted_backends;type:jsonb" json:"attempted_backends"`
 	SelectedBackend     string    `gorm:"column:selected_backend;size:64" json:"selected_backend"`
 	SymbolRefs          []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
-	CreatedAt           time.Time `gorm:"column:created_at" json:"created_at"`
+	// 阶段三（协议 v4）：每信号采集状态（collected/target_idle/no_events/
+	// unavailable/failed/unknown）、reason、lost events、物理/生效采样率、
+	// 身份不完整被丢弃的样本数。旧行默认为 unknown/0。
+	SignalStatus          string `gorm:"column:signal_status;size:16;default:unknown" json:"signal_status"`
+	SignalStatusReason    string `gorm:"column:signal_status_reason;size:512;default:''" json:"signal_status_reason"`
+	SignalLostEvents      uint64 `gorm:"column:signal_lost_events;default:0" json:"signal_lost_events"`
+	PhysicalSampleRateHz  int    `gorm:"column:physical_sample_rate_hz;default:0" json:"physical_sample_rate_hz"`
+	EffectiveSampleRateHz int    `gorm:"column:effective_sample_rate_hz;default:0" json:"effective_sample_rate_hz"`
+	IdentityUnavailable   uint64 `gorm:"column:identity_unavailable_count;default:0" json:"identity_unavailable_count"`
+	CreatedAt             time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
 // ContinuousRepairAudit 阶段一历史重复修复审计表：每次 repair run 把"同一逻辑

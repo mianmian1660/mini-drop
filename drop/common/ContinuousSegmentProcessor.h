@@ -163,7 +163,13 @@ struct HistogramPayload
     double p99 = 0;
     bool unavailable = false;
     std::string reason;
+    // 阶段三：完整进程身份（strict CO-RE 按 TGID 归属；degraded bpftrace
+    // 无法安全归属时 pid=0 且 unavailable）。process Session fan-out 必须
+    // pid + process_start_ms + exe 三项精确匹配。
     int pid = 0;
+    int64_t processStartMs = 0;
+    std::string exe;
+    std::string comm;
 };
 
 // 结构化数据库快照（SQL digest 聚合 / 锁等待链），与标量 MetricPayload 并存
@@ -198,6 +204,73 @@ inline bool logical_signal_requested(const std::vector<std::string> &requested, 
             return true;
     return false;
 }
+
+// ============================================================
+// 阶段三：统一进程身份与 Session 投影器
+// ============================================================
+
+// 统一 ProcessIdentity：所有样本、profile、metric、histogram、runtime、Go、
+// py-spy、Memray 诊断统一引用该身份类型。process Session 必须
+// pid + process_start_ms + exe 三项精确相等；身份缺失（complete()==false）
+// 时不得猜测归属，对应数据丢弃并记录 identity_unavailable。
+struct ProcessIdentity
+{
+    int pid = 0;
+    int64_t processStartMs = 0;
+    std::string exe;
+    std::string comm;
+
+    bool complete() const { return pid > 0 && processStartMs > 0 && !exe.empty(); }
+    std::string key() const
+    {
+        return std::to_string(pid) + "|" + std::to_string(processStartMs) + "|" + exe;
+    }
+};
+
+// 每 signal 的采集状态（v4 窗口序列化 + 状态窗口登记）。
+enum class SignalCollectionStatus
+{
+    Collected,     // 有真实数据
+    TargetIdle,    // 目标空闲/无事件（零计数但窗口存在）
+    NoEvents,      // 无事件（非目标空闲，如直方图无样本）
+    Unavailable,   // backend 不可用/无法安全归属
+    Failed,        // 采集失败
+    Unknown,       // 旧数据/未登记
+};
+
+inline const char *signal_status_name(SignalCollectionStatus status)
+{
+    switch (status)
+    {
+    case SignalCollectionStatus::Collected: return "collected";
+    case SignalCollectionStatus::TargetIdle: return "target_idle";
+    case SignalCollectionStatus::NoEvents: return "no_events";
+    case SignalCollectionStatus::Unavailable: return "unavailable";
+    case SignalCollectionStatus::Failed: return "failed";
+    default: return "unknown";
+    }
+}
+
+struct SignalStatus
+{
+    SignalCollectionStatus status = SignalCollectionStatus::Unknown;
+    std::string reason;
+    uint64_t lostEvents = 0;
+};
+
+// SessionContract：Session 投影所需的全部合同信息（SID、scope、targets、
+// signals、请求采样率、聚合周期、降级策略）。由 ContinuousSessionManager
+// 从 assignment 构造，SessionFanoutProjector 只依赖它做纯逻辑投影。
+struct SessionContract
+{
+    std::string sid;
+    std::string scope = "host"; // "host" | "process"
+    std::vector<ContinuousTargetProcess> targets;
+    std::vector<std::string> signals; // 请求信号（空 = 默认四类核心）
+    int requestedSampleRateHz = 19;
+    int aggregationWindowSec = 10;
+    bool allowDegraded = false;
+};
 
 // ============================================================
 // 物理层符号化诊断（结构化，供 Session 分流后重新计算，不提前固化为 JSON）
@@ -284,6 +357,18 @@ struct WindowPayload
     // 阶段一：逻辑窗口稳定 ID（内容摘要不参与 ID）与窗口内容摘要（冲突检测）。
     std::string windowID;
     std::string contentSHA256;
+    // 阶段三：物理采集器 generation（fan-out 降采样稳定键与 v4 序列化用）。
+    std::string collectorGeneration;
+    // 阶段三：物理采样率与 Session 生效采样率（v4 序列化）。低频 Session 在
+    // fan-out 时确定性降采样，effective 反映降采样后的实际频率。
+    int physicalSampleRateHz = 0;
+    int effectiveSampleRateHz = 0;
+    // 阶段三：每 signal 采集状态（collected/target_idle/no_events/unavailable/
+    // failed + reason + lost events）。零计数窗口也保留状态，使 coverage 能
+    // 区分 idle/no-events、backend unavailable 和真实 gap。
+    std::map<std::string, SignalStatus> signalStatuses;
+    // 阶段三：身份不完整被丢弃的样本数（process Session 无法归属时记录）。
+    uint64_t identityUnavailableCount = 0;
 };
 
 // ============================================================
@@ -403,6 +488,10 @@ inline int process_tgid(int pid)
     return pid;
 }
 
+// 阶段三：严格目标匹配。process Session 必须 pid + process_start_ms + exe
+// 三项精确相等；样本身份缺失（start time 或 exe 为空）时不得放宽匹配——
+// 放宽会让 PID 复用后的新进程数据错误进入旧实例 Session。host Session 恒
+// 返回 true（整机数据）。
 inline bool process_targeted(const ContinuousSamplerConfig &cfg,
                              int pid,
                              int64_t processStartMs,
@@ -411,9 +500,8 @@ inline bool process_targeted(const ContinuousSamplerConfig &cfg,
     if (cfg.scope != "process")
         return true;
     for (const auto &target : cfg.targetProcesses)
-        if (target.pid == pid &&
-            (processStartMs <= 0 || target.processStartMs <= 0 || processStartMs == target.processStartMs) &&
-            (cfg.selectorExe.empty() || exe.empty() || exe == cfg.selectorExe))
+        if (target.pid == pid && target.processStartMs > 0 && !target.exe.empty() &&
+            processStartMs == target.processStartMs && exe == target.exe)
             return true;
     return false;
 }
@@ -421,6 +509,19 @@ inline bool process_targeted(const ContinuousSamplerConfig &cfg,
 inline bool process_targeted(const ContinuousSamplerConfig &cfg, int pid, const std::string &exe)
 {
     return process_targeted(cfg, pid, 0, exe);
+}
+
+// 按 ProcessIdentity 严格匹配（供 SessionFanoutProjector 使用）。
+inline bool identity_targeted(const std::vector<ContinuousTargetProcess> &targets,
+                              const ProcessIdentity &identity)
+{
+    if (!identity.complete())
+        return false;
+    for (const auto &target : targets)
+        if (target.pid == identity.pid && target.processStartMs > 0 && !target.exe.empty() &&
+            identity.processStartMs == target.processStartMs && identity.exe == target.exe)
+            return true;
+    return false;
 }
 
 inline int64_t configured_process_start_ms(const ContinuousSamplerConfig &cfg, int pid)
@@ -1027,8 +1128,11 @@ inline std::string python_fallback_json(const std::vector<drop::PythonFallbackRe
         if (!firstReady)
             body += ",";
         firstReady = false;
+        // 阶段三：py-spy 诊断携带完整进程身份（pid+process_start_ms+exe）。
         body += "{\"pid\":" + std::to_string(result.pid) +
-                ",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) + "}";
+                ",\"process_start_ms\":" + std::to_string(result.startMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) + "}";
     }
     body += "],\"failed\":[";
     bool firstFailed = true;
@@ -1040,7 +1144,9 @@ inline std::string python_fallback_json(const std::vector<drop::PythonFallbackRe
             body += ",";
         firstFailed = false;
         body += "{\"pid\":" + std::to_string(result.pid) +
-                ",\"reason\":\"" + json_escape(result.reason) + "\"}";
+                ",\"process_start_ms\":" + std::to_string(result.startMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"reason\":\"" + json_escape(result.reason) + "\"}";
     }
     body += "],\"limited_count\":" + std::to_string(limitedCount) + "}";
     return body;
@@ -1093,7 +1199,12 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
         if (!result.ready) continue;
         if (!firstMemrayReady) body += ",";
         firstMemrayReady = false;
-        body += "{\"pid\":" + std::to_string(result.pid) + ",\"profile_id\":\"" + json_escape(result.profileID) + "\"}";
+        // 阶段三：Memray 诊断携带完整进程身份（pid+process_start_ms+exe），
+        // 服务端按实例键去重，PID 复用显示为两个实例。
+        body += "{\"pid\":" + std::to_string(result.pid) +
+                ",\"process_start_ms\":" + std::to_string(result.processStartMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"profile_id\":\"" + json_escape(result.profileID) + "\"}";
     }
     body += "],\"failed\":[";
     bool firstMemrayFailed = true;
@@ -1102,7 +1213,10 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
         if (result.ready) continue;
         if (!firstMemrayFailed) body += ",";
         firstMemrayFailed = false;
-        body += "{\"pid\":" + std::to_string(result.pid) + ",\"reason\":\"" + json_escape(result.reason) + "\"}";
+        body += "{\"pid\":" + std::to_string(result.pid) +
+                ",\"process_start_ms\":" + std::to_string(result.processStartMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"reason\":\"" + json_escape(result.reason) + "\"}";
     }
     body += "]}";
     body += "}";
@@ -1185,13 +1299,6 @@ void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
                                   const std::vector<drop::PythonFallbackResult> &pythonResults,
                                   bool *anyReplaced = nullptr);
 
-/// strict 异步 fallback：调用方先暂存 capture 期间处理出的 perf windows；全部
-/// py-spy future 完成后，本函数从所有重叠窗口删除同一 PID/start 的 perf 样本，
-/// 并追加一个使用真实 capture 起止时间的 py-spy sidecar window。
-void apply_python_sidecars_to_windows(std::vector<WindowPayload> *windows,
-                                      const std::vector<drop::PythonFallbackResult> &pythonResults,
-                                      size_t pythonLimitedCount = 0);
-
 /// 阶段二：Session 分流后重算 symbol_refs。physicalJson 为物理 symbol_refs
 /// （host Session 直接复用）；process Session 用 filteredSamples 重新计算
 /// frame 统计与 build-id，并只保留本 Session 的 runtime PID，杜绝跨 selector
@@ -1200,5 +1307,52 @@ std::string rebuild_filtered_symbol_refs(const std::string &physicalJson,
                                          const PhysicalDiagnostics &diagnostics,
                                          const std::vector<AggregatedSample> &filteredSamples,
                                          const ContinuousSamplerConfig &session);
+
+/// 用结构化诊断和最终窗口样本生成 Session 专属 symbol_refs。host Session
+/// 也重新序列化，避免多 slice 聚合后沿用最后一个 slice 的 JSON。
+std::string build_session_symbol_refs(const PhysicalDiagnostics &diagnostics,
+                                      const std::vector<AggregatedSample> &samples,
+                                      const ContinuousSamplerConfig &session);
+
+// ============================================================
+// 阶段三：SessionFanoutProjector — 物理窗口 → Session 逻辑窗口的纯逻辑投影
+// ============================================================
+// 共享采集循环不再分别手写过滤规则；所有 Session 分流统一走这里：
+//   1. 按 SessionContract.signals 严格过滤 samples/profiles/metrics/
+//      histograms/dbSnapshots（profiles 按各自 signal_type 过滤，不能因 CPU
+//      未启用而整体清空）。
+//   2. process scope：按 ProcessIdentity（pid+process_start_ms+exe）精确过滤；
+//      身份缺失/进程退出/PID 复用 → 丢弃并记录 identity_unavailable。
+//   3. 确定性按比例降采样：requested_hz < physical_hz 时用最大余数法在聚合
+//      stack 间分配样本数，相同余数用稳定排序键保证重试结果与 content hash
+//      稳定；不放大样本，极低流量窗口允许零样本并上报 target_idle。
+//   4. 重建 process Session 的 symbol_refs（复用 rebuild_filtered_symbol_refs）。
+//   5. 直方图按 signal + 身份过滤；无法安全归属的 degraded 路径标记
+//      unavailable，不得复制整机直方图。
+//   6. 每 signal 登记状态（collected/target_idle/no_events/unavailable/
+//      failed），零计数窗口也保留，使 coverage 能区分 idle 与真实 gap。
+class SessionFanoutProjector
+{
+public:
+    /// 纯函数投影。physical 为物理窗口（含物理诊断与物理采样率）；
+    /// contract 为 Session 合同；physicalSampleRateHz 为物理采集频率；
+    /// histogramAttributionSafe=false 表示当前 backend 无法把直方图安全归属
+    /// 到单个 selector（多进程 + 滚动 bpftrace fallback），此时对请求了该
+    /// 信号的 Session 只登记 unavailable 状态窗口。
+    /// 返回投影后的 Session 窗口；即使零计数也返回（状态窗口），调用方据此
+    /// 决定是否持久化。
+    WindowPayload Project(const WindowPayload &physical,
+                          const SessionContract &contract,
+                          int physicalSampleRateHz,
+                          bool histogramAttributionSafe) const;
+
+    /// 确定性降采样（纯函数，供测试直接驱动）：把 filteredSamples 按
+    /// requested/physical 比例降采样。返回降采样后的样本；不放大样本。
+    static std::vector<AggregatedSample> DownsampleDeterministic(
+        const std::vector<AggregatedSample> &samples,
+        uint64_t requestedHz,
+        uint64_t physicalHz,
+        const std::string &stabilityKey);
+};
 
 } // namespace drop
