@@ -12,6 +12,10 @@
 #include "common/SymbolCollector.h"
 #include "common/KernelSymbols.h"
 #include "common/Utils.h"
+// 阶段二：统一 strict/degraded 的 perf 段处理流水线（payload 类型、解析辅助、
+// ContinuousSegmentProcessor）。连续采样器的 strict/degraded 引擎都通过它处理
+// 不可变 perf.data 段，共享符号准备、解析、runtime 分类与诊断生成。
+#include "common/ContinuousSegmentProcessor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -45,8 +49,6 @@ namespace drop
 namespace
 {
 
-struct WindowPayload;
-
 struct RollingPerfRecorder
 {
     pid_t pid = -1;
@@ -55,8 +57,17 @@ struct RollingPerfRecorder
     int64_t wallStartMs = 0;
     int64_t monotonicStartMs = 0;
     bool Start(const ContinuousSamplerConfig &, std::string *error);
-    bool HasParseableOutput() const;
-    std::vector<WindowPayload> Drain(const ContinuousSamplerConfig &, bool final);
+    // 阶段二：RollingPerfRecorder 只负责启动、轮转、枚举与确认删除不可变
+    // segment，不再自行执行 perf script 或 runtime 分类（统一交给
+    // ContinuousSegmentProcessor）。Drain 返回尚未交付的不可变段，不删除；
+    // 处理成功后调用 Confirm(path)（删除并记录），最终失败调用 Abandon(path)
+    // （删除并记录，形成真实 coverage gap）。
+    std::vector<PerfSegment> Drain(const ContinuousSamplerConfig &, bool final);
+    void Confirm(const std::string &path);
+    void Abandon(const std::string &path);
+    // 积压保护：已关闭滚动文件组成的磁盘有界队列。
+    size_t PendingSegmentCount() const;
+    uint64_t PendingSegmentBytes() const;
     void Stop();
 };
 
@@ -102,7 +113,6 @@ static std::vector<std::string> rolling_perf_files(const std::string &directory,
 static double strict_histogram_low(uint32_t slot);
 static void append_core_histograms(WindowPayload *, const ContinuousSamplerConfig &,
                                    const std::vector<CoreHistogramSample> &, uint64_t lost);
-static constexpr uint64_t kMaxDBCount = (1ULL << 63) - 1;
 
 struct SpoolRetryState
 {
@@ -268,16 +278,8 @@ static std::string physical_signals_from_requested(const std::vector<std::string
     return out;
 }
 
-// 判断逻辑信号名是否被 requestedSignals 请求（空集合 = 全部请求）。
-static bool logical_signal_requested(const std::vector<std::string> &requested, const std::string &logical)
-{
-    if (requested.empty())
-        return true;
-    for (const auto &signal : requested)
-        if (signal == logical)
-            return true;
-    return false;
-}
+// logical_signal_requested 现由 common/ContinuousSegmentProcessor.h 提供
+// （drop::logical_signal_requested，inline），连续采样器 fan-out 与 processor 共用。
 
 // ============================================================
 // 阶段一：collector generation / target fingerprint
@@ -478,20 +480,8 @@ static std::string batch_id_from_spool_path(const std::string &path)
     return name;
 }
 
-static uint64_t clamp_count(uint64_t value)
-{
-    return value > kMaxDBCount ? kMaxDBCount : value;
-}
-
-static uint64_t add_count(uint64_t total, uint64_t value)
-{
-    value = clamp_count(value);
-    if (total >= kMaxDBCount || value >= kMaxDBCount)
-        return kMaxDBCount;
-    if (total > kMaxDBCount - value)
-        return kMaxDBCount;
-    return total + value;
-}
+// clamp_count / add_count / kMaxDBCount 现由 common/ContinuousSegmentProcessor.h
+// 提供（drop::，inline），连续采样器与 processor 共用同一份实现。
 
 static bool parse_count_strict(const std::string &text, uint64_t *out)
 {
@@ -520,129 +510,12 @@ static bool looks_like_bpftrace_error(const std::string &text)
            s.find("Unknown error") != std::string::npos;
 }
 
-struct AggregatedSample
-{
-    std::vector<std::string> stack;
-    std::vector<drop::ContinuousStackFrame> frames; // 阶段五：结构化栈（与 stack 并行，可能为空）
-    std::string comm;
-    int pid = 0;
-    int64_t processStartMs = 0;
-    std::string exe;
-    std::string stackScope;
-    std::string backend;
-    std::string runtime;
-    uint64_t count = 0;
-};
-
-// `perf script -F ...time...` prints the sample clock in seconds. Keep the
-// bounds alongside the parsed stacks so rolling files can retain the actual
-// capture interval instead of the (much later) parser wall-clock interval.
-struct PerfScriptParseResult
-{
-    std::vector<AggregatedSample> samples;
-    double startTimestampSec = 0.0;
-    double endTimestampSec = 0.0;
-    bool hasTimestamp = false;
-};
-
-struct ProfilePayload
-{
-    std::string signalType = "cpu_profile";
-    std::string backend;
-    std::string stackScope;
-    std::string profileID;
-    std::string unit = "samples";
-    std::string readyPath;
-    std::vector<AggregatedSample> samples;
-};
-
-struct MetricPayload
-{
-    std::string metric;
-    std::string unit;
-    std::string runtime;
-    std::string comm;
-    int pid = 0;
-    int64_t processStartMs = 0;
-    std::string exe;
-    int64_t timestampMs = 0;
-    uint64_t value = 0;
-};
-
-struct HistogramBucket
-{
-    std::string range;
-    double low = 0;
-    double high = 0;
-    uint64_t count = 0;
-};
-
-struct HistogramPayload
-{
-    std::string signalType;
-    std::string backend;
-    std::string unit = "us";
-    uint64_t eventCount = 0;
-    std::vector<HistogramBucket> buckets;
-    double min = 0;
-    double max = 0;
-    double p50 = 0;
-    double p95 = 0;
-    double p99 = 0;
-    bool unavailable = false;
-    std::string reason;
-    int pid = 0;
-};
-
-// 阶段二：结构化数据库快照（SQL digest 聚合 / 锁等待链），与阶段一的标量
-// MetricPayload 并存于同一个 WindowPayload。kind 区分两种语义，未用到的字段
-// 留空/留 0 即可（和 HistogramPayload 的 unavailable/reason 一样，不为每种
-// kind 单独开结构体，减少序列化分支）。
-struct DBSnapshotSample
-{
-    std::string kind;          // "digest" | "lock_wait"
-    std::string instanceLabel; // 对应 DBTargetConfig.instanceLabel
-    int64_t timestampMs = 0;
-
-    // kind == "digest"：跨轮次增量（本窗口内新发生的调用），不是累计值
-    std::string schemaName;
-    std::string digestText;     // 归一化 SQL（占位符形式），不落原始参数
-    uint64_t callCount = 0;
-    uint64_t totalLatencyUs = 0;
-    uint64_t rowsExaminedTotal = 0;
-
-    // kind == "lock_wait"
-    int64_t waitingPid = 0;
-    std::string waitingQuery;
-    int64_t blockingPid = 0;
-    std::string blockingQuery;
-    uint64_t waitSeconds = 0;
-    std::string lockedTable;
-};
-
-struct WindowPayload
-{
-    int64_t startMs = 0;
-    int64_t endMs = 0;
-    std::vector<AggregatedSample> samples;
-    std::vector<ProfilePayload> profiles;
-    std::vector<HistogramPayload> histograms;
-    std::vector<MetricPayload> metrics;
-    std::vector<DBSnapshotSample> dbSnapshots;
-    size_t rssTruncated = 0;
-    // Backend metadata (5-8: strict fallback strategy)
-    std::string backendStatus;                   // "ok" | "degraded" | "failed"
-    std::string backendReason;                   // human-readable reason
-    std::vector<std::string> attemptedBackends;  // ["core","bpftrace","perf"]
-    std::string selectedBackend;                 // "bpftrace" | "perf" | ""
-    // runtime map 符号化诊断（Java/Node/Python JIT perf map），序列化后写入
-    // 批次/窗口 JSON 的 symbol_refs，服务端据此推断 symbol_status。
-    std::string symbolRefsJson;
-    // 阶段一：逻辑窗口稳定 ID（内容摘要不参与 ID，见 make_window_id）与
-    // 窗口内容摘要（冲突检测）。
-    std::string windowID;
-    std::string contentSHA256;
-};
+// ============================================================
+// 阶段二：共享 payload 类型（AggregatedSample / ProfilePayload /
+// HistogramPayload / MetricPayload / DBSnapshotSample / WindowPayload /
+// PhysicalDiagnostics / PerfSegment / ContinuousSegmentProcessor）已统一移至
+// common/ContinuousSegmentProcessor.h（drop::），strict/degraded/测试共用同一套。
+// ============================================================
 
 // ============================================================
 // 阶段一：分信号计数 / 窗口内容摘要 / 窗口 ID / 批次内容摘要
@@ -813,24 +686,11 @@ static std::string signal_counts_json(const std::map<std::string, uint64_t> &cou
     return out;
 }
 
-static int64_t now_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-static bool env_enabled_default(const char *name, bool fallback)
-{
-    const char *value = std::getenv(name);
-    if (!value || !*value)
-        return fallback;
-    std::string text(value);
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return text == "1" || text == "true" || text == "yes" || text == "on";
-}
+// now_ms / monotonic_ms / rfc3339_from_ms / json_escape / perf_bin / read_exe /
+// process_tgid / process_targeted / configured_process_start_ms /
+// configured_process_exe / env_enabled_default / env_positive_int 已统一移至
+// common/ContinuousSegmentProcessor.h（drop::inline），连续采样器与 processor
+// 共用同一份实现，避免 strict/degraded 各写一套。
 
 // 阶段五：frames-only 模式（DROP_CONTINUOUS_FRAMES_ONLY=1）。
 // shadow/prefer 阶段同时发送 stack+frames；进入 v2-only 且回滚窗口结束后
@@ -839,151 +699,6 @@ static bool frames_only_mode()
 {
     static const bool enabled = env_enabled_default("DROP_CONTINUOUS_FRAMES_ONLY", false);
     return enabled;
-}
-
-static int env_positive_int(const char *name, int fallback)
-{
-    const char *value = std::getenv(name);
-    if (!value || !*value)
-        return fallback;
-    int parsed = std::atoi(value);
-    return parsed > 0 ? parsed : fallback;
-}
-
-static std::string rfc3339_from_ms(int64_t ms)
-{
-    std::time_t sec = static_cast<std::time_t>(ms / 1000);
-    int milliseconds = static_cast<int>(ms % 1000);
-    if (milliseconds < 0)
-    {
-        milliseconds += 1000;
-        --sec;
-    }
-    std::tm tm{};
-    gmtime_r(&sec, &tm);
-    char buf[40];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                  tm.tm_hour, tm.tm_min, tm.tm_sec, milliseconds);
-    return std::string(buf);
-}
-
-static std::string json_escape(const std::string &s)
-{
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s)
-    {
-        switch (c)
-        {
-        case '"':
-            out += "\\\"";
-            break;
-        case '\\':
-            out += "\\\\";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            break;
-        default:
-            out += c;
-        }
-    }
-    return out;
-}
-
-static bool file_exists_local(const std::string &path)
-{
-    struct stat st;
-    return stat(path.c_str(), &st) == 0;
-}
-
-static std::string perf_bin()
-{
-    const char *env = std::getenv("DROP_PERF_BIN");
-    if (env && *env)
-        return env;
-    if (file_exists_local("/usr/local/bin/perf-real"))
-        return "/usr/local/bin/perf-real";
-    return "perf";
-}
-
-static std::string read_exe(int pid)
-{
-    if (pid <= 0)
-        return "";
-    std::string path = "/proc/" + std::to_string(pid) + "/exe";
-    char buf[4096];
-    ssize_t n = readlink(path.c_str(), buf, sizeof(buf) - 1);
-    if (n <= 0)
-        return "";
-    buf[n] = '\0';
-    std::string exe(buf);
-    const std::string deletedSuffix = " (deleted)";
-    if (exe.size() > deletedSuffix.size() &&
-        exe.compare(exe.size() - deletedSuffix.size(), deletedSuffix.size(), deletedSuffix) == 0)
-        exe.resize(exe.size() - deletedSuffix.size());
-    return exe;
-}
-
-static int process_tgid(int pid)
-{
-    if (pid <= 0)
-        return pid;
-    std::ifstream in("/proc/" + std::to_string(pid) + "/status");
-    std::string key;
-    while (in >> key)
-    {
-        if (key == "Tgid:")
-        {
-            int tgid = 0;
-            in >> tgid;
-            return tgid > 0 ? tgid : pid;
-        }
-        std::string rest;
-        std::getline(in, rest);
-    }
-    return pid;
-}
-
-static bool process_targeted(const ContinuousSamplerConfig &cfg,
-                             int pid,
-                             int64_t processStartMs,
-                             const std::string &exe)
-{
-    if (cfg.scope != "process")
-        return true;
-    for (const auto &target : cfg.targetProcesses)
-        if (target.pid == pid &&
-            (processStartMs <= 0 || target.processStartMs <= 0 || processStartMs == target.processStartMs) &&
-            (cfg.selectorExe.empty() || exe.empty() || exe == cfg.selectorExe))
-            return true;
-    return false;
-}
-
-static bool process_targeted(const ContinuousSamplerConfig &cfg, int pid, const std::string &exe)
-{
-    return process_targeted(cfg, pid, 0, exe);
-}
-
-static int64_t configured_process_start_ms(const ContinuousSamplerConfig &cfg, int pid)
-{
-    for (const auto &target : cfg.targetProcesses)
-        if (target.pid == pid)
-            return target.processStartMs;
-    int64_t startMs = 0;
-    drop::python_process_start_ms(pid, &startMs);
-    return startMs;
-}
-
-static std::string configured_process_exe(const ContinuousSamplerConfig &cfg, int pid)
-{
-    for (const auto &target : cfg.targetProcesses)
-        if (target.pid == pid)
-            return target.exe;
-    return {};
 }
 
 static std::string target_pid_csv(const ContinuousSamplerConfig &cfg)
@@ -1041,769 +756,39 @@ static std::string bpftrace_target_predicate(const ContinuousSamplerConfig &cfg,
     return predicate.empty() ? "/0/" : "/" + predicate + "/";
 }
 
-static std::string parse_frame_name(const std::string &raw, int pid)
+static std::string python_fallback_scope_key(const ContinuousSamplerConfig &cfg)
 {
-    std::string line = drop::trim(raw);
-    if (line.empty())
-        return "";
-    std::istringstream iss(line);
-    std::string first;
-    iss >> first;
-    std::string rest;
-    std::getline(iss, rest);
-    std::string name = rest.empty() ? first : drop::trim(rest);
-    size_t paren = name.find(" (");
-    std::string dso;
-    if (paren != std::string::npos)
-    {
-        // perf script 解析失败时格式是 "[unknown] (<dso路径>)"——括号内的
-        // DSO 路径先取出来，符号解析成功时用不上（行为和之前一致，丢弃）。
-        size_t close = name.rfind(')');
-        if (close != std::string::npos && close > paren + 2)
-            dso = name.substr(paren + 2, close - paren - 2);
-        name = name.substr(0, paren);
-    }
-    if (name.empty())
-        name = first;
-    name = drop::trim(name);
-
-    // 子项1.2：解析失败时不再丢弃 DSO 信息，展示 "0x<addr> [<模块名>]"
-    // 而不是裸 [unknown]——只展示确定知道的信息（地址、DSO 归属），不猜
-    // 函数名，遵循 symbolization-design.md 的"宁可标记未解析"原则。
-    if (name == "[unknown]" && !dso.empty())
-    {
-        uint64_t address = std::strtoull(first.c_str(), nullptr, 16);
-        std::string goName;
-        if (address > 0 && drop::resolve_go_symbol(pid, dso, address, &goName))
-            return goName;
-        size_t slash = dso.rfind('/');
-        std::string base = slash == std::string::npos ? dso : dso.substr(slash + 1);
-        // perf 退化输出时 DSO 位置可能本身就是方括号占位符，比如
-        // "0x... [unknown] ([unknown])" 或 "[kernel.kallsyms]"——先剥掉外层
-        // 方括号，避免拼出 "0x... [[unknown]]" 这类双层括号。
-        if (base.size() >= 2 && base.front() == '[' && base.back() == ']')
-            base = base.substr(1, base.size() - 2);
-        if (base.empty() || base == "unknown")
-            return "0x" + first;
-        return "0x" + first + " [" + base + "]";
-    }
-    return name;
+    // Session SID 单独作为 key 会让 shared engine 的不同 generation 复用上一代
+    // PID 候选；PID 恰好被复用时可能 attach 到错误进程。generation 为空仅为
+    // 旧的独立 sampler 兼容。
+    return cfg.collectorGeneration.empty()
+               ? cfg.sessionSID
+               : cfg.sessionSID + ":" + cfg.collectorGeneration;
 }
 
-// ------------------------------------------------------------
-// 阶段五：perf script 行 → 结构化栈帧
-// ------------------------------------------------------------
-// perf script 每帧行的典型格式：
-//   "        7f1234abcdef symbol_name (/usr/lib/libc.so.6)"
-//   "        7f1234 [unknown] (/usr/lib/libc.so.6)"
-// 解析 IP/symbol/DSO，并从 /proc/pid/maps 的 mmap 信息计算 file-relative
-// normalized_offset；build-id 从 ELF 读取（有缓存）。取不到的字段如实留空
-// /0，不推测。
-// ------------------------------------------------------------
-
-// proc_maps_containing 在 /proc/pid/maps 中查找包含 address 且路径为 dsoPath
-// 的映射，返回映射 vaddr 基址与文件偏移（用于 file-relative offset）。
-static bool proc_maps_containing(int pid,
-                                 const std::string &dsoPath,
-                                 uint64_t address,
-                                 uint64_t *base,
-                                 uint64_t *fileOffset)
-{
-    if (pid <= 0 || dsoPath.empty() || address == 0)
-        return false;
-    std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
-    std::ifstream maps(mapsPath);
-    if (!maps.is_open())
-        return false;
-    std::string line;
-    while (std::getline(maps, line))
-    {
-        std::istringstream iss(line);
-        std::string range;
-        iss >> range;
-        size_t dash = range.find('-');
-        if (dash == std::string::npos)
-            continue;
-        uint64_t lo = std::strtoull(range.substr(0, dash).c_str(), nullptr, 16);
-        uint64_t hi = std::strtoull(range.substr(dash + 1).c_str(), nullptr, 16);
-        std::string perms;
-        iss >> perms;
-        std::string offsetHex;
-        iss >> offsetHex;
-        uint64_t offset = std::strtoull(offsetHex.c_str(), nullptr, 16);
-        // dev inode
-        std::string dev, inode;
-        iss >> dev >> inode;
-        std::string path;
-        std::getline(iss, path);
-        path = drop::trim(path);
-        if (path.empty())
-            continue;
-        // 匹配路径本身或 basename（perf 输出可能是相对名）
-        bool match = (path == dsoPath);
-        if (!match)
-        {
-            size_t slash = path.rfind('/');
-            std::string baseName = slash == std::string::npos ? path : path.substr(slash + 1);
-            size_t dslash = dsoPath.rfind('/');
-            std::string dsoBase = dslash == std::string::npos ? dsoPath : dsoPath.substr(dslash + 1);
-            match = (baseName == dsoBase);
-        }
-        if (!match)
-            continue;
-        if (address >= lo && address < hi)
-        {
-            if (base)
-                *base = lo;
-            if (fileOffset)
-                *fileOffset = offset;
-            return true;
-        }
-    }
-    return false;
-}
-
-static drop::ContinuousStackFrame parse_perf_frame(const std::string &raw, int pid)
-{
-    drop::ContinuousStackFrame frame;
-    frame.raw = drop::trim(raw);
-    if (frame.raw.empty())
-        return frame;
-    std::istringstream iss(frame.raw);
-    std::string first;
-    iss >> first;
-    std::string rest;
-    std::getline(iss, rest);
-    // IP：perf script 输出形如 "7a93e5545ca8"（无 0x 前缀）或 "0x7a93..."，
-    // 只按"全十六进制"判定，避免把符号名误当地址。
-    if (!first.empty())
-    {
-        bool allHex = true;
-        for (char ch : first)
-        {
-            if (!std::isxdigit(static_cast<unsigned char>(ch)))
-            {
-                allHex = false;
-                break;
-            }
-        }
-        if (allHex && first.size() >= 3)
-            frame.address = std::strtoull(first.c_str(), nullptr, 16);
-    }
-    // symbol 与 dso（perf 输出 "symbol (dso)"）
-    std::string name = drop::trim(rest);
-    size_t paren = name.find(" (");
-    if (paren != std::string::npos)
-    {
-        size_t close = name.rfind(')');
-        if (close != std::string::npos && close > paren + 2)
-            frame.mappingFile = name.substr(paren + 2, close - paren - 2);
-        name = drop::trim(name.substr(0, paren));
-    }
-    if (!name.empty() && name != "[unknown]")
-    {
-        frame.function = name;
-        frame.resolved = true;
-    }
-    // normalized_offset：mmap 信息（file-relative = address - vaddr + file_offset）
-    if (frame.address != 0 && !frame.mappingFile.empty())
-    {
-        uint64_t base = 0, fileOffset = 0;
-        if (proc_maps_containing(pid, frame.mappingFile, frame.address, &base, &fileOffset))
-        {
-            if (frame.address >= base)
-                frame.normalizedOffset = frame.address - base + fileOffset;
-        }
-        // build-id（ELF 读取，缓存友好）
-        std::string buildId;
-        if (drop::elf_gnu_build_id(frame.mappingFile, &buildId))
-            frame.buildId = buildId;
-    }
-    return frame;
-}
-
-// frames_to_json 序列化结构化栈（阶段五）。
-static std::string frames_to_json(const std::vector<drop::ContinuousStackFrame> &frames)
-{
-    if (frames.empty())
-        return "";
-    std::string out = "\"frames\":[";
-    for (size_t i = 0; i < frames.size(); ++i)
-    {
-        const auto &frame = frames[i];
-        if (i)
-            out += ",";
-        out += "{";
-        out += "\"function\":\"" + json_escape(frame.function) + "\",";
-        out += "\"raw\":\"" + json_escape(frame.raw) + "\",";
-        out += "\"file\":\"" + json_escape(frame.file) + "\",";
-        out += "\"line\":" + std::to_string(frame.line) + ",";
-        out += "\"address\":" + std::to_string(frame.address) + ",";
-        out += "\"mapping_file\":\"" + json_escape(frame.mappingFile) + "\",";
-        out += "\"build_id\":\"" + json_escape(frame.buildId) + "\",";
-        out += "\"normalized_offset\":" + std::to_string(frame.normalizedOffset) + ",";
-        out += std::string("\"resolved\":") + (frame.resolved ? "true" : "false");
-        out += "}";
-    }
-    out += "]";
-    return out;
-}
-
-static bool parse_sample_header(const std::string &line,
-                                std::string *comm,
-                                int *pid,
-                                double *timestampSec = nullptr)
-{
-    std::string trimmed = drop::trim(line);
-    if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == '\t')
-        return false;
-    // System-wide perf output includes a [CPU] column, while process-attached
-    // output from `perf record -p` does not. Both formats still have a numeric
-    // PID token followed by a timestamp containing ':'.
-    if (trimmed.find(':') == std::string::npos)
-        return false;
-    std::istringstream iss(trimmed);
-    std::string commToken, pidToken;
-    if (!(iss >> commToken >> pidToken))
-        return false;
-    size_t slash = pidToken.find('/');
-    if (slash != std::string::npos)
-        pidToken = pidToken.substr(0, slash);
-    int parsedPid = std::atoi(pidToken.c_str());
-    if (parsedPid <= 0)
-        return false;
-    *comm = commToken;
-    *pid = parsedPid;
-    if (timestampSec)
-    {
-        *timestampSec = 0.0;
-        std::string token;
-        while (iss >> token)
-        {
-            // The timestamp field is the only header token whose numeric
-            // value is immediately followed by ':'. This works for both
-            // `pid/tid [cpu] time:` and process-attached `pid tid time:`
-            // layouts emitted by perf versions in the supported images.
-            const size_t colon = token.find(':');
-            if (colon == std::string::npos || colon == 0)
-                continue;
-            const std::string number = token.substr(0, colon);
-            char *end = nullptr;
-            const double parsed = std::strtod(number.c_str(), &end);
-            if (!end || *end != '\0' || !std::isfinite(parsed) || parsed < 0.0)
-                continue;
-            // Event names can contain digits, but the timestamp contains a
-            // decimal point in perf's text format. Accept exponent notation
-            // too, while avoiding event tokens such as "v2:".
-            if (number.find('.') == std::string::npos && number.find('e') == std::string::npos &&
-                number.find('E') == std::string::npos)
-                continue;
-            *timestampSec = parsed;
-            break;
-        }
-    }
-    return true;
-}
-
-static void add_sample(std::map<std::string, AggregatedSample> *out,
-                       const std::string &comm,
-                       int pid,
-                       const std::vector<std::string> &rawStack,
-                       const std::vector<drop::ContinuousStackFrame> &rawFrames,
-                       const std::string &stackScope = "",
-                       const std::string &backend = "")
-{
-    if (rawStack.empty())
-        return;
-    // `perf script` reports the sampled thread ID for multithreaded runtimes
-    // such as Go and the JVM. Continuous process selectors are TGID-based, so
-    // normalize every sample before executable and start-time attribution.
-    pid = process_tgid(pid);
-    std::vector<std::string> stack = rawStack;
-    std::reverse(stack.begin(), stack.end());
-    std::vector<drop::ContinuousStackFrame> frames = rawFrames;
-    std::reverse(frames.begin(), frames.end());
-    std::string exe = read_exe(pid);
-    std::string key = comm + "|" + std::to_string(pid) + "|" + exe;
-    for (const auto &frame : stack)
-        key += "|" + frame;
-    AggregatedSample &sample = (*out)[key];
-    if (sample.count == 0)
-    {
-        sample.comm = comm;
-        sample.pid = pid;
-        sample.exe = exe;
-        sample.stack = stack;
-        sample.frames = frames;
-        sample.stackScope = stackScope;
-        sample.backend = backend;
-    }
-    sample.count++;
-}
-
-static PerfScriptParseResult parse_perf_script_result(const std::string &script)
-{
-    PerfScriptParseResult result;
-    std::map<std::string, AggregatedSample> byKey;
-    std::istringstream iss(script);
-    std::string line;
-    std::string currentComm;
-    int currentPid = 0;
-    std::vector<std::string> currentStack;
-    std::vector<drop::ContinuousStackFrame> currentFrames;
-    auto flush = [&]() {
-        add_sample(&byKey, currentComm, currentPid, currentStack, currentFrames);
-        currentComm.clear();
-        currentPid = 0;
-        currentStack.clear();
-        currentFrames.clear();
-    };
-    while (std::getline(iss, line))
-    {
-        if (drop::trim(line).empty())
-        {
-            flush();
-            continue;
-        }
-        std::string comm;
-        int pid = 0;
-        double timestampSec = 0.0;
-        if (parse_sample_header(line, &comm, &pid, &timestampSec))
-        {
-            flush();
-            currentComm = comm;
-            currentPid = pid;
-            if (timestampSec > 0.0)
-            {
-                if (!result.hasTimestamp)
-                {
-                    result.startTimestampSec = timestampSec;
-                    result.endTimestampSec = timestampSec;
-                    result.hasTimestamp = true;
-                }
-                else
-                {
-                    result.startTimestampSec = std::min(result.startTimestampSec, timestampSec);
-                    result.endTimestampSec = std::max(result.endTimestampSec, timestampSec);
-                }
-            }
-            continue;
-        }
-        if (!currentComm.empty() && (line[0] == ' ' || line[0] == '\t'))
-        {
-            std::string frame = parse_frame_name(line, currentPid);
-            if (!frame.empty())
-                currentStack.push_back(frame);
-            // 阶段五：结构化帧与旧字符串栈并行（frames-only 模式由
-            // 服务端按 frames 生成展示名称，这里始终发送两份保持兼容）。
-            drop::ContinuousStackFrame structured = parse_perf_frame(line, currentPid);
-            if (!structured.raw.empty())
-                currentFrames.push_back(structured);
-        }
-    }
-    flush();
-    result.samples.reserve(byKey.size());
-    for (auto &kv : byKey)
-        result.samples.push_back(kv.second);
-    return result;
-}
-
-static std::vector<AggregatedSample> parse_perf_script(const std::string &script)
-{
-    return parse_perf_script_result(script).samples;
-}
-
-static int64_t monotonic_ms()
-{
-    struct timespec ts = {};
-    if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-        return 0;
-    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
-}
-
-static int64_t perf_timestamp_to_unix_ms(double timestampSec,
-                                         int64_t wallAnchorMs,
-                                         int64_t monotonicAnchorMs)
-{
-    if (!std::isfinite(timestampSec) || timestampSec <= 0.0)
-        return 0;
-    // Some perf exporters print CLOCK_REALTIME seconds, while the native
-    // perf tool normally prints CLOCK_MONOTONIC seconds. Support both forms.
-    if (timestampSec >= 1000000000.0)
-        return static_cast<int64_t>(std::llround(timestampSec * 1000.0));
-    if (wallAnchorMs <= 0 || monotonicAnchorMs <= 0)
-        return 0;
-    return wallAnchorMs + static_cast<int64_t>(std::llround(timestampSec * 1000.0)) - monotonicAnchorMs;
-}
-
-// ------------------------------------------------------------
-// 任务1 + 子项1.1：perf script 解析之前的本地 build-id 缓存预热。
-// 详见 docs/continuous-symbolization-design.md 任务1。
-// ------------------------------------------------------------
-
-// 子项1.1：Agent 本地三态尝试缓存，避免每个窗口对已知读不到的 build-id
-// 反复做无用功。PerfEventSampler::Loop 和 DualTrackContinuousSampler::Loop
-// (经 std::async 调用 collect_window) 两条路径都可能触发预热，未确认二者
-// 是否会在同一进程内并发运行，加锁保安全。
-enum class BuildIdAttemptState
-{
-    TransientFail, // 这次没定位到，之后可能有别的进程映射同一二进制，值得重试
-    PermanentFail, // 确认读到的内容不是合法 ELF，再等也不会变好
-};
-
-struct BuildIdAttempt
-{
-    BuildIdAttemptState state;
-    int64_t retryAfterMs;  // 仅 TransientFail 有意义
-    int64_t lastTouchedMs; // 淘汰排序用；PermanentFail 的 retryAfterMs 固定是 0，不能复用它做排序
-};
-
-static std::mutex g_buildIdAttemptMutex;
-static std::map<std::string, BuildIdAttempt> g_buildIdAttempts;
-static constexpr int64_t kBuildIdTransientRetryMs = 5 * 60 * 1000; // 5 分钟
-// 长时间运行的 Agent 会遇到很多不同的 build-id，这张表只清成功、不淘汰
-// 失败，原本没有上限。参考 RuntimeSymbolMap.cpp 的 g_javaLastRefreshMap
-// 同款做法：超过上限时线性扫一遍淘汰最久没碰过的一条。
-static constexpr size_t kBuildIdAttemptMaxEntries = 4096;
-
-// 调用方必须持有 g_buildIdAttemptMutex。
-static void evict_oldest_build_id_attempt_locked()
-{
-    if (g_buildIdAttempts.size() <= kBuildIdAttemptMaxEntries)
-        return;
-    int64_t oldest = INT64_MAX;
-    std::string oldestKey;
-    for (const auto &kv : g_buildIdAttempts)
-    {
-        if (kv.second.lastTouchedMs < oldest)
-        {
-            oldest = kv.second.lastTouchedMs;
-            oldestKey = kv.first;
-        }
-    }
-    if (!oldestKey.empty())
-        g_buildIdAttempts.erase(oldestKey);
-}
-
-static bool should_skip_build_id_attempt(const std::string &buildId, int64_t nowMs)
-{
-    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
-    auto it = g_buildIdAttempts.find(buildId);
-    if (it == g_buildIdAttempts.end())
-        return false;
-    if (it->second.state == BuildIdAttemptState::PermanentFail)
-        return true;
-    if (nowMs < it->second.retryAfterMs)
-        return true;
-    g_buildIdAttempts.erase(it); // 过期了，允许重试
-    return false;
-}
-
-static void record_build_id_transient_fail(const std::string &buildId, int64_t nowMs)
-{
-    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
-    g_buildIdAttempts[buildId] = {BuildIdAttemptState::TransientFail, nowMs + kBuildIdTransientRetryMs, nowMs};
-    evict_oldest_build_id_attempt_locked();
-}
-
-static void record_build_id_permanent_fail(const std::string &buildId)
-{
-    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
-    g_buildIdAttempts[buildId] = {BuildIdAttemptState::PermanentFail, 0, now_ms()};
-    evict_oldest_build_id_attempt_locked();
-}
-
-static void clear_build_id_attempt(const std::string &buildId)
-{
-    std::lock_guard<std::mutex> lock(g_buildIdAttemptMutex);
-    g_buildIdAttempts.erase(buildId);
-}
-
-static bool looks_like_elf(const std::string &path)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open())
-        return false;
-    char magic[4] = {0};
-    f.read(magic, 4);
-    return f.gcount() == 4 && magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
-}
-
-// 任务1核心：perf script 之前，把能拿到的用户态二进制预热进本地 build-id
-// 缓存，让 perf script 自带的缓存回退机制命中，当场生效不依赖网络往返。
-static std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &perf, const std::string &dataPath)
-{
-    std::string listOutput;
-    int rc = drop::exec_capture({perf, "buildid-list", "-i", dataPath}, &listOutput, 65536);
-    if (rc != 0)
-        return {};
-
-    std::vector<drop::BuildIdEntry> entries = drop::parse_buildid_list(listOutput);
-    if (entries.empty())
-        return entries;
-
-    int64_t nowMs = now_ms();
-    std::vector<drop::BuildIdEntry> pending;
-    for (auto &e : entries)
-    {
-        if (drop::build_id_cached_locally(e.buildId))
-            continue;
-        if (should_skip_build_id_attempt(e.buildId, nowMs))
-            continue;
-        pending.push_back(e);
-    }
-    if (pending.empty())
-        return entries;
-
-    // 只在确实有需要解析的 build-id 时才建索引——O(进程数) 的一次性开销
-    // 不针对每个 build-id 重复付出（详见设计文档任务1"技术方案依据"）。
-    std::unordered_map<std::string, int> dsoIndex = drop::build_dso_path_index();
-
-    for (auto &e : pending)
-    {
-        auto it = dsoIndex.find(e.dsoPath);
-        if (it == dsoIndex.end())
-        {
-            record_build_id_transient_fail(e.buildId, nowMs);
-            continue;
-        }
-        std::string resolved = drop::resolve_via_pid(e.dsoPath, it->second);
-        if (resolved.empty())
-        {
-            record_build_id_transient_fail(e.buildId, nowMs);
-            continue;
-        }
-        if (!looks_like_elf(resolved))
-        {
-            record_build_id_permanent_fail(e.buildId);
-            continue;
-        }
-        if (drop::cache_build_id_locally(e.buildId, resolved))
-            clear_build_id_attempt(e.buildId);
-        else
-            record_build_id_transient_fail(e.buildId, nowMs);
-    }
-    return entries;
-}
-
-static bool unresolved_frame(const std::string &raw)
-{
-    std::string frame = drop::trim(raw);
-    if (frame.empty() || frame == "unknown" || frame == "[unknown]")
-        return true;
-    if (frame.size() > 2 && frame.front() == '[' && frame.back() == ']')
-        return true;
-    if (frame.rfind("0x", 0) != 0)
-        return false;
-    size_t i = 2;
-    while (i < frame.size() && std::isxdigit(static_cast<unsigned char>(frame[i])))
-        ++i;
-    return i > 2 && (i == frame.size() || std::isspace(static_cast<unsigned char>(frame[i])));
-}
-
-static std::string path_basename(const std::string &path)
-{
-    size_t slash = path.rfind('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-}
-
-static std::string sanitize_python_perf_frame(const std::string &frame)
-{
-    // CPython -X perf names are typically
-    // "py::function:/absolute/path/module.py+0x...". Keep the function,
-    // short file name and offset/line while preventing paths from entering
-    // uploaded batches.
-    if (frame.rfind("py::", 0) != 0)
-        return frame;
-    size_t pathStart = frame.find(':', 4);
-    if (pathStart == std::string::npos)
-        return frame;
-    ++pathStart;
-    size_t slash = frame.find_last_of("/\\");
-    if (slash == std::string::npos || slash < pathStart)
-        return frame;
-    return frame.substr(0, pathStart) + frame.substr(slash + 1);
-}
-
-static std::string sample_runtime_with_go_hint(const AggregatedSample &sample,
-                                               const drop::GoSymbolReport &goReport,
-                                               bool hasGoBuildInfo)
-{
-    std::string base = path_basename(sample.exe);
-    if (base.rfind("python", 0) == 0)
-        return "python";
-    if (base.rfind("java", 0) == 0)
-        return "java";
-    if (base.rfind("node", 0) == 0)
-        return "node";
-    auto isGo = [&](const std::vector<drop::GoSymbolItem> &items) {
-        return std::any_of(items.begin(), items.end(), [&](const auto &item) {
-            return item.dsoPath == sample.exe;
-        });
-    };
-    if (hasGoBuildInfo || isGo(goReport.ready) || isGo(goReport.pending) || isGo(goReport.failed))
-        return "go";
-    if (sample.exe.empty())
-        return sample.pid <= 2 || sample.comm.rfind("kworker", 0) == 0 ? "kernel" : "unknown";
-    return "native";
-}
-
-static std::string sample_runtime(const AggregatedSample &sample,
-                                  const drop::GoSymbolReport &goReport,
-                                  std::map<int, bool> *goBuildInfoCache)
-{
-    bool hasGoBuildInfo = false;
-    if (sample.pid > 0 && !sample.exe.empty())
-    {
-        auto cached = goBuildInfoCache->find(sample.pid);
-        if (cached == goBuildInfoCache->end())
-        {
-            std::string procExe = "/proc/" + std::to_string(sample.pid) + "/exe";
-            hasGoBuildInfo = drop::go_binary_has_build_info(procExe);
-            (*goBuildInfoCache)[sample.pid] = hasGoBuildInfo;
-        }
-        else
-        {
-            hasGoBuildInfo = cached->second;
-        }
-    }
-    return sample_runtime_with_go_hint(sample, goReport, hasGoBuildInfo);
-}
-
-static std::string python_fallback_json(const std::vector<drop::PythonFallbackResult> &results, size_t limitedCount)
-{
-    std::string body = "{\"ready\":[";
-    bool firstReady = true;
-    for (const auto &result : results)
-    {
-        if (!result.ready)
-            continue;
-        if (!firstReady)
-            body += ",";
-        firstReady = false;
-        body += "{\"pid\":" + std::to_string(result.pid) +
-                ",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) + "}";
-    }
-    body += "],\"failed\":[";
-    bool firstFailed = true;
-    for (const auto &result : results)
-    {
-        if (result.ready)
-            continue;
-        if (!firstFailed)
-            body += ",";
-        firstFailed = false;
-        body += "{\"pid\":" + std::to_string(result.pid) +
-                ",\"reason\":\"" + json_escape(result.reason) + "\"}";
-    }
-    body += "],\"limited_count\":" + std::to_string(limitedCount) + "}";
-    return body;
-}
-
-static std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &runtimeReport,
-                                             const drop::GoSymbolReport &goReport,
-                                             const std::vector<drop::PythonFallbackResult> &pythonFallback,
-                                             size_t pythonLimitedCount,
-                                             const std::vector<drop::MemrayProfileResult> &memrayResults,
-                                             const std::vector<AggregatedSample> &samples,
-                                             const std::vector<drop::BuildIdEntry> &buildIds,
-                                             const std::string &kallsymsSha256)
-{
-    uint64_t totalFrames = 0;
-    uint64_t unresolvedFrames = 0;
-    for (const auto &sample : samples)
-    {
-        for (const auto &frame : sample.stack)
-        {
-            totalFrames = add_count(totalFrames, sample.count);
-            if (unresolved_frame(frame))
-                unresolvedFrames = add_count(unresolvedFrames, sample.count);
-        }
-    }
-    std::string status = "not_applicable";
-    if (totalFrames > 0)
-        status = unresolvedFrames == 0 ? "complete" : (unresolvedFrames >= totalFrames ? "missing" : "partial");
-    std::string body = "{";
-    body += "\"symbol_status\":\"" + status + "\",";
-    body += "\"frame_stats\":{\"total_frame_weight\":" + std::to_string(totalFrames) +
-            ",\"unresolved_frame_weight\":" + std::to_string(unresolvedFrames) + "},";
-    // 本次窗口引用的全部用户态 build-id 清单（warm_build_id_cache +
-    // discover_sampled_go_build_ids 合并结果）。后端 collectContinuousSymbolRefs
-    // 递归扫 key 含 "build_id" 的字段时能捡到这里，使"重新检查符号"对非 Go
-    // 原生二进制（如 PostgreSQL/libc）也能做真实存在性检查，而不是空集恒真。
-    body += "\"build_ids\":[";
-    for (size_t i = 0; i < buildIds.size(); ++i)
-    {
-        if (i)
-            body += ",";
-        body += "\"" + json_escape(buildIds[i].buildId) + "\"";
-    }
-    body += "],";
-    if (!kallsymsSha256.empty())
-        body += "\"kallsyms_sha256\":\"" + json_escape(kallsymsSha256) + "\",";
-    body += "\"runtime_maps\":" + drop::runtime_maps_to_json(runtimeReport) + ",";
-    body += "\"native_go\":" + drop::go_symbol_report_json(goReport) + ",";
-    body += "\"python_fallback\":" + python_fallback_json(pythonFallback, pythonLimitedCount) + ",";
-    body += "\"python_memory\":{\"ready\":[";
-    bool firstMemrayReady = true;
-    for (const auto &result : memrayResults)
-    {
-        if (!result.ready) continue;
-        if (!firstMemrayReady) body += ",";
-        firstMemrayReady = false;
-        body += "{\"pid\":" + std::to_string(result.pid) + ",\"profile_id\":\"" + json_escape(result.profileID) + "\"}";
-    }
-    body += "],\"failed\":[";
-    bool firstMemrayFailed = true;
-    for (const auto &result : memrayResults)
-    {
-        if (result.ready) continue;
-        if (!firstMemrayFailed) body += ",";
-        firstMemrayFailed = false;
-        body += "{\"pid\":" + std::to_string(result.pid) + ",\"reason\":\"" + json_escape(result.reason) + "\"}";
-    }
-    body += "]}";
-    body += "}";
-    return body;
-}
-
-// 内核符号快照：低频（每 10 分钟）快照并去重上传一次 /proc/kallsyms，把
-// sha256 写进后续窗口的 symbol_refs，供"重新检查符号"诊断 kallsyms 是否入库。
-// 持续采集的内核帧本就靠 perf script 当场读本机 /proc/kallsyms 解析，快照
-// 上传只服务于符号库口径与事后审计，不阻塞当次解析。
-static std::mutex g_kallsymsSnapshotMutex;
-static std::string g_lastKallsymsSha256;
-static int64_t g_lastKallsymsSnapshotMs = 0;
-static constexpr int64_t kKallsymsSnapshotIntervalMs = 10 * 60 * 1000;
-
-static std::string ensure_kallsyms_snapshot(const ContinuousSamplerConfig &cfg)
-{
-    std::lock_guard<std::mutex> lock(g_kallsymsSnapshotMutex);
-    int64_t now = now_ms();
-    if (now - g_lastKallsymsSnapshotMs < kKallsymsSnapshotIntervalMs)
-        return g_lastKallsymsSha256;
-    g_lastKallsymsSnapshotMs = now;
-    std::string path = "/tmp/mini_drop_cp_kallsyms_" + cfg.sessionSID + ".txt";
-    if (!drop::snapshot_kallsyms(path))
-        return g_lastKallsymsSha256; // 快照失败（权限受限等），复用上次结果
-    g_lastKallsymsSha256 = drop::ensure_kernel_symbol_uploaded(cfg.apiBaseURL, cfg.sessionSID, path);
-    ::remove(path.c_str());
-    return g_lastKallsymsSha256;
-}
 
 static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
 {
     WindowPayload window;
     window.startMs = now_ms();
+    // 阶段二：wall/mono 锚点必须在 perf record 之前成对捕获（perf 样本时钟是
+    // CLOCK_MONOTONIC，解析时用这对锚点把样本时间映射回 Unix 毫秒；若 mono
+    // 锚点取在 record 之后，映射结果会整体前移一个录制时长，导致窗口时间
+    // 错位/负 capture_elapsed）。
+    const int64_t monoAnchorMs = monotonic_ms();
     std::string dataPath = "/tmp/mini_drop_native_cp_" + std::to_string(window.startMs) + ".data";
     std::string perf = perf_bin();
+    // 阶段二：degraded 的 collect_window 只负责录制原始 perf 段 + 模式特有的
+    // sidecar 数据（py-spy / RSS / Memray）；perf.data 交给统一的
+    // ContinuousSegmentProcessor 解析（符号准备/解析/runtime 分类/诊断）。
     const bool pythonFallbackEnabled = env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
     const int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
     const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
     drop::PythonFallbackCapture pythonCapture;
     if (pythonFallbackEnabled)
         pythonCapture = drop::start_python_fallback_capture(
-            cfg.sessionSID, cfg.aggregationWindowSec, pythonRateHz, pythonMaxProcesses);
+            python_fallback_scope_key(cfg), cfg.aggregationWindowSec,
+            pythonRateHz, pythonMaxProcesses);
     // 云 VM 上硬件 cycles 计数器可能冻结（perf stat 读到 2^50 固定值），
     // perf 默认的 cycles 事件会采不到任何样本。默认改用软件事件 cpu-clock，
     // 可用 DROP_NATIVE_CP_PERF_EVENT 覆盖（Step 1 实测结论）。
@@ -1812,7 +797,6 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
         if (*env)
             perfEvent = env;
     std::string recordOutput;
-    int64_t tRecordStart = now_ms();
     std::vector<std::string> recordArgs = perf_record_args(cfg, perf, perfEvent, dataPath);
     if (recordArgs.empty())
     {
@@ -1822,72 +806,18 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     }
     int rc = drop::exec_capture(recordArgs, &recordOutput, 4096);
     window.endMs = now_ms();
-    int64_t recordMs = window.endMs - tRecordStart;
     if (rc != 0)
     {
         std::cout << "[native-cp] perf record failed rc=" << rc << " output=" << recordOutput << std::endl;
         ::remove(dataPath.c_str());
-        // std::future from std::async blocks during destruction. Consume the
-        // concurrent fallback here so an error cannot create an implicit,
-        // unreported wait at function exit.
         pythonCapture.Finish();
+        window.backendStatus = "failed";
+        window.backendReason = "perf record failed rc=" + std::to_string(rc);
         return window;
     }
-    int64_t tWarmStart = now_ms();
-    std::vector<drop::BuildIdEntry> buildIds = warm_build_id_cache(perf, dataPath);
-    int64_t warmMs = now_ms() - tWarmStart;
-    // Java/Node/Python JIT perf map 定位/校验/搬运 + Java map 刷新，
-    // 必须在 perf script 前完成，让同一份 perf.data 能解析出用户函数名。
-    int64_t tRtStart = now_ms();
-    drop::RuntimeSymbolReport runtimeReport = drop::collect_runtime_maps(perf, dataPath);
-    int64_t rtMs = now_ms() - tRtStart;
-    std::set<std::string> knownDsoPaths;
-    for (const auto &entry : buildIds)
-        knownDsoPaths.insert(entry.dsoPath);
-    for (auto &entry : drop::discover_sampled_go_build_ids(runtimeReport.sampledPids))
-        if (knownDsoPaths.insert(entry.dsoPath).second)
-            buildIds.push_back(std::move(entry));
-    int64_t tGoStart = now_ms();
-    drop::GoSymbolReport goReport = drop::prepare_go_symbols(buildIds);
-    int64_t goMs = now_ms() - tGoStart;
-    int64_t tScriptStart = now_ms();
-    std::string scriptOutput;
-    rc = drop::exec_capture({perf, "script", "-F", "comm,pid,tid,time,event,ip,sym,dso", "-i", dataPath},
-                            &scriptOutput, 32 * 1024 * 1024);
-    ::remove(dataPath.c_str());
-    int64_t scriptMs = now_ms() - tScriptStart;
-    std::cout << "[native-cp] perf window record_ms=" << recordMs
-              << " buildid_ms=" << warmMs
-              << " runtime_map_ms=" << rtMs
-              << " script_ms=" << scriptMs << std::endl;
-    if (rc != 0)
-    {
-        std::cout << "[native-cp] perf script failed rc=" << rc << std::endl;
-        pythonCapture.Finish();
-        return window;
-    }
-    window.samples = parse_perf_script(scriptOutput);
-    std::map<int, bool> goBuildInfoCache;
-    for (auto &sample : window.samples)
-    {
-		sample.processStartMs = configured_process_start_ms(cfg, sample.pid);
-		if (sample.exe.empty())
-			sample.exe = configured_process_exe(cfg, sample.pid);
-        sample.backend = "perf";
-        sample.runtime = sample_runtime(sample, goReport, &goBuildInfoCache);
-        if (sample.runtime == "python")
-            for (auto &frame : sample.stack)
-                frame = sanitize_python_perf_frame(frame);
-    }
-	if (cfg.scope == "process")
-	{
-		window.samples.erase(std::remove_if(window.samples.begin(), window.samples.end(), [&](const auto &sample) {
-				return !process_targeted(cfg, sample.pid, sample.processStartMs, sample.exe);
-			}), window.samples.end());
-	}
-
-    size_t pythonLimitedCount = pythonCapture.LimitedCount();
+    // degraded 已同步等满 capture 区间，直接收尾（与旧行为一致）。
     std::vector<drop::PythonFallbackResult> pythonResults = pythonCapture.Finish();
+    const size_t pythonLimitedCount = pythonCapture.LimitedCount();
     for (auto &result : pythonResults)
     {
         if (result.ready && !drop::python_process_is_same(result.pid, result.startMs))
@@ -1897,62 +827,45 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
             result.reason = "process exited or PID was reused before stack replacement";
         }
     }
-    std::set<int> replacedPythonPids;
-    for (const auto &result : pythonResults)
-        if (result.ready)
-            replacedPythonPids.insert(result.pid);
-    if (!replacedPythonPids.empty())
-    {
-        window.samples.erase(std::remove_if(window.samples.begin(), window.samples.end(), [&](const auto &sample) {
-                                 return replacedPythonPids.count(sample.pid) > 0;
-                             }),
-                             window.samples.end());
-        for (const auto &result : pythonResults)
-        {
-            if (!result.ready)
-                continue;
-            for (const auto &raw : result.samples)
-            {
-                AggregatedSample sample;
-                sample.stack = raw.stack;
-                sample.comm = result.comm.empty() ? "python" : result.comm;
-                sample.pid = result.pid;
-				sample.processStartMs = result.startMs;
-                sample.exe = result.exe;
-                sample.backend = "py-spy";
-                sample.runtime = "python";
-                sample.count = clamp_count(raw.count);
-                window.samples.push_back(std::move(sample));
-            }
-        }
-    }
+    std::vector<drop::MemrayProfileResult> memrayResults;
+    const bool memrayEnabled = cfg.scope != "process" &&
+                               env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true);
+    if (memrayEnabled)
+        memrayResults = drop::collect_memray_profiles();
 
-    std::map<int, AggregatedSample> metadata;
-    for (const auto &sample : window.samples)
-        metadata.emplace(sample.pid, sample);
-    std::vector<drop::PythonCandidate> nextCandidates;
-    if (pythonFallbackEnabled)
-    {
-        for (int pid : runtimeReport.python.missingPids)
-        {
-            int64_t startMs = 0;
-            if (!drop::python_process_start_ms(pid, &startMs))
-                continue;
-            drop::PythonCandidate candidate;
-            candidate.pid = pid;
-            candidate.startMs = startMs;
-            candidate.samples = runtimeReport.sampledPids[pid];
-            auto it = metadata.find(pid);
-            candidate.comm = it == metadata.end() ? "python" : it->second.comm;
-            candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
-            nextCandidates.push_back(std::move(candidate));
-        }
-    }
-    drop::schedule_python_fallback(cfg.sessionSID, nextCandidates);
+    drop::RuntimeCapabilitySet capabilities;
+    capabilities.pythonFallback = pythonFallbackEnabled;
+    capabilities.pythonRss = cfg.scope != "process" &&
+                             env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true);
+    capabilities.memray = memrayEnabled;
+    capabilities.goSymbols = true;
 
-    // User-driven process Sessions expose only CPU/IO/sched. Do not scan or
-    // ingest unrelated Python memory data from the host into those Sessions.
-    if (cfg.scope != "process" && env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true))
+    PerfSegment segment;
+    segment.path = dataPath;
+    segment.sourceBackend = "perf";
+    segment.collectorGeneration = cfg.collectorGeneration;
+    segment.targetFingerprint = cfg.targetFingerprint;
+    segment.wallStartMs = window.startMs;
+    segment.monotonicStartMs = monoAnchorMs;
+
+    ContinuousSegmentProcessor processor;
+    SegmentProcessResult processed = processor.Process(segment, cfg, capabilities,
+                                                       pythonResults, pythonLimitedCount, memrayResults);
+    // degraded 单窗段处理完即删（成功或最终失败都删除，无重试队列）。
+    ::remove(dataPath.c_str());
+    if (!processed.success)
+    {
+        window.backendStatus = "failed";
+        window.backendReason = processed.failureReason;
+        std::cout << "[native-cp] degraded segment processing failed: "
+                  << processed.failureReason << std::endl;
+        return window;
+    }
+    window = std::move(processed.windows.front());
+    window.backendStatus = "ok";
+
+    // RSS：观测时间生成独立 metric（不伪装成 perf 段时间）。
+    if (capabilities.pythonRss)
     {
         size_t truncated = 0;
         auto rss = drop::collect_python_rss(
@@ -1973,56 +886,70 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
             window.metrics.push_back(std::move(metric));
         }
     }
-    std::vector<drop::MemrayProfileResult> memrayResults;
-    if (cfg.scope != "process" && env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true))
+    // Memray：自身采集时间生成 python_memory window。
+    for (const auto &result : memrayResults)
     {
-        memrayResults = drop::collect_memray_profiles();
-        for (const auto &result : memrayResults)
+        ProfilePayload profile;
+        profile.signalType = "python_memory";
+        profile.backend = "memray";
+        profile.profileID = result.profileID;
+        profile.unit = "bytes";
+        if (result.ready)
+            profile.readyPath = result.readyPath;
+        for (const auto &raw : result.samples)
         {
-            ProfilePayload profile;
-            profile.signalType = "python_memory";
-            profile.backend = "memray";
-            profile.profileID = result.profileID;
-            profile.unit = "bytes";
-            if (result.ready)
-                profile.readyPath = result.readyPath;
-            for (const auto &raw : result.samples)
-            {
-                AggregatedSample sample;
-                sample.stack = raw.stack;
-                sample.comm = result.comm;
-                sample.pid = result.pid;
-                sample.exe = result.exe;
-                sample.backend = "memray";
-                sample.runtime = "python";
-                sample.count = clamp_count(raw.count);
-                profile.samples.push_back(std::move(sample));
-            }
-            window.profiles.push_back(std::move(profile));
+            AggregatedSample sample;
+            sample.stack = raw.stack;
+            sample.comm = result.comm;
+            sample.pid = result.pid;
+            sample.exe = result.exe;
+            sample.backend = "memray";
+            sample.runtime = "python";
+            sample.count = clamp_count(raw.count);
+            profile.samples.push_back(std::move(sample));
+        }
+        window.profiles.push_back(std::move(profile));
+    }
+    if (cfg.scope == "process")
+    {
+        window.metrics.erase(std::remove_if(window.metrics.begin(), window.metrics.end(), [&](const auto &metric) {
+                                  return !process_targeted(cfg, metric.pid, metric.processStartMs, metric.exe);
+                              }),
+                             window.metrics.end());
+        for (auto &profile : window.profiles)
+            profile.samples.erase(std::remove_if(profile.samples.begin(), profile.samples.end(), [&](const auto &sample) {
+                                      return !process_targeted(cfg, sample.pid, sample.processStartMs, sample.exe);
+                                  }),
+                                  profile.samples.end());
+        window.profiles.erase(std::remove_if(window.profiles.begin(), window.profiles.end(), [](const auto &profile) {
+                                  return profile.samples.empty();
+                              }),
+                              window.profiles.end());
+    }
+
+    // 用上一批已发现候选调度下一窗 py-spy（物理级异步 sidecar，不阻塞解析）。
+    std::map<int, AggregatedSample> metadata;
+    for (const auto &sample : window.samples)
+        metadata.emplace(sample.pid, sample);
+    std::vector<drop::PythonCandidate> nextCandidates;
+    if (pythonFallbackEnabled)
+    {
+        for (int pid : processed.diagnostics.runtimeReport.python.missingPids)
+        {
+            int64_t startMs = 0;
+            if (!drop::python_process_start_ms(pid, &startMs))
+                continue;
+            drop::PythonCandidate candidate;
+            candidate.pid = pid;
+            candidate.startMs = startMs;
+            candidate.samples = processed.diagnostics.runtimeReport.sampledPids[pid];
+            auto it = metadata.find(pid);
+            candidate.comm = it == metadata.end() ? "python" : it->second.comm;
+            candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
+            nextCandidates.push_back(std::move(candidate));
         }
     }
-	if (cfg.scope == "process")
-	{
-		window.metrics.erase(std::remove_if(window.metrics.begin(), window.metrics.end(), [&](const auto &metric) {
-				return !process_targeted(cfg, metric.pid, metric.processStartMs, metric.exe);
-			}), window.metrics.end());
-			for (auto &profile : window.profiles)
-				profile.samples.erase(std::remove_if(profile.samples.begin(), profile.samples.end(), [&](const auto &sample) {
-					return !process_targeted(cfg, sample.pid, sample.processStartMs, sample.exe);
-				}), profile.samples.end());
-		window.profiles.erase(std::remove_if(window.profiles.begin(), window.profiles.end(), [](const auto &profile) {
-			return profile.samples.empty();
-		}), window.profiles.end());
-	}
-    // 低频内核符号快照上传，sha256 写入 symbol_refs 供诊断接口判断入库状态。
-    std::string kallsymsSha256 = ensure_kallsyms_snapshot(cfg);
-    window.symbolRefsJson = combined_symbol_refs_json(runtimeReport, goReport, pythonResults, pythonLimitedCount, memrayResults, window.samples, buildIds, kallsymsSha256);
-    // 异步上报本次窗口引用的 build-id 到服务端符号库（不阻塞当次解析）。
-    drop::upload_build_ids_async(buildIds, cfg.apiBaseURL);
-    std::cout << "[native-cp] Go symbols ready=" << goReport.ready.size()
-              << " pending=" << goReport.pending.size()
-              << " failed=" << goReport.failed.size()
-              << " prepare_ms=" << goMs << std::endl;
+    drop::schedule_python_fallback(python_fallback_scope_key(cfg), nextCandidates);
     return window;
 }
 
@@ -3122,6 +2049,9 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
             for (auto &sample : window.samples)
                 sample.backend = "perf";
             window.symbolRefsJson = perfWindow.symbolRefsJson; // runtime map 诊断
+            // 阶段二：结构化物理诊断随窗口一起 fan-out，供 filter_shared_window
+            // 按 Session 重算 symbol_refs。
+            window.physicalDiagnostics = perfWindow.physicalDiagnostics;
             for (const auto &sample : window.samples)
                 cpuSamples = add_count(cpuSamples, sample.count);
             window.selectedBackend = "perf";
@@ -3279,80 +2209,61 @@ bool RollingPerfRecorder::Start(const ContinuousSamplerConfig &cfg, std::string 
     return true;
 }
 
-bool RollingPerfRecorder::HasParseableOutput() const
-{
-    const auto files = rolling_perf_files(directory, false);
-    if (files.empty())
-        return false;
-    std::string ignored;
-    return drop::exec_capture({perf_bin(), "script", "-F", "time", "-i", files.front()},
-                              &ignored, 1024 * 1024) == 0;
-}
-
-std::vector<WindowPayload> RollingPerfRecorder::Drain(const ContinuousSamplerConfig &cfg, bool final)
+std::vector<PerfSegment> RollingPerfRecorder::Drain(const ContinuousSamplerConfig &cfg, bool final)
 {
     const auto files = rolling_perf_files(directory, final);
-    std::vector<WindowPayload> windows;
+    std::vector<PerfSegment> segments;
     for (const auto &path : files)
     {
-        if (!consumed.insert(path).second) continue;
-        WindowPayload window;
-        window.startMs = now_ms();
-        window.attemptedBackends = {"perf_rolling"};
-        window.selectedBackend = "perf_rolling";
-        std::string output;
-        int rc = drop::exec_capture({perf_bin(), "script", "-F", "comm,pid,tid,time,event,ip,sym,dso", "-i", path},
-                                    &output, 32 * 1024 * 1024);
-        window.endMs = now_ms();
-        if (rc != 0)
-        {
-            window.backendStatus = "failed";
-            window.backendReason = "perf script failed for rolling file";
-        }
-        else
-        {
-            PerfScriptParseResult parsed = parse_perf_script_result(output);
-            if (parsed.hasTimestamp)
-            {
-                const int64_t parsedStart = perf_timestamp_to_unix_ms(parsed.startTimestampSec,
-                                                                        wallStartMs,
-                                                                        monotonicStartMs);
-                const int64_t parsedEnd = perf_timestamp_to_unix_ms(parsed.endTimestampSec,
-                                                                      wallStartMs,
-                                                                      monotonicStartMs);
-                if (parsedStart > 0 && parsedEnd >= parsedStart)
-                {
-                    window.startMs = parsedStart;
-                    window.endMs = std::max(parsedStart + 1, parsedEnd);
-                }
-            }
-            window.samples = std::move(parsed.samples);
-            std::map<int, bool> goCache;
-            for (auto &sample : window.samples)
-            {
-                sample.processStartMs = configured_process_start_ms(cfg, sample.pid);
-				if (sample.exe.empty())
-					sample.exe = configured_process_exe(cfg, sample.pid);
-                sample.backend = "perf_rolling";
-                sample.runtime = sample_runtime(sample, {}, &goCache);
-            }
-            if (cfg.scope == "process")
-                window.samples.erase(std::remove_if(window.samples.begin(), window.samples.end(), [&](const auto &sample) {
-                    return !process_targeted(cfg, sample.pid, sample.processStartMs, sample.exe);
-                }), window.samples.end());
-            window.backendStatus = "ok";
-        }
-        if (window.endMs <= window.startMs)
-            window.endMs = std::max(window.startMs + 1, now_ms());
-        windows.push_back(std::move(window));
-        ::unlink(path.c_str());
+        if (consumed.count(path) > 0)
+            continue;
+        PerfSegment segment;
+        segment.path = path;
+        segment.sourceBackend = "perf_rolling";
+        segment.collectorGeneration = cfg.collectorGeneration;
+        segment.targetFingerprint = cfg.targetFingerprint;
+        segment.wallStartMs = wallStartMs;
+        segment.monotonicStartMs = monotonicStartMs;
+        segments.push_back(std::move(segment));
     }
-    if (final && !directory.empty())
+    return segments;
+}
+
+// 处理成功后确认删除该不可变段并记入已消费集合。
+void RollingPerfRecorder::Confirm(const std::string &path)
+{
+    if (path.empty())
+        return;
+    consumed.insert(path);
+    ::unlink(path.c_str());
+}
+
+// 最终失败（重试 3 次仍失败）后放弃：删除该段并记入已消费集合，形成真实
+// coverage gap（时间缺失，不伪造成功）。
+void RollingPerfRecorder::Abandon(const std::string &path)
+{
+    if (path.empty())
+        return;
+    consumed.insert(path);
+    ::unlink(path.c_str());
+}
+
+size_t RollingPerfRecorder::PendingSegmentCount() const
+{
+    return rolling_perf_files(directory, false).size();
+}
+
+uint64_t RollingPerfRecorder::PendingSegmentBytes() const
+{
+    const auto files = rolling_perf_files(directory, false);
+    uint64_t total = 0;
+    for (const auto &path : files)
     {
-        ::rmdir(directory.c_str());
-        directory.clear();
+        struct stat st = {};
+        if (::stat(path.c_str(), &st) == 0)
+            total = add_count(total, static_cast<uint64_t>(st.st_size));
     }
-    return windows;
+    return total;
 }
 
 void RollingPerfRecorder::Stop()
@@ -3651,6 +2562,7 @@ static void run_continuous_spool_loop(std::atomic<bool> &running,
 void PerfEventSampler::Loop()
 {
     run_continuous_spool_loop(running_, config_, collect_window);
+    drop::clear_python_fallback_schedule(python_fallback_scope_key(config_));
 }
 
 DualTrackContinuousSampler::~DualTrackContinuousSampler()
@@ -3711,6 +2623,7 @@ bool DualTrackContinuousSampler::Running() const
 void DualTrackContinuousSampler::Loop()
 {
     run_continuous_spool_loop(running_, config_, collect_dual_track_window);
+    drop::clear_python_fallback_schedule(python_fallback_scope_key(config_));
 }
 
 // ---------- DBSnapshotSampler：阶段一（标量健康指标） ----------
@@ -4321,10 +3234,16 @@ static WindowPayload filter_shared_window(const WindowPayload &source,
                                   return histogram.pid > 0 && !process_targeted(session, histogram.pid, 0, "");
                               }),
                              out.histograms.end());
-        // Runtime symbol diagnostics can contain paths/PIDs for another selector in
-        // the physical union. Per-sample symbols are already resolved, so omit the
-        // cross-target diagnostic blob from process Session payloads.
-        out.symbolRefsJson.clear();
+        // 阶段二：process Session 不再简单执行 symbolRefsJson.clear()。按
+        // PID + process_start_ms + exe 过滤后，用结构化物理诊断重建只含本
+        // Session 目标的 symbol_refs（重算 symbol_status / frame 权重 /
+        // build-id / runtime PID），杜绝看到其他 selector 的 PID、路径或诊断。
+        // kallsyms SHA、collector generation 等整机级信息允许复用。
+        if (source.physicalDiagnostics)
+            out.symbolRefsJson = drop::rebuild_filtered_symbol_refs(
+                source.symbolRefsJson, *source.physicalDiagnostics, out.samples, session);
+        else if (!out.symbolRefsJson.empty())
+            out.symbolRefsJson.clear();
     }
     // 信号级过滤：直方图按请求的信号类型剔除（host/process 均生效）。
     out.histograms.erase(std::remove_if(out.histograms.begin(), out.histograms.end(), [&](const auto &histogram) {
@@ -4512,6 +3431,15 @@ static bool finalize_shared_session(SharedSessionAccumulator *session)
 
 } // namespace
 
+// 阶段二：strict 运行结果分级，驱动 Loop 的状态转换（灰度）。
+enum class StrictRunResult
+{
+    Succeeded,       // strict 正常运行至 Stop（保持 strict）
+    Unavailable,     // strict 引擎不可用：允许 degraded 时降级，否则 failed
+    Backlogged,      // strict 滚动段队列积压：允许 degraded 时降级，否则 failed
+    ProcessorFatal,  // 公共 processor 持续致命错误：不尝试 degraded，直接 failed
+};
+
 struct SharedDualTrackContinuousSampler::Impl
 {
     std::atomic<bool> running{false};
@@ -4568,13 +3496,13 @@ struct SharedDualTrackContinuousSampler::Impl
         return true;
     }
 
-    bool RunStrict(std::vector<SharedSessionAccumulator> &accumulators)
+    StrictRunResult RunStrict(std::vector<SharedSessionAccumulator> &accumulators)
     {
         if (!CoreContinuousSamplerAvailable())
         {
             std::lock_guard<std::mutex> lock(statusMutex);
             degradationReason = "strict persistent CO-RE object is unavailable";
-            return false;
+            return StrictRunResult::Unavailable;
         }
         CoreEbpfCollector core;
         RollingPerfRecorder recorder;
@@ -4588,15 +3516,137 @@ struct SharedDualTrackContinuousSampler::Impl
             }
             core.Stop();
             recorder.Stop();
-            return false;
+            return StrictRunResult::Unavailable;
         }
         {
             std::lock_guard<std::mutex> lock(statusMutex);
             degradationReason = core.DegradationReason();
         }
         std::cout << "[native-cp] strict engine started backend=perf_rolling,libbpf-co-re" << std::endl;
+
         std::vector<CoreHistogramSample> pendingCoreSamples;
         uint64_t pendingCoreLost = 0;
+        ContinuousSegmentProcessor processor;
+        const int segmentMaxRetries = std::max(1, env_positive_int("DROP_STRICT_SEGMENT_MAX_RETRIES", 3));
+        const size_t segmentQueueLimit = static_cast<size_t>(
+            std::max(1, env_positive_int("DROP_STRICT_SEGMENT_QUEUE_LIMIT", 30)));
+        const uint64_t segmentQueueBytesLimit = static_cast<uint64_t>(
+            std::max<int64_t>(1, env_positive_int("DROP_STRICT_SEGMENT_QUEUE_BYTES",
+                                                  512 * 1024 * 1024)));
+        // 物理级 Python sidecar：异步覆盖真实 capture 区间，不阻塞滚动 perf 解析。
+        // py-spy 是 CPU fallback，process Session 同样需要；只有 RSS/Memray
+        // 继续维持 host-only，避免扫描并摄取无关进程的内存数据。
+        const bool pythonFallbackEnabled =
+            env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
+        const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
+        const int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+        const int pythonSidecarPollMs = std::max(0, env_positive_int("DROP_STRICT_PYTHON_SIDECAR_POLL_MS", 350));
+        RuntimeCapabilitySet caps;
+        caps.pythonFallback = pythonFallbackEnabled;
+        caps.pythonRss = physical.scope != "process" &&
+                         env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true);
+        caps.memray = physical.scope != "process" &&
+                      env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true);
+        caps.goSymbols = true;
+        bool sidecarInFlight = false;
+        drop::PythonFallbackCapture sidecarCapture;
+        std::vector<drop::PythonFallbackResult> pendingSidecarResults;
+        size_t sidecarLimitedCount = 0;
+        std::vector<WindowPayload> heldStrictWindows;
+
+        size_t processedSegments = 0;
+        int consecutiveProcessorFailures = 0;
+        bool strictBacklogged = false;
+        bool strictUnavailable = false;
+        int64_t lastSidecarCollectMs = 0;
+        const int64_t sidecarIntervalMs = static_cast<int64_t>(std::max(1, physical.aggregationWindowSec)) * 1000;
+
+        // 物理级内存 sidecar：RSS / Memray 用观测/自身采集时间生成独立窗口，
+        // 不伪装成 perf segment 的时间。Memray 在全部 Session fan-out 持久化
+        // 成功后才被 ACK（见 persist_shared_aggregate → acknowledge_batch_profiles）。
+        auto collectMemorySidecars = [&](WindowPayload *window, int64_t nowM) {
+            if (!window)
+                return;
+            if (caps.pythonRss && nowM - lastSidecarCollectMs >= sidecarIntervalMs)
+            {
+                size_t truncated = 0;
+                auto rss = drop::collect_python_rss(
+                    static_cast<size_t>(env_positive_int("DROP_NATIVE_CP_PYTHON_RSS_MAX_PROCESSES", 128)), &truncated);
+                window->rssTruncated = truncated;
+                for (const auto &point : rss)
+                {
+                    MetricPayload metric;
+                    metric.metric = "rss_bytes";
+                    metric.unit = "bytes";
+                    metric.runtime = "python";
+                    metric.comm = point.comm;
+                    metric.pid = point.pid;
+                    metric.processStartMs = point.startMs;
+                    metric.exe = point.exe;
+                    metric.timestampMs = point.timestampMs;
+                    metric.value = point.valueBytes;
+                    window->metrics.push_back(std::move(metric));
+                }
+            }
+            if (caps.memray && nowM - lastSidecarCollectMs >= sidecarIntervalMs)
+            {
+                auto memrayResults = drop::collect_memray_profiles();
+                for (const auto &result : memrayResults)
+                {
+                    ProfilePayload profile;
+                    profile.signalType = "python_memory";
+                    profile.backend = "memray";
+                    profile.profileID = result.profileID;
+                    profile.unit = "bytes";
+                    if (result.ready)
+                        profile.readyPath = result.readyPath;
+                    for (const auto &raw : result.samples)
+                    {
+                        AggregatedSample sample;
+                        sample.stack = raw.stack;
+                        sample.comm = result.comm;
+                        sample.pid = result.pid;
+                        sample.exe = result.exe;
+                        sample.backend = "memray";
+                        sample.runtime = "python";
+                        sample.count = clamp_count(raw.count);
+                        profile.samples.push_back(std::move(sample));
+                    }
+                    window->profiles.push_back(std::move(profile));
+                }
+            }
+            if (nowM - lastSidecarCollectMs >= sidecarIntervalMs)
+                lastSidecarCollectMs = nowM;
+        };
+
+        auto fanOutPhysicalWindows = [&](std::vector<WindowPayload> *windows) {
+            if (!windows)
+                return true;
+            for (auto &physicalWindow : *windows)
+            {
+                collectMemorySidecars(&physicalWindow, now_ms());
+                if (!WindowAllowed(physicalWindow))
+                    continue;
+                for (auto &accumulator : accumulators)
+                {
+                    accumulator.slices.push_back(
+                        filter_shared_window(physicalWindow, accumulator.config, true));
+                    const int64_t coveredMs = accumulator.slices.back().endMs -
+                                              accumulator.slices.front().startMs;
+                    if (coveredMs >= static_cast<int64_t>(accumulator.config.aggregationWindowSec) * 1000 &&
+                        !persist_shared_aggregate(&accumulator))
+                    {
+                        std::cout << "[native-cp] strict engine failed to persist sid="
+                                  << accumulator.config.sessionSID << std::endl;
+                        running = false;
+                        return false;
+                    }
+                }
+            }
+            windows->clear();
+            return true;
+        };
+
         while (running.load())
         {
             DrainAllSessionSpools(false);
@@ -4605,84 +3655,248 @@ struct SharedDualTrackContinuousSampler::Impl
             if (!core.UpdateTargets(physical.targetProcesses, &error))
             {
                 std::cout << "[native-cp] strict target refresh failed: " << error << std::endl;
-                running = false;
+                strict.store(false);
+                strictUnavailable = true;
+                {
+                    std::lock_guard<std::mutex> lock(statusMutex);
+                    degradationReason = "strict target refresh failed: " + error;
+                }
                 break;
             }
-            // A successful attach is not enough for a gap-free handoff: keep
-            // the previous recorder alive until this generation has produced
-            // and successfully parsed at least one immutable switch-output
-            // segment. Probe does not consume the file, so backpressure cannot
-            // discard the first window merely to establish readiness.
-            if (!ready.load() && recorder.HasParseableOutput())
+
+            // 阶段二：积压保护——已关闭滚动文件组成的磁盘有界队列（默认
+            // 30 段 / 512 MiB），任一达到即停止认定 strict 并停止产生新段。
+            const size_t pendingCount = recorder.PendingSegmentCount();
+            const uint64_t pendingBytes = recorder.PendingSegmentBytes();
+            if (pendingCount >= segmentQueueLimit || pendingBytes >= segmentQueueBytesLimit)
             {
-                strict.store(true);
-                failed.store(false);
-                ready.store(true);
-                std::cout << "[native-cp] strict engine ready after first parseable rolling file" << std::endl;
+                std::cout << "[native-cp] strict segment backlog count=" << pendingCount
+                          << " bytes=" << pendingBytes << std::endl;
+                strictBacklogged = true;
+                {
+                    std::lock_guard<std::mutex> lock(statusMutex);
+                    degradationReason = "strict rolling segment queue exceeded (" +
+                                        std::to_string(pendingCount) + " segments / " +
+                                        std::to_string(pendingBytes / (1024 * 1024)) +
+                                        " MiB); no longer certifying strict";
+                }
+                break;
             }
-            else if (!strict.load() && recorder.HasParseableOutput())
-            {
-                // The sampler may already have been adopted in an explicit
-                // disk-backpressure state. Promote its observed status only
-                // after the resumed recorder proves it can parse a real file.
-                strict.store(true);
-                failed.store(false);
-            }
+
             if (!spool_has_collection_capacity(sessions.front()))
             {
                 interruptible_wait(running, 500);
                 continue;
             }
-            auto windows = recorder.Drain(physical, false);
-            uint64_t lost = 0;
-            auto coreSamples = core.Drain(&lost);
-            queue_core_histograms(&windows, physical, &pendingCoreSamples, &pendingCoreLost,
-                                  std::move(coreSamples), lost);
-            for (auto &physicalWindow : windows)
+
+            // 物理级 Python sidecar：上一批已发现候选异步覆盖 capture 区间。
+            if (pythonFallbackEnabled)
             {
-                physicalWindow.attemptedBackends.push_back("libbpf-co-re");
-                physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
-                physicalWindow.backendStatus = "ok";
-                // 阶段一：cutover watermark 过滤（新 generation 切点前不输出）。
-                if (!WindowAllowed(physicalWindow))
-                    continue;
-                for (auto &accumulator : accumulators)
+                if (!sidecarInFlight && pendingSidecarResults.empty())
                 {
-                    accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
-                    const int64_t coveredMs = accumulator.slices.back().endMs - accumulator.slices.front().startMs;
-                    if (coveredMs >= static_cast<int64_t>(accumulator.config.aggregationWindowSec) * 1000 &&
-                        !persist_shared_aggregate(&accumulator))
+                    sidecarCapture = drop::start_python_fallback_capture(
+                        python_fallback_scope_key(physical),
+                        std::max(1, physical.aggregationWindowSec),
+                        pythonRateHz, pythonMaxProcesses);
+                    sidecarInFlight = sidecarCapture.AnyPending();
+                }
+                if (sidecarInFlight)
+                {
+                    auto ready = sidecarCapture.Poll(pythonSidecarPollMs);
+                    if (!ready.empty())
                     {
-                        std::cout << "[native-cp] strict engine failed to persist sid=" << accumulator.config.sessionSID << std::endl;
-                        running = false;
-                        break;
+                        pendingSidecarResults.insert(
+                            pendingSidecarResults.end(),
+                            std::make_move_iterator(ready.begin()),
+                            std::make_move_iterator(ready.end()));
+                        sidecarLimitedCount = sidecarCapture.LimitedCount();
+                    }
+                    if (!sidecarCapture.AnyPending())
+                    {
+                        sidecarInFlight = false;
+                        // capture 期间的 perf windows 一直暂存；现在按真实时间区间
+                        // 删除重叠 Python perf 样本并追加独立 py-spy window。
+                        apply_python_sidecars_to_windows(
+                            &heldStrictWindows, pendingSidecarResults, sidecarLimitedCount);
+                        if (!fanOutPhysicalWindows(&heldStrictWindows))
+                            break;
+                        pendingSidecarResults.clear();
+                        sidecarLimitedCount = 0;
                     }
                 }
             }
-            interruptible_wait(running, 250);
+
+            auto segments = recorder.Drain(physical, false);
+            if (segments.empty())
+            {
+                interruptible_wait(running, 200);
+                continue;
+            }
+            uint64_t lost = 0;
+            auto coreSamples = core.Drain(&lost);
+            std::vector<WindowPayload> iterationWindows;
+            for (auto &segment : segments)
+            {
+                SegmentProcessResult processed;
+                int attempts = 0;
+                bool segmentOk = false;
+                while (attempts < segmentMaxRetries)
+                {
+                    ++attempts;
+                    processed = processor.Process(segment, physical, caps);
+                    if (processed.success)
+                    {
+                        segmentOk = true;
+                        break;
+                    }
+                    std::cout << "[native-cp] strict segment process failed (attempt "
+                              << attempts << "/" << segmentMaxRetries << ") reason="
+                              << processed.failureReason << std::endl;
+                    interruptible_wait(running, 250);
+                }
+                if (!segmentOk)
+                {
+                    // 确定失败：记录诊断、形成真实 coverage gap（不伪造成功）。
+                    consecutiveProcessorFailures++;
+                    recorder.Abandon(segment.path);
+                    std::cout << "[native-cp] strict segment abandoned (gap) path="
+                              << segment.path << std::endl;
+                    if (consecutiveProcessorFailures >= segmentMaxRetries)
+                        break;
+                    continue;
+                }
+                consecutiveProcessorFailures = 0;
+                processedSegments++;
+                recorder.Confirm(segment.path); // 仅处理成功后删除
+                // 阶段二：strict readiness = 至少一个真实 segment 已被统一
+                // processor 成功处理（保证 cutover 后不进入缺失多语言能力的
+                // 伪 strict 状态）。
+                if (!ready.load())
+                {
+                    strict.store(true);
+                    failed.store(false);
+                    ready.store(true);
+                    std::cout << "[native-cp] strict engine ready after "
+                              << processedSegments << " processed segment(s)" << std::endl;
+                }
+
+                // 调度下一窗 py-spy 候选（物理级身份去重由单 coordinator 保证）。
+                // 必须在 move processed.windows 之前提取 metadata。
+                if (pythonFallbackEnabled)
+                {
+                    std::map<int, AggregatedSample> metadata;
+                    for (const auto &w : processed.windows)
+                        for (const auto &sample : w.samples)
+                            metadata.emplace(sample.pid, sample);
+                    std::vector<drop::PythonCandidate> nextCandidates;
+                    for (int pid : processed.diagnostics.runtimeReport.python.missingPids)
+                    {
+                        int64_t startMs = 0;
+                        if (!drop::python_process_start_ms(pid, &startMs))
+                            continue;
+                        drop::PythonCandidate candidate;
+                        candidate.pid = pid;
+                        candidate.startMs = startMs;
+                        candidate.samples = processed.diagnostics.runtimeReport.sampledPids[pid];
+                        auto it = metadata.find(pid);
+                        candidate.comm = it == metadata.end() ? "python" : it->second.comm;
+                        candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
+                        nextCandidates.push_back(std::move(candidate));
+                    }
+                    drop::schedule_python_fallback(
+                        python_fallback_scope_key(physical), nextCandidates);
+                }
+                for (auto &physicalWindow : processed.windows)
+                {
+                    physicalWindow.attemptedBackends.push_back("libbpf-co-re");
+                    physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
+                    physicalWindow.backendStatus = "ok";
+                    iterationWindows.push_back(std::move(physicalWindow));
+                }
+            }
+            const bool processorFatal = consecutiveProcessorFailures >= segmentMaxRetries;
+            // 本迭代 CO-RE 直方图附加到首个物理窗口（与旧行为一致）。
+            queue_core_histograms(&iterationWindows, physical, &pendingCoreSamples, &pendingCoreLost,
+                                  std::move(coreSamples), lost);
+            if (sidecarInFlight)
+            {
+                heldStrictWindows.insert(heldStrictWindows.end(),
+                                         std::make_move_iterator(iterationWindows.begin()),
+                                         std::make_move_iterator(iterationWindows.end()));
+            }
+            else if (!fanOutPhysicalWindows(&iterationWindows))
+                break;
+            if (processorFatal)
+                break;
+            interruptible_wait(running, 50);
         }
         recorder.Stop();
-        auto finalWindows = recorder.Drain(physical, true);
+        // 最终 drain：处理所有已接收段（处理成功才删除）。
+        auto finalSegments = recorder.Drain(physical, true);
         uint64_t lost = 0;
         auto finalCore = core.StopAndDrain(&lost);
-        queue_core_histograms(&finalWindows, physical, &pendingCoreSamples, &pendingCoreLost,
-                              std::move(finalCore), lost);
-        for (auto &physicalWindow : finalWindows)
+        std::vector<WindowPayload> finalWindows;
+        for (auto &segment : finalSegments)
         {
-            physicalWindow.attemptedBackends.push_back("libbpf-co-re");
-            physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
-            physicalWindow.backendStatus = "ok";
-            // 阶段一：旧 generation 最终 drain 只保留切点前窗口。
-            if (!WindowAllowed(physicalWindow))
-                continue;
-            for (auto &accumulator : accumulators)
-                accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
+            SegmentProcessResult processed = processor.Process(segment, physical, caps);
+            if (processed.success)
+            {
+                recorder.Confirm(segment.path);
+                for (auto &physicalWindow : processed.windows)
+                {
+                    physicalWindow.attemptedBackends.push_back("libbpf-co-re");
+                    physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
+                    physicalWindow.backendStatus = "ok";
+                    finalWindows.push_back(std::move(physicalWindow));
+                }
+            }
+            else
+            {
+                recorder.Abandon(segment.path);
+                std::cout << "[native-cp] strict final segment abandoned (gap) path="
+                          << segment.path << std::endl;
+            }
         }
+        if (sidecarInFlight)
+        {
+            auto ready = sidecarCapture.Finish();
+            pendingSidecarResults.insert(pendingSidecarResults.end(),
+                                         std::make_move_iterator(ready.begin()),
+                                         std::make_move_iterator(ready.end()));
+            sidecarLimitedCount = sidecarCapture.LimitedCount();
+        }
+        heldStrictWindows.insert(heldStrictWindows.end(),
+                                 std::make_move_iterator(finalWindows.begin()),
+                                 std::make_move_iterator(finalWindows.end()));
+        queue_core_histograms(&heldStrictWindows, physical, &pendingCoreSamples, &pendingCoreLost,
+                              std::move(finalCore), lost);
+        apply_python_sidecars_to_windows(
+            &heldStrictWindows, pendingSidecarResults, sidecarLimitedCount);
+        fanOutPhysicalWindows(&heldStrictWindows);
         for (auto &accumulator : accumulators)
             if (!finalize_shared_session(&accumulator))
-                std::cout << "[native-cp] strict engine final flush failed sid=" << accumulator.config.sessionSID << std::endl;
+                std::cout << "[native-cp] strict engine final flush failed sid="
+                          << accumulator.config.sessionSID << std::endl;
         DrainAllSessionSpools(true);
-        return true;
+
+        if (strictBacklogged)
+        {
+            strict.store(false);
+            return StrictRunResult::Backlogged;
+        }
+        if (strictUnavailable)
+            return StrictRunResult::Unavailable;
+        if (consecutiveProcessorFailures >= segmentMaxRetries)
+        {
+            strict.store(false);
+            std::lock_guard<std::mutex> lock(statusMutex);
+            if (degradationReason.find("processor") == std::string::npos)
+                degradationReason += degradationReason.empty()
+                                         ? "unified segment processor persistent failure"
+                                         : "; unified segment processor persistent failure";
+            return StrictRunResult::ProcessorFatal;
+        }
+        return StrictRunResult::Succeeded;
     }
 
     void Loop()
@@ -4724,17 +3938,28 @@ struct SharedDualTrackContinuousSampler::Impl
 
         const bool degradedFallbackAllowed = std::all_of(
             sessions.begin(), sessions.end(), [](const auto &session) { return session.allowDegraded; });
-        while (running.load() && !RunStrict(accumulators))
+        // 阶段二：strict 运行结果分级驱动状态转换。
+        //   - Succeeded：保持 strict。
+        //   - Unavailable / Backlogged 且全部 Session 允许 degraded：降级。
+        //   - 任一 Session 禁止 degraded 或公共 processor 致命：进入 failed，
+        //     按现有 reconcile 周期重试 strict，不暗中降级。
+        while (running.load())
         {
-            if (degradedFallbackAllowed)
+            StrictRunResult result = RunStrict(accumulators);
+            if (result == StrictRunResult::Succeeded)
                 break;
+            if (degradedFallbackAllowed &&
+                (result == StrictRunResult::Unavailable || result == StrictRunResult::Backlogged))
+                break; // 切换到低频 degraded 录制；切换期空白按真实 gap 展示
             strict.store(false);
             failed.store(true);
             {
                 std::lock_guard<std::mutex> lock(statusMutex);
-                if (degradationReason.find("degraded fallback is not allowed") == std::string::npos)
-                    degradationReason += degradationReason.empty() ? "strict collector is unavailable and degraded fallback is not allowed"
-                                                                   : "; degraded fallback is not allowed";
+                if (result != StrictRunResult::ProcessorFatal &&
+                    degradationReason.find("degraded fallback is not allowed") == std::string::npos)
+                    degradationReason += degradationReason.empty()
+                                             ? "strict collector is unavailable and degraded fallback is not allowed"
+                                             : "; degraded fallback is not allowed";
             }
             ready.store(true);
             interruptible_wait(running, 5000);
@@ -4792,6 +4017,7 @@ struct SharedDualTrackContinuousSampler::Impl
                 std::cout << "[native-cp] shared engine failed final Session flush sid="
                           << accumulator.config.sessionSID << " errno=" << errno << std::endl;
         DrainAllSessionSpools(true);
+        drop::clear_python_fallback_schedule(python_fallback_scope_key(physical));
     }
 };
 
@@ -4907,6 +4133,9 @@ void SharedDualTrackContinuousSampler::Stop()
     impl_->failed = false;
     if (impl_->worker.joinable())
         impl_->worker.join();
+    if (!impl_->physical.sessionSID.empty())
+        drop::clear_python_fallback_schedule(
+            python_fallback_scope_key(impl_->physical));
 }
 
 bool SharedDualTrackContinuousSampler::Running() const

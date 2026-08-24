@@ -29,6 +29,10 @@ struct PythonFallbackResult
 {
     int pid = 0;
     int64_t startMs = 0;
+    // py-spy 实际采集区间。不能把异步完成的结果伪装成“完成时”的 perf
+    // segment；strict 调度器用它判断与哪些滚动段重叠。
+    int64_t captureStartMs = 0;
+    int64_t captureEndMs = 0;
     std::string comm;
     std::string exe;
     bool ready = false;
@@ -55,7 +59,17 @@ public:
     PythonFallbackCapture(const PythonFallbackCapture &) = delete;
     PythonFallbackCapture &operator=(const PythonFallbackCapture &) = delete;
 
+    /// 阻塞等待全部 fallback 结果（覆盖真实 capture 区间后合并）。
     std::vector<PythonFallbackResult> Finish();
+
+    /// 等待最多 maxWaitMs，返回本轮已就绪的 fallback 结果；仍在后台运行的
+    /// future 保留在 capture 内（后续可再次 Poll），不阻塞滚动 perf 解析。
+    std::vector<PythonFallbackResult> Poll(int64_t maxWaitMs);
+
+    /// 是否还有尚未完成的后台 fallback future。
+    bool AnyPending() const { return !futures_.empty(); }
+
+    /// 因 maxProcesses 上限被截断的候选数（诊断用）。
     size_t LimitedCount() const { return limitedCount_; }
 
 private:
@@ -70,6 +84,10 @@ private:
 /// Replaces the candidate set for the next window. PID identity includes startMs.
 void schedule_python_fallback(const std::string &sessionSID,
                               const std::vector<PythonCandidate> &candidates);
+
+/// 采集器 generation 结束时移除候选，避免长时间运行中按 generation 累积，
+/// 也避免下一代误用旧 PID 候选。
+void clear_python_fallback_schedule(const std::string &sessionSID);
 
 /// Starts py-spy for candidates learned from the preceding perf window.
 PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSID,

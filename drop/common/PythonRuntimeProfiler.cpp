@@ -106,18 +106,22 @@ PythonFallbackResult capture_one(PythonCandidate candidate, int durationSec, int
 
     if (!python_process_is_same(candidate.pid, candidate.startMs))
     {
+        result.captureStartMs = wall_now_ms();
+        result.captureEndMs = result.captureStartMs;
         result.reason = "process exited or PID was reused";
         return result;
     }
 
+    result.captureStartMs = wall_now_ms();
     std::string path = "/tmp/mini_drop_pyspy_" + std::to_string(candidate.pid) + "_" +
-                       std::to_string(wall_now_ms()) + ".raw";
+                       std::to_string(result.captureStartMs) + ".raw";
     std::string output;
     int rc = exec_capture({"timeout", "-s", "INT", "-k", "2", std::to_string(durationSec + 2),
                            "/usr/local/bin/py-spy", "record", "--pid", std::to_string(candidate.pid),
                            "--duration", std::to_string(durationSec), "--rate", std::to_string(rateHz),
                            "--format", "raw", "--function", "--output", path},
                           &output, 16384);
+    result.captureEndMs = wall_now_ms();
     if (!python_process_is_same(candidate.pid, candidate.startMs))
     {
         ::remove(path.c_str());
@@ -229,6 +233,12 @@ void schedule_python_fallback(const std::string &sessionSID,
     g_candidatesBySession[sessionSID] = std::move(next);
 }
 
+void clear_python_fallback_schedule(const std::string &sessionSID)
+{
+    std::lock_guard<std::mutex> lock(g_candidatesMutex);
+    g_candidatesBySession.erase(sessionSID);
+}
+
 PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSID,
                                                     int durationSec,
                                                     int rateHz,
@@ -263,20 +273,51 @@ PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSI
 std::vector<PythonFallbackResult> PythonFallbackCapture::Finish()
 {
     std::vector<PythonFallbackResult> out;
+    // capture_one 自带 timeout；分段等待避免 wall_now_ms()+INT64_MAX 的有符号
+    // 溢出，同时仍保证 Finish 的“等待全部结果”语义。
+    while (!futures_.empty())
+    {
+        auto ready = Poll(1000);
+        out.insert(out.end(), std::make_move_iterator(ready.begin()),
+                   std::make_move_iterator(ready.end()));
+    }
+    return out;
+}
+
+std::vector<PythonFallbackResult> PythonFallbackCapture::Poll(int64_t maxWaitMs)
+{
+    std::vector<PythonFallbackResult> out;
     out.reserve(futures_.size());
+    if (maxWaitMs < 0)
+        maxWaitMs = 0;
+    const int64_t start = wall_now_ms();
+    const int64_t deadline = maxWaitMs > INT64_MAX - start ? INT64_MAX : start + maxWaitMs;
+    std::vector<std::future<PythonFallbackResult>> stillRunning;
     for (auto &future : futures_)
     {
-        try
+        int64_t remaining = std::max<int64_t>(0, deadline - wall_now_ms());
+        // 即使预算已用完也必须 wait_for(0)：否则已经 ready 的后续 future
+        // 会被无谓保留到下一轮。
+        if (future.wait_for(std::chrono::milliseconds(remaining)) == std::future_status::ready)
         {
-            out.push_back(future.get());
+            try
+            {
+                out.push_back(future.get());
+            }
+            catch (const std::exception &e)
+            {
+                PythonFallbackResult failed;
+                failed.reason = std::string("py-spy future failed: ") + e.what();
+                out.push_back(std::move(failed));
+            }
         }
-        catch (const std::exception &e)
+        else
         {
-            PythonFallbackResult failed;
-            failed.reason = std::string("py-spy future failed: ") + e.what();
-            out.push_back(std::move(failed));
+            // 仍未就绪：保留 future，下一轮继续等待（不阻塞滚动 perf 解析）。
+            stillRunning.push_back(std::move(future));
         }
     }
+    futures_ = std::move(stillRunning);
     {
         std::lock_guard<std::mutex> lock(g_candidatesMutex);
         int64_t now = wall_now_ms();
@@ -291,7 +332,6 @@ std::vector<PythonFallbackResult> PythonFallbackCapture::Finish()
         for (auto it = g_failureCooldown.begin(); it != g_failureCooldown.end();)
             it = it->second <= now ? g_failureCooldown.erase(it) : std::next(it);
     }
-    futures_.clear();
     return out;
 }
 

@@ -70,6 +70,7 @@ set(PROTO_GRPC_SRCS
 set(COMMON_SRCS
     common/CapabilityDetector.cpp
     common/ContinuousSampler.cpp
+    common/ContinuousSegmentProcessor.cpp
     common/CoreEbpfCollector.cpp
     common/RuntimeSymbolMap.cpp
     common/PythonRuntimeProfiler.cpp
@@ -216,6 +217,7 @@ if(GTest_FOUND)
         tests/test_runtime_symbol_map.cpp
         tests/test_go_symbolizer.cpp
         tests/test_continuous_sampler.cpp
+        tests/test_continuous_segment_processor.cpp
 		tests/test_continuous_session_manager.cpp
         tests/test_process.cpp
         server/TaskQueue.cpp
@@ -231,6 +233,7 @@ if(GTest_FOUND)
         common/MemrayProfileIngest.cpp
         common/GoSymbolizer.cpp
         common/CoreEbpfCollector.cpp
+        common/ContinuousSegmentProcessor.cpp
         agent/RunnerUtils.cpp
         agent/TaskQueue.cpp
         agent/UploadQueue.cpp
