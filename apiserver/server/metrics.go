@@ -94,6 +94,11 @@ var (
 	metricReconcileFailed      int64 // gauge：对账失败 raw 块数
 	metricReconcileQuarantined int64 // gauge：对账隔离 raw 块数
 	metricFineGCEnforceCandidates int64 // gauge：enforce 可清理候选数（observe 统计）
+	// 阶段六：migration receipt 回收指标
+	metricMigrationReceiptCount          int64 // gauge：receipt 总数
+	metricMigrationReceiptGCEligible     int64 // gauge：可回收 receipt 数（batch 已删 + 超保留期）
+	metricMigrationReceiptGCDeletedTotal int64 // counter：已回收 receipt 数
+	metricMigrationReceiptGCFailuresTotal int64 // counter：receipt 回收失败次数
 )
 
 // 按来源计数的低磁盘拒收计数（label: source）。
@@ -133,6 +138,12 @@ func incFineGCBlocked(reason, bid string) {
 	metricFineGCBlocked[reason]++
 	metricFineGCBlockedMu.Unlock()
 }
+func incMigrationReceiptGCDeleted(n int64) {
+	if n > 0 {
+		atomic.AddInt64(&metricMigrationReceiptGCDeletedTotal, n)
+	}
+}
+func incMigrationReceiptGCFailure() { atomic.AddInt64(&metricMigrationReceiptGCFailuresTotal, 1) }
 func incContinuousMigrationFailure(errorType string) {
 	atomic.AddInt64(&metricMigrationFailureTotal, 1)
 	metricMigrationFailureByTypeMu.Lock()
@@ -487,6 +498,14 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_fine_gc_reconcile_quarantined %d\n", atomic.LoadInt64(&metricReconcileQuarantined))
 	writeMetricHeader(&b, "mini_drop_fine_gc_enforce_candidates", "gauge", "Fine-grained GC candidates eligible for enforce cleanup.")
 	fmt.Fprintf(&b, "mini_drop_fine_gc_enforce_candidates %d\n", atomic.LoadInt64(&metricFineGCEnforceCandidates))
+	writeMetricHeader(&b, "mini_drop_migration_receipt_count", "gauge", "Continuous migration receipt total count.")
+	fmt.Fprintf(&b, "mini_drop_migration_receipt_count %d\n", atomic.LoadInt64(&metricMigrationReceiptCount))
+	writeMetricHeader(&b, "mini_drop_migration_receipt_gc_eligible", "gauge", "Migration receipts eligible for GC (batch deleted and past retention).")
+	fmt.Fprintf(&b, "mini_drop_migration_receipt_gc_eligible %d\n", atomic.LoadInt64(&metricMigrationReceiptGCEligible))
+	writeMetricHeader(&b, "mini_drop_migration_receipt_gc_deleted_total", "counter", "Migration receipts recycled by GC.")
+	fmt.Fprintf(&b, "mini_drop_migration_receipt_gc_deleted_total %d\n", atomic.LoadInt64(&metricMigrationReceiptGCDeletedTotal))
+	writeMetricHeader(&b, "mini_drop_migration_receipt_gc_failures_total", "counter", "Migration receipt GC failures.")
+	fmt.Fprintf(&b, "mini_drop_migration_receipt_gc_failures_total %d\n", atomic.LoadInt64(&metricMigrationReceiptGCFailuresTotal))
 	writeMetricHeader(&b, "mini_drop_storage_total_bytes", "gauge", "Total bytes of the monitored storage filesystem.")
 	fmt.Fprintf(&b, "mini_drop_storage_total_bytes %d\n", atomic.LoadInt64(&metricStorageTotalBytes))
 	writeMetricHeader(&b, "mini_drop_storage_available_bytes", "gauge", "Available bytes of the monitored storage filesystem.")

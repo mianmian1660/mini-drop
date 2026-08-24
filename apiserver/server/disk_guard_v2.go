@@ -5,7 +5,7 @@
 // required_free 门槛：低于该值时拒绝新建/重试/计划采集，已运行 Continuous
 // Session 进入 waiting/server_storage_pressure（Agent 停止产生新窗口）；
 // GC/删除继续运行；迁移与 compaction 仅在预计临时空间不侵占
-// min_free_bytes + 512MiB 时运行。空间恢复到 required_free + 512MiB 且
+// min_free_bytes + 512MiB 时运行。空间恢复到 required_free + 128MiB 且
 // 连续两次 60s 检查通过后自动恢复，防止反复启停。
 //
 // required_free = max(critical_free_bytes,
@@ -271,7 +271,7 @@ func (s *APIServer) tickRecoveryState(ctx context.Context, snap StorageDiskSnaps
 	required := s.requiredFreeBytes(ctx)
 	hysteresis := cfg.ContinuousParquet.RecoverHysteresisBytes
 	if hysteresis <= 0 {
-		hysteresis = 512 << 20
+		hysteresis = 128 << 20
 	}
 	checks := cfg.ContinuousParquet.RecoveryChecks
 	if checks <= 0 {

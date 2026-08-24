@@ -146,9 +146,17 @@ def run_stackcollapse(perf_script_output: str) -> str:
     # 的 \n 转成 \r\n，stackcollapse-perf.pl/flamegraph.pl 只用 chomp 去掉
     # \n，残留的 \r 会让它们的行格式正则匹配失败（整份输入被当无效数据丢弃）。
     # Linux 部署环境不受影响，但本地/CI 在 Windows 上跑分析管线时会误报失败。
+    #
+    # ⚠️ 末样本丢失修复：stackcollapse-perf.pl 没有 END 块，只在遇到空行时才
+    # flush 当前栈；而 run_perf_script 返回的文本被 strip() 去掉了尾部换行，
+    # 最后一个样本后没有空行，导致它被整个丢弃（pprof 与 folded 样本数差 1，
+    # 火焰图也少最后一根栈）。这里补一个尾随空行，保证末样本被正常输出。
+    input_text = perf_script_output
+    if not input_text.endswith("\n\n"):
+        input_text = input_text.rstrip("\n") + "\n\n"
     result = subprocess.run(
         ["perl", STACKCOLLAPSE_SCRIPT],
-        input=perf_script_output.encode("utf-8"),
+        input=input_text.encode("utf-8"),
         capture_output=True,
         timeout=60
     )

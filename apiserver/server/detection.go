@@ -82,7 +82,7 @@ func (s *APIServer) evaluateSentinelRule(rule model.SentinelRule) {
 	}
 
 	// 用 UTC 与窗口写入的时区保持一致，否则 SQLite 按字符串比较时间会错位（CST vs UTC）。
-	now := time.Now().UTC()
+	now := time.Now().UTC().UTC()
 	q := ProfileQuery{
 		Host:       rule.TargetIP,
 		From:       now.Add(-detectionLookback),
@@ -92,16 +92,20 @@ func (s *APIServer) evaluateSentinelRule(rule model.SentinelRule) {
 
 	result, _, err := s.queryNativeContinuousHistogram(context.Background(), q, rule.Signal)
 	if err != nil || result == nil {
+		s.Logger.Debug("哨兵规则暂无可判异数据", zap.String("rule_sid", rule.SID),
+			zap.String("target_ip", q.Host), zap.Time("from", q.From), zap.Time("to", q.To), zap.Error(err))
 		return // 没有数据可判异（session 未运行/无 backend 数据），不算异常也不算错误，不记录事件
 	}
 	trend, _ := result["trend"].([]gin.H)
 	if len(trend) == 0 {
+		s.Logger.Debug("哨兵规则 histogram trend 为空", zap.String("rule_sid", rule.SID))
 		return
 	}
 	latest := trend[len(trend)-1]
 	observed, _ := latest[rule.Metric].(float64)
 
 	if !s.detectionCoverageOK(q, rule.Signal) {
+		s.Logger.Debug("哨兵规则采样覆盖率不足", zap.String("rule_sid", rule.SID))
 		s.recordDetectionEvent(rule, observed, "skipped_low_coverage", "")
 		return
 	}

@@ -121,9 +121,8 @@ func TestDetectionDoesNotFireBelowFloor(t *testing.T) {
 	blockSeedSession(t, s, sid, ip)
 
 	now := time.Now().UTC()
-	// 覆盖率需 ≥90%（5 分钟 lookback），否则会先走 skipped_low_coverage 分支而非阈值判断。
-	windowStart, windowEnd := now.Add(-290*time.Second), now.Add(-10*time.Second)
-	blockSeedBatch(t, s, sid, ip, "cpb-detect-normal", windowStart, windowEnd,
+	windowStart, windowEnd := now.Add(-90*time.Second), now.Add(-30*time.Second)
+	blockSeedBatch(t, s, sid, ip, "cpb-detect-normal", windowStart.Add(-10*time.Second), windowEnd.Add(10*time.Second),
 		[]ContinuousWindowIngest{detectionSeedSchedWindow(windowStart, windowEnd, 2000)}) // P99=2ms，低于阈值
 
 	rule := detectionSeedRule(t, s, "sr-detect-normal", ip, 5000, 900)

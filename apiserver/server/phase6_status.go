@@ -34,6 +34,9 @@ type pqPhase6Status struct {
 	FineGCDeleted         int64                       `json:"fine_gc_deleted_total"`
 	FineGCFailures        int64                       `json:"fine_gc_failures_total"`
 	FineGCBlocked         map[string]int64            `json:"fine_gc_blocked_by_reason"`
+	MigrationReceiptCount         int64             `json:"migration_receipt_count"`
+	MigrationReceiptGCEligible    int64             `json:"migration_receipt_gc_eligible"`
+	MigrationReceiptGCDeletedTotal int64            `json:"migration_receipt_gc_deleted_total"`
 	ReconcileFailed       int64                       `json:"reconcile_failed"`
 	ReconcileQuarantined  int64                       `json:"reconcile_quarantined"`
 	SignalCoverage        map[string]pqSignalCoverage `json:"signal_coverage"`
@@ -130,6 +133,16 @@ func (s *APIServer) pqPhase6StatusSnapshot(ctx context.Context) pqPhase6Status {
 	}
 	metricFineGCBlockedMu.Unlock()
 
+	// migration receipt 计数与可回收数
+	_ = s.DB.WithContext(ctx).Model(&model.ContinuousMigrationReceipt{}).
+		Count(&out.MigrationReceiptCount).Error
+	receiptCutoff := time.Now().Add(-s.pqMigrationReceiptRetention())
+	_ = s.DB.WithContext(ctx).Model(&model.ContinuousMigrationReceipt{}).
+		Where("source_kind = ? AND updated_at < ?", "batch", receiptCutoff).
+		Where("NOT EXISTS (SELECT 1 FROM profile_batches b WHERE b.bid = continuous_migration_receipts.source_ref)").
+		Count(&out.MigrationReceiptGCEligible).Error
+	out.MigrationReceiptGCDeletedTotal = atomic.LoadInt64(&metricMigrationReceiptGCDeletedTotal)
+
 	out.ParquetV1Fallback = atomic.LoadInt64(&metricParquetV1FallbackTotal)
 	out.ParquetQueryErrors = atomic.LoadInt64(&metricParquetQueryErrorsTotal)
 	out.ParquetQueryLatencyMs = atomic.LoadInt64(&metricParquetQueryLatencyMs)
@@ -151,6 +164,9 @@ func (s *APIServer) pqRefreshPhase6Metrics(ctx context.Context) {
 	atomic.StoreInt64(&metricCoverageSegments, snap.CoverageSegments)
 	atomic.StoreInt64(&metricReconcileFailed, snap.ReconcileFailed)
 	atomic.StoreInt64(&metricReconcileQuarantined, snap.ReconcileQuarantined)
+	// migration receipt 计数与可回收数
+	atomic.StoreInt64(&metricMigrationReceiptCount, snap.MigrationReceiptCount)
+	atomic.StoreInt64(&metricMigrationReceiptGCEligible, snap.MigrationReceiptGCEligible)
 	// enforce 候选数（通过全部清理条件的 batch；observe 模式统计用）
 	if s.fineGCObserveEnabled() {
 		minutes := s.Config.ContinuousParquet.HotMetadataRetentionMinutes

@@ -17,12 +17,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/mini-drop/apiserver/config"
+	"github.com/mini-drop/apiserver/model"
 )
 
 const (
@@ -156,9 +158,9 @@ func TestCollectionOnlyRejectedOnEmergencyOrUnknown(t *testing.T) {
 		wantRej bool
 	}{
 		// required_free = max(critical=4GiB, min+reserve=1.5GiB) = 4GiB
-		{"warning_above_required", 8 * giB, false},      // > required_free
-		{"critical_below_required", 2 * giB, true},      // < required_free（阶段五新增拒收）
-		{"emergency", 512 * 1024 * 1024, true},          // < min_free
+		{"warning_above_required", 8 * giB, false}, // > required_free
+		{"critical_below_required", 2 * giB, true}, // < required_free（阶段五新增拒收）
+		{"emergency", 512 * 1024 * 1024, true},     // < min_free
 		{"normal", 20 * giB, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,6 +241,113 @@ func TestStorageStatusEndpointResponseStructure(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339, envelope.Data.CheckedAt); err != nil {
 		t.Fatalf("checked_at not RFC3339: %q", envelope.Data.CheckedAt)
+	}
+}
+
+func TestStorageStatusEndpointReflectsDynamicCapacityGate(t *testing.T) {
+	// 静态等级仍是 critical（旧 CollectionAllowed=true），但低于
+	// required_free 且处于 halted，对外两个允许字段必须都为 false。
+	setDiskFree(t, 40*giB, 3*giB, 37*giB, nil)
+	s := newTestAPIServer(t)
+	s.Config = &config.Config{
+		StorageDisk: config.StorageDiskConfig{
+			Path: "/tmp", WarningFreeBytes: 8 * giB, CriticalFreeBytes: 4 * giB, MinFreeBytes: 1 * giB,
+		},
+		ContinuousParquet: config.ContinuousParquetConfig{
+			Mode: "enforce", Tenant: "default", QuotaBytes: int64(giB), MinFreeReserve: 512 << 20,
+		},
+	}
+	state := s.diskV2()
+	state.mu.Lock()
+	state.halted = true
+	state.mu.Unlock()
+
+	router := storageStatusRouter(s)
+	req := authRequest(http.MethodGet, "/api/v1/storage/status", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			CollectionAllowed    bool `json:"collection_allowed"`
+			NewCollectionAllowed bool `json:"new_collection_allowed"`
+			CapacityHalted       bool `json:"capacity_halted"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if envelope.Data.CollectionAllowed || envelope.Data.NewCollectionAllowed || !envelope.Data.CapacityHalted {
+		t.Fatalf("dynamic gate not reflected: %s", w.Body.String())
+	}
+}
+
+// TestStorageStatusEndpointIncludesReceiptGC storage/status 必须包含 migration
+// receipt GC 字段（migration_receipt_count / gc_eligible / gc_deleted_total）。
+func TestStorageStatusEndpointIncludesReceiptGC(t *testing.T) {
+	setDiskFree(t, 40*giB, 20*giB, 20*giB, nil)
+	// 包级计数器跨测试累计，这里重置以保证确定性断言。
+	atomic.StoreInt64(&metricMigrationReceiptGCDeletedTotal, 0)
+	s := newTestAPIServer(t)
+	s.Config = &config.Config{StorageDisk: config.StorageDiskConfig{
+		Path: "/tmp", WarningFreeBytes: 8 * giB, CriticalFreeBytes: 4 * giB, MinFreeBytes: 1 * giB,
+	}}
+	// 两条 receipt：一条孤儿且超保留期（eligible），一条仍有 batch（不 eligible）
+	old := time.Now().Add(-100 * time.Hour)
+	if err := s.DB.Create(&model.ContinuousMigrationReceipt{
+		Tenant: "default", SourceKind: "batch", SourceRef: "b-gone", SessionSID: "s1",
+		SignalType: "cpu", BlockID: "block-gone",
+		BucketStart: time.Now().Add(-2 * time.Hour), BucketEnd: time.Now().Add(-time.Hour),
+		StartTime: time.Now().Add(-2 * time.Hour), EndTime: time.Now().Add(-2 * time.Hour).Add(time.Minute),
+		SampleCount: 1, RowCount: 1, Status: "passed", CreatedAt: old, UpdatedAt: old,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&model.ProfileBatch{
+		BID: "b-keep", SessionSID: "s1",
+		StartTime: time.Now().Add(-2 * time.Hour), EndTime: time.Now().Add(-2 * time.Hour).Add(time.Minute),
+		SignalTypes: mustJSONBytes([]string{"cpu_profile"}), Status: "ready",
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&model.ContinuousMigrationReceipt{
+		Tenant: "default", SourceKind: "batch", SourceRef: "b-keep", SessionSID: "s1",
+		SignalType: "cpu", BlockID: "block-keep",
+		BucketStart: time.Now().Add(-2 * time.Hour), BucketEnd: time.Now().Add(-time.Hour),
+		StartTime: time.Now().Add(-2 * time.Hour), EndTime: time.Now().Add(-2 * time.Hour).Add(time.Minute),
+		SampleCount: 1, RowCount: 1, Status: "passed", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	router := storageStatusRouter(s)
+	req := authRequest(http.MethodGet, "/api/v1/storage/status", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			ReceiptCount          int64 `json:"migration_receipt_count"`
+			ReceiptGCEligible     int64 `json:"migration_receipt_gc_eligible"`
+			ReceiptGCDeletedTotal int64 `json:"migration_receipt_gc_deleted_total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if envelope.Data.ReceiptCount != 2 {
+		t.Fatalf("migration_receipt_count = %d, want 2", envelope.Data.ReceiptCount)
+	}
+	if envelope.Data.ReceiptGCEligible != 1 {
+		t.Fatalf("migration_receipt_gc_eligible = %d, want 1 (仅孤儿且超保留期)", envelope.Data.ReceiptGCEligible)
+	}
+	if envelope.Data.ReceiptGCDeletedTotal != 0 {
+		t.Fatalf("migration_receipt_gc_deleted_total = %d, want 0", envelope.Data.ReceiptGCDeletedTotal)
 	}
 }
 
