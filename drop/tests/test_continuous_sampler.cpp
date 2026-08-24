@@ -1040,8 +1040,8 @@ TEST(SharedContinuousEngine, RefusesUnapprovedDegradedFallback)
 // ---- 首轮只建立基线 ----
 TEST(ContinuousSampler, DigestDeltaFirstSeenBaselineOnly)
 {
-    DigestCounterState first{100, 5000000000ULL, 50};
-    DigestDeltaResult delta = compute_digest_delta(nullptr, first);
+    DigestCounterState first{100, 5000000000ULL, 50, 2000};
+    DigestDeltaResult delta = compute_digest_delta(nullptr, first, 2000, 1500);
     EXPECT_EQ(delta.kind, DigestDeltaKind::FirstSeen);
     EXPECT_EQ(delta.deltaCalls, 0u);
     EXPECT_EQ(delta.deltaLatencyUs, 0u);
@@ -1051,9 +1051,9 @@ TEST(ContinuousSampler, DigestDeltaFirstSeenBaselineOnly)
 // ---- 后续仅上报窗口增量，latency 从 ps 换算成 us ----
 TEST(ContinuousSampler, DigestDeltaReportsWindowIncrement)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{120, 5200000000ULL, 60};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{120, 5200000000ULL, 60, 2000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
     EXPECT_EQ(delta.deltaCalls, 20u);
     // (5.2e12 - 5.0e12) ps = 200000000 ps = 200 us（ps -> us 除以 1e6）
@@ -1064,9 +1064,9 @@ TEST(ContinuousSampler, DigestDeltaReportsWindowIncrement)
 // ---- 零增量不输出（deltaCalls == 0）----
 TEST(ContinuousSampler, DigestDeltaZeroCallsNotEmitted)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{100, 5100000000ULL, 55};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{100, 5100000000ULL, 55, 2000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
     EXPECT_EQ(delta.deltaCalls, 0u);
     // 调用方应据此跳过上报
@@ -1075,18 +1075,18 @@ TEST(ContinuousSampler, DigestDeltaZeroCallsNotEmitted)
 // ---- countStar 回退：重建基线，本轮不上报 ----
 TEST(ContinuousSampler, DigestDeltaCounterResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{3, 5000000000ULL, 50};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{3, 5000000000ULL, 50, 2000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
 }
 
 // ---- sumTimerWaitPs 回退：重建基线，避免无符号下溢 ----
 TEST(ContinuousSampler, DigestDeltaLatencyResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{120, 4000000000ULL, 60};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{120, 4000000000ULL, 60, 2000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
     // 旧实现只检查 countStar，这里 sumTimerWaitPs 回退会触发无符号下溢
 }
@@ -1094,10 +1094,22 @@ TEST(ContinuousSampler, DigestDeltaLatencyResetRebuildsBaseline)
 // ---- sumRowsExamined 回退：重建基线，避免无符号下溢 ----
 TEST(ContinuousSampler, DigestDeltaRowsResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{120, 5200000000ULL, 10};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{120, 5200000000ULL, 10, 2000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
+}
+
+// ---- digest 跌出 TOP 50 太久后重新出现：重建基线，不把缺席期累计量算入本窗 ----
+TEST(ContinuousSampler, DigestDeltaLongGapRebuildsBaseline)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{180, 9000000000ULL, 90, 4000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 4000, 1500);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
+    EXPECT_EQ(delta.deltaCalls, 0u);
+    EXPECT_EQ(delta.deltaLatencyUs, 0u);
+    EXPECT_EQ(delta.deltaRows, 0u);
 }
 
 // ---- 跨 Session / 跨实例状态隔离 ----
