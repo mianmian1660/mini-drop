@@ -12,7 +12,6 @@ LOCK_FILE="${DEPLOY_LOCK_FILE:-/tmp/mini-drop-deploy.lock}"
 HEALTH_URL="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8191}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-30}"
 HEALTH_INTERVAL="${DEPLOY_HEALTH_INTERVAL:-2}"
-UP_TIMEOUT="${DEPLOY_UP_TIMEOUT:-600}"
 
 fail() {
   printf '[STAGE:%s] FAIL %s\n' "$1" "$2" >&2
@@ -101,12 +100,19 @@ case "${TEST_SCOPE}" in
 esac
 
 run_stage BUILD docker compose build
-run_stage UP docker compose up -d --wait --wait-timeout "${UP_TIMEOUT}"
+run_stage UP docker compose up -d
 
 health_check() {
-  local attempt
+  local attempt exited
   for attempt in $(seq 1 "${HEALTH_TRIES}"); do
-    curl -fsS "${HEALTH_URL}/healthz" >/dev/null 2>&1 && return 0
+    exited="$(docker compose ps --status exited --services | grep -vx 'minio-init' || true)"
+    [[ -z "${exited}" ]] || {
+      printf '异常退出的服务:\n%s\n' "${exited}" >&2
+      return 1
+    }
+    if curl -fsS "${HEALTH_URL}/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
     sleep "${HEALTH_INTERVAL}"
   done
   return 1
