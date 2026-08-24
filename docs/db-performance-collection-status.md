@@ -47,7 +47,7 @@
 
 ## 2. 验收任务清单
 
-链路已打通(2026-08-23 09:00,见 3.4),以下 7 个场景全部**待执行**。任务按优先级排序,不是表格原顺序——排序理由和每个任务的前置条件见下方。所有任务默认都要先满足 [4.3 环境层](#43-用户操作注意事项验收复跑必读) 的三条(密码文件重写、磁盘 >2GB、二进制是新版),不再逐条重复。
+链路已打通(2026-08-23 09:00,见 3.4),以下 7 个场景全部**待执行**。任务按优先级排序,不是表格原顺序——排序理由和每个任务的前置条件见下方。所有任务默认都要先满足 [4.3 环境层](#43-用户操作注意事项验收复跑必读) 的三条(密码文件重写、磁盘 >=1GiB、二进制是新版),不再逐条重复。
 
 | # | 任务 | 优先级理由 | 前置条件(除环境层外) | 状态 |
 |---|---|---|---|---|
@@ -103,7 +103,7 @@
 2. **真正长期阻塞:磁盘背压暂停采集(2026-08-23 凌晨最终定位)**。节流修复部署后 `profile_windows` 仍空,追查发现 agent 一直处于"采集暂停"状态:
    - agent 日志刷 `[native-cp] spool backpressure ... free_bytes=1.74GB min_free_bytes=2147483648`
    - Session `degradation_reason="shared spool backpressure: free disk is below the configured reserve; collection is paused and will resume automatically"`
-   - 机制:`spool_free_bytes`([ContinuousSampler.cpp:296](../drop/common/ContinuousSampler.cpp:296))用 `statvfs(spoolDirectory)` 统计磁盘剩余,**低于 `spoolMinFreeBytes`(2GB)时暂停全部持续采集**(防 spool 写满把系统写崩),磁盘恢复后自动 resume,这是设计内的自我保护,不是 bug。
+   - 机制:`spool_free_bytes`([ContinuousSampler.cpp:296](../drop/common/ContinuousSampler.cpp:296))用 `statvfs(spoolDirectory)` 统计磁盘剩余,**低于 `spoolMinFreeBytes`(1GiB)时暂停全部持续采集**(防 spool 写满把系统写崩),磁盘恢复到 >=1GiB 后自动 resume,这是设计内的自我保护,不是 bug。
    - 触发原因:VM 磁盘 94% 满(25G/29G)。`docker builder prune -af` + `docker system prune -f` 清出 3.4G 可用后背压解除(`grep -c "spool backpressure"` = 0)。
    - 经验点:VM 的 docker 数据不在 `/var/lib/docker`(`du -sh` 仅 4.0K),疑似 rootless docker(数据在 `~/.local/share/docker`),排查磁盘占用时别只看 `/var/lib/docker`。
 
@@ -204,7 +204,7 @@ for i in $(seq 1 300); do docker exec fault-mysql mysql -uroot -proot orders -N 
 
 #### 问题 ②:修复部署后"问题依旧"——其实是磁盘背压
 - **现象**:修复后 `profile_windows` 仍空,Session 显示 `degraded`。
-- **根因**:VM 磁盘 94% 满(25G/29G),`spool_free_bytes`([ContinuousSampler.cpp:296](../drop/common/ContinuousSampler.cpp:296))用 `statvfs(spoolDirectory)` 统计,低于 `spoolMinFreeBytes`(2GB)时 agent **主动暂停全部持续采集**(防 spool 写爆崩盘,设计内自我保护,不是 bug)。
+- **根因**:VM 磁盘 94% 满(25G/29G),`spool_free_bytes`([ContinuousSampler.cpp:296](../drop/common/ContinuousSampler.cpp:296))用 `statvfs(spoolDirectory)` 统计,低于 `spoolMinFreeBytes`(1GiB)时 agent **主动暂停全部持续采集**(防 spool 写爆崩盘,设计内自我保护,不是 bug)。
 - **解决**:`docker builder prune -af` + `docker system prune -f` 清出 3.4G,背压自动解除。
 - **教训**:磁盘不足时 agent **静默暂停**,表现成"代码没生效";排查顺序永远先看 Session 的 `degradation_reason`。
 
@@ -236,7 +236,7 @@ for i in $(seq 1 300); do docker exec fault-mysql mysql -uroot -proot orders -N 
 1. 每次 VM 重启 / 容器重建后,三样东西会丢或变,必须重做:
    - `fault-mysql` 容器 → 账号、orders 库、lock_wait 权限**全套重建**(新容器是全新 MySQL)。
    - agent 密码文件 `/etc/mini-drop/db-credentials.d/orders-mysql.env`(overlay 层清空)。
-2. 先清盘再验收:`df -h /` 可用需 > 2GB,否则背压暂停一切采集。
+2. 先清盘再验收:`df -h /` 可用需 >= 1GiB,否则背压暂停一切采集。
 3. 确认二进制是新版:`docker exec mini-drop-drop_agent-1 ls -la /app/drop_agent` 时间应 ≥ `Aug 22 17:03`(UTC)。
 
 **测试流量层(最容易栽)**

@@ -441,34 +441,44 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
             assignment.aggregationWindowSec = item.value("aggregation_window_sec", 10);
             assignment.uploadBatchSec = item.value("upload_batch_sec", 60);
             assignment.retentionHours = item.value("retention_hours", 24);
+            // 阶段一：signals 字符串数组（Reconcile assignment DTO 显式下发）。
+            // 空集合保持为空（BuildSamplerConfig 回退四类默认）。
+            assignment.requestedSignals.clear();
+            for (const auto &signal : item.value("signals", json::array()))
+                if (signal.is_string() && !signal.get<std::string>().empty())
+                    assignment.requestedSignals.push_back(signal.get<std::string>());
             // labels 是 base64 包一层 JSON（见 base64_decode 上方注释），解码失败
             // 或不含 db_targets 时静默跳过——数据库巡检是可选能力，不能因为
-            // labels 格式问题拖垮整条 CPU/IO/sched 采集链路。
-            const std::string labelsB64 = item.value("labels", std::string());
-            if (!labelsB64.empty() && labelsB64 != "null")
+            // labels 格式问题拖垮整条 CPU/IO/sched 采集链路。labels 可能为
+            // null（无 labels 的 Session），此时跳过解析。
+            if (item.contains("labels") && !item.at("labels").is_null())
             {
-                try
+                const std::string labelsB64 = item.value("labels", std::string());
+                if (!labelsB64.empty())
                 {
-                    json labels = json::parse(base64_decode(labelsB64));
-                    for (const auto &dbItem : labels.value("db_targets", json::array()))
+                    try
                     {
-                        drop::DBTargetConfig target;
-                        target.engine = dbItem.value("engine", "");
-                        target.instanceLabel = dbItem.value("instance_label", "");
-                        target.host = dbItem.value("host", "");
-                        target.port = dbItem.value("port", 0);
-                        target.user = dbItem.value("user", "");
-                        target.passwordRef = dbItem.value("password_ref", "");
-                        target.pollIntervalSec = dbItem.value("poll_interval_sec", assignment.aggregationWindowSec);
-                        target.queryTimeoutMs = dbItem.value("query_timeout_ms", 500);
-                        if (!target.engine.empty() && !target.host.empty())
-                            assignment.dbTargets.push_back(std::move(target));
+                        json labels = json::parse(base64_decode(labelsB64));
+                        for (const auto &dbItem : labels.value("db_targets", json::array()))
+                        {
+                            drop::DBTargetConfig target;
+                            target.engine = dbItem.value("engine", "");
+                            target.instanceLabel = dbItem.value("instance_label", "");
+                            target.host = dbItem.value("host", "");
+                            target.port = dbItem.value("port", 0);
+                            target.user = dbItem.value("user", "");
+                            target.passwordRef = dbItem.value("password_ref", "");
+                            target.pollIntervalSec = dbItem.value("poll_interval_sec", assignment.aggregationWindowSec);
+                            target.queryTimeoutMs = dbItem.value("query_timeout_ms", 500);
+                            if (!target.engine.empty() && !target.host.empty())
+                                assignment.dbTargets.push_back(std::move(target));
+                        }
                     }
-                }
-                catch (const std::exception &error)
-                {
-                    std::cerr << "[native-cp] reconcile labels parse failed sid=" << assignment.sid
-                              << ": " << error.what() << std::endl;
+                    catch (const std::exception &error)
+                    {
+                        std::cerr << "[native-cp] reconcile labels parse failed sid=" << assignment.sid
+                                  << ": " << error.what() << std::endl;
+                    }
                 }
             }
             if (!assignment.sid.empty())
@@ -584,7 +594,13 @@ drop::ContinuousSamplerConfig ContinuousSessionManager::BuildSamplerConfig(const
     samplerConfig.authUID = authUID_;
     samplerConfig.scope = runtime.assignment.scope;
     samplerConfig.selectorExe = runtime.assignment.selectorExe;
-    samplerConfig.signals = "cpu,io,io_syscall,sched";
+    // 阶段一：信号控制面。requestedSignals 来自 assignment；为空时回退四类
+    // 默认。signals（物理采集集）由 requestedSignals 换算；共享采集器还会在
+    // shared_physical_config 里对所有活动 Session 取并集。
+    samplerConfig.requestedSignals = runtime.assignment.requestedSignals;
+    if (samplerConfig.requestedSignals.empty())
+        samplerConfig.requestedSignals = {"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"};
+    samplerConfig.signals = drop::PhysicalSignalsFromRequested(samplerConfig.requestedSignals);
     samplerConfig.allowDegraded = runtime.assignment.allowDegraded || runtime.assignment.continuityMode == "degraded";
     samplerConfig.targetProcesses = runtime.targets;
     samplerConfig.dbTargets = runtime.assignment.dbTargets;
@@ -670,7 +686,12 @@ void ContinuousSessionManager::RebuildSharedEngine()
         fingerprint << entry.first << '|' << runtime.assignment.revision << '|'
                     << runtime.assignment.scope << '|' << runtime.assignment.continuityMode << '|'
                     << runtime.assignment.allowDegraded << '|' << runtime.assignment.sampleRateHz << '|'
-                    << runtime.assignment.aggregationWindowSec << '|' << runtime.assignment.uploadBatchSec << ';';
+                    << runtime.assignment.aggregationWindowSec << '|' << runtime.assignment.uploadBatchSec << '|';
+        // 阶段一：请求信号集与目标集（target fingerprint 的来源）也计入共享
+        // 引擎 fingerprint，变化时触发受控切换。
+        for (const auto &signal : runtime.assignment.requestedSignals)
+            fingerprint << signal << ',';
+        fingerprint << ';';
         for (const auto &target : runtime.targets)
             fingerprint << target.pid << ':' << target.processStartMs << ',';
     }
@@ -694,10 +715,13 @@ void ContinuousSessionManager::RebuildSharedEngine()
     // Blue/green handoff: attach the replacement collector while the current
     // one is still sampling. Only after the new backend reports ready do we
     // stop the old recorder, preventing a target/PID change from creating an
-    // avoidable startup gap. Both generations use the same session spool and
-    // the old generation is stopped before the new one can emit its next
-    // complete aggregation window, so ownership remains time ordered.
+    // avoidable startup gap. Both generations use the same session spool.
+    const bool hasPrevious = sharedSampler_ && sharedSampler_->Running();
     auto replacement = std::make_unique<drop::SharedDualTrackContinuousSampler>();
+    // standby 必须在线程启动前设置，否则 Start() 后到 BeginHandoff() 之间
+    // replacement 可能抢先持久化窗口，破坏 cutover 的单一所有权。
+    if (hasPrevious)
+        replacement->BeginHandoff();
     std::string error;
     if (!replacement->Start(configs, &error))
     {
@@ -733,10 +757,28 @@ void ContinuousSessionManager::RebuildSharedEngine()
         }
         return;
     }
-    auto previous = std::move(sharedSampler_);
-    sharedSampler_ = std::move(replacement);
-    if (previous)
+    // 阶段一：唯一 cutover watermark——切点前后由不同 generation 独占，绝不
+    // 产生重叠窗口。旧 generation 只提交完整结束于切点前的数据
+    //（keepBefore=true），跨切点聚合窗丢弃；新
+    // generation 在切点重置并只提交切点后数据（Own(watermark)）。若无法完成
+    // barrier，旧实例在 Own 之前已停止，允许形成短缺口但绝无重叠。
+    if (hasPrevious)
+    {
+        const int64_t watermarkMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+        sharedSampler_->SetCutoverWatermark(watermarkMs, /*keepBefore=*/true);
+        replacement->Own(watermarkMs);
+        auto previous = std::move(sharedSampler_);
+        sharedSampler_ = std::move(replacement);
         previous->Stop();
+    }
+    else
+    {
+        // 首次启动（无前代）：owning，无 cutover（全量持久化）。
+        replacement->Own(0);
+        sharedSampler_ = std::move(replacement);
+    }
     sharedFingerprint_ = nextFingerprint;
     UpdateRuntimeEngineStatus(configs);
 }

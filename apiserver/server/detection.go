@@ -234,7 +234,7 @@ func (s *APIServer) detectionCoverageOK(q ProfileQuery, signal string) bool {
 		Find(&windows).Error; err != nil || len(windows) == 0 {
 		return false
 	}
-	_, coverage := continuousTimelineCoverage(windows, q.From, q.To, detectionCoverageTolerance)
+	_, coverage := continuousTimelineCoverage(windows, q.From, q.To, time.Time{}, detectionCoverageTolerance)
 	ratio, _ := coverage["ratio"].(float64)
 	return ratio >= detectionCoverageMinRatio
 }

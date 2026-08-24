@@ -298,11 +298,13 @@ func (s *APIServer) tickRecoveryState(ctx context.Context, snap StorageDiskSnaps
 }
 
 // capacityHalted 返回当前是否处于容量暂停（不触发计算，供采集入口判断）。
+// 阶段一：continuousRepairPause（维护期修复暂停）叠加在磁盘暂停之上——修复
+// 窗口内阻止新窗口产生，但不停止用户业务进程。
 func (s *APIServer) capacityHalted() bool {
 	state := s.diskV2()
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	return state.halted
+	return state.halted || continuousRepairPause.Load()
 }
 
 // maintenanceSpaceOK 迁移/compaction 的临时空间门槛：

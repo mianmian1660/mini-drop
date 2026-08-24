@@ -106,14 +106,18 @@ func TestCreateContinuousSessionRequiresDegradedConfirmation(t *testing.T) {
 }
 
 func TestNormalizeContinuousRequestedSignalsPreservesSelection(t *testing.T) {
-	got := normalizeContinuousRequestedSignals([]string{"cpu_profile", "io_latency", "cpu_profile", "unsupported"})
+	got, err := normalizeContinuousRequestedSignals([]string{"cpu_profile", "io_latency", "cpu_profile"})
 	want := []string{"cpu_profile", "io_latency"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("normalized signals=%v, want %v", got, want)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized signals=%v err=%v, want %v", got, err, want)
 	}
-	got = normalizeContinuousRequestedSignals(nil)
-	if !reflect.DeepEqual(got, continuousDefaultSignals) {
-		t.Fatalf("empty signals=%v, want defaults %v", got, continuousDefaultSignals)
+	// 未知信号不再静默过滤：直接报错（API 侧 400），避免"回退为全开"掩盖配置错误。
+	if _, err := normalizeContinuousRequestedSignals([]string{"cpu_profile", "unsupported"}); err == nil {
+		t.Fatalf("unknown signal should be rejected")
+	}
+	got, err = normalizeContinuousRequestedSignals(nil)
+	if err != nil || !reflect.DeepEqual(got, continuousDefaultSignals) {
+		t.Fatalf("empty signals=%v err=%v, want defaults %v", got, err, continuousDefaultSignals)
 	}
 }
 

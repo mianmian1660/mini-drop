@@ -147,18 +147,162 @@ static uint64_t agent_generation_id()
     return identity;
 }
 
-static std::string make_batch_id(const ContinuousSamplerConfig &cfg, int64_t windowStartMs)
+static std::string make_batch_id(const ContinuousSamplerConfig &cfg)
+{
+    // 阶段一：batch ID 由 session、collector generation 与单调递增的
+    // batch_sequence 生成；重试始终使用相同 ID 与摘要。collector_generation
+    // 为空时回退 agent 进程身份（兼容尚未赋 generation 的调用路径）。
+    std::ostringstream identity;
+    identity << cfg.scope << '|' << cfg.selectorExe << '|';
+    for (const auto &target : cfg.targetProcesses)
+        identity << target.pid << ':' << target.processStartMs << ':' << target.exe << ';';
+    const std::string generation = cfg.collectorGeneration.empty()
+                                       ? ("gen-" + std::to_string(agent_generation_id()))
+                                       : cfg.collectorGeneration;
+    std::ostringstream id;
+    id << "cpb-" << std::hex << stable_string_hash(cfg.sessionSID)
+       << '-' << stable_string_hash(identity.str())
+       << std::dec << '-' << cfg.batchSequence
+       << '-' << std::hex << stable_string_hash(generation);
+    return id.str();
+}
+
+// ============================================================
+// 阶段一：SHA-256（自研紧凑实现，避免对 sha256sum 子进程的依赖）
+// ============================================================
+
+static const uint32_t kSha256K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+static void sha256_transform(uint32_t state[8], const uint8_t block[64])
+{
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i)
+        w[i] = (static_cast<uint32_t>(block[i * 4]) << 24) | (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
+               (static_cast<uint32_t>(block[i * 4 + 2]) << 8) | static_cast<uint32_t>(block[i * 4 + 3]);
+    for (int i = 16; i < 64; ++i)
+    {
+        uint32_t s0 = ((w[i - 15] >> 7) | (w[i - 15] << 25)) ^ ((w[i - 15] >> 18) | (w[i - 15] << 14)) ^ (w[i - 15] >> 3);
+        uint32_t s1 = ((w[i - 2] >> 17) | (w[i - 2] << 15)) ^ ((w[i - 2] >> 19) | (w[i - 2] << 13)) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+    for (int i = 0; i < 64; ++i)
+    {
+        uint32_t S1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t temp1 = h + S1 + ch + kSha256K[i] + w[i];
+        uint32_t S0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = S0 + maj;
+        h = g; g = f; f = e; e = d + temp1;
+        d = c; c = b; b = a; a = temp1 + temp2;
+    }
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+static std::string sha256_hex(const std::string &input)
+{
+    uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    uint64_t bitLen = static_cast<uint64_t>(input.size()) * 8;
+    std::string data = input;
+    data.push_back(static_cast<char>(0x80));
+    while ((data.size() % 64) != 56)
+        data.push_back('\0');
+    for (int i = 7; i >= 0; --i)
+        data.push_back(static_cast<char>((bitLen >> (i * 8)) & 0xFF));
+    for (size_t offset = 0; offset < data.size(); offset += 64)
+        sha256_transform(state, reinterpret_cast<const uint8_t *>(data.data() + offset));
+    static const char *hexDigits = "0123456789abcdef";
+    std::string out;
+    for (int i = 0; i < 8; ++i)
+        for (int shift = 28; shift >= 0; shift -= 4)
+            out.push_back(hexDigits[(state[i] >> shift) & 0xF]);
+    return out;
+}
+
+// ============================================================
+// 阶段一：信号映射（物理采集名 ↔ 服务端逻辑 signal_type）
+// ============================================================
+
+static const std::vector<std::pair<std::string, std::string>> &signal_name_map()
+{
+    static const std::vector<std::pair<std::string, std::string>> map = {
+        {"cpu", "cpu_profile"}, {"io", "io_latency"}, {"io_syscall", "io_syscall_latency"}, {"sched", "sched_latency"}};
+    return map;
+}
+
+// requestedSignals（逻辑名）→ 物理信号集合字符串（逗号分隔），供共享采集器
+// 取并集。空集合回退四类全开。
+static std::string physical_signals_from_requested(const std::vector<std::string> &requested)
+{
+    if (requested.empty())
+        return "cpu,io,io_syscall,sched";
+    std::vector<std::string> physical;
+    for (const auto &logical : requested)
+        for (const auto &entry : signal_name_map())
+            if (entry.second == logical)
+            {
+                physical.push_back(entry.first);
+                break;
+            }
+    if (physical.empty())
+        return "cpu,io,io_syscall,sched";
+    std::string out;
+    for (size_t i = 0; i < physical.size(); ++i)
+    {
+        if (i)
+            out += ",";
+        out += physical[i];
+    }
+    return out;
+}
+
+// 判断逻辑信号名是否被 requestedSignals 请求（空集合 = 全部请求）。
+static bool logical_signal_requested(const std::vector<std::string> &requested, const std::string &logical)
+{
+    if (requested.empty())
+        return true;
+    for (const auto &signal : requested)
+        if (signal == logical)
+            return true;
+    return false;
+}
+
+// ============================================================
+// 阶段一：collector generation / target fingerprint
+// ============================================================
+
+// 每个共享采集器实例拥有独立 collector generation：agent 进程身份 + 进程内
+// 自增实例号。切换（replacement）即新实例 → 新 generation；Agent/容器重启时
+// agent 进程身份变化 → 新 generation。
+static std::string collector_generation_id()
+{
+    static std::atomic<uint64_t> instanceCounter{0};
+    std::ostringstream id;
+    id << "gen-" << std::hex << agent_generation_id() << '-' << std::dec << instanceCounter.fetch_add(1);
+    return id.str();
+}
+
+// 目标进程集稳定指纹：scope + selector + 有序 pid:start:exe 列表的摘要。
+// 目标集变化 → 指纹变化 → 触发共享引擎受控切换。
+static std::string target_fingerprint_for(const ContinuousSamplerConfig &cfg)
 {
     std::ostringstream identity;
     identity << cfg.scope << '|' << cfg.selectorExe << '|';
     for (const auto &target : cfg.targetProcesses)
         identity << target.pid << ':' << target.processStartMs << ':' << target.exe << ';';
-    std::ostringstream id;
-    id << "cpb-" << std::hex << stable_string_hash(cfg.sessionSID)
-       << '-' << stable_string_hash(identity.str())
-       << std::dec << '-' << windowStartMs
-       << '-' << std::hex << agent_generation_id();
-    return id.str();
+    return sha256_hex(identity.str()).substr(0, 32);
 }
 
 static bool ensure_directory(const std::string &path)
@@ -494,7 +638,180 @@ struct WindowPayload
     // runtime map 符号化诊断（Java/Node/Python JIT perf map），序列化后写入
     // 批次/窗口 JSON 的 symbol_refs，服务端据此推断 symbol_status。
     std::string symbolRefsJson;
+    // 阶段一：逻辑窗口稳定 ID（内容摘要不参与 ID，见 make_window_id）与
+    // 窗口内容摘要（冲突检测）。
+    std::string windowID;
+    std::string contentSHA256;
 };
+
+// ============================================================
+// 阶段一：分信号计数 / 窗口内容摘要 / 窗口 ID / 批次内容摘要
+// ============================================================
+
+// 某窗口的分信号计数（逻辑信号名 → 计数）。histogram 用 eventCount，CPU 样本
+// 用 count 累加（含 profiles），metric/db 用条目数。与服务端
+// continuousWindowSampleCount 口径一致。
+static std::map<std::string, uint64_t> window_signal_counts(const WindowPayload &window)
+{
+    std::map<std::string, uint64_t> counts;
+    auto add = [&counts](const std::string &signal, uint64_t value) {
+        if (signal.empty())
+            return;
+        counts[signal] = add_count(counts[signal], value);
+    };
+    if (!window.samples.empty())
+    {
+        uint64_t total = 0;
+        for (const auto &sample : window.samples)
+            total = add_count(total, sample.count);
+        add("cpu_profile", total);
+    }
+    for (const auto &profile : window.profiles)
+    {
+        uint64_t total = 0;
+        for (const auto &sample : profile.samples)
+            total = add_count(total, sample.count);
+        add(profile.signalType.empty() ? "cpu_profile" : profile.signalType, total);
+    }
+    for (const auto &hist : window.histograms)
+        add(hist.signalType, hist.eventCount);
+    if (!window.metrics.empty())
+        add("python_rss", static_cast<uint64_t>(window.metrics.size()));
+    if (!window.dbSnapshots.empty())
+        add("db_snapshot", static_cast<uint64_t>(window.dbSnapshots.size()));
+    if (counts.empty() && !window.samples.empty())
+        add("cpu_profile", 1);
+    return counts;
+}
+
+// 窗口内容摘要：对窗口 payload 的规范化表示做 sha256。同一逻辑内容 → 相同
+// 摘要；内容变化 → 摘要变化（服务端据此判冲突）。与字段顺序无关。
+static std::string window_content_digest(const WindowPayload &window)
+{
+    std::ostringstream content;
+    auto text = [&content](const std::string &value) {
+        content << value.size() << ':' << value << '|';
+    };
+    content << "ws=" << window.startMs << "|we=" << window.endMs << ";";
+    for (const auto &sample : window.samples)
+    {
+        content << "s:" << sample.pid << ':' << sample.processStartMs << ':' << sample.count << ':';
+        text(sample.comm); text(sample.exe); text(sample.runtime); text(sample.stackScope); text(sample.backend);
+        for (const auto &frame : sample.stack)
+            text(frame);
+        for (const auto &frame : sample.frames)
+        {
+            text(frame.function); text(frame.raw); text(frame.file); text(frame.mappingFile); text(frame.buildId);
+            content << frame.line << ':' << frame.address << ':' << frame.normalizedOffset << ':' << frame.resolved << '|';
+        }
+        content << ";";
+    }
+    for (const auto &profile : window.profiles)
+    {
+        content << "p:"; text(profile.signalType); text(profile.backend); text(profile.stackScope);
+        text(profile.profileID); text(profile.unit);
+        for (const auto &sample : profile.samples)
+        {
+            content << sample.pid << ':' << sample.processStartMs << ':' << sample.count << ':';
+            text(sample.comm); text(sample.exe); text(sample.runtime); text(sample.backend);
+            for (const auto &frame : sample.stack)
+                text(frame);
+            for (const auto &frame : sample.frames)
+            {
+                text(frame.function); text(frame.raw); text(frame.file); text(frame.mappingFile); text(frame.buildId);
+                content << frame.line << ':' << frame.address << ':' << frame.normalizedOffset << ':' << frame.resolved << '|';
+            }
+        }
+        content << ";";
+    }
+    for (const auto &hist : window.histograms)
+    {
+        content << "h:"; text(hist.signalType); text(hist.backend); text(hist.unit); text(hist.reason);
+        content << hist.pid << ':' << hist.eventCount << ':' << hist.unavailable << ':'
+                << hist.min << ':' << hist.max << ':' << hist.p50 << ':' << hist.p95 << ':' << hist.p99 << ':';
+        for (const auto &bucket : hist.buckets)
+        {
+            text(bucket.range);
+            content << bucket.low << ':' << bucket.high << ':' << bucket.count << ',';
+        }
+        content << ";";
+    }
+    for (const auto &metric : window.metrics)
+    {
+        content << "m:" << metric.pid << ':' << metric.processStartMs << ':' << metric.timestampMs << ':' << metric.value << ':';
+        text(metric.metric); text(metric.unit); text(metric.runtime); text(metric.comm); text(metric.exe);
+        content << ';';
+    }
+    for (const auto &snap : window.dbSnapshots)
+    {
+        content << "d:" << snap.timestampMs << ':' << snap.callCount << ':' << snap.totalLatencyUs << ':'
+                << snap.rowsExaminedTotal << ':' << snap.waitingPid << ':' << snap.blockingPid << ':' << snap.waitSeconds << ':';
+        text(snap.kind); text(snap.instanceLabel); text(snap.schemaName); text(snap.digestText);
+        text(snap.waitingQuery); text(snap.blockingQuery); text(snap.lockedTable);
+        content << ';';
+    }
+    content << "meta:" << window.rssTruncated << ':';
+    text(window.backendStatus); text(window.backendReason); text(window.selectedBackend);
+    for (const auto &backend : window.attemptedBackends)
+        text(backend);
+    if (!window.symbolRefsJson.empty())
+    {
+        content << "sr:";
+        text(window.symbolRefsJson);
+    }
+    return sha256_hex(content.str());
+}
+
+// 逻辑窗口稳定 ID：session + collector generation + 起止时间 + target
+// fingerprint。内容摘要不参与 ID——内容冲突仍是同一合法 ID，绝不允许生成
+// 第二个 ID（服务端靠该 ID 判冲突/幂等）。
+static std::string make_window_id(const ContinuousSamplerConfig &cfg, const WindowPayload &window)
+{
+    std::ostringstream identity;
+    identity << cfg.sessionSID << '|' << cfg.collectorGeneration << '|'
+             << window.startMs << '|' << window.endMs << '|' << cfg.targetFingerprint;
+    std::ostringstream id;
+    id << "cpw-" << sha256_hex(identity.str()).substr(0, 32);
+    return id.str();
+}
+
+// 批次内容摘要：session + generation + sequence + 起止时间 + 各窗口内容摘要
+// 的汇总 sha256。同一内容重传 → 相同摘要；内容变化 → 摘要变化。
+static std::string batch_content_digest(const ContinuousSamplerConfig &cfg,
+                                        const std::vector<WindowPayload> &windows)
+{
+    std::ostringstream content;
+    content << cfg.sessionSID << '|' << cfg.collectorGeneration << '|' << cfg.batchSequence << '|';
+    for (const auto &window : windows)
+        content << window.startMs << '-' << window.endMs << ':' << window_content_digest(window) << ';';
+    return sha256_hex(content.str());
+}
+
+// 批次分信号计数（跨窗口求和）。
+static std::map<std::string, uint64_t> batch_signal_counts(const std::vector<WindowPayload> &windows)
+{
+    std::map<std::string, uint64_t> counts;
+    for (const auto &window : windows)
+        for (const auto &entry : window_signal_counts(window))
+            counts[entry.first] = add_count(counts[entry.first], entry.second);
+    return counts;
+}
+
+static std::string signal_counts_json(const std::map<std::string, uint64_t> &counts)
+{
+    // 信号名来自固定白名单（cpu_profile/io_latency/io_syscall_latency/
+    // sched_latency/python_rss/db_snapshot），不含 JSON 特殊字符，无需转义。
+    std::string out = "{";
+    size_t index = 0;
+    for (const auto &entry : counts)
+    {
+        if (index++)
+            out += ",";
+        out += "\"" + entry.first + "\":" + std::to_string(entry.second);
+    }
+    out += "}";
+    return out;
+}
 
 static int64_t now_ms()
 {
@@ -2075,17 +2392,6 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
 {
     std::string start = windows.empty() ? rfc3339_from_ms(now_ms()) : rfc3339_from_ms(windows.front().startMs);
     std::string end = windows.empty() ? start : rfc3339_from_ms(windows.back().endMs);
-    uint64_t sampleCount = 0;
-    for (const auto &window : windows)
-    {
-        for (const auto &sample : window.samples)
-            sampleCount = add_count(sampleCount, sample.count);
-        for (const auto &profile : window.profiles)
-            for (const auto &sample : profile.samples)
-                sampleCount = add_count(sampleCount, sample.count);
-        for (const auto &hist : window.histograms)
-            sampleCount = add_count(sampleCount, hist.eventCount);
-    }
 
     std::set<std::string> signalTypes;
     std::map<std::string, std::string> backends;
@@ -2132,7 +2438,14 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
     body += "\"session_sid\":\"" + json_escape(cfg.sessionSID) + "\",";
     body += "\"batch_id\":\"" + json_escape(batchID) + "\",";
     body += "\"target_ip\":\"" + json_escape(cfg.targetIP) + "\",";
-    body += "\"schema_version\":2,";
+    // 阶段一：协议 v3。batch 层 sample_count 废弃写 0；分信号计数
+    // signal_counts、collector_generation、batch_sequence、content_sha256
+    // 是服务端幂等/冲突校验与统计的新事实来源。
+    body += "\"schema_version\":3,";
+    body += "\"collector_generation\":\"" + json_escape(cfg.collectorGeneration) + "\",";
+    body += "\"batch_sequence\":" + std::to_string(cfg.batchSequence) + ",";
+    body += "\"content_sha256\":\"" + batch_content_digest(cfg, windows) + "\",";
+    body += "\"signal_counts\":" + signal_counts_json(batch_signal_counts(windows)) + ",";
     body += "\"profile_format\":\"json\",";
     // Batch-level backend metadata (aggregated from windows)
     std::string batchBackendStatus = "ok";
@@ -2190,7 +2503,8 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
     body += "\"start_time\":\"" + start + "\",";
     body += "\"end_time\":\"" + end + "\",";
     body += "\"window_count\":" + std::to_string(windows.size()) + ",";
-    body += "\"sample_count\":" + std::to_string(sampleCount) + ",";
+    // 阶段一：batch 层 sample_count 废弃并写 0（所有计数读 signal_counts）。
+    body += "\"sample_count\":0,";
     // Batch-level symbol_refs：取最后一个非空窗口的 runtime map 报告（反映最新
     // 运行时状态；runtime map 是进程生命周期相关，用最新比用首个更有代表性）。
     std::string batchSymbolRefs;
@@ -2216,7 +2530,16 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
         for (const auto &profile : window.profiles)
             for (const auto &sample : profile.samples)
                 windowSamples = add_count(windowSamples, sample.count);
+        // 阶段一：逻辑窗口稳定 ID 与内容摘要（确定性，重传/内容冲突时一致）。
+        const std::string windowID = window.windowID.empty() ? make_window_id(cfg, window) : window.windowID;
+        const std::string windowContent = window.contentSHA256.empty() ? window_content_digest(window) : window.contentSHA256;
+        const std::string windowCountsJson = signal_counts_json(window_signal_counts(window));
         body += "{";
+        body += "\"window_id\":\"" + json_escape(windowID) + "\",";
+        body += "\"collector_generation\":\"" + json_escape(cfg.collectorGeneration) + "\",";
+        body += "\"target_fingerprint\":\"" + json_escape(cfg.targetFingerprint) + "\",";
+        body += "\"content_sha256\":\"" + json_escape(windowContent) + "\",";
+        body += "\"signal_counts\":" + windowCountsJson + ",";
         body += "\"window_start\":\"" + rfc3339_from_ms(window.startMs) + "\",";
         body += "\"window_end\":\"" + rfc3339_from_ms(window.endMs) + "\",";
         body += "\"sample_count\":" + std::to_string(windowSamples) + ",";
@@ -2412,7 +2735,6 @@ static bool response_acknowledges_batch(const std::string &response, const std::
 enum class SpoolPostResult
 {
     Acknowledged,
-    BatchIDConflict,
     PermanentlyRejected,
     Failed,
 };
@@ -2453,8 +2775,12 @@ static SpoolPostResult post_spooled_batch(const ContinuousSamplerConfig &cfg,
     }
     if (rc == 0 && httpStatus == 409)
     {
-        std::cout << "[native-cp] batch ID conflict batch=" << batchID << std::endl;
-        return SpoolPostResult::BatchIDConflict;
+        // 阶段一：内容冲突/同一 ID 已被占用。服务端对这类冲突一律返回
+        // 不可重试；Agent 移入 .rejected 隔离区并上报错误，绝不通过换 ID
+        // （旧版 cpb-retry-* rekey）绕过幂等约束。
+        std::cout << "[native-cp] batch/window content conflict batch=" << batchID
+                  << " response=" << response << std::endl;
+        return SpoolPostResult::PermanentlyRejected;
     }
     if (rc == 0 && response_is_permanent_rejection(httpStatus, response))
     {
@@ -2487,50 +2813,6 @@ static bool quarantine_rejected_spooled_batch(const std::string &path,
     }
     std::cout << "[native-cp] quarantined permanently rejected batch=" << batchID
               << " path=" << rejectedPath << std::endl;
-    return true;
-}
-
-static bool rekey_conflicted_spooled_batch(const ContinuousSamplerConfig &cfg,
-                                           const std::string &path,
-                                           const std::string &batchID)
-{
-    std::string body;
-    if (!read_file(path, &body))
-        return false;
-    const std::string oldField = "\"batch_id\":\"" + json_escape(batchID) + "\"";
-    const size_t fieldOffset = body.find(oldField);
-    if (fieldOffset == std::string::npos)
-        return false;
-    std::ostringstream generated;
-    generated << "cpb-retry-" << std::hex << stable_string_hash(cfg.sessionSID)
-              << '-' << stable_string_hash(body);
-    const std::string replacementID = generated.str();
-    const std::string replacementField = "\"batch_id\":\"" + replacementID + "\"";
-    body.replace(fieldOffset, oldField.size(), replacementField);
-    const std::string replacementPath = spool_path(cfg, replacementID);
-    if (file_exists_local(replacementPath))
-    {
-        std::string existing;
-        if (!read_file(replacementPath, &existing) || existing != body)
-            return false;
-        return ::unlink(path.c_str()) == 0;
-    }
-    const std::string journal = journal_path(cfg, replacementID);
-    if (!atomic_write_file(journal, body) || ::rename(journal.c_str(), replacementPath.c_str()) != 0)
-    {
-        ::unlink(journal.c_str());
-        return false;
-    }
-    int dirfd = ::open(session_spool_directory(cfg).c_str(), O_RDONLY | O_DIRECTORY);
-    if (dirfd >= 0)
-    {
-        ::fsync(dirfd);
-        ::close(dirfd);
-    }
-    if (::unlink(path.c_str()) != 0)
-        return false;
-    std::cout << "[native-cp] re-keyed conflicting batch old=" << batchID
-              << " new=" << replacementID << std::endl;
     return true;
 }
 
@@ -2620,13 +2902,6 @@ static bool drain_one_spooled_batch(const ContinuousSamplerConfig &cfg,
         if (::unlink(path.c_str()) != 0)
             std::cout << "[native-cp] ACK received but spool removal failed path=" << path
                       << " errno=" << errno << std::endl;
-        retry->delaySec = 1;
-        retry->nextAttemptMs = 0;
-        return true;
-    }
-    if (result == SpoolPostResult::BatchIDConflict &&
-        rekey_conflicted_spooled_batch(cfg, path, batchID))
-    {
         retry->delaySec = 1;
         retry->nextAttemptMs = 0;
         return true;
@@ -3176,6 +3451,12 @@ static void queue_core_histograms(std::vector<WindowPayload> *windows,
 
 } // namespace (anonymous)
 
+// 阶段一：逻辑信号集合 → 物理采集信号集合字符串（公开 API）。
+std::string PhysicalSignalsFromRequested(const std::vector<std::string> &requested)
+{
+    return physical_signals_from_requested(requested);
+}
+
 // 阶段五：服务器存储压力全局开关（公开 API，见 ContinuousSampler.h）。
 void SetContinuousServerPressure(bool halted)
 {
@@ -3201,16 +3482,9 @@ bool DrainOneContinuousSessionBatch(const ContinuousSamplerConfig &config)
     const std::string &path = files.front();
     const std::string batchID = batch_id_from_spool_path(path);
     const SpoolPostResult result = post_spooled_batch(config, path, batchID);
-    if (result == SpoolPostResult::BatchIDConflict)
-    {
-        if (!rekey_conflicted_spooled_batch(config, path, batchID))
-            return false;
-        return !list_session_spool_files(config, ".json").empty()
-                   ? DrainOneContinuousSessionBatch(config)
-                   : true;
-    }
     if (result == SpoolPostResult::PermanentlyRejected)
     {
+        // 阶段一：内容冲突/不可重试拒绝 → 移入 .rejected 隔离区，绝不换 ID 重传。
         if (!quarantine_rejected_spooled_batch(path, batchID))
             return false;
         return !list_session_spool_files(config, ".json").empty()
@@ -3261,6 +3535,12 @@ bool PerfEventSampler::Start(const ContinuousSamplerConfig &config, std::string 
     if (running_.load())
         return true;
     config_ = config;
+    // 阶段一：独立采集器实例分配独立 generation（重启/重建即变），
+    // 目标指纹为空时补算（供 window_id 稳定使用）。
+    if (config_.collectorGeneration.empty())
+        config_.collectorGeneration = collector_generation_id();
+    if (config_.targetFingerprint.empty())
+        config_.targetFingerprint = target_fingerprint_for(config_);
     running_ = true;
     worker_ = std::thread(&PerfEventSampler::Loop, this);
     return true;
@@ -3285,43 +3565,53 @@ static void run_continuous_spool_loop(std::atomic<bool> &running,
 {
     ensure_directory(session_spool_directory(config));
     recover_spool_journals(config);
+    // 阶段一：本地可变副本，用于维护单调递增的 batch_sequence。
+    ContinuousSamplerConfig cfg = config;
     SpoolRetryState retry;
-    while (running.load() && drain_one_spooled_batch(config, &retry, true))
+    while (running.load() && drain_one_spooled_batch(cfg, &retry, true))
     {
-        if (list_session_spool_files(config, ".json").empty())
+        if (list_session_spool_files(cfg, ".json").empty())
             break;
     }
 
-    int windowsPerBatch = std::max(1, config.uploadBatchSec / config.aggregationWindowSec);
+    int windowsPerBatch = std::max(1, cfg.uploadBatchSec / cfg.aggregationWindowSec);
     std::vector<WindowPayload> batch;
     batch.reserve(static_cast<size_t>(windowsPerBatch));
     std::string batchID;
     while (running.load())
     {
-        drain_one_spooled_batch(config, &retry, false);
-        if (!spool_has_collection_capacity(config))
+        drain_one_spooled_batch(cfg, &retry, false);
+        if (!spool_has_collection_capacity(cfg))
         {
-            std::cout << "[native-cp] spool backpressure usage_bytes=" << spool_usage_bytes(config)
-                      << " max_bytes=" << config.spoolMaxBytes
-                      << " free_bytes=" << spool_free_bytes(config)
-                      << " min_free_bytes=" << config.spoolMinFreeBytes << std::endl;
+            std::cout << "[native-cp] spool backpressure usage_bytes=" << spool_usage_bytes(cfg)
+                      << " max_bytes=" << cfg.spoolMaxBytes
+                      << " free_bytes=" << spool_free_bytes(cfg)
+                      << " min_free_bytes=" << cfg.spoolMinFreeBytes << std::endl;
             interruptible_wait(running, 1000);
             continue;
         }
 
-        WindowPayload window = collector(config);
+        WindowPayload window = collector(cfg);
+        // 阶段一：补齐稳定 window_id / 内容摘要。
+        if (window.windowID.empty())
+            window.windowID = make_window_id(cfg, window);
+        if (window.contentSHA256.empty())
+            window.contentSHA256 = window_content_digest(window);
         batch.push_back(window);
         if (batchID.empty())
-            batchID = make_batch_id(config, window.startMs);
-        std::string body = build_batch_json(config, batchID, batch);
-        bool persisted = persist_batch(config, batchID, body);
+        {
+            cfg.batchSequence += 1;
+            batchID = make_batch_id(cfg);
+        }
+        std::string body = build_batch_json(cfg, batchID, batch);
+        bool persisted = persist_batch(cfg, batchID, body);
         while (!persisted && running.load())
         {
             std::cout << "[native-cp] failed to persist batch journal batch=" << batchID
                       << " errno=" << errno << ", retrying without collecting" << std::endl;
-            drain_one_spooled_batch(config, &retry, false);
+            drain_one_spooled_batch(cfg, &retry, false);
             interruptible_wait(running, 1000);
-            persisted = persist_batch(config, batchID, body);
+            persisted = persist_batch(cfg, batchID, body);
         }
         if (!persisted)
         {
@@ -3335,7 +3625,7 @@ static void run_continuous_spool_loop(std::atomic<bool> &running,
 
         if (static_cast<int>(batch.size()) >= windowsPerBatch)
         {
-            if (!finalize_batch(config, batchID))
+            if (!finalize_batch(cfg, batchID))
             {
                 std::cout << "[native-cp] failed to finalize batch journal batch=" << batchID
                           << " errno=" << errno << std::endl;
@@ -3344,15 +3634,15 @@ static void run_continuous_spool_loop(std::atomic<bool> &running,
             }
             batch.clear();
             batchID.clear();
-            drain_one_spooled_batch(config, &retry, false);
+            drain_one_spooled_batch(cfg, &retry, false);
         }
     }
 
     if (!batch.empty() && !batchID.empty())
     {
-        std::string body = build_batch_json(config, batchID, batch);
-        if (persist_batch(config, batchID, body) && finalize_batch(config, batchID))
-            drain_one_spooled_batch(config, &retry, true);
+        std::string body = build_batch_json(cfg, batchID, batch);
+        if (persist_batch(cfg, batchID, body) && finalize_batch(cfg, batchID))
+            drain_one_spooled_batch(cfg, &retry, true);
         else
             release_batch_profiles(batch);
     }
@@ -3396,6 +3686,11 @@ bool DualTrackContinuousSampler::Start(const ContinuousSamplerConfig &config, st
     if (running_.load())
         return true;
     config_ = config;
+    // 阶段一：独立采集器实例分配独立 generation / 目标指纹。
+    if (config_.collectorGeneration.empty())
+        config_.collectorGeneration = collector_generation_id();
+    if (config_.targetFingerprint.empty())
+        config_.targetFingerprint = target_fingerprint_for(config_);
     running_ = true;
     worker_ = std::thread(&DualTrackContinuousSampler::Loop, this);
     return true;
@@ -3969,6 +4264,11 @@ bool DBSnapshotSampler::Start(const ContinuousSamplerConfig &config, std::string
     if (running_.load())
         return true;
     config_ = config;
+    // 阶段一：独立采集器实例分配独立 generation / 目标指纹。
+    if (config_.collectorGeneration.empty())
+        config_.collectorGeneration = collector_generation_id();
+    if (config_.targetFingerprint.empty())
+        config_.targetFingerprint = target_fingerprint_for(config_);
     running_ = true;
     worker_ = std::thread(&DBSnapshotSampler::Loop, this);
     return true;
@@ -4002,6 +4302,8 @@ struct SharedSessionAccumulator
     std::vector<WindowPayload> slices;
     std::vector<WindowPayload> batch;
     std::string batchID;
+    // 阶段一：该 Session 在本次 collector generation 内单调递增的批次序号。
+    uint64_t batchSequence = 0;
 };
 
 static ContinuousSamplerConfig shared_physical_config(const std::vector<ContinuousSamplerConfig> &sessions)
@@ -4028,11 +4330,18 @@ static ContinuousSamplerConfig shared_physical_config(const std::vector<Continuo
     for (const auto &entry : targets)
         physical.targetProcesses.push_back(entry.second);
 
-    // The rolling bpftrace fallback produces one aggregate histogram. It is
-    // safe to fan out only when exactly one process Session is active. With
-    // multiple selectors, collect CPU once and mark per-Session histograms as
-    // unavailable instead of leaking another selector's latency samples.
-    physical.signals = (!hostScope && sessions.size() > 1) ? "cpu" : "cpu,io,io_syscall,sched";
+    // 阶段一：物理采集信号 = 所有活动 Session 请求信号的并集。逻辑层在
+    // filter_shared_window 严格按各自 requestedSignals 分流（多进程选择器 +
+    // 滚动 bpftrace fallback 无法安全归属直方图时，fanout 标记 unavailable，
+    // 但物理层仍按并集采集，strict CO-RE 路径可正确按 PID 归属）。
+    std::vector<std::string> unionRequested;
+    for (const auto &session : sessions)
+        for (const auto &signal : session.requestedSignals)
+            if (std::find(unionRequested.begin(), unionRequested.end(), signal) == unionRequested.end())
+                unionRequested.push_back(signal);
+    physical.signals = physical_signals_from_requested(unionRequested);
+    // 阶段一：共享采集器实例拥有独立 collector generation（新实例 = 新 generation）。
+    physical.collectorGeneration = collector_generation_id();
     return physical;
 }
 
@@ -4050,45 +4359,86 @@ static WindowPayload filter_shared_window(const WindowPayload &source,
                                           const ContinuousSamplerConfig &session,
                                           bool histogramAttributionSafe)
 {
-    if (session.scope != "process")
-        return source;
+    // 阶段一：逻辑层严格按该 Session 请求的信号分流（对 host/process 两种
+    // scope 都生效）：未请求的信号从窗口 payload 中剔除，后续 build_batch_json
+    // 按剔除后的内容重算分信号计数。
+    const bool cpuRequested = logical_signal_requested(session.requestedSignals, "cpu_profile");
+    const bool ioRequested = logical_signal_requested(session.requestedSignals, "io_latency");
+    const bool ioSyscallRequested = logical_signal_requested(session.requestedSignals, "io_syscall_latency");
+    const bool schedRequested = logical_signal_requested(session.requestedSignals, "sched_latency");
+    const bool rssRequested = logical_signal_requested(session.requestedSignals, "python_rss");
+    const bool dbRequested = logical_signal_requested(session.requestedSignals, "db_snapshot");
 
     WindowPayload out = source;
-    out.samples.erase(std::remove_if(out.samples.begin(), out.samples.end(), [&](const auto &sample) {
-                          return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
-                      }),
-                      out.samples.end());
-    for (auto &profile : out.profiles)
+    if (!cpuRequested)
     {
-        profile.readyPath.clear();
-        profile.samples.erase(std::remove_if(profile.samples.begin(), profile.samples.end(), [&](const auto &sample) {
-                                  return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
-                              }),
-                              profile.samples.end());
+        out.samples.clear();
+        out.profiles.clear();
     }
-    out.profiles.erase(std::remove_if(out.profiles.begin(), out.profiles.end(), [](const auto &profile) {
-                           return profile.samples.empty();
-                       }),
-                       out.profiles.end());
-    out.metrics.erase(std::remove_if(out.metrics.begin(), out.metrics.end(), [&](const auto &metric) {
-                          return !process_targeted(session, metric.pid, metric.processStartMs, metric.exe);
-                      }),
-                      out.metrics.end());
-    out.histograms.erase(std::remove_if(out.histograms.begin(), out.histograms.end(), [&](const auto &histogram) {
-                              return histogram.pid > 0 && !process_targeted(session, histogram.pid, 0, "");
+    else if (session.scope == "process")
+    {
+        out.samples.erase(std::remove_if(out.samples.begin(), out.samples.end(), [&](const auto &sample) {
+                              return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
                           }),
+                          out.samples.end());
+        for (auto &profile : out.profiles)
+        {
+            profile.readyPath.clear();
+            profile.samples.erase(std::remove_if(profile.samples.begin(), profile.samples.end(), [&](const auto &sample) {
+                                      return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
+                                  }),
+                                  profile.samples.end());
+        }
+        out.profiles.erase(std::remove_if(out.profiles.begin(), out.profiles.end(), [](const auto &profile) {
+                               return profile.samples.empty();
+                           }),
+                           out.profiles.end());
+    }
+    if (!rssRequested)
+        out.metrics.clear();
+    else if (session.scope == "process")
+    {
+        out.metrics.erase(std::remove_if(out.metrics.begin(), out.metrics.end(), [&](const auto &metric) {
+                              return !process_targeted(session, metric.pid, metric.processStartMs, metric.exe);
+                          }),
+                          out.metrics.end());
+    }
+    if (!dbRequested)
+        out.dbSnapshots.clear();
+    if (session.scope == "process")
+    {
+        out.histograms.erase(std::remove_if(out.histograms.begin(), out.histograms.end(), [&](const auto &histogram) {
+                                  return histogram.pid > 0 && !process_targeted(session, histogram.pid, 0, "");
+                              }),
+                             out.histograms.end());
+        // Runtime symbol diagnostics can contain paths/PIDs for another selector in
+        // the physical union. Per-sample symbols are already resolved, so omit the
+        // cross-target diagnostic blob from process Session payloads.
+        out.symbolRefsJson.clear();
+    }
+    // 信号级过滤：直方图按请求的信号类型剔除（host/process 均生效）。
+    out.histograms.erase(std::remove_if(out.histograms.begin(), out.histograms.end(), [&](const auto &histogram) {
+                             const std::string &signal = histogram.signalType;
+                             if (signal == "io_latency")
+                                 return !ioRequested;
+                             if (signal == "io_syscall_latency")
+                                 return !ioSyscallRequested;
+                             if (signal == "sched_latency")
+                                 return !schedRequested;
+                             return true; // 未知直方图信号类型一律剔除
+                         }),
                          out.histograms.end());
-
-    // Runtime symbol diagnostics can contain paths/PIDs for another selector in
-    // the physical union. Per-sample symbols are already resolved, so omit the
-    // cross-target diagnostic blob from process Session payloads.
-    out.symbolRefsJson.clear();
     if (!histogramAttributionSafe)
     {
+        // 多进程选择器 + 滚动 bpftrace fallback：直方图无法安全归属到单个
+        // selector，仅对请求了该信号的 Session 打 unavailable 标记。
         out.histograms.clear();
-        out.histograms.push_back(unavailable_shared_histogram("io_latency"));
-        out.histograms.push_back(unavailable_shared_histogram("io_syscall_latency"));
-        out.histograms.push_back(unavailable_shared_histogram("sched_latency"));
+        if (ioRequested)
+            out.histograms.push_back(unavailable_shared_histogram("io_latency"));
+        if (ioSyscallRequested)
+            out.histograms.push_back(unavailable_shared_histogram("io_syscall_latency"));
+        if (schedRequested)
+            out.histograms.push_back(unavailable_shared_histogram("sched_latency"));
     }
     return out;
 }
@@ -4205,9 +4555,21 @@ static bool persist_shared_aggregate(SharedSessionAccumulator *session)
         return true;
     std::vector<WindowPayload> aggregates = merge_shared_slices_preserving_gaps(session->slices);
     session->slices.clear();
+    // 阶段一：为合并后的窗口补齐稳定 window_id / 内容摘要（保证同逻辑窗口
+    // 重传一致；内容摘要不参与 ID，冲突时仍是同一 ID）。
+    for (auto &window : aggregates)
+    {
+        if (window.windowID.empty())
+            window.windowID = make_window_id(session->config, window);
+        if (window.contentSHA256.empty())
+            window.contentSHA256 = window_content_digest(window);
+    }
     session->batch.insert(session->batch.end(), aggregates.begin(), aggregates.end());
     if (session->batchID.empty())
-        session->batchID = make_batch_id(session->config, aggregates.front().startMs);
+    {
+        session->config.batchSequence = ++session->batchSequence;
+        session->batchID = make_batch_id(session->config);
+    }
     std::string body = build_batch_json(session->config, session->batchID, session->batch);
     if (!persist_batch(session->config, session->batchID, body))
         return false;
@@ -4252,6 +4614,29 @@ struct SharedDualTrackContinuousSampler::Impl
     std::vector<ContinuousSamplerConfig> sessions;
     ContinuousSamplerConfig physical;
     std::vector<SpoolRetryState> spoolRetries;
+    // 阶段一：无重叠采集器切换。
+    //   owning=false 表示 ready-but-not-owning（replacement 已就绪但不输出正式窗口）。
+    //   cutoverWatermarkMs / cutoverKeepBefore 实现唯一 cutover watermark：
+    //     旧 generation 只保留 start < watermark（keepBefore=true），
+    //     新 generation 只保留 start >= watermark（keepBefore=false）。
+    std::atomic<bool> owning{true};
+    std::atomic<int64_t> cutoverWatermarkMs{0};
+    std::atomic<bool> cutoverKeepBefore{false};
+
+    // 该窗口是否被允许正式输出（owning + cutover watermark 过滤）。
+    bool WindowAllowed(const WindowPayload &window) const
+    {
+        if (!owning.load())
+            return false; // ready-but-not-owning：不输出正式窗口
+        const int64_t watermark = cutoverWatermarkMs.load();
+        if (watermark <= 0)
+            return true; // 首次启动无 cutover
+        if (cutoverKeepBefore.load())
+            // 跨越切点的聚合窗口无法在不伪造样本时间的情况下拆分，必须丢弃；
+            // 只保留完整结束于切点前的旧代窗口，确保与新代绝不重叠。
+            return window.endMs <= watermark;
+        return window.startMs >= watermark;    // 新 generation 只保留切点后
+    }
 
     bool DrainAllSessionSpools(bool force)
     {
@@ -4348,6 +4733,9 @@ struct SharedDualTrackContinuousSampler::Impl
                 physicalWindow.attemptedBackends.push_back("libbpf-co-re");
                 physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
                 physicalWindow.backendStatus = "ok";
+                // 阶段一：cutover watermark 过滤（新 generation 切点前不输出）。
+                if (!WindowAllowed(physicalWindow))
+                    continue;
                 for (auto &accumulator : accumulators)
                 {
                     accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
@@ -4374,6 +4762,9 @@ struct SharedDualTrackContinuousSampler::Impl
             physicalWindow.attemptedBackends.push_back("libbpf-co-re");
             physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
             physicalWindow.backendStatus = "ok";
+            // 阶段一：旧 generation 最终 drain 只保留切点前窗口。
+            if (!WindowAllowed(physicalWindow))
+                continue;
             for (auto &accumulator : accumulators)
                 accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
         }
@@ -4467,6 +4858,10 @@ struct SharedDualTrackContinuousSampler::Impl
                 continue;
             }
             WindowPayload physicalWindow = collect_dual_track_window(physical);
+            // 阶段一：cutover watermark 过滤（新 generation 切点前不输出；
+            // 旧 generation 切点后不输出）。
+            if (!WindowAllowed(physicalWindow))
+                continue;
             for (auto &accumulator : accumulators)
             {
                 accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, histogramAttributionSafe));
@@ -4543,12 +4938,53 @@ bool SharedDualTrackContinuousSampler::Start(const std::vector<ContinuousSampler
     }
     impl_->sessions = sessions;
     impl_->physical = shared_physical_config(sessions);
+    // 阶段一：把本采集器实例的 collector generation 与每个 Session 的目标
+    // 指纹传播进 session config，供 window_id / batch_id / 内容摘要稳定使用。
+    for (auto &config : impl_->sessions)
+    {
+        config.collectorGeneration = impl_->physical.collectorGeneration;
+        if (config.targetFingerprint.empty())
+            config.targetFingerprint = target_fingerprint_for(config);
+        if (config.requestedSignals.empty())
+            config.requestedSignals = {"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"};
+    }
     impl_->running = true;
     impl_->worker = std::thread(&SharedDualTrackContinuousSampler::Impl::Loop, impl_.get());
     std::cout << "[native-cp] shared engine started sessions=" << sessions.size()
               << " targets=" << impl_->physical.targetProcesses.size()
-              << " rate_hz=" << impl_->physical.sampleRateHz << std::endl;
+              << " rate_hz=" << impl_->physical.sampleRateHz
+              << " generation=" << impl_->physical.collectorGeneration << std::endl;
     return true;
+}
+
+void SharedDualTrackContinuousSampler::BeginHandoff()
+{
+    if (!impl_)
+        return;
+    impl_->owning.store(false);
+    impl_->cutoverWatermarkMs.store(0);
+}
+
+void SharedDualTrackContinuousSampler::SetCutoverWatermark(int64_t watermarkMs, bool keepBefore)
+{
+    if (!impl_)
+        return;
+    impl_->cutoverWatermarkMs.store(watermarkMs);
+    impl_->cutoverKeepBefore.store(keepBefore);
+}
+
+void SharedDualTrackContinuousSampler::Own(int64_t watermarkMs)
+{
+    if (!impl_)
+        return;
+    impl_->cutoverWatermarkMs.store(watermarkMs);
+    impl_->cutoverKeepBefore.store(false);
+    impl_->owning.store(true);
+}
+
+bool SharedDualTrackContinuousSampler::Owning() const
+{
+    return impl_ && impl_->owning.load();
 }
 
 void SharedDualTrackContinuousSampler::Stop()

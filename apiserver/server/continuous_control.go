@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -27,25 +28,77 @@ var (
 
 var continuousDefaultSignals = []string{"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"}
 
-func normalizeContinuousRequestedSignals(signals []string) []string {
+// normalizeContinuousRequestedSignals 阶段一信号控制面：
+//   - 空 signals → 四类默认值（按固定顺序）；
+//   - 非空 signals → 校验每个值，未知值返回错误（API 侧 400，不再静默过滤后
+//     回退为全开）；已知值按出现顺序去重保存。
+//
+// 返回的切片是去重后的副本，不持有入参引用。
+func normalizeContinuousRequestedSignals(signals []string) ([]string, error) {
 	allowed := map[string]bool{}
 	for _, signal := range continuousDefaultSignals {
 		allowed[signal] = true
+	}
+	if len(signals) == 0 {
+		return append([]string(nil), continuousDefaultSignals...), nil
 	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(signals))
 	for _, signal := range signals {
 		signal = strings.ToLower(strings.TrimSpace(signal))
-		if !allowed[signal] || seen[signal] {
+		if signal == "" {
+			continue
+		}
+		if !allowed[signal] {
+			return nil, fmt.Errorf("未知信号类型: %s（支持 %s）", signal, strings.Join(continuousDefaultSignals, ", "))
+		}
+		if seen[signal] {
 			continue
 		}
 		seen[signal] = true
 		out = append(out, signal)
 	}
 	if len(out) == 0 {
-		return append([]string(nil), continuousDefaultSignals...)
+		return append([]string(nil), continuousDefaultSignals...), nil
 	}
-	return out
+	return out, nil
+}
+
+// continuousSessionSignals 从 session 的 signals jsonb 解析字符串数组；为空或
+// 解析失败时回退四类默认值（用于 Reconcile assignment DTO 显式下发）。
+func continuousSessionSignals(session model.ContinuousSession) []string {
+	if len(session.Signals) > 0 {
+		var signals []string
+		if err := json.Unmarshal(session.Signals, &signals); err == nil && len(signals) > 0 {
+			normalized, err := normalizeContinuousRequestedSignals(signals)
+			if err == nil {
+				return normalized
+			}
+		}
+	}
+	return append([]string(nil), continuousDefaultSignals...)
+}
+
+// continuousSessionSignalSet 返回 session 请求信号的集合（供 v3 ingest 校验
+// "Session 只保存其请求的信号"）。
+func continuousSessionSignalSet(session model.ContinuousSession) map[string]bool {
+	set := map[string]bool{}
+	for _, signal := range continuousSessionSignals(session) {
+		set[signal] = true
+	}
+	return set
+}
+
+// continuousCoreSignal 判断是否为四类核心选择器信号（cpu_profile/io_latency/
+// io_syscall_latency/sched_latency）。python_rss/db_snapshot 是独立数据通道，
+// 不受 signals 选择器约束。
+func continuousCoreSignal(signal string) bool {
+	for _, core := range continuousDefaultSignals {
+		if signal == core {
+			return true
+		}
+	}
+	return false
 }
 
 type continuousProcessReport struct {
@@ -74,6 +127,87 @@ type reconcileContinuousReq struct {
 	Revision      uint64                     `json:"revision"`
 	Processes     []continuousProcessReport  `json:"processes"`
 	Sessions      []continuousObservedReport `json:"sessions"`
+}
+
+// continuousAssignmentDTO 阶段一：Reconcile 下发的显式 assignment DTO。
+// signals / requested_signals 直接返回字符串数组（不依赖 GORM 对 jsonb
+// []byte 的 base64 自动编码），Agent 侧无需再猜解码方式；labels 保持现有
+// base64 JSON（避免扩大改动范围）。collector_generation / target_fingerprint /
+// batch_sequence 是 Agent 侧采集器实例概念，DTO 仅透传服务端已知值（通常为空
+// 字符串/0），由 Agent 在生成 batch/window 时填充。
+type continuousAssignmentDTO struct {
+	SID                  string     `json:"sid"`
+	Name                 string     `json:"name"`
+	TargetIP             string     `json:"target_ip"`
+	Hostname             string     `json:"hostname"`
+	ServiceName          string     `json:"service_name"`
+	SampleRateHz         uint32     `json:"sample_rate_hz"`
+	AggregationWindowSec uint32     `json:"aggregation_window_sec"`
+	UploadBatchSec       uint32     `json:"upload_batch_sec"`
+	RetentionHours       uint32     `json:"retention_hours"`
+	Labels               []byte     `json:"labels"`
+	Capabilities         []byte     `json:"capabilities"`
+	Status               string     `json:"status"`
+	Scope                string     `json:"scope"`
+	SelectorExe          string     `json:"selector_exe"`
+	SelectorMode         string     `json:"selector_mode"`
+	Signals              []string   `json:"signals"`
+	RequestedSignals     []string   `json:"requested_signals"`
+	DesiredState         string     `json:"desired_state"`
+	ObservedState        string     `json:"observed_state"`
+	ContinuityMode       string     `json:"continuity_mode"`
+	AllowDegraded        bool       `json:"allow_degraded"`
+	DegradationReason    string     `json:"degradation_reason"`
+	LastError            string     `json:"last_error"`
+	Revision             uint64     `json:"revision"`
+	AgentID              string     `json:"agent_id"`
+	UID                  string     `json:"uid"`
+	UserName             string     `json:"user_name"`
+	StartedAt            time.Time  `json:"started_at"`
+	StoppedAt            *time.Time `json:"stopped_at"`
+	CollectorGeneration  string     `json:"collector_generation,omitempty"`
+	TargetFingerprint    string     `json:"target_fingerprint,omitempty"`
+	BatchSequence        uint64     `json:"batch_sequence,omitempty"`
+}
+
+// continuousAssignmentDTOs 把 GORM Session 行转换为显式 assignment DTO。
+func continuousAssignmentDTOs(sessions []model.ContinuousSession) []continuousAssignmentDTO {
+	out := make([]continuousAssignmentDTO, 0, len(sessions))
+	for _, session := range sessions {
+		signals := continuousSessionSignals(session)
+		out = append(out, continuousAssignmentDTO{
+			SID:                  session.SID,
+			Name:                 session.Name,
+			TargetIP:             session.TargetIP,
+			Hostname:             session.Hostname,
+			ServiceName:          session.ServiceName,
+			SampleRateHz:         session.SampleRateHz,
+			AggregationWindowSec: session.AggregationWindowSec,
+			UploadBatchSec:       session.UploadBatchSec,
+			RetentionHours:       session.RetentionHours,
+			Labels:               session.Labels,
+			Capabilities:         session.Capabilities,
+			Status:               session.Status,
+			Scope:                session.Scope,
+			SelectorExe:          session.SelectorExe,
+			SelectorMode:         session.SelectorMode,
+			Signals:              signals,
+			RequestedSignals:     signals,
+			DesiredState:         session.DesiredState,
+			ObservedState:        session.ObservedState,
+			ContinuityMode:       session.ContinuityMode,
+			AllowDegraded:        session.AllowDegraded,
+			DegradationReason:    session.DegradationReason,
+			LastError:            session.LastError,
+			Revision:             session.Revision,
+			AgentID:              session.AgentID,
+			UID:                  session.UID,
+			UserName:             session.UserName,
+			StartedAt:            session.StartedAt,
+			StoppedAt:            session.StoppedAt,
+		})
+	}
+	return out
 }
 
 func validateContinuousCreateRequest(req CreateContinuousSessionReq) string {
@@ -362,12 +496,11 @@ func (s *APIServer) ReconcileContinuousSessions(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "读取持续采集任务失败")
 		return
 	}
-	if assignments == nil {
-		assignments = []model.ContinuousSession{}
-	}
 	var authoritativeState model.ContinuousAgentState
 	_ = s.DB.Where("target_ip = ?", req.TargetIP).First(&authoritativeState).Error
 	revision := authoritativeState.Revision
+	// 阶段一：Reconcile 下发显式 assignment DTO，signals 直接返回字符串数组。
+	assignmentDTOs := continuousAssignmentDTOs(assignments)
 	// 阶段五：容量暂停时通过心跳把 server_storage_pressure 推给 Agent，
 	// Agent 停止产生新窗口（已产生窗口继续上报/ACK）。
 	halted := s.capacityHalted()
@@ -379,7 +512,7 @@ func (s *APIServer) ReconcileContinuousSessions(c *gin.Context) {
 		pressure["reason"] = "server_storage_pressure"
 	}
 	s.RespondOK(c, gin.H{
-		"assignments": assignments, "revision": revision, "server_time": now,
+		"assignments": assignmentDTOs, "revision": revision, "server_time": now,
 		"server_pressure": pressure,
 	})
 }

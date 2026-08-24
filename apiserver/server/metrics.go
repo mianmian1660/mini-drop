@@ -28,6 +28,9 @@ var (
 	metricContinuousSourceDeleteRetryTotal int64
 	metricContinuousCompactionSkipTotal    int64
 	metricContinuousReclaimedBytesTotal    int64
+	// 阶段一：持续采集正确性指标
+	metricContinuousConflictTotal       int64 // counter：内容冲突（409 不可重试）次数
+	metricContinuousDuplicateBatchTotal int64 // counter：批次级重复 ACK 次数
 	// 阶段 0：磁盘止血指标
 	metricStorageTotalBytes     int64 // gauge：受监控文件系统总字节数
 	metricStorageAvailableBytes int64 // gauge：受监控文件系统剩余字节数
@@ -45,39 +48,39 @@ var (
 	metricArtifactsByStatusMu sync.Mutex
 	metricArtifactsByStatus   = map[string]int64{}
 	// 存储阶段二：物理 Blob 指标
-	metricBlobPhysicalBytes       int64 // gauge：ready blob 物理字节
-	metricBlobLogicalBytes        int64 // gauge：ready blob 逻辑字节
-	metricBlobDeduplicatedBytes   int64 // gauge：去重+压缩收益
-	metricBlobMigrationBacklog    int64 // gauge：迁移剩余候选
-	metricBlobBackfillBacklog     int64 // gauge：待回填引用数
-	metricBlobBackfillCreated     int64 // counter：回填创建的 blob 数
-	metricBlobBackfillLinked      int64 // counter：回填关联的引用数
-	metricBlobBackfillStatFail    int64 // counter：回填 Stat 失败次数
-	metricBlobBackfillConflicts   int64 // counter：同 key 多大小冲突次数
-	metricBlobMigrationObjects    int64 // counter：迁移完成对象数
-	metricBlobMigrationFailures   int64 // counter：迁移失败对象数
-	metricBlobMigrationReclaimed  int64 // counter：迁移回收字节（逻辑-存储）
-	metricBlobGCDeleted           int64 // counter：GC 删除对象数
-	metricBlobGCDeletedBytes      int64 // counter：GC 回收字节
-	metricBlobGCFailures          int64 // counter：GC 删除失败次数
-	metricBlobOrphanReconciled    int64 // counter：孤儿回填 blob 墓碑化数
-	metricMaintenanceSkipTotal    int64 // counter：maintenance 跳过（低磁盘/unknown）
-	metricBlobByStatusMu          sync.Mutex
-	metricBlobByStatus            = map[string]int64{}
-	metricBlobByStatusBytesMu     sync.Mutex
-	metricBlobByStatusBytes       = map[string]int64{}
+	metricBlobPhysicalBytes      int64 // gauge：ready blob 物理字节
+	metricBlobLogicalBytes       int64 // gauge：ready blob 逻辑字节
+	metricBlobDeduplicatedBytes  int64 // gauge：去重+压缩收益
+	metricBlobMigrationBacklog   int64 // gauge：迁移剩余候选
+	metricBlobBackfillBacklog    int64 // gauge：待回填引用数
+	metricBlobBackfillCreated    int64 // counter：回填创建的 blob 数
+	metricBlobBackfillLinked     int64 // counter：回填关联的引用数
+	metricBlobBackfillStatFail   int64 // counter：回填 Stat 失败次数
+	metricBlobBackfillConflicts  int64 // counter：同 key 多大小冲突次数
+	metricBlobMigrationObjects   int64 // counter：迁移完成对象数
+	metricBlobMigrationFailures  int64 // counter：迁移失败对象数
+	metricBlobMigrationReclaimed int64 // counter：迁移回收字节（逻辑-存储）
+	metricBlobGCDeleted          int64 // counter：GC 删除对象数
+	metricBlobGCDeletedBytes     int64 // counter：GC 回收字节
+	metricBlobGCFailures         int64 // counter：GC 删除失败次数
+	metricBlobOrphanReconciled   int64 // counter：孤儿回填 blob 墓碑化数
+	metricMaintenanceSkipTotal   int64 // counter：maintenance 跳过（低磁盘/unknown）
+	metricBlobByStatusMu         sync.Mutex
+	metricBlobByStatus           = map[string]int64{}
+	metricBlobByStatusBytesMu    sync.Mutex
+	metricBlobByStatusBytes      = map[string]int64{}
 	// 阶段五：Parquet v2 指标
-	metricParquetBuildSkipTotal       int64 // counter：v2 块构建跳过（低磁盘/配额）
+	metricParquetBuildSkipTotal         int64 // counter：v2 块构建跳过（低磁盘/配额）
 	metricParquetMetricUnknownKindTotal int64 // counter：未登记 metric 类型告警
 	// 阶段六：细粒度 GC / 迁移失败 / 查询指标
-	metricFineGCCandidatesTotal  int64 // counter：细粒度 GC 候选 batch 数
-	metricFineGCDeletedTotal     int64 // counter：细粒度 GC 已清理 batch 数
-	metricFineGCFailuresTotal    int64 // counter：细粒度 GC 失败次数
-	metricMigrationFailureTotal  int64 // counter：迁移失败记录新增数
+	metricFineGCCandidatesTotal    int64 // counter：细粒度 GC 候选 batch 数
+	metricFineGCDeletedTotal       int64 // counter：细粒度 GC 已清理 batch 数
+	metricFineGCFailuresTotal      int64 // counter：细粒度 GC 失败次数
+	metricMigrationFailureTotal    int64 // counter：迁移失败记录新增数
 	metricMigrationQuarantineTotal int64 // counter：隔离数
-	metricParquetV1FallbackTotal int64 // counter：v1 fallback 次数
-	metricParquetQueryErrorsTotal int64 // counter：Parquet 查询错误次数
-	metricParquetQueryLatencyMs  int64 // gauge：最近一次 Parquet 查询耗时（ms）
+	metricParquetV1FallbackTotal   int64 // counter：v1 fallback 次数
+	metricParquetQueryErrorsTotal  int64 // counter：Parquet 查询错误次数
+	metricParquetQueryLatencyMs    int64 // gauge：最近一次 Parquet 查询耗时（ms）
 	// 按原因计数的细粒度 GC 阻塞（label: reason）
 	metricFineGCBlockedMu sync.Mutex
 	metricFineGCBlocked   = map[string]int64{}
@@ -85,19 +88,19 @@ var (
 	metricMigrationFailureByTypeMu sync.Mutex
 	metricMigrationFailureByType   = map[string]int64{}
 	// 阶段六：热表/对账/覆盖率 gauge（由 pqRefreshPhase6Metrics 刷新）
-	metricHotWindowCount       int64 // gauge：热 window 数（< 2h）
-	metricHotBatchCount        int64 // gauge：热 batch 数
-	metricHotWindowOldestMs    int64 // gauge：最老热 window 时间戳（ms）
-	metricHotBatchOldestMs     int64 // gauge：最老热 batch 时间戳（ms）
-	metricOrphanWindowCount    int64 // gauge：orphan window 数
-	metricCoverageSegments     int64 // gauge：coverage segment 数
-	metricReconcileFailed      int64 // gauge：对账失败 raw 块数
-	metricReconcileQuarantined int64 // gauge：对账隔离 raw 块数
+	metricHotWindowCount          int64 // gauge：热 window 数（< 2h）
+	metricHotBatchCount           int64 // gauge：热 batch 数
+	metricHotWindowOldestMs       int64 // gauge：最老热 window 时间戳（ms）
+	metricHotBatchOldestMs        int64 // gauge：最老热 batch 时间戳（ms）
+	metricOrphanWindowCount       int64 // gauge：orphan window 数
+	metricCoverageSegments        int64 // gauge：coverage segment 数
+	metricReconcileFailed         int64 // gauge：对账失败 raw 块数
+	metricReconcileQuarantined    int64 // gauge：对账隔离 raw 块数
 	metricFineGCEnforceCandidates int64 // gauge：enforce 可清理候选数（observe 统计）
 	// 阶段六：migration receipt 回收指标
-	metricMigrationReceiptCount          int64 // gauge：receipt 总数
-	metricMigrationReceiptGCEligible     int64 // gauge：可回收 receipt 数（batch 已删 + 超保留期）
-	metricMigrationReceiptGCDeletedTotal int64 // counter：已回收 receipt 数
+	metricMigrationReceiptCount           int64 // gauge：receipt 总数
+	metricMigrationReceiptGCEligible      int64 // gauge：可回收 receipt 数（batch 已删 + 超保留期）
+	metricMigrationReceiptGCDeletedTotal  int64 // counter：已回收 receipt 数
 	metricMigrationReceiptGCFailuresTotal int64 // counter：receipt 回收失败次数
 )
 
@@ -128,8 +131,8 @@ func incParquetMetricUnknownKind(metric string) {
 func incParquetShadowFailure() { parquetShadowFailures.Add(1) }
 
 // 阶段六指标辅助。
-func incFineGCCandidate(bid string)  { atomic.AddInt64(&metricFineGCCandidatesTotal, 1) }
-func incFineGCDeleted(bid string)    { atomic.AddInt64(&metricFineGCDeletedTotal, 1) }
+func incFineGCCandidate(bid string) { atomic.AddInt64(&metricFineGCCandidatesTotal, 1) }
+func incFineGCDeleted(bid string)   { atomic.AddInt64(&metricFineGCDeletedTotal, 1) }
 func incFineGCFailure(reason, bid string) {
 	atomic.AddInt64(&metricFineGCFailuresTotal, 1)
 }
@@ -171,6 +174,16 @@ func incContinuousBlocksCreated(replaced bool) {
 	if replaced {
 		atomic.AddInt64(&metricContinuousBlocksReplacedTotal, 1)
 	}
+}
+
+// incContinuousConflictTotal 阶段一：内容冲突（409 不可重试）计数。
+func incContinuousConflictTotal() {
+	atomic.AddInt64(&metricContinuousConflictTotal, 1)
+}
+
+// incContinuousDuplicateBatchTotal 阶段一：批次级重复 ACK 计数。
+func incContinuousDuplicateBatchTotal() {
+	atomic.AddInt64(&metricContinuousDuplicateBatchTotal, 1)
 }
 func incContinuousBlocksRead()        { atomic.AddInt64(&metricContinuousBlocksReadTotal, 1) }
 func incContinuousSourceDeleteRetry() { atomic.AddInt64(&metricContinuousSourceDeleteRetryTotal, 1) }
@@ -260,13 +273,13 @@ func incBlobMigrationObjects(format string) {
 	atomic.AddInt64(&metricBlobMigrationObjects, 1)
 	_ = format // 日志已带 format，计数器不细分避免 label 膨胀
 }
-func incBlobMigrationFailures()        { atomic.AddInt64(&metricBlobMigrationFailures, 1) }
+func incBlobMigrationFailures() { atomic.AddInt64(&metricBlobMigrationFailures, 1) }
 func incBlobMigrationReclaimedBytes(n int64) {
 	if n > 0 {
 		atomic.AddInt64(&metricBlobMigrationReclaimed, n)
 	}
 }
-func incBlobGCDeleted()      { atomic.AddInt64(&metricBlobGCDeleted, 1) }
+func incBlobGCDeleted() { atomic.AddInt64(&metricBlobGCDeleted, 1) }
 func incBlobGCDeletedBytes(n int64) {
 	if n > 0 {
 		atomic.AddInt64(&metricBlobGCDeletedBytes, n)
@@ -358,6 +371,8 @@ func resetMetricsForTest() {
 	atomic.StoreInt64(&metricContinuousSourceDeleteRetryTotal, 0)
 	atomic.StoreInt64(&metricContinuousCompactionSkipTotal, 0)
 	atomic.StoreInt64(&metricContinuousReclaimedBytesTotal, 0)
+	atomic.StoreInt64(&metricContinuousConflictTotal, 0)
+	atomic.StoreInt64(&metricContinuousDuplicateBatchTotal, 0)
 	atomic.StoreInt64(&metricStorageTotalBytes, 0)
 	atomic.StoreInt64(&metricStorageAvailableBytes, 0)
 	atomic.StoreInt64(&metricStoragePressureLevel, 4) // unknown 兜底
@@ -427,6 +442,10 @@ func (s *APIServer) Metrics(c *gin.Context) {
 	fmt.Fprintf(&b, "mini_drop_continuous_compaction_skip_total %d\n", atomic.LoadInt64(&metricContinuousCompactionSkipTotal))
 	writeMetricHeader(&b, "mini_drop_continuous_reclaimed_bytes_total", "counter", "Bytes reclaimed by block/source-object garbage collection.")
 	fmt.Fprintf(&b, "mini_drop_continuous_reclaimed_bytes_total %d\n", atomic.LoadInt64(&metricContinuousReclaimedBytesTotal))
+	writeMetricHeader(&b, "mini_drop_continuous_conflict_total", "counter", "Continuous batch/window content conflicts rejected as non-retryable 409.")
+	fmt.Fprintf(&b, "mini_drop_continuous_conflict_total %d\n", atomic.LoadInt64(&metricContinuousConflictTotal))
+	writeMetricHeader(&b, "mini_drop_continuous_duplicate_batch_total", "counter", "Continuous batch-level duplicate ACKs (same batch_id retransmit).")
+	fmt.Fprintf(&b, "mini_drop_continuous_duplicate_batch_total %d\n", atomic.LoadInt64(&metricContinuousDuplicateBatchTotal))
 	writeMetricHeader(&b, "mini_drop_parquet_build_skip_total", "counter", "Parquet v2 block builds skipped (low disk or quota exceeded).")
 	fmt.Fprintf(&b, "mini_drop_parquet_build_skip_total %d\n", atomic.LoadInt64(&metricParquetBuildSkipTotal))
 	writeMetricHeader(&b, "mini_drop_parquet_metric_unknown_kind_total", "counter", "Unknown metric kinds treated as gauge (alert for counter misclassification).")

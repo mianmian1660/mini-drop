@@ -214,7 +214,7 @@ TEST(ContinuousSampler, BackendAggregationAnyFailedDegraded)
     EXPECT_NE(json.find("\"cpu_profile\""), std::string::npos);
 }
 
-// ---- sample_count 包含 histogram eventCount（向后兼容） ----
+// ---- sample_count 语义：v3 起 batch 层写 0，分信号计数在 signal_counts ----
 TEST(ContinuousSampler, SampleCountIncludesHistogramEvents)
 {
     ContinuousSamplerConfig cfg = make_cfg();
@@ -230,8 +230,9 @@ TEST(ContinuousSampler, SampleCountIncludesHistogramEvents)
     window.histograms.push_back(hist);
 
     std::string json = build_batch_json(cfg, "cpb-test", {window});
-    // cpu samples(4) + histogram events(7) = 11（保持向后兼容）
-    EXPECT_NE(json.find("\"sample_count\":11"), std::string::npos);
+    // v3：batch 层 sample_count=0（废弃），histogram 事件走 signal_counts。
+    EXPECT_NE(json.find("\"sample_count\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"signal_counts\":{\"cpu_profile\":4,\"io_latency\":7}"), std::string::npos);
     EXPECT_NE(json.find("\"io_latency\""), std::string::npos);
 }
 
@@ -455,44 +456,15 @@ TEST(ContinuousSpool, BatchIDIsStableAndUniqueAcrossSessions)
     ContinuousSamplerConfig second = first;
     second.sessionSID = "another-session";
 
-    const std::string firstID = make_batch_id(first, 1234567890);
-    EXPECT_EQ(firstID, make_batch_id(first, 1234567890));
-    EXPECT_NE(firstID, make_batch_id(second, 1234567890));
+    const std::string firstID = make_batch_id(first);
+    EXPECT_EQ(firstID, make_batch_id(first));
+    EXPECT_NE(firstID, make_batch_id(second));
     second = first;
     second.scope = "process";
     second.selectorExe = "/opt/api";
     second.targetProcesses = {{42, 1000, "api", "/opt/api"}};
-    EXPECT_NE(firstID, make_batch_id(second, 1234567890));
+    EXPECT_NE(firstID, make_batch_id(second));
     EXPECT_LT(firstID.size(), 64u);
-}
-
-TEST(ContinuousSpool, RekeysConflictingBatchWithoutDiscardingPayload)
-{
-    char directoryTemplate[] = "/tmp/mini-drop-spool-conflict-XXXXXX";
-    char *directory = ::mkdtemp(directoryTemplate);
-    ASSERT_NE(directory, nullptr);
-    ContinuousSamplerConfig cfg = make_cfg();
-    cfg.spoolDirectory = directory;
-    cfg.sessionSID = "conflict-session";
-    ASSERT_TRUE(ensure_directory(session_spool_directory(cfg)));
-    const std::string oldID = "cpb-conflict";
-    const std::string body =
-        "{\"session_sid\":\"conflict-session\",\"batch_id\":\"cpb-conflict\",\"windows\":[]}";
-    ASSERT_TRUE(atomic_write_file(spool_path(cfg, oldID), body));
-    ASSERT_TRUE(rekey_conflicted_spooled_batch(cfg, spool_path(cfg, oldID), oldID));
-
-    const auto files = list_session_spool_files(cfg, ".json");
-    ASSERT_EQ(files.size(), 1u);
-    const std::string newID = batch_id_from_spool_path(files.front());
-    EXPECT_NE(newID, oldID);
-    std::string rekeyed;
-    ASSERT_TRUE(read_file(files.front(), &rekeyed));
-    EXPECT_NE(rekeyed.find("\"batch_id\":\"" + newID + "\""), std::string::npos);
-    EXPECT_EQ(rekeyed.find("\"batch_id\":\"" + oldID + "\""), std::string::npos);
-
-    ::unlink(files.front().c_str());
-    ::rmdir(session_spool_directory(cfg).c_str());
-    ::rmdir(directory);
 }
 
 TEST(ContinuousSpool, QuarantinesPermanentlyRejectedBatchWithoutDeletingPayload)
@@ -515,6 +487,190 @@ TEST(ContinuousSpool, QuarantinesPermanentlyRejectedBatchWithoutDeletingPayload)
     ::unlink((path + ".rejected").c_str());
     ::rmdir(session_spool_directory(cfg).c_str());
     ::rmdir(directory);
+}
+
+// ============================================================
+// 阶段一：信号控制面 / 稳定 ID / 分信号计数 / cutover
+// ============================================================
+
+// ============================================================
+// 阶段一：信号控制面 / 稳定 ID / 分信号计数 / cutover
+// ============================================================
+
+TEST(ContinuousSampler, PhysicalSignalsFromRequested)
+{
+    // 空集合 → 四类全开。
+    EXPECT_EQ(physical_signals_from_requested({}), "cpu,io,io_syscall,sched");
+    // 单信号子集。
+    EXPECT_EQ(physical_signals_from_requested({"cpu_profile"}), "cpu");
+    // 并集（去重、保持逻辑顺序映射）。
+    EXPECT_EQ(physical_signals_from_requested({"io_latency", "cpu_profile", "sched_latency"}), "io,cpu,sched");
+    // 公开 API 同语义。
+    EXPECT_EQ(drop::PhysicalSignalsFromRequested({"cpu_profile", "io_latency"}), "cpu,io");
+}
+
+TEST(ContinuousSampler, WindowIDIsStableAndContentIndependent)
+{
+    ContinuousSamplerConfig cfg = make_cfg();
+    cfg.collectorGeneration = "gen-test-1";
+    cfg.targetFingerprint = "fp-1";
+    WindowPayload window;
+    window.startMs = 1'000;
+    window.endMs = 11'000;
+    window.samples.push_back(make_sample("a", 1, 3));
+    const std::string id1 = make_window_id(cfg, window);
+    // 相同窗口 → 相同 ID（重传稳定）。
+    EXPECT_EQ(id1, make_window_id(cfg, window));
+    // 内容不同但起止时间/身份相同 → 同一 ID（内容摘要不参与 ID，冲突时
+    // 仍是同一合法 ID，绝不生成第二个 ID）。
+    WindowPayload changed = window;
+    changed.samples[0].count = 999;
+    EXPECT_EQ(id1, make_window_id(cfg, changed));
+    // 起止时间变化 → 新 ID。
+    WindowPayload otherTime = window;
+    otherTime.endMs = 12'000;
+    EXPECT_NE(id1, make_window_id(cfg, otherTime));
+    // generation 变化 → 新 ID（采集器切换即新 generation）。
+    ContinuousSamplerConfig nextGen = cfg;
+    nextGen.collectorGeneration = "gen-test-2";
+    EXPECT_NE(id1, make_window_id(nextGen, window));
+}
+
+TEST(ContinuousSampler, WindowContentDigestReflectsContent)
+{
+    WindowPayload window;
+    window.startMs = 1'000;
+    window.endMs = 11'000;
+    window.samples.push_back(make_sample("a", 1, 3));
+    const std::string d1 = window_content_digest(window);
+    // 相同内容 → 相同摘要。
+    EXPECT_EQ(d1, window_content_digest(window));
+    // 计数变化 → 摘要变化。
+    WindowPayload changed = window;
+    changed.samples[0].count = 5;
+    EXPECT_NE(d1, window_content_digest(changed));
+    // 窗口时间变化也反映进摘要。
+    WindowPayload moved = window;
+    moved.startMs = 2'000;
+    EXPECT_NE(d1, window_content_digest(moved));
+    // 会影响查询/诊断语义的非计数字段也必须进入摘要，不能让不同 payload
+    // 被误判成精确重传。
+    WindowPayload changedBackend = window;
+    changedBackend.samples[0].backend = "py-spy";
+    EXPECT_NE(d1, window_content_digest(changedBackend));
+    WindowPayload changedExe = window;
+    changedExe.samples[0].exe = "/opt/other";
+    EXPECT_NE(d1, window_content_digest(changedExe));
+}
+
+TEST(ContinuousSampler, SHA256ImplementationMatchesKnownVector)
+{
+    EXPECT_EQ(sha256_hex("abc"),
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+TEST(ContinuousSampler, WindowSignalCountsRecompute)
+{
+    WindowPayload window;
+    window.startMs = 1'000;
+    window.endMs = 11'000;
+    window.samples.push_back(make_sample("a", 1, 3));
+    HistogramPayload hist;
+    hist.signalType = "io_latency";
+    hist.eventCount = 7;
+    window.histograms.push_back(hist);
+    auto counts = window_signal_counts(window);
+    EXPECT_EQ(counts["cpu_profile"], 3u);
+    EXPECT_EQ(counts["io_latency"], 7u);
+    // batch 汇总跨窗口求和。
+    WindowPayload w2;
+    w2.startMs = 12'000;
+    w2.endMs = 22'000;
+    w2.samples.push_back(make_sample("b", 2, 4));
+    auto batchCounts = batch_signal_counts({window, w2});
+    EXPECT_EQ(batchCounts["cpu_profile"], 7u);
+}
+
+TEST(ContinuousSampler, BuildBatchJsonV3EmitsCorrectnessFields)
+{
+    ContinuousSamplerConfig cfg = make_cfg();
+    cfg.collectorGeneration = "gen-test-1";
+    cfg.batchSequence = 3;
+    cfg.targetFingerprint = "fp-1";
+    WindowPayload window;
+    window.startMs = 1'000;
+    window.endMs = 11'000;
+    window.samples.push_back(make_sample("a", 1, 3));
+    window.windowID = make_window_id(cfg, window);
+    window.contentSHA256 = window_content_digest(window);
+
+    std::string json = build_batch_json(cfg, "cpb-v3", {window});
+    // schema_version=3；batch 层 sample_count 废弃写 0。
+    EXPECT_NE(json.find("\"schema_version\":3"), std::string::npos);
+    EXPECT_NE(json.find("\"sample_count\":0"), std::string::npos);
+    // 新协议字段。
+    EXPECT_NE(json.find("\"collector_generation\":\"gen-test-1\""), std::string::npos);
+    EXPECT_NE(json.find("\"batch_sequence\":3"), std::string::npos);
+    EXPECT_NE(json.find("\"content_sha256\":\""), std::string::npos);
+    EXPECT_NE(json.find("\"signal_counts\":{\"cpu_profile\":3}"), std::string::npos);
+    // 窗口级字段。
+    EXPECT_NE(json.find("\"window_id\":\"cpw-"), std::string::npos);
+    EXPECT_NE(json.find("\"target_fingerprint\":\"fp-1\""), std::string::npos);
+    EXPECT_NE(json.find("\"signal_counts\":{\"cpu_profile\":3}"), std::string::npos);
+    // 窗口行 sample_count 仍是该窗口自身计数（cpu=3）。
+    EXPECT_NE(json.find("\"sample_count\":3"), std::string::npos);
+}
+
+TEST(ContinuousSampler, FilterSharedWindowByRequestedSignals)
+{
+    ContinuousSamplerConfig session = make_cfg();
+    session.requestedSignals = {"cpu_profile"}; // CPU-only Session
+    WindowPayload source;
+    source.startMs = 1'000;
+    source.endMs = 11'000;
+    source.samples.push_back(make_sample("a", 1, 3));
+    HistogramPayload io;
+    io.signalType = "io_latency";
+    io.eventCount = 5;
+    source.histograms.push_back(io);
+
+    // CPU-only：直方图被剔除，CPU 样本保留。
+    WindowPayload out = filter_shared_window(source, session, true);
+    EXPECT_EQ(out.samples.size(), 1u);
+    EXPECT_TRUE(out.histograms.empty());
+
+    // 四信号 Session：直方图保留。
+    ContinuousSamplerConfig all = make_cfg();
+    all.requestedSignals = {"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"};
+    WindowPayload out2 = filter_shared_window(source, all, true);
+    EXPECT_EQ(out2.histograms.size(), 1u);
+
+    // 未请求 histogramAttributionSafe=false：请求了 io 的 Session 得到
+    // unavailable 标记，未请求的 sched 不出现。
+    ContinuousSamplerConfig ioOnly = make_cfg();
+    ioOnly.requestedSignals = {"io_latency"};
+    WindowPayload out3 = filter_shared_window(source, ioOnly, false);
+    ASSERT_EQ(out3.histograms.size(), 1u);
+    EXPECT_TRUE(out3.histograms[0].unavailable);
+    EXPECT_EQ(out3.histograms[0].signalType, "io_latency");
+    EXPECT_TRUE(out3.samples.empty()); // cpu 未请求 → 剔除
+}
+
+TEST(ContinuousSampler, BatchIDIncludesGenerationAndSequence)
+{
+    ContinuousSamplerConfig cfg = make_cfg();
+    cfg.collectorGeneration = "gen-test-1";
+    cfg.batchSequence = 1;
+    const std::string id1 = make_batch_id(cfg);
+    // 同一 generation + sequence → 稳定。
+    EXPECT_EQ(id1, make_batch_id(cfg));
+    // sequence 递增 → 新 ID。
+    cfg.batchSequence = 2;
+    EXPECT_NE(id1, make_batch_id(cfg));
+    // generation 变化 → 新 ID（采集器切换，不允许旧 ID 复用）。
+    cfg.batchSequence = 1;
+    cfg.collectorGeneration = "gen-test-2";
+    EXPECT_NE(id1, make_batch_id(cfg));
 }
 
 TEST(ContinuousSampler, SortsSharedSlicesAndPreservesValidMergedBounds)
@@ -682,7 +838,13 @@ TEST(SharedContinuousEngine, BuildsOneUnionTargetSetAtHighestFrequency)
     EXPECT_EQ(physical.sampleRateHz, 49);
     EXPECT_EQ(physical.aggregationWindowSec, 5);
     EXPECT_EQ(physical.targetProcesses.size(), 2u);
-    EXPECT_EQ(physical.signals, "cpu");
+    // 阶段一：物理采集信号 = 所有 Session 请求信号的并集。两个 Session 均未
+    // 显式请求（回退四类默认）→ 物理全开。
+    EXPECT_EQ(physical.signals, "cpu,io,io_syscall,sched");
+    // 单 Session 只请求 cpu → 物理只采 cpu。
+    ContinuousSamplerConfig cpuOnly = first;
+    cpuOnly.requestedSignals = {"cpu_profile"};
+    EXPECT_EQ(shared_physical_config({cpuOnly}).signals, "cpu");
     const auto args = perf_record_args(physical, "perf", "cpu-clock", "/tmp/shared.data");
     EXPECT_EQ(std::find(args.begin(), args.end(), "-a"), args.end());
     auto pidFlag = std::find(args.begin(), args.end(), "-p");

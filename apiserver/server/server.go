@@ -766,6 +766,7 @@ func (s *APIServer) registerRoutes() {
 		api.POST("/internal/continuous/reconcile", s.ReconcileContinuousSessions)
 		api.POST("/internal/continuous/batches", s.IngestContinuousBatch)
 		api.POST("/internal/continuous/symbol-check", s.ContinuousSymbolCheck)
+		api.POST("/internal/continuous/repair", s.RepairContinuousDuplicates)
 		api.GET("/continuous/raw", s.ViewContinuousProfileObject)
 		api.GET("/continuous/sessions/:sid/timeline", s.GetContinuousTimeline)
 		api.GET("/continuous/query", s.QueryContinuousProfile)
