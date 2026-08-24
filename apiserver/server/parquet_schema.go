@@ -101,7 +101,8 @@ func (r pqMetricRow) pqSortKey() pqSortKey {
 	return pqSortKey{Timestamp: r.Timestamp, SessionSID: r.SessionSID, PID: r.PID, ProcessStartMs: r.ProcessStartMs}
 }
 
-// pqHistogramRow 一行 = 一个 histogram bucket（EventCount 在事件级重复）。
+// pqHistogramRow 一行 = 一个 histogram bucket。EventCount 只写在同一
+// histogram 的第一条 bucket row，避免查询聚合时按 bucket 数量倍增。
 // 粗粒度层合并相同 (low,high) 边界后重算 P50/P95/P99。
 type pqHistogramRow struct {
 	Timestamp   int64             `parquet:"timestamp"`
@@ -130,25 +131,25 @@ func (r pqHistogramRow) pqSortKey() pqSortKey {
 // pqDBRow 一行 = 一个 db digest 聚合增量 或 lock wait 事件聚合。
 // Kind: "digest" | "lock_wait"。
 type pqDBRow struct {
-	Timestamp            int64             `parquet:"timestamp"`
-	SessionSID           string            `parquet:"session_sid,dict"`
-	Kind                 string            `parquet:"kind,dict"`
-	Instance             string            `parquet:"instance,dict"`
-	SchemaName           string            `parquet:"schema_name,dict"`
-	DigestText           string            `parquet:"digest_text,dict"`
-	CallCount            uint64            `parquet:"call_count"`
-	TotalLatencyUs       uint64            `parquet:"total_latency_us"`
-	RowsExaminedTotal    uint64            `parquet:"rows_examined_total"`
-	WaitingPID           int64             `parquet:"waiting_pid"`
-	WaitingQuery         string            `parquet:"waiting_query"`
-	BlockingPID          int64             `parquet:"blocking_pid"`
-	BlockingQuery        string            `parquet:"blocking_query"`
-	WaitSeconds          uint64            `parquet:"wait_seconds"`
-	LockedTable          string            `parquet:"locked_table,dict"`
-	OccurrenceCount      uint64            `parquet:"occurrence_count"`
-	MaxWaitSeconds       uint64            `parquet:"max_wait_seconds"`
-	MaxWaitRepresentative string           `parquet:"max_wait_representative"`
-	Labels               map[string]string `parquet:"labels"`
+	Timestamp             int64             `parquet:"timestamp"`
+	SessionSID            string            `parquet:"session_sid,dict"`
+	Kind                  string            `parquet:"kind,dict"`
+	Instance              string            `parquet:"instance,dict"`
+	SchemaName            string            `parquet:"schema_name,dict"`
+	DigestText            string            `parquet:"digest_text,dict"`
+	CallCount             uint64            `parquet:"call_count"`
+	TotalLatencyUs        uint64            `parquet:"total_latency_us"`
+	RowsExaminedTotal     uint64            `parquet:"rows_examined_total"`
+	WaitingPID            int64             `parquet:"waiting_pid"`
+	WaitingQuery          string            `parquet:"waiting_query"`
+	BlockingPID           int64             `parquet:"blocking_pid"`
+	BlockingQuery         string            `parquet:"blocking_query"`
+	WaitSeconds           uint64            `parquet:"wait_seconds"`
+	LockedTable           string            `parquet:"locked_table,dict"`
+	OccurrenceCount       uint64            `parquet:"occurrence_count"`
+	MaxWaitSeconds        uint64            `parquet:"max_wait_seconds"`
+	MaxWaitRepresentative string            `parquet:"max_wait_representative"`
+	Labels                map[string]string `parquet:"labels"`
 }
 
 func (r pqDBRow) pqSortKey() pqSortKey {
@@ -165,10 +166,10 @@ type pqSignalRows struct {
 
 // pqMetricKind 已知 metric 类型登记（未登记指标按 gauge 处理并记录告警）。
 var knownMetricKinds = map[string]string{
-	"rss_bytes":                            "gauge",
-	"db_active_connections":                "gauge",
-	"db_innodb_buffer_pool_hit_ratio_bps":  "gauge",
-	"db_questions_total":                   "counter",
+	"rss_bytes":                           "gauge",
+	"db_active_connections":               "gauge",
+	"db_innodb_buffer_pool_hit_ratio_bps": "gauge",
+	"db_questions_total":                  "counter",
 }
 
 // pqMetricKindFor 返回指标类型：登记过返回登记值；未登记按 gauge 处理。

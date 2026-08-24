@@ -953,15 +953,15 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 	}
 	query := s.DB.Where("session_sid = ?", session.SID).Order("window_start ASC")
 	query = query.Where("window_end >= ? AND window_start <= ?", boundaryFrom, boundaryTo)
-	var windows []model.ProfileWindow
-	if err := query.Find(&windows).Error; err != nil {
+
+	// 阶段六：Timeline 从 coverage segments + 最近热 window 计算，保持
+	// windows/gaps/coverage/clock 兼容字段；历史压缩条目 compacted=true +
+	// coverage_source=parquet_catalog（避免长范围全量返回明细窗口）。
+	windows, gaps, coverage, err := s.continuousTimelineV2(c.Request.Context(), session, boundaryFrom, boundaryTo, query)
+	if err != nil {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 Continuous timeline 失败")
 		return
 	}
-	if windows == nil {
-		windows = []model.ProfileWindow{}
-	}
-	gaps, coverage := continuousTimelineCoverage(windows, boundaryFrom, boundaryTo, 5*time.Second)
 	s.RespondOK(c, gin.H{
 		"session": session, "windows": windows, "total": len(windows),
 		"gaps": gaps, "coverage": coverage,
@@ -970,6 +970,90 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 			"observed_at": session.AgentClockObservedAt,
 		},
 	})
+}
+
+// continuousTimelineV2 阶段六 timeline：热 window（< 2h，v1 staging）+
+// coverage segments（历史已压缩，compacted=true）合成 windows/gaps/coverage。
+// 长范围不再全量返回明细 window，避免响应体积随范围线性膨胀。
+func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.ContinuousSession, from, to time.Time,
+	baseQuery *gorm.DB) ([]gin.H, []continuousTimelineGap, gin.H, error) {
+	hotRetention := time.Duration(s.Config.ContinuousParquet.HotMetadataRetentionMinutes) * time.Minute
+	if hotRetention <= 0 {
+		hotRetention = 120 * time.Minute
+	}
+	hotCutoff := time.Now().Add(-hotRetention)
+
+	var hotWindows []model.ProfileWindow
+	if err := baseQuery.WithContext(ctx).
+		Where("window_start >= ?", func() time.Time {
+			if from.After(hotCutoff) {
+				return from
+			}
+			return hotCutoff
+		}()).
+		Find(&hotWindows).Error; err != nil {
+		return nil, nil, nil, err
+	}
+	var segments []model.ContinuousCoverageSegment
+	catalogTo := to
+	if hotCutoff.Before(catalogTo) {
+		catalogTo = hotCutoff
+	}
+	if err := s.DB.WithContext(ctx).
+		Where("session_sid = ? AND segment_start < ? AND segment_end > ?", session.SID, catalogTo, from).
+		Order("segment_start ASC").Find(&segments).Error; err != nil {
+		return nil, nil, nil, err
+	}
+
+	items := make([]gin.H, 0, len(hotWindows)+len(segments))
+	merged := make([]model.ProfileWindow, 0, len(hotWindows)+len(segments))
+	for _, window := range hotWindows {
+		items = append(items, gin.H{
+			"id": window.ID, "session_sid": window.SessionSID, "batch_bid": window.BatchBID,
+			"window_start": window.WindowStart, "window_end": window.WindowEnd,
+			"object_key": window.ObjectKey, "sample_count": window.SampleCount,
+			"signal_type": window.SignalType, "backend": window.Backend,
+			"labels": json.RawMessage(window.Labels), "compacted": false,
+			"coverage_source": "v1_staging",
+		})
+		merged = append(merged, window)
+	}
+	for _, segment := range segments {
+		item := gin.H{
+			"session_sid": segment.SessionSID, "signal_type": segment.SignalType,
+			"window_start": segment.SegmentStart, "window_end": segment.SegmentEnd,
+			"sample_count": segment.SampleCount, "compacted": true,
+			"coverage_source": "parquet_catalog", "resolution": segment.Resolution,
+			"source_block": segment.SourceBlock, "source_version": segment.SourceVersion,
+		}
+		if segment.SegmentStart.Before(from) {
+			item["window_start"] = from
+		}
+		if segment.SegmentEnd.After(to) {
+			item["window_end"] = to
+		}
+		if segment.SegmentEnd.After(hotCutoff) {
+			item["window_end"] = hotCutoff
+		}
+		items = append(items, item)
+		merged = append(merged, model.ProfileWindow{
+			SessionSID: segment.SessionSID, SignalType: segment.SignalType,
+			WindowStart: segment.SegmentStart, WindowEnd: segment.SegmentEnd,
+			SampleCount: segment.SampleCount,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return windowStartOf(items[i]).Before(windowStartOf(items[j]))
+	})
+	gaps, coverage := continuousTimelineCoverage(merged, from, to, 5*time.Second)
+	return items, gaps, coverage, nil
+}
+
+func windowStartOf(item gin.H) time.Time {
+	if value, ok := item["window_start"].(time.Time); ok {
+		return value
+	}
+	return time.Time{}
 }
 
 type continuousTimelineGap struct {
@@ -1060,39 +1144,39 @@ func (s *APIServer) QueryContinuousProfile(c *gin.Context) {
 	}
 	if !found {
 		s.RespondOK(c, gin.H{
-			"query":               profileLabelSelector(q),
-			"nodes":               []ProfileNode{},
-			"items":               []ProfileTopItem{},
-			"total":               0,
-			"unit":                "samples",
-			"empty":               true,
-			"message":             "Native Continuous Profiling 暂无覆盖该时间范围的 10s window",
-			"source":              "mini-drop-native",
-			"profile_source":      "native",
-			"generated_at":        time.Now(),
-			"resolution_seconds":  stats.ResolutionSeconds,
-			"mixed_resolution":    stats.MixedResolution,
-			"storage_source":      stats.StorageSource,
+			"query":                 profileLabelSelector(q),
+			"nodes":                 []ProfileNode{},
+			"items":                 []ProfileTopItem{},
+			"total":                 0,
+			"unit":                  "samples",
+			"empty":                 true,
+			"message":               "Native Continuous Profiling 暂无覆盖该时间范围的 10s window",
+			"source":                "mini-drop-native",
+			"profile_source":        "native",
+			"generated_at":          time.Now(),
+			"resolution_seconds":    stats.ResolutionSeconds,
+			"mixed_resolution":      stats.MixedResolution,
+			"storage_source":        stats.StorageSource,
 			"earliest_available_at": stats.EarliestAvailable,
 		})
 		return
 	}
 	s.RespondOK(c, gin.H{
-		"query":               fg.Query,
-		"nodes":               fg.Nodes,
-		"items":               topn.Items,
-		"total":               fg.Total,
-		"unit":                fg.Unit,
-		"empty":               fg.Empty,
-		"message":             fg.Message,
-		"source":              fg.Source,
-		"profile_source":      fg.ProfileSource,
-		"profile_url":         fg.ProfileURL,
-		"raw_profile_url":     fg.RawProfileURL,
-		"generated_at":        fg.GeneratedAt,
-		"resolution_seconds":  stats.ResolutionSeconds,
-		"mixed_resolution":    stats.MixedResolution,
-		"storage_source":      stats.StorageSource,
+		"query":                 fg.Query,
+		"nodes":                 fg.Nodes,
+		"items":                 topn.Items,
+		"total":                 fg.Total,
+		"unit":                  fg.Unit,
+		"empty":                 fg.Empty,
+		"message":               fg.Message,
+		"source":                fg.Source,
+		"profile_source":        fg.ProfileSource,
+		"profile_url":           fg.ProfileURL,
+		"raw_profile_url":       fg.RawProfileURL,
+		"generated_at":          fg.GeneratedAt,
+		"resolution_seconds":    stats.ResolutionSeconds,
+		"mixed_resolution":      stats.MixedResolution,
+		"storage_source":        stats.StorageSource,
 		"earliest_available_at": stats.EarliestAvailable,
 	})
 }
@@ -1571,6 +1655,12 @@ func (s *APIServer) queryNativeContinuousSummary(ctx context.Context, q ProfileQ
 func (s *APIServer) downsampleContinuousWindows(ctx context.Context, session model.ContinuousSession, windows []model.ProfileWindow) (map[string]bool, error) {
 	failedObjects := map[string]bool{}
 
+	// 阶段六：enforce 下 v2 1h 层承担 30 天保留，停止生成新的
+	// ContinuousWindowSummary；旧摘要继续按 168h 自然过期。
+	if s.pqModeOf() == "enforce" {
+		return failedObjects, nil
+	}
+
 	byObject := map[string][]model.ProfileWindow{}
 	for _, w := range windows {
 		if w.SignalType != "cpu_profile" || w.ObjectKey == "" {
@@ -1809,7 +1899,8 @@ func (s *APIServer) GetProfileTimeseries(c *gin.Context) {
 	if maxSeries > 128 {
 		maxSeries = 128
 	}
-	series, found, err := s.queryNativeContinuousTimeseries(c.Request.Context(), q, metric, maxSeries)
+	// 阶段六：prefer/enforce 逐小时混合（v2 历史小时 + v1 热小时）
+	series, found, err := s.pqQueryTimeseriesMixed(c.Request.Context(), q, metric, maxSeries)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
@@ -1817,7 +1908,12 @@ func (s *APIServer) GetProfileTimeseries(c *gin.Context) {
 	if !found {
 		series = []ProfileTimeseriesSeries{}
 	}
-	s.RespondOK(c, gin.H{"series": series, "metric": metric, "unit": "bytes", "empty": len(series) == 0, "generated_at": time.Now()})
+	stats := s.pqQueryStatsFor(c.Request.Context(), q)
+	s.RespondOK(c, gin.H{
+		"series": series, "metric": metric, "unit": "bytes", "empty": len(series) == 0, "generated_at": time.Now(),
+		"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
+		"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
+	})
 }
 
 func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q ProfileQuery, metricName string, maxSeries int) ([]ProfileTimeseriesSeries, bool, error) {
@@ -1924,40 +2020,17 @@ func downsampleRSSPoints(points []ProfileTimeseriesPoint, limit int) []ProfileTi
 }
 
 func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q ProfileQuery) (continuousAggregate, bool, error) {
-	// 阶段五：prefer/enforce 模式优先 v2（覆盖完整时走纯 v2，缺口整段回退 v1）。
+	// 阶段五/六：prefer/enforce 模式走逐小时混合规划器（v2 历史小时 +
+	// v1 当前小时；某小时 parquet 缺失/失败仅该小时回退 v1）。
 	if pqModeQueryV2(s.pqModeOf()) {
-		v2Agg, v2Found, err := s.pqQueryAggregateV2(ctx, q)
+		v2Agg, v2Found, err := s.pqQueryAggregateMixed(ctx, q)
 		if err != nil {
 			return continuousAggregate{}, false, err
 		}
 		if v2Found {
 			return v2Agg, true, nil
 		}
-		// 无 v2 覆盖 → 回退 v1
-	}
-	var windows []model.ProfileWindow
-	sessionQuery := s.continuousSessionSelection(q)
-	signalType := "cpu_profile"
-	if q.ProfileType == "memory" {
-		signalType = "python_memory"
-	}
-	err := s.DB.Where("session_sid IN (?)", sessionQuery).
-		Where("signal_type = ?", signalType).
-		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
-		Order("window_start ASC").
-		Limit(continuousMaxWindowCount + 1).
-		Find(&windows).Error
-	if err != nil {
-		return continuousAggregate{}, false, err
-	}
-	if len(windows) > continuousMaxWindowCount {
-		return continuousAggregate{}, true, errContinuousWindowLimit
-	}
-	if len(windows) == 0 {
-		return continuousAggregate{}, false, nil
-	}
-	if !s.StorageConnected() {
-		return continuousAggregate{}, true, errProfileUnavailable
+		// 无任何 v2/v1 数据 → 走原 v1 空路径（返回 not found）
 	}
 	agg := continuousAggregate{
 		Top: map[string]*ProfileTopItem{},
@@ -1976,11 +2049,50 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		Backends:           map[string]bool{},
 		SymbolStatus:       "not_applicable",
 		SymbolReasons:      map[string]bool{},
-		WindowCount:        len(windows),
 		Unit:               map[bool]string{true: "bytes", false: "samples"}[q.ProfileType == "memory"],
 		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
 		SeenProfileIDs:     map[string]bool{},
 	}
+	found, err := s.aggregateV1WindowsInto(ctx, q, q.From, q.To, &agg)
+	if err != nil {
+		return continuousAggregate{}, true, err
+	}
+	if !found {
+		return continuousAggregate{}, false, nil
+	}
+	continuousFinalizeSymbolStatus(&agg)
+	return agg, true, nil
+}
+
+// aggregateV1WindowsInto 把 [from, to) 内的 v1 window 数据聚合进 agg
+// （CPU/profile 信号；按 window_start 分区，避免小时边界重复计数）。
+// 返回 (是否找到 window, 错误)。供整段 v1 查询与逐小时混合规划器复用。
+func (s *APIServer) aggregateV1WindowsInto(ctx context.Context, q ProfileQuery, from, to time.Time, agg *continuousAggregate) (bool, error) {
+	var windows []model.ProfileWindow
+	sessionQuery := s.continuousSessionSelection(q)
+	signalType := "cpu_profile"
+	if q.ProfileType == "memory" {
+		signalType = "python_memory"
+	}
+	err := s.DB.WithContext(ctx).Where("session_sid IN (?)", sessionQuery).
+		Where("signal_type = ?", signalType).
+		Where("window_start >= ? AND window_start < ?", from, to).
+		Order("window_start ASC").
+		Limit(continuousMaxWindowCount + 1).
+		Find(&windows).Error
+	if err != nil {
+		return false, err
+	}
+	if len(windows) > continuousMaxWindowCount {
+		return true, errContinuousWindowLimit
+	}
+	if len(windows) == 0 {
+		return false, nil
+	}
+	if !s.StorageConnected() {
+		return true, errProfileUnavailable
+	}
+	agg.WindowCount += len(windows)
 	byObject := map[string][]model.ProfileWindow{}
 	objectOrder := []string{}
 	for _, window := range windows {
@@ -1997,7 +2109,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		// （多 batch）。块只加载解压一次，再按 DB 行选中的 batch_bid 关联。
 		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
-			return continuousAggregate{}, true, err
+			return true, err
 		}
 		agg.ObjectKeys = append(agg.ObjectKeys, objectKey)
 		batchByID := continuousBatchIndex(batches)
@@ -2009,7 +2121,9 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 			}
 			seenBatch[rowKey] = true
 			for _, window := range batch.Windows {
-				if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
+				// 阶段六：按 window_start 归属小时（半开区间），避免小时边界
+				// window 在相邻小时被重复聚合（旧逻辑 windowOverlaps 会双计）。
+				if window.WindowStart.IsZero() || window.WindowStart.Before(from) || !window.WindowStart.Before(to) {
 					continue
 				}
 				matched := make([]ContinuousStackSample, 0)
@@ -2023,16 +2137,15 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 						relevantDSOs[exe] = true
 					}
 				}
-				continuousAggregateSymbolMetadata(&agg, window.SymbolRefs, relevantDSOs)
-				continuousAggregateRuntimeMetadata(&agg, window.SymbolRefs)
+				continuousAggregateSymbolMetadata(agg, window.SymbolRefs, relevantDSOs)
+				continuousAggregateRuntimeMetadata(agg, window.SymbolRefs)
 				for _, sample := range matched {
-					continuousAddSample(&agg, sample, window.Labels)
+					continuousAddSample(agg, sample, window.Labels)
 				}
 			}
 		}
 	}
-	continuousFinalizeSymbolStatus(&agg)
-	return agg, true, nil
+	return true, nil
 }
 
 // continuousAggregateSymbolMetadata only carries extraction state/reasons.
@@ -2274,21 +2387,24 @@ func (s *APIServer) QueryContinuousHistogram(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "signal_type 仅支持 io_latency/io_syscall_latency/sched_latency")
 		return
 	}
-	data, found, err := s.queryNativeContinuousHistogram(c.Request.Context(), q, signalType)
+	data, found, err := s.pqQueryHistogramMixed(c.Request.Context(), q, signalType)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
 	}
 	if !found {
+		stats := s.pqQueryStatsFor(c.Request.Context(), q)
 		s.RespondOK(c, gin.H{
-			"query":        profileLabelSelector(q),
-			"signal_type":  signalType,
-			"empty":        true,
-			"message":      "Native Continuous eBPF 暂无覆盖该时间范围的 histogram window",
-			"source":       "mini-drop-native",
-			"generated_at": time.Now(),
-			"buckets":      []ContinuousHistogramBucket{},
-			"trend":        []gin.H{},
+			"query":          profileLabelSelector(q),
+			"signal_type":    signalType,
+			"empty":          true,
+			"message":        "Native Continuous eBPF 暂无覆盖该时间范围的 histogram window",
+			"source":         "mini-drop-native",
+			"generated_at":   time.Now(),
+			"buckets":        []ContinuousHistogramBucket{},
+			"trend":          []gin.H{},
+			"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
+			"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
 		})
 		return
 	}
@@ -2439,21 +2555,24 @@ func (s *APIServer) QueryContinuousDBSnapshot(c *gin.Context) {
 	if !ok {
 		return
 	}
-	data, found, err := s.queryNativeContinuousDBSnapshot(c.Request.Context(), q)
+	data, found, err := s.pqQueryDBMixed(c.Request.Context(), q)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
 	}
 	if !found {
+		stats := s.pqQueryStatsFor(c.Request.Context(), q)
 		s.RespondOK(c, gin.H{
-			"query":        profileLabelSelector(q),
-			"signal_type":  "db_snapshot",
-			"empty":        true,
-			"message":      "该时间范围暂无数据库快照数据",
-			"source":       "mini-drop-native",
-			"generated_at": time.Now(),
-			"digests":      []gin.H{},
-			"lock_waits":   []gin.H{},
+			"query":          profileLabelSelector(q),
+			"signal_type":    "db_snapshot",
+			"empty":          true,
+			"message":        "该时间范围暂无数据库快照数据",
+			"source":         "mini-drop-native",
+			"generated_at":   time.Now(),
+			"digests":        []gin.H{},
+			"lock_waits":     []gin.H{},
+			"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
+			"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
 		})
 		return
 	}

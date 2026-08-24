@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,6 +234,9 @@ func TestPQDownsampleMetricCounter(t *testing.T) {
 	if gout[0].Min != 10 || gout[0].Max != 30 || gout[0].Count != 3 || gout[0].Last != 20 || gout[0].Sum != 60 {
 		t.Errorf("gauge 聚合不符: %+v", gout[0])
 	}
+	if gout[0].Value != 30 {
+		t.Errorf("gauge 查询值必须保持峰值语义: value=%d want=30", gout[0].Value)
+	}
 }
 
 func TestPQDownsampleHistogram(t *testing.T) {
@@ -254,6 +258,19 @@ func TestPQDownsampleHistogram(t *testing.T) {
 	// 加权平均 P50 = (5*2 + 6*3)/5 = 5.6
 	if out[0].P50 != 5.6 {
 		t.Errorf("P50 重算: %v (want 5.6)", out[0].P50)
+	}
+}
+
+func TestPQHistogramEventCountDeduplicatesBucketRows(t *testing.T) {
+	base := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	rows := []pqHistogramRow{
+		{Timestamp: base.UnixMilli(), SessionSID: "s1", SignalType: "io_latency", Backend: "ebpf", BucketLow: 0, BucketHigh: 10, EventCount: 7},
+		{Timestamp: base.UnixMilli(), SessionSID: "s1", SignalType: "io_latency", Backend: "ebpf", BucketLow: 10, BucketHigh: 20, EventCount: 7},
+		{Timestamp: base.UnixMilli(), SessionSID: "s2", SignalType: "io_latency", Backend: "ebpf", BucketLow: 0, BucketHigh: 10, EventCount: 3},
+	}
+	authorized := map[string]struct{}{"s1": {}, "s2": {}}
+	if got := pqHistogramEventTotal(rows, "io_latency", base, base.Add(time.Minute), authorized); got != 10 {
+		t.Fatalf("event_count must count histograms, not buckets: got=%d want=10", got)
 	}
 }
 
@@ -448,13 +465,22 @@ func TestPQStagingReclaimRequiresEnforceAndValidatedLineage(t *testing.T) {
 		BlockID: "pq-covered", Tenant: "default", BucketStart: batch.StartTime.UTC().Truncate(time.Hour),
 		BucketEnd: batch.StartTime.UTC().Truncate(time.Hour).Add(time.Hour), SignalType: model.ContinuousParquetSignalCPU,
 		Resolution: model.ContinuousParquetResolutionRaw, Status: model.ContinuousParquetStatusActive,
-		Validation: model.ContinuousParquetValidationPassed, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		Validation: model.ContinuousParquetValidationPassed, ReconcileStatus: model.ContinuousParquetReconcilePassed,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if err := s.DB.Create(&block).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DB.Create(&model.ContinuousParquetBlockMember{
 		BlockID: block.BlockID, SourceKind: "batch", SourceRef: batch.BID, CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&model.ContinuousMigrationReceipt{
+		Tenant: "default", SourceKind: "batch", SourceRef: batch.BID, SessionSID: batch.SessionSID,
+		SignalType: model.ContinuousParquetSignalCPU, BlockID: block.BlockID,
+		BucketStart: block.BucketStart, BucketEnd: block.BucketEnd,
+		StartTime: batch.StartTime, EndTime: batch.EndTime, Status: continuousMigrationReceiptPassed,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -546,6 +572,59 @@ func TestPQSealedHourRetriesMissingSignalAndLateWindow(t *testing.T) {
 	}
 }
 
+func TestPQSealedHoursExcludeCurrentPartialHour(t *testing.T) {
+	s := pqTestServer(t)
+	s.Config.ContinuousParquet.Mode = "shadow"
+	s.Config.ContinuousParquet.ShadowBackfillHours = 48
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	if err := s.DB.Create(&model.ProfileWindow{
+		SessionSID: "s1", BatchBID: "b-current", ObjectKey: "k", SignalType: "cpu_profile",
+		WindowStart: hour.Add(time.Minute), WindowEnd: hour.Add(2 * time.Minute), CreatedAt: hour.Add(2 * time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 10:30 时，10:01 已早于 now-delay，但整个 10 点小时尚未结束，不能封存。
+	if hours := s.pqSealedRawHours(context.Background(), "default", hour.Add(30*time.Minute), 12); len(hours) != 0 {
+		t.Fatalf("partial current hour must not be sealed: %v", hours)
+	}
+	// hour_end + 10min 后才允许构建。
+	if hours := s.pqSealedRawHours(context.Background(), "default", hour.Add(time.Hour+11*time.Minute), 12); len(hours) != 1 || !hours[0].Equal(hour) {
+		t.Fatalf("fully sealed hour must be eligible: %v", hours)
+	}
+}
+
+func TestPQSealedHoursDoNotStarveOlderGap(t *testing.T) {
+	s := pqTestServer(t)
+	s.Config.ContinuousParquet.Mode = "shadow"
+	s.Config.ContinuousParquet.ShadowBackfillHours = 48
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 20, 0, 0, 0, time.UTC)
+	for i := 0; i < 13; i++ {
+		hour := base.Add(time.Duration(i) * time.Hour)
+		if err := s.DB.Create(&model.ProfileWindow{
+			SessionSID: "s1", BatchBID: fmt.Sprintf("b-%d", i), ObjectKey: "k", SignalType: "cpu_profile",
+			WindowStart: hour.Add(time.Minute), WindowEnd: hour.Add(2 * time.Minute), CreatedAt: hour.Add(2 * time.Minute),
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			continue // 最老小时故意留缺口
+		}
+		if err := s.DB.Create(&model.ContinuousParquetBlock{
+			BlockID: fmt.Sprintf("covered-%d", i), Tenant: "default", BucketStart: hour, BucketEnd: hour.Add(time.Hour),
+			SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw,
+			Status: model.ContinuousParquetStatusActive, Validation: model.ContinuousParquetValidationPassed,
+			ReconcileStatus: model.ContinuousParquetReconcilePassed, CreatedAt: hour.Add(3 * time.Minute), UpdatedAt: hour.Add(3 * time.Minute),
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	hours := s.pqSealedRawHours(ctx, "default", base.Add(15*time.Hour), 1)
+	if len(hours) != 1 || !hours[0].Equal(base) {
+		t.Fatalf("older uncovered hour must not starve behind covered recent hours: %v", hours)
+	}
+}
+
 type immediatePutFailureStorage struct{ *continuousMemoryStorage }
 
 func (s *immediatePutFailureStorage) PutObject(context.Context, string, string, io.Reader, int64, string) error {
@@ -572,27 +651,82 @@ func TestPQWriterDoesNotDeadlockWhenUploadFailsWithoutReading(t *testing.T) {
 	}
 }
 
-func TestPQShadowMismatchNeverBecomesActive(t *testing.T) {
+func TestPQReadBlockRowsIsAtomicAcrossParts(t *testing.T) {
 	s := pqTestServer(t)
-	s.Config.ContinuousParquet.Mode = "shadow"
+	ctx := context.Background()
 	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	result, err := writeParquetPartGeneric(s, ctx, "continuous/v2/part-ok.parquet", []pqCPURow{{
+		Timestamp: hour.UnixMilli(), SessionSID: "s1", Value: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []model.ContinuousParquetBlockFile{
+		{BlockID: "pq-parts", PartIndex: 0, ObjectKey: result.ObjectKey, CreatedAt: time.Now()},
+		{BlockID: "pq-parts", PartIndex: 1, ObjectKey: "continuous/v2/part-missing.parquet", CreatedAt: time.Now()},
+	}
+	for i := range files {
+		if err := s.DB.Create(&files[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, _, err := pqReadBlockRows[pqCPURow](s, ctx, "pq-parts", hour.UnixMilli(), hour.Add(time.Hour).UnixMilli())
+	if err == nil || len(rows) != 0 {
+		t.Fatalf("partial part read must expose no rows: rows=%d err=%v", len(rows), err)
+	}
+}
+
+func TestPQShadowMismatchNeverBecomesActive(t *testing.T) {
+	// 阶段六：raw 块激活前按信号做窗口完整性对账（fail-closed）——任何
+	// 可解析源窗口未被消费，整小时构建失败，绝不产生 active 块。
+	s := pqTestServer(t)
+	setDiskFree(t, 100<<30, 80<<30, 20<<30, nil)
+	s.Config.ContinuousParquet.Mode = "shadow"
+	ctx := context.Background()
+	hour := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	objKey := "continuous/s1/b-missing.json"
+
+	// 源窗口存在（batch 指向的对象在 MinIO 缺失）→ 构建必须失败
 	if err := s.DB.Create(&model.ProfileWindow{
 		SessionSID: "s1", BatchBID: "b1", WindowStart: hour.Add(time.Minute), WindowEnd: hour.Add(2 * time.Minute),
-		ObjectKey: "source", SignalType: "cpu_profile", SampleCount: 9, CreatedAt: time.Now(),
+		ObjectKey: objKey, SignalType: "cpu_profile", SampleCount: 2, CreatedAt: time.Now(),
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.pqWriteSignalBlock(context.Background(), "default", hour, hour.Add(time.Hour),
-		model.ContinuousParquetSignalCPU, model.ContinuousParquetResolutionRaw, "",
-		[]pqCPURow{{Timestamp: hour.Add(time.Minute).UnixMilli(), SessionSID: "s1", Value: 2, ProfileType: "cpu_profile"}},
-		nil, nil, nil, map[string]bool{"s1": true}, nil,
-		map[string]map[string]bool{"b1": {"batch": true}})
-	if err == nil {
-		t.Fatal("shadow source mismatch must fail the block")
+	if err := s.DB.Create(&model.ProfileBatch{
+		BID: "b1", SessionSID: "s1", ObjectKey: objKey, StartTime: hour.Add(time.Minute), EndTime: hour.Add(2 * time.Minute),
+		SignalTypes: mustJSONBytes([]string{"cpu_profile"}), Status: "ready", CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 对象不存在 → 登记 migration failure 并跳过（不阻塞），不产生 active 块
+	if built, err := s.pqBuildRawHour(ctx, "default", hour); err != nil || built {
+		t.Fatalf("missing source object must be recorded, not fail or build: built=%v err=%v", built, err)
 	}
 	key := pqBlockKey{Tenant: "default", BucketStart: hour, SignalType: model.ContinuousParquetSignalCPU, Resolution: model.ContinuousParquetResolutionRaw}
-	if active, findErr := s.pqFindActiveBlock(context.Background(), key); findErr != nil || active != nil {
-		t.Fatalf("mismatched shadow block became active: active=%+v err=%v", active, findErr)
+	if active, findErr := s.pqFindActiveBlock(ctx, key); findErr != nil || active != nil {
+		t.Fatalf("failed hour build must not activate any block: active=%+v err=%v", active, findErr)
+	}
+	var migCount int64
+	if err := s.DB.Model(&model.ContinuousMigrationFailure{}).
+		Where("source_kind = ? AND error_type = ?", "window", "missing_object").Count(&migCount).Error; err != nil || migCount == 0 {
+		t.Fatalf("missing object must be recorded as migration failure: count=%d err=%v", migCount, err)
+	}
+
+	// 窗口完整性：payload 存在但窗口未被消费（无失败记录）→ 构建失败
+	objKey2 := "continuous/s1/b2.json"
+	if err := s.DB.Create(&model.ProfileWindow{
+		SessionSID: "s1", BatchBID: "b2", WindowStart: hour.Add(3 * time.Minute), WindowEnd: hour.Add(4 * time.Minute),
+		ObjectKey: objKey2, SignalType: "cpu_profile", SampleCount: 1, CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	mem := s.Storage.(*continuousMemoryStorage)
+	if err := mem.PutObject(ctx, "drop-data", objKey2, strings.NewReader(`{"session_sid":"s1","batch_id":"b2","windows":[]}`), 0, "application/json"); err != nil {
+		t.Fatal(err)
+	}
+	if built, err := s.pqBuildRawHour(ctx, "default", hour); err == nil || built {
+		t.Fatalf("unconsumed window must fail the hour build: built=%v err=%v", built, err)
 	}
 }
 
@@ -627,7 +761,7 @@ func TestPQQueryRequiresFullCoverageAndAuthorizedSession(t *testing.T) {
 	}
 	q := ProfileQuery{SessionSID: "s-owned", Host: "10.0.0.1", OwnerUIDs: []string{"owner"},
 		From: hour, To: hour.Add(30 * time.Minute), ProfileType: "cpu"}
-	agg, found, err := s.pqQueryAggregateV2(ctx, q)
+	agg, found, err := s.pqQueryAggregateMixed(ctx, q)
 	if err != nil || !found {
 		t.Fatalf("authorized v2 query failed: found=%v err=%v", found, err)
 	}
@@ -635,9 +769,15 @@ func TestPQQueryRequiresFullCoverageAndAuthorizedSession(t *testing.T) {
 		t.Fatalf("cross-session data leaked into aggregate: total=%v", agg.Total)
 	}
 
+	// 阶段六：跨出覆盖小时 → 该小时回退 v1（无数据则不计入），covered 小时
+	// 仍走 v2，不再整段回退；结果不得包含未授权 session 数据。
 	q.To = hour.Add(time.Hour + 30*time.Minute)
-	if _, found, err := s.pqQueryAggregateV2(ctx, q); err != nil || found {
-		t.Fatalf("partial coverage must fall back entirely: found=%v err=%v", found, err)
+	agg2, found, err := s.pqQueryAggregateMixed(ctx, q)
+	if err != nil || !found {
+		t.Fatalf("mixed partial-coverage query must return covered data: found=%v err=%v", found, err)
+	}
+	if agg2.Total != 2 {
+		t.Fatalf("mixed query must not leak unauthorized or uncovered data: total=%v", agg2.Total)
 	}
 }
 

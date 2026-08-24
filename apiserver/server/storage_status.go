@@ -113,6 +113,8 @@ func (s *APIServer) StorageStatus(c *gin.Context) {
 	quota := s.continuousQuotaSnapshot(ctx)
 	coverage := s.pqCoverageSnapshot(ctx)
 	mode := s.pqModeOf()
+	// 阶段六：细粒度目录状态
+	phase6 := s.pqPhase6StatusSnapshot(ctx)
 
 	s.RespondOK(c, gin.H{
 		"path":                 snap.Path,
@@ -141,6 +143,26 @@ func (s *APIServer) StorageStatus(c *gin.Context) {
 		"parquet_validation_backlog": coverage.ValidationBacklog,
 		"v1_fallback_bytes":         quota.V1BlockBytes,
 		"earliest_available_at":     coverage.EarliestActiveAt,
+		// 阶段六：细粒度目录瘦身状态
+		"fine_gc_mode":              phase6.FineGCMode,
+		"hot_window_count":          phase6.HotWindowCount,
+		"hot_batch_count":           phase6.HotBatchCount,
+		"hot_window_oldest_at":      phase6.HotWindowOldestAt,
+		"hot_batch_oldest_at":       phase6.HotBatchOldestAt,
+		"orphan_window_count":       phase6.OrphanWindowCount,
+		"migration_failures_retrying": phase6.MigrationFailures,
+		"migration_failures_quarantined": phase6.MigrationQuarantined,
+		"coverage_segment_count":    phase6.CoverageSegments,
+		"fine_gc_candidates_total":  phase6.FineGCCandidates,
+		"fine_gc_deleted_total":     phase6.FineGCDeleted,
+		"fine_gc_failures_total":    phase6.FineGCFailures,
+		"fine_gc_blocked_by_reason": phase6.FineGCBlocked,
+		"reconcile_failed_blocks":   phase6.ReconcileFailed,
+		"reconcile_quarantined_blocks": phase6.ReconcileQuarantined,
+		"signal_coverage":           phase6.SignalCoverage,
+		"parquet_v1_fallback_total": phase6.ParquetV1Fallback,
+		"parquet_query_errors_total": phase6.ParquetQueryErrors,
+		"parquet_query_latency_ms":  phase6.ParquetQueryLatencyMs,
 		"lifecycle_mode":       lifecycle.Mode,
 		"policy_version":       lifecycle.PolicyVersion,
 		"reconcile_backlog":    lifecycle.ReconcileBacklog,

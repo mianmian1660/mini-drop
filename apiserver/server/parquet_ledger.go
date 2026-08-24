@@ -139,6 +139,9 @@ func (s *APIServer) pqRegisterActiveBlock(ctx context.Context, key pqBlockKey, b
 			"bucket_end":           bucketEnd,
 			"status":               model.ContinuousParquetStatusActive,
 			"validation":           model.ContinuousParquetValidationPassed,
+			"reconcile_status":     model.ContinuousParquetReconcilePassed,
+			"reconciled_at":        now,
+			"reconcile_error":      "",
 			"member_count":         len(members),
 			"row_count":            stats.RowCount,
 			"value_total":          stats.ValueTotal,
@@ -182,6 +185,14 @@ func (s *APIServer) pqRegisterActiveBlock(ctx context.Context, key pqBlockKey, b
 			}
 			if err := tx.Create(&members[i]).Error; err != nil {
 				return err
+			}
+		}
+		if err := s.pqPersistMigrationReceiptsTx(tx, key, blockID, bucketEnd, members); err != nil {
+			return fmt.Errorf("登记永久 migration receipt 失败: %w", err)
+		}
+		if key.Resolution == model.ContinuousParquetResolutionRaw {
+			if err := s.pqRebuildCoverageSegmentsTx(tx, key.Tenant, key.BucketStart, key.SignalType, blockID, version); err != nil {
+				return fmt.Errorf("重建 coverage segments 失败: %w", err)
 			}
 		}
 		return nil
