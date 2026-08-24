@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -25,6 +26,15 @@ import (
 
 const continuousMaxDBCount = uint64(1<<63 - 1)
 const continuousMaxReasonableProfileSampleCount = uint64(1_000_000_000)
+
+// errContinuousConflict 是窗口/批次内容冲突的哨兵错误：触发整个事务回滚，
+// 由 IngestContinuousBatch 映射为 409 不可重试冲突。绝不允许 Agent 通过换
+// ID（如旧版 cpb-retry-* rekey）绕过幂等约束。
+var errContinuousConflict = errors.New("continuous batch/window content conflict")
+
+// continuousSchemaVersionV3 是阶段一协议版本：v3 起启用窗口级 window_id 幂等、
+// content_sha256 冲突检测与分信号 signal_counts；v1/v2 走兼容旧路径。
+const continuousSchemaVersionV3 = uint32(3)
 
 // continuousSummaryBucketDuration 冷层摘要按 1 小时对齐分桶，和原始数据
 // 10s 窗口/60s batch 的粒度差好几个数量级——冷层本来就是拿精度换存储。
@@ -60,47 +70,61 @@ type CreateContinuousSessionReq struct {
 }
 
 type ContinuousBatchIngestReq struct {
-	SessionSID        string                   `json:"session_sid" binding:"required"`
-	BatchID           string                   `json:"batch_id"`
-	TargetIP          string                   `json:"target_ip"`
-	ObjectKey         string                   `json:"object_key"`
-	StartTime         time.Time                `json:"start_time" binding:"required"`
-	EndTime           time.Time                `json:"end_time" binding:"required"`
-	WindowCount       uint32                   `json:"window_count"`
-	SampleCount       uint64                   `json:"sample_count"`
-	SchemaVersion     uint32                   `json:"schema_version"`
-	SignalTypes       []string                 `json:"signal_types"`
-	Backends          map[string]string        `json:"backends"`
-	ProfileFormat     string                   `json:"profile_format"`
-	BackendStatus     string                   `json:"backend_status"`
-	BackendReason     string                   `json:"backend_reason"`
-	AttemptedBackends []string                 `json:"attempted_backends"`
-	SelectedBackend   string                   `json:"selected_backend"`
-	SymbolRefs        map[string]interface{}   `json:"symbol_refs"`
-	Windows           []ContinuousWindowIngest `json:"windows"`
+	SessionSID    string    `json:"session_sid" binding:"required"`
+	BatchID       string    `json:"batch_id"`
+	TargetIP      string    `json:"target_ip"`
+	ObjectKey     string    `json:"object_key"`
+	StartTime     time.Time `json:"start_time" binding:"required"`
+	EndTime       time.Time `json:"end_time" binding:"required"`
+	WindowCount   uint32    `json:"window_count"`
+	SampleCount   uint64    `json:"sample_count"`
+	SchemaVersion uint32    `json:"schema_version"`
+	// 阶段一（协议 v3）：collector_generation 标识物理采集器实例，
+	// batch_sequence 单调递增，content_sha256 幂等摘要，signal_counts 分信号计数。
+	CollectorGeneration string                   `json:"collector_generation"`
+	BatchSequence       uint64                   `json:"batch_sequence"`
+	ContentSHA256       string                   `json:"content_sha256"`
+	SignalCounts        map[string]uint64        `json:"signal_counts"`
+	SignalTypes         []string                 `json:"signal_types"`
+	Backends            map[string]string        `json:"backends"`
+	ProfileFormat       string                   `json:"profile_format"`
+	BackendStatus       string                   `json:"backend_status"`
+	BackendReason       string                   `json:"backend_reason"`
+	AttemptedBackends   []string                 `json:"attempted_backends"`
+	SelectedBackend     string                   `json:"selected_backend"`
+	SymbolRefs          map[string]interface{}   `json:"symbol_refs"`
+	Windows             []ContinuousWindowIngest `json:"windows"`
 }
 
 type ContinuousWindowIngest struct {
-	WindowStart       time.Time                    `json:"window_start"`
-	WindowEnd         time.Time                    `json:"window_end"`
-	ObjectKey         string                       `json:"object_key"`
-	SampleCount       uint64                       `json:"sample_count"`
-	SignalType        string                       `json:"signal_type"`
-	SchemaVersion     uint32                       `json:"schema_version"`
-	Backend           string                       `json:"backend"`
-	Labels            map[string]interface{}       `json:"labels"`
-	ProfileFormat     string                       `json:"profile_format"`
-	BackendStatus     string                       `json:"backend_status"`
-	BackendReason     string                       `json:"backend_reason"`
-	AttemptedBackends []string                     `json:"attempted_backends"`
-	SelectedBackend   string                       `json:"selected_backend"`
-	SymbolRefs        map[string]interface{}       `json:"symbol_refs"`
-	Samples           []ContinuousStackSample      `json:"samples"`
-	Profiles          []ContinuousProfileIngest    `json:"profiles"`
-	Histograms        []ContinuousHistogramIngest  `json:"histograms"`
-	Metrics           []ContinuousMetricIngest     `json:"metrics"`
-	DBSnapshots       []ContinuousDBSnapshotIngest `json:"db_snapshots"`
-	RSSTruncated      int                          `json:"rss_truncated"`
+	WindowStart   time.Time `json:"window_start"`
+	WindowEnd     time.Time `json:"window_end"`
+	ObjectKey     string    `json:"object_key"`
+	SampleCount   uint64    `json:"sample_count"`
+	SignalType    string    `json:"signal_type"`
+	SchemaVersion uint32    `json:"schema_version"`
+	// 阶段一（协议 v3）：window_id 逻辑窗口稳定 ID（幂等键），collector_generation
+	// / target_fingerprint 标识产生窗口的采集器与目标集，content_sha256 窗口
+	// 内容摘要，signal_counts 分信号计数。
+	WindowID            string                       `json:"window_id"`
+	CollectorGeneration string                       `json:"collector_generation"`
+	TargetFingerprint   string                       `json:"target_fingerprint"`
+	ContentSHA256       string                       `json:"content_sha256"`
+	SignalCounts        map[string]uint64            `json:"signal_counts"`
+	Backend             string                       `json:"backend"`
+	Labels              map[string]interface{}       `json:"labels"`
+	ProfileFormat       string                       `json:"profile_format"`
+	BackendStatus       string                       `json:"backend_status"`
+	BackendReason       string                       `json:"backend_reason"`
+	AttemptedBackends   []string                     `json:"attempted_backends"`
+	SelectedBackend     string                       `json:"selected_backend"`
+	SymbolRefs          map[string]interface{}       `json:"symbol_refs"`
+	Samples             []ContinuousStackSample      `json:"samples"`
+	Profiles            []ContinuousProfileIngest    `json:"profiles"`
+	Histograms          []ContinuousHistogramIngest  `json:"histograms"`
+	Metrics             []ContinuousMetricIngest     `json:"metrics"`
+	DBSnapshots         []ContinuousDBSnapshotIngest `json:"db_snapshots"`
+	RSSTruncated        int                          `json:"rss_truncated"`
 }
 
 // ContinuousDBSnapshotIngest 对应 Agent 侧的 DBSnapshotSample（阶段二）。
@@ -210,21 +234,25 @@ type ContinuousHistogramSummary struct {
 }
 
 type continuousStoredBatch struct {
-	SessionSID        string                   `json:"session_sid"`
-	BatchID           string                   `json:"batch_id"`
-	TargetIP          string                   `json:"target_ip"`
-	StartTime         time.Time                `json:"start_time"`
-	EndTime           time.Time                `json:"end_time"`
-	SchemaVersion     uint32                   `json:"schema_version"`
-	SignalTypes       []string                 `json:"signal_types,omitempty"`
-	Backends          map[string]string        `json:"backends,omitempty"`
-	ProfileFormat     string                   `json:"profile_format,omitempty"`
-	BackendStatus     string                   `json:"backend_status,omitempty"`
-	BackendReason     string                   `json:"backend_reason,omitempty"`
-	AttemptedBackends []string                 `json:"attempted_backends,omitempty"`
-	SelectedBackend   string                   `json:"selected_backend,omitempty"`
-	SymbolRefs        map[string]interface{}   `json:"symbol_refs,omitempty"`
-	Windows           []ContinuousWindowIngest `json:"windows"`
+	SessionSID          string                   `json:"session_sid"`
+	BatchID             string                   `json:"batch_id"`
+	TargetIP            string                   `json:"target_ip"`
+	StartTime           time.Time                `json:"start_time"`
+	EndTime             time.Time                `json:"end_time"`
+	SchemaVersion       uint32                   `json:"schema_version"`
+	CollectorGeneration string                   `json:"collector_generation,omitempty"`
+	BatchSequence       uint64                   `json:"batch_sequence,omitempty"`
+	ContentSHA256       string                   `json:"content_sha256,omitempty"`
+	SignalCounts        map[string]uint64        `json:"signal_counts,omitempty"`
+	SignalTypes         []string                 `json:"signal_types,omitempty"`
+	Backends            map[string]string        `json:"backends,omitempty"`
+	ProfileFormat       string                   `json:"profile_format,omitempty"`
+	BackendStatus       string                   `json:"backend_status,omitempty"`
+	BackendReason       string                   `json:"backend_reason,omitempty"`
+	AttemptedBackends   []string                 `json:"attempted_backends,omitempty"`
+	SelectedBackend     string                   `json:"selected_backend,omitempty"`
+	SymbolRefs          map[string]interface{}   `json:"symbol_refs,omitempty"`
+	Windows             []ContinuousWindowIngest `json:"windows"`
 }
 
 type continuousAggregate struct {
@@ -243,13 +271,13 @@ type continuousAggregate struct {
 	ModuleUnresolvedFrameWeight float64
 	NoModuleFrameWeight         float64
 	GoSymbolReady               bool
-	GoSymbolPending       bool
-	GoSymbolFailed        bool
-	SymbolReasons         map[string]bool
-	WindowCount           int
-	Unit                  string
-	RuntimeDiagnostics    map[string]*runtimeDiagnosticAccumulator
-	SeenProfileIDs        map[string]bool
+	GoSymbolPending             bool
+	GoSymbolFailed              bool
+	SymbolReasons               map[string]bool
+	WindowCount                 int
+	Unit                        string
+	RuntimeDiagnostics          map[string]*runtimeDiagnosticAccumulator
+	SeenProfileIDs              map[string]bool
 }
 
 type runtimeDiagnosticAccumulator struct {
@@ -296,7 +324,10 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "target_ip 不能为空")
 		return
 	}
-	applyContinuousDefaults(&req)
+	if err := applyContinuousDefaults(&req); err != nil {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, err.Error())
+		return
+	}
 	if message := validateContinuousCreateRequest(req); message != "" {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, message)
 		return
@@ -337,6 +368,7 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 	labels, _ := util.MarshalJSONB(req.Labels)
 	caps, _ := util.MarshalJSONB(req.Capabilities)
 	signals, _ := util.MarshalJSONB(req.Signals)
+	requestedSignals, _ := util.MarshalJSONB(req.Signals)
 	now := time.Now()
 	session := model.ContinuousSession{
 		SID:                  "cps-" + util.GenTID()[4:],
@@ -355,6 +387,7 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		SelectorExe:          req.SelectorExe,
 		SelectorMode:         req.SelectorMode,
 		Signals:              signals,
+		RequestedSignals:     requestedSignals,
 		DesiredState:         model.ContinuousDesiredStateRunning,
 		ObservedState:        observedState,
 		ActiveProcesses:      []byte(`[]`),
@@ -719,6 +752,23 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "batch 时间范围不合法")
 		return
 	}
+	// 阶段一：schema_version 白名单。v1/v2 走兼容旧路径（升级过渡期遗留
+	// spool 仍可排空），v3 起启用窗口级 window_id 幂等、content_sha256 冲突
+	// 检测与分信号 signal_counts。未知版本一律拒绝（不可重试）。
+	if req.SchemaVersion == 0 {
+		req.SchemaVersion = 1
+	}
+	if req.SchemaVersion > continuousSchemaVersionV3 {
+		s.respondContinuousConflict(c, req, "不支持的 schema_version，仅接受 v3 及以下")
+		return
+	}
+	isV3 := req.SchemaVersion >= continuousSchemaVersionV3
+	if isV3 {
+		if message := validateContinuousV3Batch(req); message != "" {
+			s.respondContinuousConflict(c, req, message)
+			return
+		}
+	}
 	var session model.ContinuousSession
 	if err := s.DB.Where("sid = ?", req.SessionSID).First(&session).Error; err != nil {
 		s.RespondHTTPError(c, http.StatusNotFound, ErrCodeTargetNotFound, "ContinuousSession 不存在")
@@ -727,6 +777,22 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	if session.AgentID != "" && getRequestUID(c) != session.AgentID {
 		s.forbid(c)
 		return
+	}
+	// 阶段一 v3：Session 只保存其请求的信号。batch 内出现 Session 未请求的
+	// 四类核心信号（CPU/IO/SCHED，协议违规，如 CPU-only Session 携带 IO/sched
+	// 直方图）→ 拒绝入库。python_rss/db_snapshot 是独立数据通道（python 运行时
+	// 指标 / db_targets 巡检），不受 signals 选择器约束，允许照常入库。
+	if isV3 {
+		signalSet := continuousSessionSignalSet(session)
+		for signal := range continuousBatchSignalSet(req.Windows) {
+			if !continuousCoreSignal(signal) {
+				continue
+			}
+			if !signalSet[signal] {
+				s.respondContinuousConflict(c, req, "窗口包含 Session 未请求的信号: "+signal)
+				return
+			}
+		}
 	}
 	if req.BatchID == "" {
 		req.BatchID = "cpb-" + util.GenTID()[4:]
@@ -743,16 +809,19 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	if req.WindowCount == 0 {
 		req.WindowCount = uint32(len(req.Windows))
 	}
-	if req.SchemaVersion == 0 {
-		req.SchemaVersion = 1
-	}
 	receivedAt := time.Now()
 	clockOffsetMS, clockStatus, clockObserved := continuousAgentClock(c, receivedAt)
 
+	// 阶段一 v3：batch 级幂等。同 batch_id 重传必须携带相同 content_sha256；
+	// 摘要不同 = 内容冲突（不可重试，禁止换 ID 绕过）。
 	var existing model.ProfileBatch
 	if err := s.DB.Where("bid = ?", req.BatchID).First(&existing).Error; err == nil {
 		if existing.SessionSID != req.SessionSID || !existing.StartTime.Equal(req.StartTime) || !existing.EndTime.Equal(req.EndTime) {
-			s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, "batch_id 已被不同采集批次使用")
+			s.respondContinuousConflict(c, req, "batch_id 已被不同采集批次使用")
+			return
+		}
+		if isV3 && existing.ContentSHA256 != "" && req.ContentSHA256 != "" && existing.ContentSHA256 != req.ContentSHA256 {
+			s.respondContinuousConflict(c, req, "batch_id 内容摘要冲突：相同 ID 不同内容，禁止换 ID 重传")
 			return
 		}
 		s.updateContinuousAgentClock(req.SessionSID, clockOffsetMS, clockStatus, clockObserved)
@@ -767,28 +836,44 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		req.Backends = map[string]string{}
 	}
 	now := receivedAt
+
+	// 阶段一：分信号计数由服务端权威重算（不信任 Agent 上报值）。v3 起 batch
+	// 层 sample_count 废弃写 0，窗口行 sample_count 仅表示该行信号自身计数。
+	windowSignalCounts := make([]map[string]uint64, len(req.Windows))
+	for i := range req.Windows {
+		windowSignalCounts[i] = continuousWindowSignalCountsFor(req.Windows[i])
+	}
+	batchSignalCounts := continuousBatchSignalCounts(req.Windows)
+	batchSampleCount := uint64(0)
+	if !isV3 {
+		batchSampleCount = clampContinuousCount(req.SampleCount)
+	}
 	batch := model.ProfileBatch{
-		BID:                req.BatchID,
-		SessionSID:         req.SessionSID,
-		TargetIP:           req.TargetIP,
-		ObjectKey:          req.ObjectKey,
-		StartTime:          req.StartTime,
-		EndTime:            req.EndTime,
-		WindowCount:        req.WindowCount,
-		SampleCount:        clampContinuousCount(req.SampleCount),
-		SchemaVersion:      req.SchemaVersion,
-		SignalTypes:        mustJSONBytes(req.SignalTypes),
-		Backends:           mustJSONBytes(req.Backends),
-		Status:             model.ContinuousBatchStatusReady,
-		ProfileFormat:      firstNonEmpty(req.ProfileFormat, "json"),
-		BackendStatus:      firstNonEmpty(req.BackendStatus, "ok"),
-		BackendReason:      req.BackendReason,
-		AttemptedBackends:  mustJSONBytes(req.AttemptedBackends),
-		SelectedBackend:    req.SelectedBackend,
-		SymbolRefs:         mustJSONBytes(req.SymbolRefs),
-		ReceivedAt:         receivedAt,
-		AgentClockOffsetMs: clockOffsetMS,
-		CreatedAt:          now,
+		BID:                 req.BatchID,
+		SessionSID:          req.SessionSID,
+		TargetIP:            req.TargetIP,
+		ObjectKey:           req.ObjectKey,
+		StartTime:           req.StartTime,
+		EndTime:             req.EndTime,
+		WindowCount:         req.WindowCount,
+		SampleCount:         batchSampleCount,
+		SchemaVersion:       req.SchemaVersion,
+		CollectorGeneration: req.CollectorGeneration,
+		BatchSequence:       req.BatchSequence,
+		ContentSHA256:       req.ContentSHA256,
+		SignalCounts:        continuousSignalCountsJSON(batchSignalCounts),
+		SignalTypes:         mustJSONBytes(req.SignalTypes),
+		Backends:            mustJSONBytes(req.Backends),
+		Status:              model.ContinuousBatchStatusReady,
+		ProfileFormat:       firstNonEmpty(req.ProfileFormat, "json"),
+		BackendStatus:       firstNonEmpty(req.BackendStatus, "ok"),
+		BackendReason:       req.BackendReason,
+		AttemptedBackends:   mustJSONBytes(req.AttemptedBackends),
+		SelectedBackend:     req.SelectedBackend,
+		SymbolRefs:          mustJSONBytes(req.SymbolRefs),
+		ReceivedAt:          receivedAt,
+		AgentClockOffsetMs:  clockOffsetMS,
+		CreatedAt:           now,
 	}
 	duplicate := false
 	var payloadStoreErr error
@@ -798,6 +883,14 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
+			// 并发竞态：同一 batch_id 已被写入。校验摘要，摘要不同 = 冲突。
+			var raced model.ProfileBatch
+			if err := tx.Where("bid = ?", req.BatchID).First(&raced).Error; err != nil {
+				return err
+			}
+			if isV3 && raced.ContentSHA256 != "" && req.ContentSHA256 != "" && raced.ContentSHA256 != req.ContentSHA256 {
+				return errContinuousConflict
+			}
 			duplicate = true
 			return nil
 		}
@@ -811,33 +904,64 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 				return err
 			}
 		}
-		for _, in := range req.Windows {
+		for wi, in := range req.Windows {
 			if in.WindowStart.IsZero() || in.WindowEnd.IsZero() || !in.WindowStart.Before(in.WindowEnd) {
 				continue
 			}
 			labels, _ := json.Marshal(in.Labels)
 			symbolRefs, _ := json.Marshal(in.SymbolRefs)
-			for _, signal := range continuousWindowSignalRows(in) {
+			signalRows := continuousWindowSignalRows(in)
+			if isV3 {
+				// 阶段一 v3：一个逻辑窗口每种信号只建一行（backend 内部信息）。
+				signalRows = continuousWindowSignalRowsV3(in)
+			}
+			for _, signal := range signalRows {
 				window := model.ProfileWindow{
-					SessionSID:        req.SessionSID,
-					BatchBID:          req.BatchID,
-					WindowStart:       in.WindowStart,
-					WindowEnd:         in.WindowEnd,
-					ObjectKey:         firstNonEmpty(in.ObjectKey, req.ObjectKey),
-					SampleCount:       clampContinuousCount(continuousWindowSampleCount(in, signal.SignalType)),
-					SignalType:        signal.SignalType,
-					SchemaVersion:     firstNonZeroUint32(in.SchemaVersion, req.SchemaVersion),
-					Backend:           signal.Backend,
-					Labels:            labels,
-					ProfileFormat:     firstNonEmpty(in.ProfileFormat, req.ProfileFormat, "json"),
-					BackendStatus:     firstNonEmpty(in.BackendStatus, req.BackendStatus, "ok"),
-					BackendReason:     firstNonEmpty(in.BackendReason, req.BackendReason),
-					AttemptedBackends: mustJSONBytes(firstNonEmptySlice(in.AttemptedBackends, req.AttemptedBackends)),
-					SelectedBackend:   firstNonEmpty(in.SelectedBackend, req.SelectedBackend),
-					SymbolRefs:        symbolRefs,
-					CreatedAt:         now,
+					SessionSID:          req.SessionSID,
+					BatchBID:            req.BatchID,
+					WindowStart:         in.WindowStart,
+					WindowEnd:           in.WindowEnd,
+					ObjectKey:           firstNonEmpty(in.ObjectKey, req.ObjectKey),
+					SampleCount:         clampContinuousCount(continuousWindowSampleCount(in, signal.SignalType)),
+					SignalType:          signal.SignalType,
+					SchemaVersion:       firstNonZeroUint32(in.SchemaVersion, req.SchemaVersion),
+					WindowID:            in.WindowID,
+					CollectorGeneration: firstNonEmpty(in.CollectorGeneration, req.CollectorGeneration),
+					TargetFingerprint:   in.TargetFingerprint,
+					ContentSHA256:       in.ContentSHA256,
+					SignalCounts:        continuousSignalCountsJSON(windowSignalCounts[wi]),
+					Backend:             signal.Backend,
+					Labels:              labels,
+					ProfileFormat:       firstNonEmpty(in.ProfileFormat, req.ProfileFormat, "json"),
+					BackendStatus:       firstNonEmpty(in.BackendStatus, req.BackendStatus, "ok"),
+					BackendReason:       firstNonEmpty(in.BackendReason, req.BackendReason),
+					AttemptedBackends:   mustJSONBytes(firstNonEmptySlice(in.AttemptedBackends, req.AttemptedBackends)),
+					SelectedBackend:     firstNonEmpty(in.SelectedBackend, req.SelectedBackend),
+					SymbolRefs:          symbolRefs,
+					CreatedAt:           now,
+				}
+				// 阶段一 v3：窗口级幂等/冲突。同一 (session, window_id, signal_type)
+				// 已存在时：内容摘要相同 → 跳过（不重复计数）；不同 → 内容冲突。
+				if isV3 && in.WindowID != "" {
+					var existingWindow model.ProfileWindow
+					ewErr := tx.Where("session_sid = ? AND window_id = ? AND signal_type = ?",
+						req.SessionSID, in.WindowID, signal.SignalType).First(&existingWindow).Error
+					if ewErr == nil {
+						if existingWindow.ContentSHA256 != "" && in.ContentSHA256 != "" &&
+							existingWindow.ContentSHA256 != in.ContentSHA256 {
+							return errContinuousConflict
+						}
+						continue
+					} else if !errors.Is(ewErr, gorm.ErrRecordNotFound) {
+						return ewErr
+					}
 				}
 				if err := tx.Create(&window).Error; err != nil {
+					// Postgres 部分唯一索引 (session_sid, window_id, signal_type)
+					// 兜底：并发窗口冲突 → 不可重试冲突，整批回滚。
+					if continuousIsUniqueViolation(err) {
+						return errContinuousConflict
+					}
 					return err
 				}
 			}
@@ -852,6 +976,11 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 			}).Error
 	})
 	if err != nil {
+		if errors.Is(err, errContinuousConflict) {
+			s.Logger.Warn("Continuous 批次内容冲突，拒绝入库", zap.String("sid", req.SessionSID), zap.String("bid", req.BatchID))
+			s.respondContinuousConflict(c, req, "窗口/批次内容冲突：相同 ID 不同内容，禁止换 ID 重传")
+			return
+		}
 		if payloadStoreErr != nil {
 			s.Logger.Error("保存 Continuous ProfileBatch payload 失败", zap.String("sid", req.SessionSID), zap.Error(payloadStoreErr))
 			s.RespondHTTPError(c, http.StatusServiceUnavailable, ErrCodeDependencyUnavailable, "保存 Continuous ProfileBatch payload 失败")
@@ -872,6 +1001,82 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	}
 	s.cleanupContinuousRetention(c.Request.Context(), session)
 	s.respondContinuousBatchACK(c, req, duplicate)
+}
+
+// validateContinuousV3Batch 收紧 v3 幂等契约。任一身份/摘要字段为空都会让
+// 唯一索引或冲突检测失效，因此不能像 v1/v2 一样静默补默认值或跳过窗口。
+func validateContinuousV3Batch(req ContinuousBatchIngestReq) string {
+	if strings.TrimSpace(req.BatchID) == "" {
+		return "v3 batch_id 不能为空"
+	}
+	if strings.TrimSpace(req.CollectorGeneration) == "" || len(req.CollectorGeneration) > 64 {
+		return "v3 collector_generation 不合法"
+	}
+	if req.BatchSequence == 0 {
+		return "v3 batch_sequence 必须大于 0"
+	}
+	if !continuousValidSHA256(req.ContentSHA256) {
+		return "v3 content_sha256 必须是 64 位十六进制 SHA-256"
+	}
+	if len(req.Windows) == 0 {
+		return "v3 batch 必须至少包含一个窗口"
+	}
+	if req.WindowCount != 0 && int(req.WindowCount) != len(req.Windows) {
+		return "v3 window_count 与 windows 数量不一致"
+	}
+	for i, window := range req.Windows {
+		if window.WindowStart.IsZero() || window.WindowEnd.IsZero() || !window.WindowStart.Before(window.WindowEnd) {
+			return fmt.Sprintf("v3 windows[%d] 时间范围不合法", i)
+		}
+		if window.WindowStart.Before(req.StartTime) || window.WindowEnd.After(req.EndTime) {
+			return fmt.Sprintf("v3 windows[%d] 超出 batch 时间范围", i)
+		}
+		if strings.TrimSpace(window.WindowID) == "" || len(window.WindowID) > 128 {
+			return fmt.Sprintf("v3 windows[%d].window_id 不合法", i)
+		}
+		if strings.TrimSpace(window.TargetFingerprint) == "" || len(window.TargetFingerprint) > 256 {
+			return fmt.Sprintf("v3 windows[%d].target_fingerprint 不合法", i)
+		}
+		if window.CollectorGeneration != "" && window.CollectorGeneration != req.CollectorGeneration {
+			return fmt.Sprintf("v3 windows[%d].collector_generation 与 batch 不一致", i)
+		}
+		if !continuousValidSHA256(window.ContentSHA256) {
+			return fmt.Sprintf("v3 windows[%d].content_sha256 必须是 64 位十六进制 SHA-256", i)
+		}
+	}
+	return ""
+}
+
+func continuousValidSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, ch := range value {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// continuousIsUniqueViolation 判断错误是否为唯一约束冲突（Postgres 与 SQLite
+// 的诊断串不同）。
+func continuousIsUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate key value violates unique constraint") ||
+		strings.Contains(msg, "unique constraint failed") ||
+		strings.Contains(msg, "unique constraint") ||
+		strings.Contains(msg, "duplicate entry")
+}
+
+// respondContinuousConflict 返回 409 不可重试冲突。Agent 侧对 retryable:false
+// 的 4xx 会把 spool 文件移入 .rejected 隔离区，绝不换 ID 重传。
+func (s *APIServer) respondContinuousConflict(c *gin.Context, req ContinuousBatchIngestReq, message string) {
+	incContinuousConflictTotal()
+	s.RespondHTTPError(c, http.StatusConflict, ErrCodeTaskInvalidArgument, message)
 }
 
 func continuousAgentClock(c *gin.Context, receivedAt time.Time) (int64, string, *time.Time) {
@@ -917,6 +1122,9 @@ func continuousSessionClockStatus(session model.ContinuousSession) string {
 }
 
 func (s *APIServer) respondContinuousBatchACK(c *gin.Context, req ContinuousBatchIngestReq, duplicate bool) {
+	if duplicate {
+		incContinuousDuplicateBatchTotal()
+	}
 	s.RespondOK(c, gin.H{
 		"accepted": true, "duplicate": duplicate,
 		"batch_id": req.BatchID, "session_sid": req.SessionSID,
@@ -959,10 +1167,16 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 	query := s.DB.Where("session_sid = ?", session.SID).Order("window_start ASC")
 	query = query.Where("window_end >= ? AND window_start <= ?", boundaryFrom, boundaryTo)
 
+	// 阶段一：finalization 状态。running Session 的 finalization grace =
+	// upload_batch_sec + 2×aggregation_window_sec + 15s；finalized_to 之前
+	// 缺失的数据才计入真实 gap，之后到查询终点属于 pending tail。Session 停止
+	// 后以 stopped_at 作为最终边界，不再显示 pending。
+	fin := s.continuousFinalizationState(session, now)
+
 	// 阶段六：Timeline 从 coverage segments + 最近热 window 计算，保持
 	// windows/gaps/coverage/clock 兼容字段；历史压缩条目 compacted=true +
 	// coverage_source=parquet_catalog（避免长范围全量返回明细窗口）。
-	windows, gaps, coverage, err := s.continuousTimelineV2(c.Request.Context(), session, boundaryFrom, boundaryTo, query)
+	windows, gaps, coverage, err := s.continuousTimelineV2(c.Request.Context(), session, boundaryFrom, boundaryTo, fin.FinalizedTo, query)
 	if err != nil {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 Continuous timeline 失败")
 		return
@@ -970,6 +1184,12 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 	s.RespondOK(c, gin.H{
 		"session": session, "windows": windows, "total": len(windows),
 		"gaps": gaps, "coverage": coverage,
+		"finalized_to":         fin.FinalizedTo,
+		"pending":              fin.Pending,
+		"pending_tail_seconds": fin.PendingTailSeconds,
+		"ingest_lag_seconds":   fin.IngestLagSeconds,
+		"delivery_lag_seconds": fin.DeliveryLagSeconds,
+		"collector_stalled":    fin.CollectorStalled,
 		"clock": gin.H{
 			"offset_ms": session.AgentClockOffsetMs, "status": continuousSessionClockStatus(session),
 			"observed_at": session.AgentClockObservedAt,
@@ -977,10 +1197,93 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 	})
 }
 
+// continuousTimelineFinalization 阶段一：Timeline 正确性所需的上传/交付状态。
+type continuousTimelineFinalization struct {
+	FinalizedTo        time.Time `json:"finalized_to"`
+	Pending            bool      `json:"pending"`
+	PendingTailSeconds float64   `json:"pending_tail_seconds"`
+	IngestLagSeconds   float64   `json:"ingest_lag_seconds"`
+	DeliveryLagSeconds float64   `json:"delivery_lag_seconds"`
+	CollectorStalled   bool      `json:"collector_stalled"`
+}
+
+// continuousFinalizationState 计算 running/stopped Session 的上传最终化边界。
+func (s *APIServer) continuousFinalizationState(session model.ContinuousSession, now time.Time) continuousTimelineFinalization {
+	st := continuousTimelineFinalization{}
+	// 上一个已确认入库的 batch 结束时间 = 最新 finalized 数据点。
+	// 直接按 end_time DESC 取最新 batch，跨 SQLite/Postgres 正确处理 NULL。
+	var lastEnd, lastReceivedAt time.Time
+	var latestBatch model.ProfileBatch
+	if err := s.DB.Model(&model.ProfileBatch{}).
+		Where("session_sid = ?", session.SID).
+		Order("end_time DESC").Limit(1).First(&latestBatch).Error; err == nil {
+		lastEnd = latestBatch.EndTime
+		lastReceivedAt = latestBatch.ReceivedAt
+	}
+
+	// Session 停止后：stopped_at 是最终边界，不再显示 pending，也不标记
+	// collector_stalled（停止后不存在"采集停滞"语义；若数据提前停止，
+	// [lastEnd, stopped_at] 的真实缺口由 coverage 在 finalized 域内体现）。
+	if session.StoppedAt != nil {
+		st.FinalizedTo = *session.StoppedAt
+		return st
+	}
+	// running：grace 之后的数据已经超过正常上传等待期，应进入 finalized 域。
+	// finalized_to 取“安全时间地平线”和最新已入库 batch 结束时间的较晚者：
+	// 最近已收到的数据可以立即计入覆盖；采集停滞时 [lastEnd,horizon] 会成为
+	// 真实 trailing gap，而不是永远被隐藏在 pending tail 中。
+	grace := time.Duration(firstNonZeroUint32(session.UploadBatchSec, 60))*time.Second +
+		2*time.Duration(firstNonZeroUint32(session.AggregationWindowSec, 10))*time.Second +
+		15*time.Second
+	horizon := now.Add(-grace)
+	if lastEnd.IsZero() {
+		startedAt := session.StartedAt
+		if startedAt.IsZero() {
+			startedAt = session.CreatedAt
+		}
+		st.FinalizedTo = startedAt
+		if horizon.After(st.FinalizedTo) {
+			st.FinalizedTo = horizon
+			st.CollectorStalled = true
+		}
+		st.Pending = true
+		st.PendingTailSeconds = now.Sub(st.FinalizedTo).Seconds()
+		st.IngestLagSeconds = now.Sub(startedAt).Seconds()
+		if st.IngestLagSeconds < 0 {
+			st.IngestLagSeconds = 0
+		}
+		if st.PendingTailSeconds < 0 {
+			st.PendingTailSeconds = 0
+		}
+		return st
+	}
+	st.FinalizedTo = lastEnd
+	if horizon.After(st.FinalizedTo) {
+		st.FinalizedTo = horizon
+	}
+	st.IngestLagSeconds = now.Sub(lastEnd).Seconds()
+	if st.IngestLagSeconds < 0 {
+		st.IngestLagSeconds = 0
+	}
+	if !lastReceivedAt.IsZero() {
+		st.DeliveryLagSeconds = lastReceivedAt.Sub(lastEnd).Seconds()
+		if st.DeliveryLagSeconds < 0 {
+			st.DeliveryLagSeconds = 0
+		}
+	}
+	st.Pending = true
+	st.CollectorStalled = now.Sub(lastEnd) > grace
+	st.PendingTailSeconds = now.Sub(st.FinalizedTo).Seconds()
+	if st.PendingTailSeconds < 0 {
+		st.PendingTailSeconds = 0
+	}
+	return st
+}
+
 // continuousTimelineV2 阶段六 timeline：热 window（< 2h，v1 staging）+
 // coverage segments（历史已压缩，compacted=true）合成 windows/gaps/coverage。
 // 长范围不再全量返回明细 window，避免响应体积随范围线性膨胀。
-func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.ContinuousSession, from, to time.Time,
+func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.ContinuousSession, from, to, finalizedTo time.Time,
 	baseQuery *gorm.DB) ([]gin.H, []continuousTimelineGap, gin.H, error) {
 	hotRetention := time.Duration(s.Config.ContinuousParquet.HotMetadataRetentionMinutes) * time.Minute
 	if hotRetention <= 0 {
@@ -1050,7 +1353,7 @@ func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.Cont
 	sort.Slice(items, func(i, j int) bool {
 		return windowStartOf(items[i]).Before(windowStartOf(items[j]))
 	})
-	gaps, coverage := continuousTimelineCoverage(merged, from, to, 5*time.Second)
+	gaps, coverage := continuousTimelineCoverage(merged, from, to, finalizedTo, 5*time.Second)
 	return items, gaps, coverage, nil
 }
 
@@ -1068,7 +1371,17 @@ type continuousTimelineGap struct {
 	Type            string    `json:"type"`
 }
 
-func continuousTimelineCoverage(windows []model.ProfileWindow, from, to time.Time, tolerance time.Duration) ([]continuousTimelineGap, gin.H) {
+// continuousTimelineCoverage 计算 [from, to] 内的真实缺口与覆盖率。阶段一：
+// finalizedTo 为最终化边界——finalizedTo 之前缺失的数据才计入真实 gap，之后
+// 到 to 属于 pending tail（由调用方单独上报，不降低 finalized 覆盖率）。
+func continuousTimelineCoverage(windows []model.ProfileWindow, from, to, finalizedTo time.Time, tolerance time.Duration) ([]continuousTimelineGap, gin.H) {
+	finalTo := to
+	if !finalizedTo.IsZero() && finalizedTo.Before(finalTo) {
+		finalTo = finalizedTo
+	}
+	if finalTo.Before(from) {
+		finalTo = from
+	}
 	type interval struct{ start, end time.Time }
 	intervals := make([]interval, 0, len(windows))
 	for _, window := range windows {
@@ -1076,8 +1389,8 @@ func continuousTimelineCoverage(windows []model.ProfileWindow, from, to time.Tim
 		if start.Before(from) {
 			start = from
 		}
-		if end.After(to) {
-			end = to
+		if end.After(finalTo) {
+			end = finalTo
 		}
 		if start.Before(end) {
 			intervals = append(intervals, interval{start: start, end: end})
@@ -1109,10 +1422,10 @@ func continuousTimelineCoverage(windows []model.ProfileWindow, from, to time.Tim
 			cursor = item.end
 		}
 	}
-	if to.Sub(cursor) > tolerance {
-		gaps = append(gaps, continuousTimelineGap{Start: cursor, End: to, DurationSeconds: to.Sub(cursor).Seconds(), Type: "trailing"})
+	if finalTo.Sub(cursor) > tolerance {
+		gaps = append(gaps, continuousTimelineGap{Start: cursor, End: finalTo, DurationSeconds: finalTo.Sub(cursor).Seconds(), Type: "trailing"})
 	}
-	totalSeconds := to.Sub(from).Seconds()
+	totalSeconds := finalTo.Sub(from).Seconds()
 	gapSeconds := float64(0)
 	for _, gap := range gaps {
 		gapSeconds += gap.DurationSeconds
@@ -1126,7 +1439,7 @@ func continuousTimelineCoverage(windows []model.ProfileWindow, from, to time.Tim
 		ratio = coveredSeconds / totalSeconds
 	}
 	return gaps, gin.H{
-		"from": from, "to": to, "total_seconds": totalSeconds,
+		"from": from, "to": finalTo, "total_seconds": totalSeconds,
 		"covered_seconds": coveredSeconds, "gap_seconds": gapSeconds, "ratio": ratio,
 	}
 }
@@ -1223,21 +1536,25 @@ func (s *APIServer) storeContinuousBatchPayload(ctx context.Context, req Continu
 		return errProfileUnavailable
 	}
 	payload := continuousStoredBatch{
-		SessionSID:        req.SessionSID,
-		BatchID:           req.BatchID,
-		TargetIP:          req.TargetIP,
-		StartTime:         req.StartTime,
-		EndTime:           req.EndTime,
-		SchemaVersion:     req.SchemaVersion,
-		SignalTypes:       req.SignalTypes,
-		Backends:          req.Backends,
-		ProfileFormat:     req.ProfileFormat,
-		BackendStatus:     req.BackendStatus,
-		BackendReason:     req.BackendReason,
-		AttemptedBackends: req.AttemptedBackends,
-		SelectedBackend:   req.SelectedBackend,
-		SymbolRefs:        req.SymbolRefs,
-		Windows:           req.Windows,
+		SessionSID:          req.SessionSID,
+		BatchID:             req.BatchID,
+		TargetIP:            req.TargetIP,
+		StartTime:           req.StartTime,
+		EndTime:             req.EndTime,
+		SchemaVersion:       req.SchemaVersion,
+		CollectorGeneration: req.CollectorGeneration,
+		BatchSequence:       req.BatchSequence,
+		ContentSHA256:       req.ContentSHA256,
+		SignalCounts:        req.SignalCounts,
+		SignalTypes:         req.SignalTypes,
+		Backends:            req.Backends,
+		ProfileFormat:       req.ProfileFormat,
+		BackendStatus:       req.BackendStatus,
+		BackendReason:       req.BackendReason,
+		AttemptedBackends:   req.AttemptedBackends,
+		SelectedBackend:     req.SelectedBackend,
+		SymbolRefs:          req.SymbolRefs,
+		Windows:             req.Windows,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -3337,7 +3654,7 @@ func windowOverlaps(start, end, from, to time.Time) bool {
 	return !end.Before(from) && !start.After(to)
 }
 
-func applyContinuousDefaults(req *CreateContinuousSessionReq) {
+func applyContinuousDefaults(req *CreateContinuousSessionReq) error {
 	req.Name = strings.TrimSpace(req.Name)
 	req.TargetIP = strings.TrimSpace(req.TargetIP)
 	req.Hostname = strings.TrimSpace(req.Hostname)
@@ -3359,7 +3676,12 @@ func applyContinuousDefaults(req *CreateContinuousSessionReq) {
 	if req.ContinuityMode == "" {
 		req.ContinuityMode = "strict"
 	}
-	req.Signals = normalizeContinuousRequestedSignals(req.Signals)
+	// 阶段一：信号控制面严格校验（未知值 400，空值四类默认，按序去重）。
+	signals, err := normalizeContinuousRequestedSignals(req.Signals)
+	if err != nil {
+		return err
+	}
+	req.Signals = signals
 	if req.SampleRateHz == 0 {
 		req.SampleRateHz = 19
 	}
@@ -3378,6 +3700,7 @@ func applyContinuousDefaults(req *CreateContinuousSessionReq) {
 	if req.Capabilities == nil {
 		req.Capabilities = map[string]interface{}{}
 	}
+	return nil
 }
 
 type continuousSignalRow struct {
@@ -3421,6 +3744,17 @@ func continuousWindowSignalRows(window ContinuousWindowIngest) []continuousSigna
 	return rows
 }
 
+// continuousBatchSignalSet 返回 batch 内所有窗口实际携带的信号类型集合。
+func continuousBatchSignalSet(windows []ContinuousWindowIngest) map[string]bool {
+	set := map[string]bool{}
+	for _, window := range windows {
+		for _, row := range continuousWindowSignalRowsV3(window) {
+			set[row.SignalType] = true
+		}
+	}
+	return set
+}
+
 func continuousLegacyProfileBackend(window ContinuousWindowIngest) string {
 	if window.Backend != "" {
 		return window.Backend
@@ -3431,6 +3765,45 @@ func continuousLegacyProfileBackend(window ContinuousWindowIngest) string {
 		}
 	}
 	return ""
+}
+
+// continuousWindowSignalRowsV3 阶段一 v3：一个逻辑窗口每种信号只建立一条
+// profile_windows 元数据行（backend 取首个出现者，多个 backend 作为该信号
+// payload 的内部信息，不再按 backend 重复建行）。窗口级幂等键是
+// (session_sid, window_id, signal_type)，与之一致。
+func continuousWindowSignalRowsV3(window ContinuousWindowIngest) []continuousSignalRow {
+	seen := map[string]bool{}
+	rows := []continuousSignalRow{}
+	add := func(signalType, backend string) {
+		signalType = strings.ToLower(strings.TrimSpace(firstNonEmpty(signalType, "cpu_profile")))
+		if signalType == "" {
+			signalType = "cpu_profile"
+		}
+		if seen[signalType] {
+			return
+		}
+		seen[signalType] = true
+		rows = append(rows, continuousSignalRow{SignalType: signalType, Backend: backend})
+	}
+	if len(window.Samples) > 0 {
+		add(firstNonEmpty(window.SignalType, "cpu_profile"), continuousLegacyProfileBackend(window))
+	}
+	for _, profile := range window.Profiles {
+		add(firstNonEmpty(profile.SignalType, "cpu_profile"), firstNonEmpty(profile.Backend, window.Backend))
+	}
+	for _, hist := range window.Histograms {
+		add(hist.SignalType, firstNonEmpty(hist.Backend, window.Backend))
+	}
+	if len(window.Metrics) > 0 {
+		add("python_rss", "procfs")
+	}
+	if len(window.DBSnapshots) > 0 {
+		add("db_snapshot", "db_system_views")
+	}
+	if len(rows) == 0 {
+		add(firstNonEmpty(window.SignalType, "cpu_profile"), window.Backend)
+	}
+	return rows
 }
 
 func continuousWindowSampleCount(window ContinuousWindowIngest, signalType string) uint64 {
@@ -3486,6 +3859,40 @@ func clampContinuousCount(value uint64) uint64 {
 		return continuousMaxDBCount
 	}
 	return value
+}
+
+// continuousWindowSignalCountsFor 返回某 window 的分信号计数（服务端权威重算，
+// 不信任 Agent 上报的 signal_counts/sample_count）。按信号类型去重（每个信号
+// 只算一次），与 v3 的"一个逻辑窗口每种信号一行"语义一致。
+func continuousWindowSignalCountsFor(window ContinuousWindowIngest) map[string]uint64 {
+	counts := map[string]uint64{}
+	for _, signal := range continuousWindowSignalRowsV3(window) {
+		counts[signal.SignalType] = continuousWindowSampleCount(window, signal.SignalType)
+	}
+	return counts
+}
+
+// continuousBatchSignalCounts 汇总 batch 内所有 window 的分信号计数。
+func continuousBatchSignalCounts(windows []ContinuousWindowIngest) map[string]uint64 {
+	counts := map[string]uint64{}
+	for _, window := range windows {
+		for signal, count := range continuousWindowSignalCountsFor(window) {
+			counts[signal] = addContinuousCount(counts[signal], count)
+		}
+	}
+	return counts
+}
+
+// continuousSignalCountsJSON 将分信号计数 map 序列化为 jsonb 字节。
+func continuousSignalCountsJSON(counts map[string]uint64) []byte {
+	if len(counts) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(counts)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 func normalizeContinuousSignalTypes(req ContinuousBatchIngestReq) []string {

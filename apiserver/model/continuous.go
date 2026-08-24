@@ -40,23 +40,27 @@ const (
 )
 
 type ContinuousSession struct {
-	ID                   uint           `gorm:"primaryKey" json:"id"`
-	SID                  string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
-	Name                 string         `gorm:"column:name;size:256" json:"name"`
-	TargetIP             string         `gorm:"column:target_ip;size:45;index" json:"target_ip"`
-	Hostname             string         `gorm:"column:hostname;size:256" json:"hostname"`
-	ServiceName          string         `gorm:"column:service_name;size:128;default:hotmethod" json:"service_name"`
-	SampleRateHz         uint32         `gorm:"column:sample_rate_hz;default:19" json:"sample_rate_hz"`
-	AggregationWindowSec uint32         `gorm:"column:aggregation_window_sec;default:10" json:"aggregation_window_sec"`
-	UploadBatchSec       uint32         `gorm:"column:upload_batch_sec;default:60" json:"upload_batch_sec"`
-	RetentionHours       uint32         `gorm:"column:retention_hours;default:24" json:"retention_hours"`
-	Labels               []byte         `gorm:"column:labels;type:jsonb" json:"labels"`
-	Capabilities         []byte         `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
-	Status               string         `gorm:"column:status;size:32;default:running;index" json:"status"`
-	Scope                string         `gorm:"column:scope;size:16;default:host;index" json:"scope"`
-	SelectorExe          string         `gorm:"column:selector_exe;size:4096;index" json:"selector_exe"`
-	SelectorMode         string         `gorm:"column:selector_mode;size:32;default:all_instances" json:"selector_mode"`
-	Signals              []byte         `gorm:"column:signals;type:jsonb" json:"signals"`
+	ID                   uint   `gorm:"primaryKey" json:"id"`
+	SID                  string `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
+	Name                 string `gorm:"column:name;size:256" json:"name"`
+	TargetIP             string `gorm:"column:target_ip;size:45;index" json:"target_ip"`
+	Hostname             string `gorm:"column:hostname;size:256" json:"hostname"`
+	ServiceName          string `gorm:"column:service_name;size:128;default:hotmethod" json:"service_name"`
+	SampleRateHz         uint32 `gorm:"column:sample_rate_hz;default:19" json:"sample_rate_hz"`
+	AggregationWindowSec uint32 `gorm:"column:aggregation_window_sec;default:10" json:"aggregation_window_sec"`
+	UploadBatchSec       uint32 `gorm:"column:upload_batch_sec;default:60" json:"upload_batch_sec"`
+	RetentionHours       uint32 `gorm:"column:retention_hours;default:24" json:"retention_hours"`
+	Labels               []byte `gorm:"column:labels;type:jsonb" json:"labels"`
+	Capabilities         []byte `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
+	Status               string `gorm:"column:status;size:32;default:running;index" json:"status"`
+	Scope                string `gorm:"column:scope;size:16;default:host;index" json:"scope"`
+	SelectorExe          string `gorm:"column:selector_exe;size:4096;index" json:"selector_exe"`
+	SelectorMode         string `gorm:"column:selector_mode;size:32;default:all_instances" json:"selector_mode"`
+	Signals              []byte `gorm:"column:signals;type:jsonb" json:"signals"`
+	// RequestedSignals 是 signals 的显式字符串数组镜像（阶段一）：Reconcile
+	// 下发 assignment 时按字符串数组返回，避免 GORM 对 jsonb 的 []byte 自动
+	// 编码导致 Agent 侧解析歧义。写入时由服务端在创建/更新 Session 时维护。
+	RequestedSignals     []byte         `gorm:"column:requested_signals;type:jsonb" json:"requested_signals"`
 	DesiredState         string         `gorm:"column:desired_state;size:16;default:running;index" json:"desired_state"`
 	ObservedState        string         `gorm:"column:observed_state;size:16;default:pending;index" json:"observed_state"`
 	ObservedAt           *time.Time     `gorm:"column:observed_at;index" json:"observed_at"`
@@ -109,27 +113,35 @@ type ContinuousAgentState struct {
 }
 
 type ProfileBatch struct {
-	ID                 uint      `gorm:"primaryKey" json:"id"`
-	BID                string    `gorm:"column:bid;uniqueIndex;size:64" json:"bid"`
-	SessionSID         string    `gorm:"column:session_sid;size:64;index" json:"session_sid"`
-	TargetIP           string    `gorm:"column:target_ip;size:45;index" json:"target_ip"`
-	ObjectKey          string    `gorm:"column:object_key;size:512" json:"object_key"`
-	StartTime          time.Time `gorm:"column:start_time;index" json:"start_time"`
-	EndTime            time.Time `gorm:"column:end_time;index" json:"end_time"`
-	WindowCount        uint32    `gorm:"column:window_count" json:"window_count"`
-	SampleCount        uint64    `gorm:"column:sample_count" json:"sample_count"`
-	SchemaVersion      uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
-	SignalTypes        []byte    `gorm:"column:signal_types;type:jsonb" json:"signal_types"`
-	Backends           []byte    `gorm:"column:backends;type:jsonb" json:"backends"`
-	Status             string    `gorm:"column:status;size:32;default:ready" json:"status"`
-	ProfileFormat      string    `gorm:"column:profile_format;size:32;default:json" json:"profile_format"`
-	BackendStatus      string    `gorm:"column:backend_status;size:32;default:ok" json:"backend_status"`
-	BackendReason      string    `gorm:"column:backend_reason" json:"backend_reason"`
-	AttemptedBackends  []byte    `gorm:"column:attempted_backends;type:jsonb" json:"attempted_backends"`
-	SelectedBackend    string    `gorm:"column:selected_backend;size:64" json:"selected_backend"`
-	SymbolRefs         []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
-	ReceivedAt         time.Time `gorm:"column:received_at" json:"received_at"`
-	AgentClockOffsetMs int64     `gorm:"column:agent_clock_offset_ms;default:0" json:"agent_clock_offset_ms"`
+	ID            uint      `gorm:"primaryKey" json:"id"`
+	BID           string    `gorm:"column:bid;uniqueIndex;size:64" json:"bid"`
+	SessionSID    string    `gorm:"column:session_sid;size:64;index" json:"session_sid"`
+	TargetIP      string    `gorm:"column:target_ip;size:45;index" json:"target_ip"`
+	ObjectKey     string    `gorm:"column:object_key;size:512" json:"object_key"`
+	StartTime     time.Time `gorm:"column:start_time;index" json:"start_time"`
+	EndTime       time.Time `gorm:"column:end_time;index" json:"end_time"`
+	WindowCount   uint32    `gorm:"column:window_count" json:"window_count"`
+	SampleCount   uint64    `gorm:"column:sample_count" json:"sample_count"`
+	SchemaVersion uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
+	// 阶段一（协议 v3）新字段：collector generation 唯一标识物理采集器实例，
+	// batch_sequence 单调递增，content_sha256 为 batch 内容摘要（幂等校验），
+	// signal_counts 分信号计数。v3 起 batch 层 sample_count 废弃并写 0，所有
+	// 计数改读 signal_counts。
+	CollectorGeneration string    `gorm:"column:collector_generation;size:64;default:''" json:"collector_generation"`
+	BatchSequence       uint64    `gorm:"column:batch_sequence;default:0" json:"batch_sequence"`
+	ContentSHA256       string    `gorm:"column:content_sha256;size:64;default:''" json:"content_sha256"`
+	SignalCounts        []byte    `gorm:"column:signal_counts;type:jsonb" json:"signal_counts"`
+	SignalTypes         []byte    `gorm:"column:signal_types;type:jsonb" json:"signal_types"`
+	Backends            []byte    `gorm:"column:backends;type:jsonb" json:"backends"`
+	Status              string    `gorm:"column:status;size:32;default:ready" json:"status"`
+	ProfileFormat       string    `gorm:"column:profile_format;size:32;default:json" json:"profile_format"`
+	BackendStatus       string    `gorm:"column:backend_status;size:32;default:ok" json:"backend_status"`
+	BackendReason       string    `gorm:"column:backend_reason" json:"backend_reason"`
+	AttemptedBackends   []byte    `gorm:"column:attempted_backends;type:jsonb" json:"attempted_backends"`
+	SelectedBackend     string    `gorm:"column:selected_backend;size:64" json:"selected_backend"`
+	SymbolRefs          []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
+	ReceivedAt          time.Time `gorm:"column:received_at" json:"received_at"`
+	AgentClockOffsetMs  int64     `gorm:"column:agent_clock_offset_ms;default:0" json:"agent_clock_offset_ms"`
 	// BlockID 指向所属 continuous_profile_blocks 行；为空表示该 batch 尚未被
 	// 压缩进小时块（热数据，仍读取原分钟对象）。
 	BlockID string `gorm:"column:block_id;size:64;index" json:"block_id"`
@@ -195,22 +207,54 @@ type ContinuousWindowSummary struct {
 }
 
 type ProfileWindow struct {
-	ID                uint      `gorm:"primaryKey" json:"id"`
-	SessionSID        string    `gorm:"column:session_sid;size:64;index:idx_profile_windows_session_time,priority:1" json:"session_sid"`
-	BatchBID          string    `gorm:"column:batch_bid;size:64;index" json:"batch_bid"`
-	WindowStart       time.Time `gorm:"column:window_start;index:idx_profile_windows_session_time,priority:2" json:"window_start"`
-	WindowEnd         time.Time `gorm:"column:window_end;index" json:"window_end"`
-	ObjectKey         string    `gorm:"column:object_key;size:512" json:"object_key"`
-	SampleCount       uint64    `gorm:"column:sample_count" json:"sample_count"`
-	SignalType        string    `gorm:"column:signal_type;size:64;default:cpu_profile;index" json:"signal_type"`
-	SchemaVersion     uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
-	Backend           string    `gorm:"column:backend;size:64" json:"backend"`
-	Labels            []byte    `gorm:"column:labels;type:jsonb" json:"labels"`
-	ProfileFormat     string    `gorm:"column:profile_format;size:32;default:json" json:"profile_format"`
-	BackendStatus     string    `gorm:"column:backend_status;size:32;default:ok" json:"backend_status"`
-	BackendReason     string    `gorm:"column:backend_reason" json:"backend_reason"`
-	AttemptedBackends []byte    `gorm:"column:attempted_backends;type:jsonb" json:"attempted_backends"`
-	SelectedBackend   string    `gorm:"column:selected_backend;size:64" json:"selected_backend"`
-	SymbolRefs        []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
-	CreatedAt         time.Time `gorm:"column:created_at" json:"created_at"`
+	ID            uint      `gorm:"primaryKey" json:"id"`
+	SessionSID    string    `gorm:"column:session_sid;size:64;index:idx_profile_windows_session_time,priority:1" json:"session_sid"`
+	BatchBID      string    `gorm:"column:batch_bid;size:64;index" json:"batch_bid"`
+	WindowStart   time.Time `gorm:"column:window_start;index:idx_profile_windows_session_time,priority:2" json:"window_start"`
+	WindowEnd     time.Time `gorm:"column:window_end;index" json:"window_end"`
+	ObjectKey     string    `gorm:"column:object_key;size:512" json:"object_key"`
+	SampleCount   uint64    `gorm:"column:sample_count" json:"sample_count"`
+	SignalType    string    `gorm:"column:signal_type;size:64;default:cpu_profile;index" json:"signal_type"`
+	SchemaVersion uint32    `gorm:"column:schema_version;default:1" json:"schema_version"`
+	// 阶段一（协议 v3）新字段：window_id 为逻辑窗口稳定 ID（唯一约束
+	// session_sid+window_id+signal_type 的幂等键），collector_generation /
+	// target_fingerprint 标识产生窗口的采集器与目标集，content_sha256 窗口
+	// 内容摘要（冲突检测），signal_counts 分信号计数。
+	WindowID            string    `gorm:"column:window_id;size:128;default:''" json:"window_id"`
+	CollectorGeneration string    `gorm:"column:collector_generation;size:64;default:''" json:"collector_generation"`
+	TargetFingerprint   string    `gorm:"column:target_fingerprint;size:256;default:''" json:"target_fingerprint"`
+	ContentSHA256       string    `gorm:"column:content_sha256;size:64;default:''" json:"content_sha256"`
+	SignalCounts        []byte    `gorm:"column:signal_counts;type:jsonb" json:"signal_counts"`
+	Backend             string    `gorm:"column:backend;size:64" json:"backend"`
+	Labels              []byte    `gorm:"column:labels;type:jsonb" json:"labels"`
+	ProfileFormat       string    `gorm:"column:profile_format;size:32;default:json" json:"profile_format"`
+	BackendStatus       string    `gorm:"column:backend_status;size:32;default:ok" json:"backend_status"`
+	BackendReason       string    `gorm:"column:backend_reason" json:"backend_reason"`
+	AttemptedBackends   []byte    `gorm:"column:attempted_backends;type:jsonb" json:"attempted_backends"`
+	SelectedBackend     string    `gorm:"column:selected_backend;size:64" json:"selected_backend"`
+	SymbolRefs          []byte    `gorm:"column:symbol_refs;type:jsonb" json:"symbol_refs"`
+	CreatedAt           time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+// ContinuousRepairAudit 阶段一历史重复修复审计表：每次 repair run 把"同一逻辑
+// 窗口被排除的 batch"记成一条只读审计记录（保留/排除双方 batch、摘要、原因与
+// 时间），原始对象暂不立即删除，保证修复可审计、可回放、可对账。逻辑窗口键
+// logical_window_key 由 session+signal+起止时间规范化生成；window_id 为新协议
+// 稳定 ID（历史 v2 行为空）。
+type ContinuousRepairAudit struct {
+	ID                    uint      `gorm:"primaryKey" json:"id"`
+	RunID                 string    `gorm:"column:run_id;size:64;index" json:"run_id"`
+	Tenant                string    `gorm:"column:tenant;size:64;default:default" json:"tenant"`
+	SessionSID            string    `gorm:"column:session_sid;size:64;index" json:"session_sid"`
+	LogicalWindowKey      string    `gorm:"column:logical_window_key;size:512" json:"logical_window_key"`
+	WindowID              string    `gorm:"column:window_id;size:128;default:''" json:"window_id"`
+	SignalType            string    `gorm:"column:signal_type;size:32" json:"signal_type"`
+	WindowStart           time.Time `gorm:"column:window_start" json:"window_start"`
+	WindowEnd             time.Time `gorm:"column:window_end" json:"window_end"`
+	KeptBatchBID          string    `gorm:"column:kept_batch_bid;size:64" json:"kept_batch_bid"`
+	ExcludedBatchBID      string    `gorm:"column:excluded_batch_bid;size:64" json:"excluded_batch_bid"`
+	KeptContentSHA256     string    `gorm:"column:kept_content_sha256;size:64" json:"kept_content_sha256"`
+	ExcludedContentSHA256 string    `gorm:"column:excluded_content_sha256;size:64" json:"excluded_content_sha256"`
+	Reason                string    `gorm:"column:reason;size:128" json:"reason"`
+	CreatedAt             time.Time `gorm:"column:created_at" json:"created_at"`
 }

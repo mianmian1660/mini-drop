@@ -27,6 +27,9 @@ struct ContinuousAssignment
     int aggregationWindowSec = 10;
     int uploadBatchSec = 60;
     int retentionHours = 24;
+    // 阶段一：信号控制面。由 Reconcile assignment DTO 的 signals 字符串数组
+    // 解析而来（cpu_profile/io_latency/io_syscall_latency/sched_latency）。
+    std::vector<std::string> requestedSignals;
     // 来自 session.labels.db_targets（服务端零迁移透传的 jsonb），驱动
     // DBSnapshotSampler。为空时该 Session 不做数据库巡检。
     std::vector<drop::DBTargetConfig> dbTargets;
@@ -103,7 +106,7 @@ private:
     std::string spoolDirectory_;
     std::string cachePath_;
     uint64_t spoolMaxBytes_ = 5ULL * 1024 * 1024 * 1024;
-    uint64_t spoolMinFreeBytes_ = 2ULL * 1024 * 1024 * 1024;
+    uint64_t spoolMinFreeBytes_ = 1ULL * 1024 * 1024 * 1024;
     int retryMaxSec_ = 300;
     std::atomic<bool> &agentRunning_;
     std::atomic<bool> running_{false};

@@ -53,7 +53,7 @@ struct ContinuousSamplerConfig
     int uploadBatchSec = 60;
     int retentionHours = 24;
     uint64_t spoolMaxBytes = 5ULL * 1024 * 1024 * 1024;
-    uint64_t spoolMinFreeBytes = 2ULL * 1024 * 1024 * 1024;
+    uint64_t spoolMinFreeBytes = 1ULL * 1024 * 1024 * 1024;
     int retryMaxSec = 300;
     std::string spoolDirectory = "/var/lib/mini-drop/continuous-spool";
     std::string sessionSID;
@@ -64,6 +64,15 @@ struct ContinuousSamplerConfig
     std::string scope = "host";
     std::string selectorExe;
     std::string signals = "cpu,io,io_syscall,sched";
+    // 阶段一：信号控制面。requestedSignals 是该 Session 请求的逻辑信号
+    // （cpu_profile/io_latency/io_syscall_latency/sched_latency），由 assignment
+    // 下发；signals 是物理采集信号集合（cpu/io/io_syscall/sched），共享采集器
+    // 取其并集。collectorGeneration 标识物理采集器实例（切换即变），
+    // targetFingerprint 标识目标进程集，batchSequence 单调递增。
+    std::vector<std::string> requestedSignals;
+    std::string collectorGeneration;
+    std::string targetFingerprint;
+    uint64_t batchSequence = 0;
     bool allowDegraded = false;
     std::vector<ContinuousTargetProcess> targetProcesses;
     std::vector<DBTargetConfig> dbTargets;
@@ -73,6 +82,12 @@ struct ContinuousSamplerConfig
 // configured CO-RE object can be opened. Runtime attach is still validated when
 // a shared engine starts; callers use this for capability reporting only.
 bool CoreContinuousSamplerAvailable();
+
+// 阶段一：逻辑信号集合（cpu_profile/io_latency/io_syscall_latency/
+// sched_latency）→ 物理采集信号集合字符串（cpu,io,io_syscall,sched）。
+// 供 ContinuousSessionManager 构造采样器配置时把 assignment 的信号换算成
+// 物理采集集；共享采集器再对所有活动 Session 取并集。
+std::string PhysicalSignalsFromRequested(const std::vector<std::string> &requested);
 
 // 阶段五：服务器存储压力（server_storage_pressure）全局开关。由
 // ContinuousSessionManager 从心跳响应的 server_pressure.halted 解析后设置；
@@ -199,6 +214,20 @@ public:
     bool Strict() const;
     bool Failed() const;
     std::string DegradationReason() const;
+    // 阶段一：无重叠采集器切换（cutover）。
+    //   BeginHandoff()：进入 ready-but-not-owning——replacement 启动后先就绪
+    //     但不输出正式窗口，直到 Own() 被调用。
+    //   SetCutoverWatermark(ms, keepBefore)：
+    //     旧 generation 收到 watermark 后，仅持久化 endMs <= watermark 的
+    //     窗口（keepBefore=true，切点后数据让渡给新 generation）；
+    //     新 generation 收到 watermark 后，仅持久化 startMs >= watermark 的
+    //     窗口（keepBefore=false，切点前数据不输出）。
+    //   Own(watermarkMs)：从 ready-but-not-owning 转为 owning；watermark=0
+    //     表示首次启动无 cutover（全量持久化）。旧 generation 不调用 Own。
+    void BeginHandoff();
+    void SetCutoverWatermark(int64_t watermarkMs, bool keepBefore);
+    void Own(int64_t watermarkMs);
+    bool Owning() const;
 
 private:
     struct Impl;

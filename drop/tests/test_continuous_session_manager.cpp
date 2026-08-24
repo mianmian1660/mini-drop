@@ -211,6 +211,47 @@ TEST(ContinuousSessionManager, RejectsMalformedAssignmentEnvelope)
         manager, "not-json", &assignments, &revision));
 }
 
+// 阶段一：Reconcile assignment DTO 的 signals 字符串数组解析。
+TEST(ContinuousSessionManager, ParsesAssignmentSignalsArray)
+{
+    AgentConfig config;
+    config.ipAddr = "127.0.0.1";
+    config.hostname = "test-host";
+    config.uid = "agent-test";
+    std::atomic<bool> agentRunning{true};
+    ContinuousSessionManager manager(config, "http://127.0.0.1:8191", "agent-test", agentRunning);
+    const std::string response =
+        R"({"code":0,"data":{"revision":9,"assignments":[{"sid":"cps-sig","scope":"host","desired_state":"running","revision":9,"signals":["cpu_profile"],"labels":null}]}})";
+    std::vector<ContinuousAssignment> assignments;
+    uint64_t revision = 0;
+    ASSERT_TRUE(ContinuousSessionManagerTestAccess::ParseAssignments(manager, response, &assignments, &revision));
+    ASSERT_EQ(assignments.size(), 1u);
+    EXPECT_EQ(revision, 9u);
+    ASSERT_EQ(assignments[0].requestedSignals.size(), 1u);
+    EXPECT_EQ(assignments[0].requestedSignals[0], "cpu_profile");
+}
+
+// 阶段一：assignment 信号 → 物理采集信号换算。
+TEST(ContinuousSessionManager, BuildSamplerConfigCarriesRequestedSignals)
+{
+    AgentConfig config;
+    config.ipAddr = "127.0.0.1";
+    config.hostname = "test-host";
+    config.uid = "agent-test";
+    std::atomic<bool> agentRunning{true};
+    ContinuousSessionManager manager(config, "http://127.0.0.1:8191", "agent-test", agentRunning);
+    ContinuousSessionManagerTestAccess::AddRuntimeReport(manager, "cps-sig2", "running", "strict", "");
+    const std::string response =
+        R"({"code":0,"data":{"revision":1,"assignments":[{"sid":"cps-sig2","scope":"host","desired_state":"running","revision":1,"signals":["cpu_profile"]}]}})";
+    std::vector<ContinuousAssignment> assignments;
+    uint64_t revision = 0;
+    ASSERT_TRUE(ContinuousSessionManagerTestAccess::ParseAssignments(manager, response, &assignments, &revision));
+    ASSERT_EQ(assignments.size(), 1u);
+    // 直接验证 requestedSignals 与物理信号集合换算。
+    EXPECT_EQ(assignments[0].requestedSignals.size(), 1u);
+    EXPECT_EQ(drop::PhysicalSignalsFromRequested(assignments[0].requestedSignals), "cpu");
+}
+
 TEST(ContinuousSessionManager, ReportsRuntimeContinuityInsteadOfStaticObjectAvailability)
 {
     AgentConfig config;

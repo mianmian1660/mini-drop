@@ -28,12 +28,33 @@ func TestContinuousTimelineCoverageUsesFiveSecondTolerance(t *testing.T) {
 		{WindowStart: base.Add(15 * time.Second), WindowEnd: base.Add(25 * time.Second)},
 		{WindowStart: base.Add(31 * time.Second), WindowEnd: base.Add(40 * time.Second)},
 	}
-	gaps, coverage := continuousTimelineCoverage(windows, base, base.Add(40*time.Second), 5*time.Second)
+	gaps, coverage := continuousTimelineCoverage(windows, base, base.Add(40*time.Second), time.Time{}, 5*time.Second)
 	if len(gaps) != 1 || gaps[0].Start != base.Add(25*time.Second) || gaps[0].DurationSeconds != 6 {
 		t.Fatalf("unexpected gaps: %#v", gaps)
 	}
 	if coverage["gap_seconds"].(float64) != 6 {
 		t.Fatalf("unexpected coverage: %#v", coverage)
+	}
+}
+
+func TestContinuousTimelineCoverageExcludesPendingTailFromFinalizedDomain(t *testing.T) {
+	base := time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)
+	// 数据只到 30s；finalized_to=30s，查询终点 to=60s。30-60s 属于 pending
+	// tail，不计入真实 gap，finalized 覆盖率应为 100%。
+	windows := []model.ProfileWindow{
+		{WindowStart: base, WindowEnd: base.Add(10 * time.Second)},
+		{WindowStart: base.Add(15 * time.Second), WindowEnd: base.Add(30 * time.Second)},
+	}
+	finalizedTo := base.Add(30 * time.Second)
+	gaps, coverage := continuousTimelineCoverage(windows, base, base.Add(60*time.Second), finalizedTo, 5*time.Second)
+	if len(gaps) != 0 {
+		t.Fatalf("pending tail should not be a real gap: %#v", gaps)
+	}
+	if coverage["to"].(time.Time) != finalizedTo {
+		t.Fatalf("coverage to=%v, want finalizedTo=%v", coverage["to"], finalizedTo)
+	}
+	if coverage["ratio"].(float64) != 1.0 {
+		t.Fatalf("finalized coverage ratio=%v, want 1.0", coverage["ratio"])
 	}
 }
 

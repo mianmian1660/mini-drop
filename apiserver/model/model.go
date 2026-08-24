@@ -274,6 +274,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&ContinuousMigrationReceipt{},
 		&ContinuousCoverageSegment{},
 		&ContinuousMigrationFailure{},
+		&ContinuousRepairAudit{},
 		&SentinelRule{},
 		&DetectionState{},
 		&DetectionEvent{},
