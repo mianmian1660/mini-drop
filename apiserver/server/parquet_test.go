@@ -48,6 +48,10 @@ func pqTestServer(t *testing.T) *APIServer {
 	s := newTestAPIServer(t)
 	s.Config = pqTestConfig()
 	s.Storage = newContinuousMemoryStorage()
+	// 阶段八：隔离宿主磁盘状态——CI/部署服务器磁盘波动（/tmp 为宿主根分区
+	// bind mount，docker build 时会急剧下降）会让 maintenanceSpaceOK 前置
+	// 检查不稳定，导致 pqBuildRawHour 时而 built=false。固定为正常快照。
+	setDiskFree(t, 64<<30, 32<<30, 32<<30, nil)
 	return s
 }
 
