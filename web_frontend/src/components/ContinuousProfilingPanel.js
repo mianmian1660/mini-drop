@@ -1473,61 +1473,83 @@ function LegendItem({ color, label }) {
 // 的 coverage_bands；其次顶层 coverage_bands（旧客户端/无 signal 参数）；
 // 最后降级为旧 coverage/gaps 两色段（covered/gap）。
 export function coverageBandsFromReliability(reliability, signal) {
-    const fallback = () => {
-        const segments = coverageSegments(reliability.coverage, reliability.gaps || []);
-        const hasGaps = (reliability.gaps || []).length > 0;
-        const ratio = Number(reliability.coverage?.ratio) || 0;
-        return {
-            bands: segments.map(segment => ({
+    const data = reliability || {};
+    const legacyCoverage = data.coverage || {};
+    const legacyGaps = Array.isArray(data.gaps) ? data.gaps : [];
+
+    const buildView = (source, useLegacyFields) => {
+        const sourceCoverage = source?.coverage || (useLegacyFields ? legacyCoverage : {});
+        const gaps = Array.isArray(source?.gaps) ? source.gaps : (useLegacyFields ? legacyGaps : []);
+        const rawBands = Array.isArray(source?.coverage_bands) ? source.coverage_bands : [];
+        const sourceRatio = validCoverageRatio(source?.coverage?.ratio);
+        const legacyRatio = validCoverageRatio(legacyCoverage.ratio);
+        const ratio = sourceRatio ?? (useLegacyFields ? legacyRatio : validCoverageRatio(data.coverage?.ratio)) ?? 0;
+        const statusSummary = source?.status_summary || (useLegacyFields ? data.status_summary : null);
+
+        let bands;
+        if (rawBands.length > 0) {
+            bands = rawBands.map(band => ({ ...band, percent: bandPercent(band, sourceCoverage) }));
+        } else if (gaps.length > 0 || ratio === 1 || useLegacyFields) {
+            bands = coverageSegments(sourceCoverage, gaps).map(segment => ({
                 start: new Date(segment.start).toISOString(),
                 end: new Date(segment.end).toISOString(),
                 status: segment.type === 'gap' ? 'real_gap' : 'healthy',
                 duration_seconds: (segment.end - segment.start) / 1000,
                 percent: segment.percent,
                 sample_count: 0,
-            })),
-            ratio,
-            gaps: reliability.gaps || [],
-            gapCountTotal: (reliability.gaps || []).length,
-            gapSeconds: Number(reliability.coverage?.gap_seconds) || 0,
-            statusSummary: null,
-            status: hasGaps ? 'real_gap' : (ratio > 0 ? 'healthy' : 'unknown'),
-        };
+            }));
+        } else {
+            // A signal response may legitimately have no detail bands yet.
+            // Keep its own zero/unknown state instead of borrowing another signal.
+            bands = [];
+        }
+
+        const rawGapCount = source?.gap_count_total ?? (useLegacyFields ? data.gap_count_total : undefined);
+        const gapCountTotal = validGapCount(rawGapCount) ?? gaps.length;
+        const explicitGapSeconds = validNonNegativeNumber(sourceCoverage?.gap_seconds);
+        const gapSeconds = explicitGapSeconds ?? gaps.reduce((sum, gap) => sum + gapDurationSeconds(gap), 0);
+        const status = source?.status || statusSummary?.status || (gaps.length > 0 ? 'real_gap' : (ratio > 0 ? 'healthy' : 'unknown'));
+        return { bands, ratio, gaps, gapCountTotal, gapSeconds, statusSummary: statusSummary || null, status };
     };
-    if (!reliability?.coverage) return fallback();
-    const sc = signal ? reliability.signal_coverage?.[signal] : null;
-    if (sc?.coverage_bands?.length) {
-        // ratio 必须用当前信号的精确值（含 0）：0 是合法值（无数据），
-        // 不能用 || 回退到旧口径，否则 IO 无数据会被 CPU 的覆盖率"填绿"。
-        const scRatio = sc.coverage?.ratio;
-        return {
-            bands: sc.coverage_bands.map(band => ({ ...band, percent: bandPercent(band, sc.coverage) })),
-            ratio: scRatio !== undefined && scRatio !== null ? Number(scRatio) : (Number(reliability.coverage?.ratio) || 0),
-            gaps: sc.gaps || [],
-            gapCountTotal: Number(sc.gap_count_total) ?? (sc.gaps || []).length,
-            gapSeconds: Number(sc.coverage?.gap_seconds) || 0,
-            statusSummary: sc.status_summary || null,
-            status: sc.status || '',
-        };
+
+    const sc = signal ? data.signal_coverage?.[signal] : null;
+    if (sc) {
+        // signal_coverage is authoritative even when coverage_bands is empty.
+        // In particular, ratio=0 is valid and must never inherit CPU/legacy data.
+        return buildView(sc, false);
     }
-    if (reliability.coverage_bands?.length) {
-        return {
-            bands: reliability.coverage_bands.map(band => ({ ...band, percent: bandPercent(band, reliability.coverage) })),
-            ratio: Number(reliability.coverage?.ratio) || 0,
-            gaps: reliability.gaps || [],
-            gapCountTotal: (reliability.gaps || []).length,
-            gapSeconds: Number(reliability.coverage?.gap_seconds) || 0,
-            statusSummary: reliability.status_summary || null,
-            status: reliability.status_summary?.status || '',
-        };
-    }
-    return fallback();
+    return buildView(data, true);
 }
 
 function bandPercent(band, coverage) {
     const total = (new Date(coverage?.to).getTime() - new Date(coverage?.from).getTime()) / 1000;
     if (!Number.isFinite(total) || total <= 0) return 0;
-    return ((Number(band.duration_seconds) || 0) / total) * 100;
+    const duration = validNonNegativeNumber(band?.duration_seconds) || 0;
+    return Math.max(0, Math.min(100, (duration / total) * 100));
+}
+
+function validNonNegativeNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function validCoverageRatio(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 && number <= 1 ? number : null;
+}
+
+function validGapCount(value) {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
+function gapDurationSeconds(gap) {
+    const explicit = validNonNegativeNumber(gap?.duration_seconds);
+    if (explicit !== null) return explicit;
+    const start = new Date(gap?.start).getTime();
+    const end = new Date(gap?.end).getTime();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+    return (end - start) / 1000;
 }
 
 // 状态 → 色带颜色：绿=有数据，红=确认缺数/采集异常，黄=整理中，灰=空闲/启动/收尾/未知。

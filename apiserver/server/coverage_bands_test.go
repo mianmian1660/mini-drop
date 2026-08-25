@@ -159,7 +159,7 @@ func TestContinuousStartupGraceBoundary(t *testing.T) {
 	if sc.Coverage["gray_seconds"].(float64) != grace.Seconds() {
 		t.Fatalf("gray_seconds=%v, want %v（启动 grace 灰色）", sc.Coverage["gray_seconds"], grace.Seconds())
 	}
-	if sc.Coverage["gap_seconds"].(float64) != (300-grace.Seconds()) {
+	if sc.Coverage["gap_seconds"].(float64) != (300 - grace.Seconds()) {
 		t.Fatalf("gap_seconds=%v, want %v（grace 外真实缺口）", sc.Coverage["gap_seconds"], 300-grace.Seconds())
 	}
 	if sc.Status != "real_gap" {
@@ -392,5 +392,63 @@ func TestContinuousLegacyCoverageFieldsStillPresent(t *testing.T) {
 	}
 	if _, ok := coverage["covered_seconds"]; !ok {
 		t.Fatalf("legacy coverage missing covered_seconds: %+v", coverage)
+	}
+}
+
+func TestContinuousSessionBoundariesIgnoreNonHealthyWindows(t *testing.T) {
+	base := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
+	session := coverageTestSession(base)
+	from, to := base, base.Add(2*time.Minute)
+	merged := []model.ProfileWindow{
+		{WindowStart: base.Add(5 * time.Second), WindowEnd: base.Add(20 * time.Second), SignalStatus: "target_idle"},
+		{WindowStart: base.Add(20 * time.Second), WindowEnd: base.Add(35 * time.Second), SignalStatus: "failed"},
+		{WindowStart: base.Add(35 * time.Second), WindowEnd: base.Add(50 * time.Second), SampleCount: 1},
+	}
+	b := continuousSessionBoundariesFor(merged, session, from, to, 95*time.Second)
+	if b.startupGrace == nil || !b.startupGrace.end.Equal(base.Add(35*time.Second)) {
+		t.Fatalf("startup grace=%+v, want end at first healthy window", b.startupGrace)
+	}
+}
+
+func TestMergeStatusIntervalsDoesNotDoubleCountOverlap(t *testing.T) {
+	base := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
+	intervals := []continuousStatusInterval{
+		{start: base, end: base.Add(10 * time.Second), status: continuousCoverageHealthy, sampleCount: 100},
+		{start: base.Add(5 * time.Second), end: base.Add(15 * time.Second), status: continuousCoverageRealGap},
+	}
+	merged := mergeStatusIntervals(intervals, 0)
+	stats := continuousCoverageStatsOf(merged)
+	if stats.coveredSeconds != 5 || stats.redSeconds != 10 {
+		t.Fatalf("stats covered=%v red=%v, want 5/10: %+v", stats.coveredSeconds, stats.redSeconds, merged)
+	}
+	if stats.sampleCount != 50 {
+		t.Fatalf("sample_count=%d, want 50 for non-overlapped healthy half", stats.sampleCount)
+	}
+}
+
+func TestContinuousCoverageBandsUseFullBucketVisualDuration(t *testing.T) {
+	base := time.Date(2026, 8, 25, 0, 3, 0, 0, time.UTC)
+	from, to := base, base.Add(2*time.Hour)
+	intervals := make([]continuousStatusInterval, 0, 601)
+	for i := 0; i < 601; i++ {
+		start := from.Add(time.Duration(i) * 10 * time.Second)
+		intervals = append(intervals, continuousStatusInterval{start: start, end: start.Add(10 * time.Second), status: continuousCoverageHealthy})
+	}
+	bands, resolution := continuousCoverageBands(intervals, from, to)
+	if len(bands) == 0 || resolution <= 0 {
+		t.Fatalf("bands=%d resolution=%v, want aggregated bands", len(bands), resolution)
+	}
+	if !bands[0].Start.Equal(from) {
+		t.Fatalf("first band starts at %v, want query start %v", bands[0].Start, from)
+	}
+	var width float64
+	for _, band := range bands {
+		if band.DurationSeconds != band.End.Sub(band.Start).Seconds() {
+			t.Fatalf("band duration=%v, want full width %v", band.DurationSeconds, band.End.Sub(band.Start).Seconds())
+		}
+		width += band.DurationSeconds
+	}
+	if width > to.Sub(from).Seconds() {
+		t.Fatalf("visual width=%v exceeds query duration=%v", width, to.Sub(from).Seconds())
 	}
 }

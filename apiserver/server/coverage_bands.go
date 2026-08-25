@@ -18,6 +18,7 @@
 package server
 
 import (
+	"container/heap"
 	"math"
 	"sort"
 	"time"
@@ -27,6 +28,38 @@ import (
 	"github.com/mini-drop/apiserver/model"
 	"github.com/mini-drop/apiserver/util"
 )
+
+type coverageIntervalCandidate struct {
+	index    int
+	priority int
+}
+
+type coverageIntervalHeap []coverageIntervalCandidate
+
+func (h coverageIntervalHeap) Len() int { return len(h) }
+func (h coverageIntervalHeap) Less(i, j int) bool {
+	if h[i].priority != h[j].priority {
+		return h[i].priority > h[j].priority
+	}
+	return h[i].index < h[j].index
+}
+func (h coverageIntervalHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *coverageIntervalHeap) Push(value interface{}) {
+	*h = append(*h, value.(coverageIntervalCandidate))
+}
+func (h *coverageIntervalHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	value := old[n-1]
+	*h = old[:n-1]
+	return value
+}
+
+type coverageIntervalEvent struct {
+	at    time.Time
+	index int
+	start bool
+}
 
 // continuousCoverageStatus 覆盖状态分类（服务端权威口径，前端只做展示）。
 type continuousCoverageStatus string
@@ -218,6 +251,9 @@ func continuousSessionBoundariesFor(merged []model.ProfileWindow, session model.
 	}
 	firstData, lastData := time.Time{}, time.Time{}
 	for _, w := range merged {
+		if continuousWindowCoverageStatus(w) != continuousCoverageHealthy {
+			continue
+		}
 		if firstData.IsZero() || w.WindowStart.Before(firstData) {
 			firstData = w.WindowStart
 		}
@@ -333,22 +369,79 @@ func continuousStatusIntervalsFor(merged []model.ProfileWindow, from, to, finali
 	return intervals
 }
 
-// mergeStatusIntervals 合并相邻（间隔 ≤ tolerance）且状态相同的区间。
-// 相同起点时高优先级状态在前（防御性排序，正常输入无重叠）。
+// mergeStatusIntervals 先把重叠区间切成互不重叠的状态片段，再合并
+// 相邻（间隔 ≤ tolerance）且状态相同的区间。重叠时只保留优先级最高的
+// 状态，避免覆盖/缺口秒数被重复统计。
 func mergeStatusIntervals(intervals []continuousStatusInterval, tolerance time.Duration) []continuousStatusInterval {
 	if len(intervals) == 0 {
 		return nil
 	}
-	sorted := make([]continuousStatusInterval, len(intervals))
-	copy(sorted, intervals)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].start.Equal(sorted[j].start) {
-			return coverageStatusPriority(sorted[i].status) > coverageStatusPriority(sorted[j].status)
+	events := make([]coverageIntervalEvent, 0, len(intervals)*2)
+	for index, iv := range intervals {
+		if iv.start.Before(iv.end) {
+			events = append(events,
+				coverageIntervalEvent{at: iv.start, index: index, start: true},
+				coverageIntervalEvent{at: iv.end, index: index},
+			)
 		}
-		return sorted[i].start.Before(sorted[j].start)
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].at.Equal(events[j].at) {
+			return events[i].start && !events[j].start
+		}
+		return events[i].at.Before(events[j].at)
 	})
-	merged := make([]continuousStatusInterval, 0, len(sorted))
-	for _, iv := range sorted {
+	active := make([]bool, len(intervals))
+	activeHeap := &coverageIntervalHeap{}
+	heap.Init(activeHeap)
+	allocatedSamples := make([]uint64, len(intervals))
+	sampleProgress := make([]float64, len(intervals))
+	segments := make([]continuousStatusInterval, 0, len(events))
+	for eventIndex := 0; eventIndex < len(events); {
+		point := events[eventIndex].at
+		for eventIndex < len(events) && events[eventIndex].at.Equal(point) {
+			event := events[eventIndex]
+			active[event.index] = event.start
+			if event.start {
+				heap.Push(activeHeap, coverageIntervalCandidate{
+					index: event.index, priority: coverageStatusPriority(intervals[event.index].status),
+				})
+			}
+			eventIndex++
+		}
+		if eventIndex >= len(events) {
+			break
+		}
+		next := events[eventIndex].at
+		for activeHeap.Len() > 0 && !active[(*activeHeap)[0].index] {
+			heap.Pop(activeHeap)
+		}
+		if activeHeap.Len() == 0 || !point.Before(next) {
+			continue
+		}
+		winnerIndex := (*activeHeap)[0].index
+		winner := intervals[winnerIndex]
+		fraction := next.Sub(point).Seconds() / winner.end.Sub(winner.start).Seconds()
+		// A winner can be split by higher-priority overlaps. Allocate samples
+		// by the winning fraction, preserving an integer total without letting
+		// truncation lose samples on every split.
+		sampleProgress[winnerIndex] += fraction
+		targetSamples := float64(winner.sampleCount) * sampleProgress[winnerIndex]
+		var cumulativeSamples uint64
+		if sampleProgress[winnerIndex] >= 1-1e-9 {
+			cumulativeSamples = winner.sampleCount
+		} else if targetSamples > 0 {
+			cumulativeSamples = uint64(math.Floor(targetSamples))
+		}
+		segmentSamples := cumulativeSamples - allocatedSamples[winnerIndex]
+		allocatedSamples[winnerIndex] = cumulativeSamples
+		segments = append(segments, continuousStatusInterval{
+			start: point, end: next, status: winner.status,
+			sampleCount: segmentSamples,
+		})
+	}
+	merged := make([]continuousStatusInterval, 0, len(segments))
+	for _, iv := range segments {
 		last := len(merged) - 1
 		if last >= 0 && iv.status == merged[last].status && iv.start.Sub(merged[last].end) <= tolerance {
 			if iv.end.After(merged[last].end) {
@@ -550,30 +643,50 @@ func continuousCoverageBands(intervals []continuousStatusInterval, from, to time
 	total := to.Sub(from).Seconds()
 	resolution := niceBucketResolution(total / continuousCoverageBandLimit)
 	grid := time.Duration(resolution * float64(time.Second))
+	if grid <= 0 {
+		return nil, resolution
+	}
 	byBucket := map[int64]*continuousCoverageBand{}
 	for _, iv := range intervals {
 		cur := iv.start
+		if cur.Before(from) {
+			cur = from
+		}
 		for cur.Before(iv.end) {
-			bucketStart := cur.Truncate(grid)
+			// Anchor buckets to the requested range, rather than Unix epoch.
+			// Truncate(grid) would make an unaligned first bucket overlap the
+			// following bucket (for example from=10:03, grid=5m).
+			bucketIndex := int64(cur.Sub(from) / grid)
+			bucketStart := from.Add(time.Duration(bucketIndex) * grid)
 			bucketEnd := bucketStart.Add(grid)
 			if bucketEnd.After(to) {
 				bucketEnd = to
 			}
 			segEnd := iv.end
+			if segEnd.After(to) {
+				segEnd = to
+			}
 			if segEnd.After(bucketEnd) {
 				segEnd = bucketEnd
 			}
-			key := bucketStart.Unix()
+			if !segEnd.After(cur) {
+				break
+			}
+			key := bucketIndex
 			band := byBucket[key]
 			if band == nil {
-				band = &continuousCoverageBand{Start: bucketStart, End: bucketEnd, Status: string(iv.status)}
+				band = &continuousCoverageBand{
+					Start: bucketStart, End: bucketEnd, Status: string(iv.status),
+					DurationSeconds: bucketEnd.Sub(bucketStart).Seconds(),
+				}
 				byBucket[key] = band
 			}
 			if coverageStatusPriority(iv.status) > coverageStatusPriority(continuousCoverageStatus(band.Status)) {
 				band.Status = string(iv.status)
 			}
 			band.SampleCount += iv.sampleCount
-			band.DurationSeconds += segEnd.Sub(cur).Seconds()
+			// DurationSeconds is the full visual bucket width. CoveredSeconds and
+			// GapSeconds retain the exact in-bucket statistics separately.
 			if iv.status == continuousCoverageHealthy {
 				band.CoveredSeconds += segEnd.Sub(cur).Seconds()
 			}

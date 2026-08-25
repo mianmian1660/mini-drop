@@ -441,6 +441,46 @@ test('coverage ratio zero does not fall back to the legacy ratio', () => {
     expect(io.gapCountTotal).toBe(1);
 });
 
+test('signal coverage keeps exact gap data when bands are temporarily empty', () => {
+    const reliability = {
+        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.8 },
+        gaps: [],
+        signal_coverage: {
+            io_latency: {
+                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0, gap_seconds: 600 },
+                gaps: [{ start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:10:00Z', duration_seconds: 600 }],
+                gap_count_total: 1,
+                status: 'real_gap',
+                coverage_bands: [],
+            },
+        },
+    };
+    const io = coverageBandsFromReliability(reliability, 'io_latency');
+    expect(io.ratio).toBe(0);
+    expect(io.gapSeconds).toBe(600);
+    expect(io.gapCountTotal).toBe(1);
+    expect(io.bands[0].status).toBe('real_gap');
+});
+
+test('invalid signal coverage fields never render NaN', () => {
+    const view = coverageBandsFromReliability({
+        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.4 },
+        signal_coverage: {
+            io_latency: {
+                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 'bad', gap_seconds: 'bad' },
+                gaps: [],
+                gap_count_total: 'bad',
+                status: 'unknown',
+                coverage_bands: [{ start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:10:00Z', status: 'unknown', duration_seconds: 'bad' }],
+            },
+        },
+    }, 'io_latency');
+    expect(view.ratio).toBe(0.4);
+    expect(view.gapCountTotal).toBe(0);
+    expect(view.gapSeconds).toBe(0);
+    expect(view.bands[0].percent).toBe(0);
+});
+
 test('coverage status colors map red/yellow/gray/green correctly', () => {
     expect(coverageStatusColor('healthy')).toBe('#12b76a');
     expect(coverageStatusColor('real_gap')).toBe('#d92d20');
