@@ -136,7 +136,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [customTo, setCustomTo] = useState(() => initialWindow ? toLocalDateTimeInput(initialWindow.to) : '');
     const [customAnchorNow, setCustomAnchorNow] = useState(() => new Date().toISOString());
     const [appliedCustomWindow, setAppliedCustomWindow] = useState(null);
-    const [profileType, setProfileType] = useState(() => initialQuery?.profileType || 'cpu');
+    // Memory profiling is not currently supported by continuous collection.
+    // Keep legacy links/query state on the supported CPU view.
+    const [profileType, setProfileType] = useState('cpu');
     const [signalTab, setSignalTab] = useState('cpu');
     const [stackScope, setStackScope] = useState(() => initialQuery?.stackScope || 'all');
     const [flamegraph, setFlamegraph] = useState(null);
@@ -769,9 +771,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         </select>
                     </Field>
                     <Field label="Profile 类型">
-                        <select style={S.select} value={profileType} onChange={e => { setProfileType(e.target.value); if (e.target.value === 'memory') setSignalTab('cpu'); }}>
+                        <select style={S.select} value={profileType} onChange={e => setProfileType(e.target.value)}>
                             <option value="cpu">CPU</option>
-                            <option value="memory">Memory</option>
                         </select>
                     </Field>
                     <Field label="语言">

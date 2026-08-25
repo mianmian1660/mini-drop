@@ -653,106 +653,28 @@ test('session signal tabs only show signals configured on the session', async ()
     container.remove();
 });
 
-// ============================================================
-// 阶段七：Memory 视图（Memray profiles + RSS 诊断）
-// ============================================================
-
-test('Memory 视图：Memray profile 列表展示状态/时间窗口/进程身份', async () => {
+// Memory profiling is intentionally unavailable in the continuous profiling UI.
+test('Profile 类型仅展示 CPU，且不会加载 Memory 数据', async () => {
     profiles.flamegraph.mockResolvedValue({ code: 0, data: { nodes: [], empty: true } });
     profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
     profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
-    profiles.timeseries.mockResolvedValue({ code: 0, data: { series: [], empty: true, diagnostics: ['没有 python_rss 采集窗口'] } });
-    profiles.memoryProfiles.mockResolvedValue({ code: 0, data: { profiles: [
-        { profile_id: 'memray-1-100', window_start: '2026-08-25T10:00:00Z', window_end: '2026-08-25T10:01:00Z', pid: 1001, process_start_ms: 1724160000123, comm: 'python3', exe: '/usr/bin/python3', sample_count: 4096, status: 'ready' },
-        { profile_id: 'memray-1-100', window_start: '2026-08-25T10:01:00Z', window_end: '2026-08-25T10:02:00Z', pid: 1001, process_start_ms: 1724160000123, comm: 'python3', exe: '/usr/bin/python3', sample_count: 4096, status: 'duplicate' },
-        { profile_id: 'memray-1-200', window_start: '2026-08-25T10:00:00Z', window_end: '2026-08-25T10:01:00Z', pid: 0, comm: '', exe: '', sample_count: 0, status: 'failed', reason: 'profile 无可用样本' },
-    ], total: 3, empty: false } });
-    profiles.heapTasks.mockResolvedValue({ code: 0, data: { tasks: [] } });
+    profiles.timeseries.mockResolvedValue({ code: 0, data: { series: [], empty: true } });
     continuous.timeline.mockResolvedValue({ code: 0, data: null });
 
-    const session = {
-        sid: 'cps-mem',
-        name: 'Memory',
-        scope: 'host',
-        observed_state: 'running',
-        desired_state: 'running',
-        signals: ['cpu_profile', 'python_rss', 'python_memory'],
-    };
     const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
     const container = document.createElement('div');
     document.body.appendChild(container);
     const root = createRoot(container);
     await act(async () => {
-        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
+        root.render(<ContinuousProfilingPanel target={target} fixedSession={{ sid: 'cps-cpu', signals: ['cpu_profile'] }} initialQuery={{ profileType: 'memory' }} />);
     });
     await act(async () => { await Promise.resolve(); });
 
-    // 切到 Memory 类型
-    const select = container.querySelector('select');
-    const selects = container.querySelectorAll('select');
-    const profileTypeSelect = Array.from(selects).find(el => Array.from(el.options).some(opt => opt.value === 'memory'));
-    expect(profileTypeSelect).not.toBeNull();
-    await act(async () => {
-        Simulate.change(profileTypeSelect, { target: { value: 'memory' } });
-    });
-    await act(async () => { await Promise.resolve(); });
-    await act(async () => { await Promise.resolve(); });
-
-    expect(profiles.memoryProfiles).toHaveBeenCalled();
-    expect(container.textContent).toContain('Memray Allocation Profiles');
-    expect(container.textContent).toContain('memray-1-100');
-    expect(container.textContent).toContain('ready');
-    expect(container.textContent).toContain('duplicate');
-    expect(container.textContent).toContain('failed');
-    expect(container.textContent).toContain('profile 无可用样本');
-    // RSS 空态诊断
-    expect(container.textContent).toContain('没有 python_rss 采集窗口');
-
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('Memory 视图：RSS 趋势展示截断诊断', async () => {
-    profiles.flamegraph.mockResolvedValue({ code: 0, data: { nodes: [], empty: true } });
-    profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
-    profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
-    profiles.timeseries.mockResolvedValue({ code: 0, data: {
-        series: [{ pid: 123, process_start_ms: 1000, comm: 'python3', exe: '/usr/bin/python3', peak: 1048576, points: [{ timestamp: '2026-08-25T10:00:00Z', value: 1048576 }] }],
-        empty: false, rss_truncated: 3, process_count: 1,
-        diagnostics: ['Agent 侧进程数超过上限，RSS 采样被截断（最多 3 个进程）'],
-    } });
-    profiles.memoryProfiles.mockResolvedValue({ code: 0, data: { profiles: [], total: 0, empty: true } });
-    profiles.heapTasks.mockResolvedValue({ code: 0, data: { tasks: [] } });
-    continuous.timeline.mockResolvedValue({ code: 0, data: null });
-
-    const session = {
-        sid: 'cps-mem2',
-        name: 'Memory',
-        scope: 'host',
-        observed_state: 'running',
-        desired_state: 'running',
-        signals: ['cpu_profile', 'python_rss', 'python_memory'],
-    };
-    const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    await act(async () => {
-        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
-    });
-    await act(async () => { await Promise.resolve(); });
-
-    const selects = container.querySelectorAll('select');
-    const profileTypeSelect = Array.from(selects).find(el => Array.from(el.options).some(opt => opt.value === 'memory'));
-    await act(async () => {
-        Simulate.change(profileTypeSelect, { target: { value: 'memory' } });
-    });
-    await act(async () => { await Promise.resolve(); });
-    await act(async () => { await Promise.resolve(); });
-
-    expect(container.textContent).toContain('Python RSS 趋势');
-    expect(container.textContent).toContain('已截断 3');
-    expect(container.textContent).toContain('RSS 采样被截断');
+    const profileTypeSelect = Array.from(container.querySelectorAll('select')).find(el => el.value === 'cpu');
+    expect(profileTypeSelect).not.toBeUndefined();
+    expect(Array.from(profileTypeSelect.options).map(option => option.value)).toEqual(['cpu']);
+    expect(profiles.memoryProfiles).not.toHaveBeenCalled();
+    expect(profiles.heapTasks).not.toHaveBeenCalled();
 
     act(() => root.unmount());
     container.remove();
