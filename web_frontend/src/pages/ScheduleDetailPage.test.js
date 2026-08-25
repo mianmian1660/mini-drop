@@ -13,7 +13,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 
 jest.mock('../api', () => ({
     schedules: { detail: jest.fn(), toggle: jest.fn(), delete: jest.fn() },
-    tasks: { timeline: jest.fn(), diff: jest.fn(), cancel: jest.fn() },
+    tasks: { timeline: jest.fn(), diff: jest.fn(), diffFlamegraph: jest.fn(), cancel: jest.fn() },
 }));
 
 jest.mock('../components/TimelineChart', () => {
@@ -21,6 +21,14 @@ jest.mock('../components/TimelineChart', () => {
     MockTimelineChart.statusColor = () => '#4caf50';
     return MockTimelineChart;
 });
+
+// InlineDiffPanel（经 ScheduleTimeline 渲染）里的 InteractiveFlamegraph 拉真实
+// d3-selection/d3-flame-graph（ESM），jest 不跑真实 d3，见同款处理
+// ContinuousProfilingPanel.test.js / InlineDiffPanel.test.js。
+jest.mock('../components/InteractiveFlamegraph', () => ({
+    __esModule: true,
+    default: () => null,
+}));
 
 jest.mock('../utils/time', () => ({
     browserTimeZoneLabel: () => '本地时区',

@@ -850,6 +850,46 @@ func (s *APIServer) UpdateContinuousSessionLabels(c *gin.Context) {
 	s.RespondOK(c, gin.H{"session": session})
 }
 
+// ListDBTestScenarios 返回预置的数据库测试场景清单，供前端"运行测试场景"
+// 卡片一键应用 db_targets，供 demo/验收使用。场景对应的 fault-mysql 容器
+// 需要运维提前按 scripts/db_snapshot_acceptance.sh 里记录的步骤建好，这里
+// 只是把已知能跑通的配置和对应的故障注入命令固定下来，不做场景的持久化
+// 管理（数量少，硬编码足够，不值得为 demo 功能建表）。
+func (s *APIServer) ListDBTestScenarios(c *gin.Context) {
+	s.RespondOK(c, gin.H{"scenarios": dbTestScenarios})
+}
+
+var dbTestScenarios = []gin.H{
+	{
+		"id":          "mysql-lock-wait",
+		"title":       "MySQL 锁等待场景",
+		"description": "两个连接互相持锁阻塞，验证锁等待检测链路",
+		"target": gin.H{
+			"engine":         "mysql",
+			"instance_label": "orders-mysql",
+			"host":           "127.0.0.1",
+			"port":           3306,
+			"user":           "mini_drop",
+			"password_ref":   "/etc/mini-drop/db-credentials.d/orders-mysql.env",
+		},
+		"inject_hint": "docker exec fault-mysql mysql -uroot -proot -e \"USE orders; START TRANSACTION; UPDATE order_line SET status='lock' WHERE id=1; SELECT SLEEP(25);\" &\nsleep 2\ndocker exec fault-mysql mysql -uroot -proot -e \"USE orders; UPDATE order_line SET status='blocked' WHERE id=1;\"",
+	},
+	{
+		"id":          "mysql-slow-query",
+		"title":       "MySQL 慢查询场景",
+		"description": "持续跑不走索引的查询，验证 digest 环比检测",
+		"target": gin.H{
+			"engine":         "mysql",
+			"instance_label": "orders-mysql",
+			"host":           "127.0.0.1",
+			"port":           3306,
+			"user":           "mini_drop",
+			"password_ref":   "/etc/mini-drop/db-credentials.d/orders-mysql.env",
+		},
+		"inject_hint": "for i in $(seq 1 40); do docker exec fault-mysql mysql -uroot -proot -N -e \"SELECT COUNT(*) FROM orders.order_line WHERE status='new';\"; sleep 1; done",
+	},
+}
+
 func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	var req ContinuousBatchIngestReq
 	if err := c.ShouldBindJSON(&req); err != nil {

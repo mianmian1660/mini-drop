@@ -2497,6 +2497,25 @@ func (s *APIServer) GetTaskDiff(c *gin.Context) {
 		return
 	}
 
+	// format=flamegraph：走差分火焰图路径（folded.txt 建树 + 归一化 + 复用
+	// 持续采集已有的 diffContinuousTreeNode/truncateDiffTree），不传或传
+	// table 时维持原有的 top.json 扁平表格对比，行为不变。
+	if strings.EqualFold(strings.TrimSpace(c.Query("format")), "flamegraph") {
+		maxNodes := 0
+		if raw := strings.TrimSpace(c.Query("max_nodes")); raw != "" {
+			if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+				maxNodes = v
+			}
+		}
+		result, reason := s.buildTaskDiffFlamegraph(baselineTask, compareTask, maxNodes)
+		if reason != "" {
+			c.JSON(http.StatusConflict, gin.H{"code": 409, "message": reason})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"code": 0, "data": result})
+		return
+	}
+
 	// 缺产物时说明是哪一侧、为什么缺，而不是回空表让用户自己猜
 	fetchSide := func(t *model.HotmethodTask, field string) ([]map[string]interface{}, bool) {
 		top := s.fetchTopFunctions(t.TID)

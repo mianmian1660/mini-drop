@@ -94,6 +94,13 @@ export const tasks = {
         client.get('/api/v1/tasks/diff', {
             params: { baseline_tid: baselineTid, compare_tid: compareTid, threshold },
         }),
+    // 差分火焰图（GetTaskDiff 的 format=flamegraph 分支）：调用栈按各自任务总样本数
+    // 归一化成百分比后再对齐两棵树；eBPF 直方图类任务没有调用栈，会 409。
+    // GET /api/v1/tasks/diff?baseline_tid=&compare_tid=&format=flamegraph
+    diffFlamegraph: (baselineTid, compareTid) =>
+        client.get('/api/v1/tasks/diff', {
+            params: { baseline_tid: baselineTid, compare_tid: compareTid, format: 'flamegraph' },
+        }),
 };
 
 // ---------- Native Continuous Profiling ----------
@@ -123,6 +130,7 @@ export const continuous = {
     query: (params = {}) => client.get('/api/v1/continuous/query', { params }),
     histogram: (params = {}) => client.get('/api/v1/continuous/histogram', { params }),
     dbSnapshot: (params = {}) => client.get('/api/v1/continuous/db-snapshot', { params }),
+    dbTestScenarios: () => client.get('/api/v1/continuous/db-test-scenarios'),
 };
 
 // ---------- 分析结果 ----------

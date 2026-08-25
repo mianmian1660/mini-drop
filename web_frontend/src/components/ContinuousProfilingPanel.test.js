@@ -6,6 +6,8 @@ jest.mock('../api', () => ({
     continuous: {
         timeline: jest.fn(),
         histogram: jest.fn(),
+        dbTestScenarios: jest.fn(() => Promise.resolve({ code: 0, data: { scenarios: [] } })),
+        updateLabels: jest.fn(() => Promise.resolve({ code: 0, data: {} })),
     },
     profiles: {
         flamegraph: jest.fn(),
@@ -68,6 +70,10 @@ global.IS_REACT_ACT_ENVIRONMENT = true;
 
 beforeEach(() => {
     jest.clearAllMocks();
+    // react-scripts 的 jest 预设开了 resetMocks，jest.mock 工厂里给 dbTestScenarios
+    // 设的默认返回值每个测试前都会被清空，DBSnapshotPanel 现在无条件挂载
+    // TestScenarioCard 会调用它，这里统一给个空场景列表兜底，不影响各测试自己的断言。
+    continuous.dbTestScenarios.mockResolvedValue({ code: 0, data: { scenarios: [] } });
 });
 
 test('diagnostic JSON uses two-space indentation for nested values', () => {

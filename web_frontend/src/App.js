@@ -27,7 +27,6 @@ import LoginPage from './pages/LoginPage';
 import ProfilesPage from './pages/ProfilesPage';
 import HostDetailPage from './pages/HostDetailPage';
 import ContinuousSessionDetailPage from './pages/ContinuousSessionDetailPage';
-import DBAccountsPage from './pages/DBAccountsPage';
 
 // ============================================================
 // CSS 样式
@@ -130,9 +129,9 @@ export default function App() {
                 <nav className="app-nav" style={styles.nav}>
                     <Link to="/" style={styles.navLink}>首页</Link>
                     <span style={{ color: '#555' }}>|</span>
-                    <Link to="/db-accounts" style={{ ...styles.userInfo, textDecoration: 'none', cursor: 'pointer' }}>
+                    <span style={styles.userInfo}>
                         👤 {userName}
-                    </Link>
+                    </span>
                     <button style={styles.logoutBtn} onClick={handleLogout}>退出</button>
                 </nav>
             </header>
@@ -150,7 +149,6 @@ export default function App() {
                 <Route path="/task/result" element={<TaskResultPage />} />
                 <Route path="/timeline" element={<TimelinePage />} />
                 <Route path="/task/diff" element={<TaskDiffPage />} />
-                <Route path="/db-accounts" element={<DBAccountsPage />} />
                 <Route path="/login" element={<LoginPage onLoginSuccess={handleLoginSuccess} />} />
             </Routes>
         </div>

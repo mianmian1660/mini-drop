@@ -910,7 +910,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 />
                 {sampleNotice && <div style={{ ...S.info, marginTop: 12 }}>{sampleNotice}</div>}
                 {coverageAlert && <CoverageAlert alert={coverageAlert} />}
-			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} targetIP={target?.ip} timeWindow={timeWindow} />
+			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} targetIP={target?.ip} timeWindow={timeWindow} sid={sessionSID} sessionLabels={decodeJSONField(fixedSession?.labels, {})} />
                 : <HistogramPanel
                     data={histogram} loading={querying}
                     title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'}
@@ -2034,10 +2034,83 @@ function DBMetricTrends({ metrics }) {
     );
 }
 
+// "运行测试场景"：demo/验收场景下，与其让人手填 host/port/user/password_ref
+// 一堆字段（容易在密码文件格式上翻车），不如把已经在 VM 上验证过的固定配置
+// 包成一键应用的卡片——应用只是复用现有的 updateLabels 写 db_targets，
+// 不新增写路径；真正的故障注入命令仍由人在终端里跑，不做"前端一键触发远程
+// SQL"，那属于新增攻击面，不值得为演示引入。
+function TestScenarioCard({ sid, sessionLabels }) {
+    const [scenarios, setScenarios] = useState([]);
+    const [applying, setApplying] = useState('');
+    const [appliedId, setAppliedId] = useState('');
+    const [error, setError] = useState('');
+
+    useEffect(() => {
+        let cancelled = false;
+        continuous.dbTestScenarios()
+            .then(response => { if (!cancelled && response.code === 0) setScenarios(response.data?.scenarios || []); })
+            .catch(() => { if (!cancelled) setScenarios([]); });
+        return () => { cancelled = true; };
+    }, []);
+
+    if (scenarios.length === 0) return null;
+
+    const apply = async scenario => {
+        if (!sid || applying) return;
+        setApplying(scenario.id);
+        setError('');
+        try {
+            const response = await continuous.updateLabels(sid, { ...sessionLabels, db_targets: [scenario.target] });
+            if (response.code !== 0) throw new Error(response.message || '应用失败');
+            setAppliedId(scenario.id);
+        } catch (err) {
+            setError(err?.response?.data?.message || err?.message || '应用失败');
+        } finally {
+            setApplying('');
+        }
+    };
+
+    const applied = scenarios.find(item => item.id === appliedId);
+
+    return (
+        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 16, marginBottom: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: '#344054' }}>运行测试场景</span>
+                <span style={{ fontSize: 11, color: '#98a2b3' }}>应用到当前会话，已在 VM 验证可用</span>
+            </div>
+            {error && <div style={{ marginBottom: 10, color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: 8, fontSize: 12 }}>{error}</div>}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10 }}>
+                {scenarios.map(scenario => (
+                    <div key={scenario.id} style={{ border: '1px solid #e5e7eb', borderRadius: 8, padding: 12 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>{scenario.title}</div>
+                        <p style={{ margin: '0 0 10px', fontSize: 12, color: '#667085', lineHeight: 1.5 }}>{scenario.description}</p>
+                        <button
+                            type="button"
+                            disabled={!sid || applying === scenario.id}
+                            onClick={() => apply(scenario)}
+                            style={{ background: '#315efb', color: '#fff', border: 0, borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 700, cursor: !sid || applying === scenario.id ? 'not-allowed' : 'pointer', opacity: !sid ? 0.6 : 1 }}
+                        >
+                            {applying === scenario.id ? '应用中...' : '应用'}
+                        </button>
+                    </div>
+                ))}
+            </div>
+            {applied && (
+                <div style={{ marginTop: 10, background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: 6, padding: 10 }}>
+                    <div style={{ fontSize: 11, color: '#067647', fontWeight: 700, marginBottom: 6 }}>
+                        已应用「{applied.title}」，现场执行下方命令注入故障
+                    </div>
+                    <pre style={{ margin: 0, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11, color: '#344054', background: '#fff', border: '1px solid #eaecf0', borderRadius: 4, padding: 8, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{applied.inject_hint}</pre>
+                </div>
+            )}
+        </div>
+    );
+}
+
 // 锁等待链单独成表而不是并进 digest 表：digest 是"这段时间哪些 SQL 累计
 // 最慢"（聚合量），锁等待是"某一时刻谁在等谁"（时点事实），两者聚合口径不
 // 同，合并展示会让人误以为锁等待也是累计值。
-export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
+export function DBSnapshotPanel({ data, loading, targetIP, timeWindow, sid, sessionLabels }) {
     const [events, setEvents] = useState([]);
 
     useEffect(() => {
@@ -2049,12 +2122,19 @@ export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
         return () => { cancelled = true; };
     }, [targetIP, timeWindow?.from, timeWindow?.to]);
 
-    if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询数据库快照...</div></section>;
+    if (loading && !data) return (
+        <>
+            <TestScenarioCard sid={sid} sessionLabels={sessionLabels} />
+            <section style={S.card}><div style={S.empty}>正在查询数据库快照...</div></section>
+        </>
+    );
     const digests = data?.digests || [];
     const lockWaits = data?.lock_waits || [];
     const deadlocks = data?.deadlocks || [];
     const firedEvents = events.filter(e => e.status === 'fired_no_action');
     return (
+        <>
+        <TestScenarioCard sid={sid} sessionLabels={sessionLabels} />
         <section style={S.card}>
             <div style={S.sectionHead}>
                 <div>
@@ -2171,6 +2251,7 @@ export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
                 </>
             )}
         </section>
+        </>
     );
 }
 

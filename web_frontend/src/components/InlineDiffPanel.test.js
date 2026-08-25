@@ -13,7 +13,14 @@ jest.mock('react-router-dom', () => ({
 }));
 
 jest.mock('../api', () => ({
-    tasks: { diff: jest.fn() },
+    tasks: { diff: jest.fn(), diffFlamegraph: jest.fn() },
+}));
+
+// InteractiveFlamegraph 拉真实 d3-selection/d3-flame-graph（ESM），jest 不跑真实 d3
+// （和 ContinuousProfilingPanel.test.js 的处理一致），这里只关心表格 tab 的既有断言。
+jest.mock('./InteractiveFlamegraph', () => ({
+    __esModule: true,
+    default: () => null,
 }));
 
 import InlineDiffPanel from './InlineDiffPanel';
