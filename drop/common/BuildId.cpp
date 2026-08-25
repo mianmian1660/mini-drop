@@ -253,13 +253,11 @@ namespace drop
                 continue;
             // 只对可执行/只读代码段尝试（r-xp / r--p），避免误取匿名段。
             string link = "/proc/" + to_string(pid) + "/map_files/" + range;
-            char buf[4096];
-            ssize_t n = ::readlink(link.c_str(), buf, sizeof(buf) - 1);
-            if (n <= 0)
-                continue;
-            buf[n] = '\0';
-            if (file_readable(string(buf)))
-                return string(buf);
+            // deleted mapping 的 readlink 目标通常是已不存在的
+            // "/path/lib.so (deleted)"；真正仍可 open 的是 map_files
+            // 链接本身，不能对 readlink 结果做 file_readable。
+            if (file_readable(link))
+                return link;
         }
         return "";
     }

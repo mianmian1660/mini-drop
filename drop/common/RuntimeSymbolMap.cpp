@@ -18,6 +18,7 @@
 #include <mutex>
 #include <sstream>
 #include <set>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -291,6 +292,8 @@ bool runtime_copy_map_atomic(const std::string &src, const std::string &dst)
     std::ostringstream tmpSuffix;
     tmpSuffix << ".tmp" << ::getpid() << "." << std::this_thread::get_id();
     std::string tmp = dst + tmpSuffix.str();
+    struct stat srcStat {};
+    const bool haveSourceStat = ::stat(src.c_str(), &srcStat) == 0;
     {
         std::ifstream in(src, std::ios::binary);
         if (!in.is_open())
@@ -305,6 +308,12 @@ bool runtime_copy_map_atomic(const std::string &src, const std::string &dst)
             ::remove(tmp.c_str());
             return false;
         }
+    }
+    if (haveSourceStat)
+    {
+        ::chmod(tmp.c_str(), srcStat.st_mode & 0777);
+        struct timespec times[2] = {srcStat.st_atim, srcStat.st_mtim};
+        ::utimensat(AT_FDCWD, tmp.c_str(), times, 0);
     }
     if (::rename(tmp.c_str(), dst.c_str()) != 0)
     {

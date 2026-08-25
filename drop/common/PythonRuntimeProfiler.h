@@ -32,7 +32,9 @@ struct PythonFallbackResult
     std::string comm;
     std::string exe;
     bool ready = false;
+    bool nativeStacks = false; // 本次成功结果是否实际使用 --native
     std::string reason;
+    std::string warning;       // 成功但发生可观测降级（例如 native 展开失败）
     std::vector<PythonStackSample> samples;
     // 阶段四：py-spy 真实 capture 区间（wall clock）。结果只能替换时间重叠
     // 且身份一致的 perf 样本；过期结果不得应用到后续 PID 或窗口。
@@ -109,7 +111,7 @@ PythonRuntimeProbe probe_python_runtime(int pid);
 std::vector<PythonCandidate> hottest_python_candidates_by_cpu_ticks(size_t limit);
 
 /// 是否启用 py-spy native 栈（C 扩展调用链）。DROP_NATIVE_CP_PYSPY_NATIVE，
-/// 默认开启。
+/// 默认关闭；开启后失败会自动降级为纯 Python 栈。
 bool pyspy_native_enabled();
 
 /// Parses py-spy folded/raw output. Frames remain root-to-leaf.

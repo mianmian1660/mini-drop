@@ -92,6 +92,7 @@ struct FrameCounts
     uint64_t total = 0;      // 非内核帧权重
     uint64_t unresolved = 0; // 未解析帧权重（非内核）
     uint64_t semantic = 0;   // 本语言语义帧权重
+    uint64_t semanticSample = 0; // 至少含一个语义帧的样本权重
 };
 
 FrameCounts accumulate_sample_frames(
@@ -101,6 +102,7 @@ FrameCounts accumulate_sample_frames(
     bool excludeInfrastructure)
 {
     FrameCounts counts;
+    bool hasSemanticFrame = false;
     size_t index = 0;
     for (const auto &frameText : sample.stack)
     {
@@ -119,8 +121,13 @@ FrameCounts accumulate_sample_frames(
             continue;
         }
         if (isSemantic(structured, frameText))
+        {
             counts.semantic = add_count(counts.semantic, weight);
+            hasSemanticFrame = true;
+        }
     }
+    if (hasSemanticFrame)
+        counts.semanticSample = clamp_count(sample.count);
     return counts;
 }
 
@@ -288,12 +295,32 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         ProcessIdentity identity{pid, startMs, exe, ""};
         return identity_targeted(*targets, identity);
     };
-    auto liveIdentityMatched = [&](int pid) {
-        if (targets == nullptr)
-            return true;
-        int64_t startMs = 0;
-        drop::python_process_start_ms(pid, &startMs);
-        return identityMatched(pid, startMs, read_exe(pid));
+    auto processIdentity = [&](int pid, int64_t *startMs, std::string *exe, std::string *comm) {
+        for (const auto &sample : samples)
+        {
+            if (sample.pid != pid || sample.processStartMs <= 0 || sample.exe.empty())
+                continue;
+            *startMs = sample.processStartMs;
+            *exe = sample.exe;
+            *comm = sample.comm;
+            return identityMatched(pid, *startMs, *exe);
+        }
+        if (targets != nullptr)
+        {
+            for (const auto &target : *targets)
+            {
+                if (target.pid != pid)
+                    continue;
+                *startMs = target.processStartMs;
+                *exe = target.exe;
+                *comm = target.comm;
+                return identityMatched(pid, *startMs, *exe);
+            }
+            return false;
+        }
+        drop::python_process_start_ms(pid, startMs);
+        *exe = read_exe(pid);
+        return *startMs > 0 && !exe->empty();
     };
 
     // ---- 按语言聚合帧统计与样本权重 ----
@@ -301,6 +328,8 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
     {
         FrameCounts counts;
         uint64_t sampleWeight = 0;
+        uint64_t targetModuleFrames = 0;
+        uint64_t targetModuleUnresolved = 0;
     };
     std::map<std::string, LangStats> stats;
     const std::vector<std::string> kLanguages = {"go", "java", "node", "python", "native", "kernel"};
@@ -355,11 +384,44 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         entry.counts.total = add_count(entry.counts.total, counts.total);
         entry.counts.unresolved = add_count(entry.counts.unresolved, counts.unresolved);
         entry.counts.semantic = add_count(entry.counts.semantic, counts.semantic);
+        entry.counts.semanticSample = add_count(entry.counts.semanticSample, counts.semanticSample);
+        if (runtime == "native" && frames != nullptr && !sample.exe.empty())
+        {
+            for (size_t i = 0; i < sample.stack.size(); ++i)
+            {
+                const auto &structured = (*frames)[i];
+                if (structured.mappingFile.empty())
+                    continue;
+                const bool ownModule = structured.mappingFile == sample.exe ||
+                                       path_basename(structured.mappingFile) == path_basename(sample.exe);
+                if (!ownModule)
+                    continue;
+                entry.targetModuleFrames = add_count(entry.targetModuleFrames, sample.count);
+                if (unresolved_frame(sample.stack[i]))
+                    entry.targetModuleUnresolved =
+                        add_count(entry.targetModuleUnresolved, sample.count);
+            }
+        }
     }
 
     auto makeEntry = [&](const std::string &lang) -> LanguageStatusEntry & {
         LanguageStatusEntry empty;
         return report.languages.emplace(lang, empty).first->second;
+    };
+    auto populateQuality = [&](LanguageStatusEntry *entry, const LangStats &lang) {
+        entry->sampleCount = lang.sampleWeight;
+        entry->frameWeight = lang.counts.total;
+        entry->semanticFrameWeight = lang.counts.semantic;
+        entry->unresolvedFrameWeight = lang.counts.unresolved;
+        entry->semanticSampleWeight = lang.counts.semanticSample;
+        entry->targetModuleFrameWeight = lang.targetModuleFrames;
+        entry->targetModuleUnresolvedFrameWeight = lang.targetModuleUnresolved;
+        entry->semanticFramePercent = percent(lang.counts.semantic, lang.counts.total);
+        entry->semanticSamplePercent = percent(lang.counts.semanticSample, lang.sampleWeight);
+        entry->unresolvedFramePercent = percent(lang.counts.unresolved, lang.counts.total);
+        entry->targetModuleUnresolvedPercent =
+            percent(lang.targetModuleUnresolved, lang.targetModuleFrames);
+        entry->symbolStatus = symbol_status_from_weights(lang.counts.total, lang.counts.unresolved);
     };
 
     // ---- Native 行 ----
@@ -370,14 +432,14 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         const bool detected = lang.sampleWeight > 0;
         entry.runtimeDetection = detected ? "detected" : "not_detected";
         entry.collectorModes.push_back(unwindMode == "dwarf" ? "perf-dwarf" : "perf-fp");
-        entry.sampleCount = lang.sampleWeight;
-        entry.semanticFramePercent = percent(lang.counts.semantic, lang.counts.total);
-        entry.unresolvedFramePercent = percent(lang.counts.unresolved, lang.counts.total);
-        entry.symbolStatus = symbol_status_from_weights(lang.counts.total, lang.counts.unresolved);
+        populateQuality(&entry, lang);
+        const bool nativeSymbolsReady = entry.targetModuleFrameWeight > 0
+                                            ? entry.targetModuleUnresolvedPercent < 5.0
+                                            : entry.unresolvedFramePercent <= 20.0;
         entry.collectorStatus = aggregate_collector_status(
             detected, detected, false, false, false,
-            entry.semanticFramePercent >= 70.0, entry.unresolvedFramePercent <= 20.0);
-        if (detected && entry.collectorStatus == "missing" && entry.unresolvedFramePercent > 20.0)
+            entry.semanticSamplePercent >= 70.0, nativeSymbolsReady);
+        if (detected && entry.collectorStatus != "ready")
             append_reason(&entry.reasons,
                           unwindMode == "dwarf"
                               ? "high unresolved ratio under DWARF unwinding"
@@ -395,10 +457,7 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         entry.runtimeDetection = detected ? "detected" : "not_detected";
         if (!go.ready.empty())
             entry.collectorModes.push_back("goresym");
-        entry.sampleCount = lang.sampleWeight;
-        entry.semanticFramePercent = percent(lang.counts.semantic, lang.counts.total);
-        entry.unresolvedFramePercent = percent(lang.counts.unresolved, lang.counts.total);
-        entry.symbolStatus = symbol_status_from_weights(lang.counts.total, lang.counts.unresolved);
+        populateQuality(&entry, lang);
 
         bool anyReady = !go.ready.empty();
         bool anyPending = !go.pending.empty();
@@ -419,7 +478,7 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
 
         // 阶段四：Go 的 ready 以质量为准——perf 原生符号（非 stripped 程序）
         // 已达到覆盖门槛时，不要求 GoReSym 产物；GoReSym 只是 stripped 兜底。
-        const bool qualityOk = entry.semanticFramePercent >= 70.0 &&
+        const bool qualityOk = entry.semanticSamplePercent >= 70.0 &&
                                entry.unresolvedFramePercent <= 20.0;
         if (!detected)
             entry.collectorStatus = "not_applicable";
@@ -457,26 +516,26 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
                                !diagnostics.pythonFallback.empty());
         entry.runtimeDetection = detected ? "detected" : "not_detected";
 
-        bool anyReadyProc = false, anyMissingProc = false, anyFailedProc = false;
+        bool anyPerfMapReady = false;
         if (info != nullptr)
         {
             std::set<int> attachFailed(info->failedAttachPids.begin(), info->failedAttachPids.end());
             for (int pid : info->readyPids)
             {
-                if (!liveIdentityMatched(pid))
-                    continue;
                 LanguageProcessStatus proc;
+                if (!processIdentity(pid, &proc.processStartMs, &proc.exe, &proc.comm))
+                    continue;
                 proc.pid = pid;
                 proc.mode = def.mode;
                 proc.status = "ready";
                 entry.processes.push_back(std::move(proc));
-                anyReadyProc = true;
+                anyPerfMapReady = true;
             }
             for (int pid : info->missingPids)
             {
-                if (!liveIdentityMatched(pid))
-                    continue;
                 LanguageProcessStatus proc;
+                if (!processIdentity(pid, &proc.processStartMs, &proc.exe, &proc.comm))
+                    continue;
                 proc.pid = pid;
                 proc.mode = def.mode;
                 // 阶段四：确定性 attach 失败（权限/退出/超时）标 failed，
@@ -485,21 +544,16 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
                 {
                     proc.status = "failed";
                     proc.reason = info->reason;
-                    anyFailedProc = true;
                 }
                 else
                 {
                     proc.status = "missing";
                     proc.reason = info->reason;
-                    anyMissingProc = true;
                 }
                 entry.processes.push_back(std::move(proc));
             }
         }
-        entry.sampleCount = lang.sampleWeight;
-        entry.semanticFramePercent = percent(lang.counts.semantic, lang.counts.total);
-        entry.unresolvedFramePercent = percent(lang.counts.unresolved, lang.counts.total);
-        entry.symbolStatus = symbol_status_from_weights(lang.counts.total, lang.counts.unresolved);
+        populateQuality(&entry, lang);
 
         if (info != nullptr && !info->reason.empty())
             append_reason(&entry.reasons, info->reason);
@@ -519,20 +573,31 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
                 proc.processStartMs = result.startMs;
                 proc.comm = result.comm;
                 proc.exe = result.exe;
-                proc.mode = "py-spy-native";
+                proc.mode = result.nativeStacks ? "py-spy-native" : "py-spy";
                 proc.status = result.ready ? "ready" : "failed";
-                proc.reason = result.ready ? "" : result.reason;
+                proc.reason = result.ready ? result.warning : result.reason;
+                // 已就绪的 fallback 满足该进程的语言采集能力，不能再把
+                // 同一 PID 缺 perf-map 计为进程级 missing。
+                if (result.ready)
+                    entry.processes.erase(
+                        std::remove_if(entry.processes.begin(), entry.processes.end(),
+                                       [&](const auto &existing) {
+                                           return existing.pid == result.pid &&
+                                                  existing.mode == "perf-map" &&
+                                                  existing.status == "missing";
+                                       }),
+                        entry.processes.end());
                 entry.processes.push_back(std::move(proc));
                 if (result.ready)
                 {
-                    anyReadyProc = true;
                     if (std::find(entry.collectorModes.begin(), entry.collectorModes.end(),
-                                  "py-spy-native") == entry.collectorModes.end())
-                        entry.collectorModes.push_back("py-spy-native");
+                                  result.nativeStacks ? "py-spy-native" : "py-spy") ==
+                        entry.collectorModes.end())
+                        entry.collectorModes.push_back(result.nativeStacks ? "py-spy-native" : "py-spy");
+                    append_reason(&entry.reasons, result.warning);
                 }
                 else
                 {
-                    anyFailedProc = true;
                     append_reason(&entry.reasons, result.reason);
                 }
             }
@@ -545,14 +610,22 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
 
         // perf-map 模式只有在确实拿到 map 时才登记，缺 flag 的 missing 进程
         // 不能把模式伪装成可用。
-        if (anyReadyProc &&
+        if (anyPerfMapReady &&
             std::find(entry.collectorModes.begin(), entry.collectorModes.end(), def.mode) ==
                 entry.collectorModes.end())
             entry.collectorModes.insert(entry.collectorModes.begin(), def.mode);
 
+        bool anyReadyProc = false, anyMissingProc = false, anyFailedProc = false;
+        for (const auto &proc : entry.processes)
+        {
+            anyReadyProc = anyReadyProc || proc.status == "ready";
+            anyMissingProc = anyMissingProc || proc.status == "missing";
+            anyFailedProc = anyFailedProc || proc.status == "failed";
+        }
+
         entry.collectorStatus = aggregate_collector_status(
             detected, anyReadyProc, anyMissingProc, anyFailedProc, false,
-            entry.semanticFramePercent >= 70.0, entry.unresolvedFramePercent <= 20.0);
+            entry.semanticSamplePercent >= 70.0, entry.unresolvedFramePercent <= 20.0);
         if (detected && entry.collectorStatus == "missing")
         {
             if (def.name == std::string("node"))
@@ -571,10 +644,7 @@ LanguageStatusReport build_language_status(const std::vector<AggregatedSample> &
         const bool detected = lang.sampleWeight > 0;
         entry.runtimeDetection = detected ? "detected" : "not_detected";
         entry.collectorModes.push_back("kallsyms");
-        entry.sampleCount = lang.sampleWeight;
-        entry.semanticFramePercent = percent(lang.counts.semantic, lang.counts.total);
-        entry.unresolvedFramePercent = percent(lang.counts.unresolved, lang.counts.total);
-        entry.symbolStatus = symbol_status_from_weights(lang.counts.total, lang.counts.unresolved);
+        populateQuality(&entry, lang);
         entry.collectorStatus = detected ? "ready" : "not_applicable";
     }
 
@@ -604,7 +674,18 @@ std::string language_status_to_json(const LanguageStatusReport &report)
         body += "\"collector_status\":\"" + json_escape(entry.collectorStatus) + "\",";
         body += "\"symbol_status\":\"" + json_escape(entry.symbolStatus) + "\",";
         body += "\"semantic_frame_percent\":" + format_percent(entry.semanticFramePercent) + ",";
+        body += "\"semantic_sample_percent\":" + format_percent(entry.semanticSamplePercent) + ",";
         body += "\"unresolved_frame_percent\":" + format_percent(entry.unresolvedFramePercent) + ",";
+        body += "\"target_module_unresolved_percent\":" +
+                format_percent(entry.targetModuleUnresolvedPercent) + ",";
+        body += "\"frame_weight\":" + std::to_string(entry.frameWeight) + ",";
+        body += "\"semantic_frame_weight\":" + std::to_string(entry.semanticFrameWeight) + ",";
+        body += "\"unresolved_frame_weight\":" + std::to_string(entry.unresolvedFrameWeight) + ",";
+        body += "\"semantic_sample_weight\":" + std::to_string(entry.semanticSampleWeight) + ",";
+        body += "\"target_module_frame_weight\":" +
+                std::to_string(entry.targetModuleFrameWeight) + ",";
+        body += "\"target_module_unresolved_frame_weight\":" +
+                std::to_string(entry.targetModuleUnresolvedFrameWeight) + ",";
         body += "\"sample_count\":" + std::to_string(entry.sampleCount) + ",";
         body += "\"reasons\":[";
         for (size_t i = 0; i < entry.reasons.size(); ++i)

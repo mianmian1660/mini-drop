@@ -93,8 +93,44 @@ TEST(LanguageStatusReport, ReadyRequiresSemanticThreshold)
     EXPECT_EQ(java->collectorStatus, "ready");
     EXPECT_EQ(java->symbolStatus, "complete");
     EXPECT_EQ(java->semanticFramePercent, 100.0);
+    EXPECT_EQ(java->semanticSamplePercent, 100.0);
     EXPECT_EQ(java->unresolvedFramePercent, 0.0);
     EXPECT_EQ(java->sampleCount, 10u);
+}
+
+TEST(LanguageStatusReport, ReadyUsesSemanticSampleCoverageNotStackDepth)
+{
+    PhysicalDiagnostics diagnostics;
+    diagnostics.runtimeReport.java.detected = true;
+    diagnostics.runtimeReport.java.ready = true;
+    diagnostics.runtimeReport.java.readyPids = {42};
+
+    // 每个样本都命中业务方法，但栈里还有已解析的 JVM 辅助帧。帧占比只有
+    // 25%，语言级样本覆盖是 100%，采集能力应判 ready。
+    std::vector<AggregatedSample> samples = {
+        makeSample("java", 42, 10,
+                   {"com.example.Burner.work", "CompilerThread", "Safepoint", "VMThread"})};
+    LanguageStatusReport report = build_language_status(samples, diagnostics, nullptr, "fp");
+    const LanguageStatusEntry *java = report.find("java");
+    ASSERT_NE(java, nullptr);
+    EXPECT_EQ(java->semanticFramePercent, 25.0);
+    EXPECT_EQ(java->semanticSamplePercent, 100.0);
+    EXPECT_EQ(java->collectorStatus, "ready");
+}
+
+TEST(LanguageStatusReport, NativeQualityUsesTargetModuleUnresolvedRatio)
+{
+    PhysicalDiagnostics diagnostics;
+    std::vector<AggregatedSample> samples = {
+        makeSample("native", 3, 10, {"hot_a", "0x7f00 [libc.so.6]"},
+                   {"/usr/bin/app", "/lib/x86_64-linux-gnu/libc.so.6"})};
+    LanguageStatusReport report = build_language_status(samples, diagnostics, nullptr, "fp");
+    const LanguageStatusEntry *native = report.find("native");
+    ASSERT_NE(native, nullptr);
+    EXPECT_EQ(native->unresolvedFramePercent, 50.0);
+    EXPECT_EQ(native->targetModuleFrameWeight, 10u);
+    EXPECT_EQ(native->targetModuleUnresolvedPercent, 0.0);
+    EXPECT_EQ(native->collectorStatus, "ready");
 }
 
 TEST(LanguageStatusReport, MissingWhenNoMapEvenWithSamples)
@@ -179,7 +215,33 @@ TEST(LanguageStatusReport, PySpyFailureMarksFailedProcess)
     EXPECT_EQ(python->collectorStatus, "failed");
     ASSERT_EQ(python->processes.size(), 1u);
     EXPECT_EQ(python->processes[0].status, "failed");
-    EXPECT_EQ(python->processes[0].mode, "py-spy-native");
+    EXPECT_EQ(python->processes[0].mode, "py-spy");
+}
+
+TEST(LanguageStatusReport, ReadyPySpySupersedesMissingPerfMapForSameProcess)
+{
+    PhysicalDiagnostics diagnostics;
+    diagnostics.runtimeReport.python.detected = true;
+    diagnostics.runtimeReport.python.missingPids = {11};
+    diagnostics.runtimeReport.python.reason = "python perf map missing; start with -X perf";
+    PythonFallbackResult ready;
+    ready.pid = 11;
+    ready.startMs = 1234;
+    ready.exe = "/usr/bin/app";
+    ready.comm = "python";
+    ready.ready = true;
+    ready.nativeStacks = false;
+    diagnostics.pythonFallback.push_back(ready);
+
+    std::vector<AggregatedSample> samples = {
+        makeSample("python", 11, 10, {"hot_a (/app/main.py:7)"})};
+    LanguageStatusReport report = build_language_status(samples, diagnostics, nullptr, "fp");
+    const LanguageStatusEntry *python = report.find("python");
+    ASSERT_NE(python, nullptr);
+    EXPECT_EQ(python->collectorStatus, "ready");
+    ASSERT_EQ(python->processes.size(), 1u);
+    EXPECT_EQ(python->processes[0].mode, "py-spy");
+    EXPECT_EQ(python->processes[0].status, "ready");
 }
 
 TEST(LanguageStatusReport, GoPendingReportsPendingState)
@@ -229,7 +291,15 @@ TEST(LanguageStatusJson, SerializesContractFields)
     entry.collectorStatus = "ready";
     entry.symbolStatus = "complete";
     entry.semanticFramePercent = 92.46;
+    entry.semanticSamplePercent = 98.25;
     entry.unresolvedFramePercent = 4.07;
+    entry.targetModuleUnresolvedPercent = 1.25;
+    entry.frameWeight = 2000;
+    entry.semanticFrameWeight = 1849;
+    entry.unresolvedFrameWeight = 81;
+    entry.semanticSampleWeight = 1212;
+    entry.targetModuleFrameWeight = 800;
+    entry.targetModuleUnresolvedFrameWeight = 10;
     entry.sampleCount = 1234;
     LanguageProcessStatus proc;
     proc.pid = 5;
@@ -247,7 +317,11 @@ TEST(LanguageStatusJson, SerializesContractFields)
     EXPECT_NE(json.find("\"collector_status\":\"ready\""), std::string::npos);
     EXPECT_NE(json.find("\"symbol_status\":\"complete\""), std::string::npos);
     EXPECT_NE(json.find("\"semantic_frame_percent\":92.46"), std::string::npos);
+    EXPECT_NE(json.find("\"semantic_sample_percent\":98.25"), std::string::npos);
     EXPECT_NE(json.find("\"unresolved_frame_percent\":4.07"), std::string::npos);
+    EXPECT_NE(json.find("\"target_module_unresolved_percent\":1.25"), std::string::npos);
+    EXPECT_NE(json.find("\"frame_weight\":2000"), std::string::npos);
+    EXPECT_NE(json.find("\"semantic_sample_weight\":1212"), std::string::npos);
     EXPECT_NE(json.find("\"sample_count\":1234"), std::string::npos);
     EXPECT_NE(json.find("\"process_start_ms\":777"), std::string::npos);
 }

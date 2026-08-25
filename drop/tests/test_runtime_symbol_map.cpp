@@ -115,6 +115,7 @@ TEST(RuntimeSymbolMap, AtomicCopy)
     std::string dst = temp_path("copy_dst.map");
     std::string dstTmp = dst + ".tmp" + std::to_string(::getpid());
     write_file(src, "0x2000 0x10 fn\n");
+    set_mtime(src, 1700000000);
     ::remove(dst.c_str());
     ::remove(dstTmp.c_str());
 
@@ -124,6 +125,10 @@ TEST(RuntimeSymbolMap, AtomicCopy)
         std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         EXPECT_EQ(content, "0x2000 0x10 fn\n");
     }
+    struct stat srcStat {}, dstStat {};
+    ASSERT_EQ(::stat(src.c_str(), &srcStat), 0);
+    ASSERT_EQ(::stat(dst.c_str(), &dstStat), 0);
+    EXPECT_EQ(dstStat.st_mtime, srcStat.st_mtime);
     // 同文件跳过
     EXPECT_TRUE(runtime_copy_map_atomic(src, dst));
     // 同 inode（src 的硬链接）跳过

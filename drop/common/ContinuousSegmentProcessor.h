@@ -1258,9 +1258,13 @@ inline std::string python_fallback_json(const std::vector<drop::PythonFallbackRe
         body += "{\"pid\":" + std::to_string(result.pid) +
                 ",\"process_start_ms\":" + std::to_string(result.startMs) +
                 ",\"exe\":\"" + json_escape(result.exe) +
-                "\",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) +
+                "\",\"mode\":\"" + std::string(result.nativeStacks ? "py-spy-native" : "py-spy") +
+                "\",\"samples\":" + std::to_string(result.samples.size()) +
                 ",\"capture_start_ms\":" + std::to_string(result.captureStartMs) +
-                ",\"capture_end_ms\":" + std::to_string(result.captureEndMs) + "}";
+                ",\"capture_end_ms\":" + std::to_string(result.captureEndMs);
+        if (!result.warning.empty())
+            body += ",\"warning\":\"" + json_escape(result.warning) + "\"";
+        body += "}";
     }
     body += "],\"failed\":[";
     bool firstFailed = true;

@@ -1,4 +1,5 @@
 #include "common/PythonRuntimeProfiler.h"
+#include "common/RuntimeSymbolMap.h"
 #include "common/Utils.h"
 
 #include <algorithm>
@@ -134,17 +135,22 @@ PythonFallbackResult capture_one(PythonCandidate candidate, int durationSec, int
     std::ifstream inFirst(path, std::ios::binary);
     std::string raw((std::istreambuf_iterator<char>(inFirst)), std::istreambuf_iterator<char>());
     result.samples = parse_pyspy_raw(raw);
+    result.nativeStacks = nativeWanted && !result.samples.empty();
     // 阶段四：--native 展开失败（如 UNW_EINVAL）时自动退回纯 Python 栈重试，
     // 不让 C 扩展展开能力缺陷拖垮整个 fallback。
     if (result.samples.empty() && nativeWanted)
     {
         ::remove(path.c_str());
+        output.clear();
         result.captureStartMs = wall_now_ms();
         rc = runPySpy(false);
         result.captureEndMs = wall_now_ms();
         std::ifstream inRetry(path, std::ios::binary);
         raw.assign((std::istreambuf_iterator<char>(inRetry)), std::istreambuf_iterator<char>());
         result.samples = parse_pyspy_raw(raw);
+        result.nativeStacks = false;
+        if (!result.samples.empty())
+            result.warning = "py-spy --native unavailable; using Python-only stacks";
     }
     ::remove(path.c_str());
     if (!python_process_is_same(candidate.pid, candidate.startMs))
@@ -216,7 +222,7 @@ bool pyspy_native_enabled()
 {
     const char *value = std::getenv("DROP_NATIVE_CP_PYSPY_NATIVE");
     if (!value || !*value)
-        return true; // 默认开启：C 扩展调用链是两级策略的一部分
+        return false;
     std::string text(value);
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -266,6 +272,13 @@ PythonRuntimeProbe probe_python_runtime(int pid)
             probe.pythonMinor = static_cast<int>(minor);
         break;
     }
+    int64_t startMs = 0;
+    const bool haveStart = runtime_process_start_ms(pid, &startMs);
+    const int namespacePid = runtime_pid_namespace_pid(pid);
+    probe.hasPerfMap =
+        runtime_map_ready(runtime_perf_map_pid_root_path(pid, namespacePid),
+                          haveStart ? startMs : 0) ||
+        runtime_map_ready(runtime_perf_map_host_path(pid), haveStart ? startMs : 0);
     return probe;
 }
 
