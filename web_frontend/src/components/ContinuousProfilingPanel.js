@@ -1497,9 +1497,12 @@ export function coverageBandsFromReliability(reliability, signal) {
     if (!reliability?.coverage) return fallback();
     const sc = signal ? reliability.signal_coverage?.[signal] : null;
     if (sc?.coverage_bands?.length) {
+        // ratio 必须用当前信号的精确值（含 0）：0 是合法值（无数据），
+        // 不能用 || 回退到旧口径，否则 IO 无数据会被 CPU 的覆盖率"填绿"。
+        const scRatio = sc.coverage?.ratio;
         return {
             bands: sc.coverage_bands.map(band => ({ ...band, percent: bandPercent(band, sc.coverage) })),
-            ratio: Number(sc.coverage?.ratio) || Number(reliability.coverage?.ratio) || 0,
+            ratio: scRatio !== undefined && scRatio !== null ? Number(scRatio) : (Number(reliability.coverage?.ratio) || 0),
             gaps: sc.gaps || [],
             gapCountTotal: Number(sc.gap_count_total) ?? (sc.gaps || []).length,
             gapSeconds: Number(sc.coverage?.gap_seconds) || 0,

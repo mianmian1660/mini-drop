@@ -419,6 +419,28 @@ test('coverage bands prefer the current signal coverage', () => {
     expect(io.gapCountTotal).toBe(1);
 });
 
+test('coverage ratio zero does not fall back to the legacy ratio', () => {
+    // 当前信号 ratio=0（无数据）时，绝不能回退到旧 coverage.ratio（0.5），
+    // 否则 IO 无数据会被 CPU 的覆盖率"填绿"。
+    const reliability = {
+        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5 },
+        signal_coverage: {
+            io_latency: {
+                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0, gap_seconds: 600 },
+                gaps: [{ start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:10:00Z', duration_seconds: 600 }],
+                gap_count_total: 1,
+                status: 'real_gap',
+                coverage_bands: [
+                    { start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:10:00Z', status: 'real_gap', duration_seconds: 600, sample_count: 0 },
+                ],
+            },
+        },
+    };
+    const io = coverageBandsFromReliability(reliability, 'io_latency');
+    expect(io.ratio).toBe(0);
+    expect(io.gapCountTotal).toBe(1);
+});
+
 test('coverage status colors map red/yellow/gray/green correctly', () => {
     expect(coverageStatusColor('healthy')).toBe('#12b76a');
     expect(coverageStatusColor('real_gap')).toBe('#d92d20');
