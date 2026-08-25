@@ -143,6 +143,10 @@ func New(db *gorm.DB, logger *zap.Logger, cfg *config.Config) *APIServer {
 	// 初始化定时任务调度器（W5：恢复 DB 中的 cron 任务并启动）
 	s.initCron()
 
+	// 间隔型周期计划 DB 轮询 worker（新任务不注册 cron，由本 worker 领取
+	// 到期计划；旧 cron 计划仍走 initCron 的进程内 cron）。
+	go s.startScheduleWorker()
+
 	s.registerRoutes()
 	return s
 }
