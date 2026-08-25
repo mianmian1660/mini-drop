@@ -472,6 +472,34 @@ func TestContinuousLanguageStatusV2LatestProcessStateReplacesStaleFailure(t *tes
 	}
 }
 
+func TestContinuousLanguageStatusV2MissingCollectorCannotBePromotedByFrames(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+	refs := map[string]interface{}{
+		"diagnostics_version": 2,
+		"language_status": map[string]interface{}{
+			"node": map[string]interface{}{
+				"runtime_detection":       "detected",
+				"collector_status":        "missing",
+				"sample_count":            10,
+				"frame_weight":            10,
+				"semantic_frame_weight":   8,
+				"semantic_sample_weight":  10,
+				"unresolved_frame_weight": 0,
+				"processes": []interface{}{map[string]interface{}{
+					"pid": 7, "process_start_ms": 1000, "exe": "/usr/bin/node",
+					"mode": "perf-map", "status": "missing",
+				}},
+			},
+		},
+	}
+	continuousAggregateRuntimeMetadata(agg, refs)
+	node := continuousRuntimeDiagnostics(*agg)["node"]
+	if node.CollectorStatus != "missing" || node.SemanticSamplePercent != 100 {
+		t.Fatalf("semantic frames must not promote a missing collector: %#v", node)
+	}
+}
+
 func TestContinuousLanguageStatusLegacyWindowsKeepOldDerivation(t *testing.T) {
 	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
 		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}

@@ -2972,8 +2972,9 @@ func continuousRuntimeDiagnostics(agg continuousAggregate) map[string]ProfileRun
 					diag.CollectorStatus = "ready"
 				case item.CollectorStatus == "failed" && len(item.Ready) == 0:
 					diag.CollectorStatus = "failed"
-				case item.CollectorStatus == "missing" && len(item.Ready) == 0 &&
-					diag.SemanticSamplePercent == 0:
+				case item.CollectorStatus == "missing" && len(item.Ready) == 0:
+					// 没有任何 ready 采集进程时，偶然解析出的 runtime/native
+					// 帧不能把“缺采集能力”抬升为 partial。
 					diag.CollectorStatus = "missing"
 				default:
 					diag.CollectorStatus = "partial"
