@@ -1392,7 +1392,7 @@ function RuntimeDiagnostics({ diagnostics }) {
                         <td style={S.td}>{runtimeLabel(runtime)}</td>
                         <td style={S.td}>{runtimeStatusLabel(item)}</td>
                         <td style={S.td}>{((item.collector_modes || []).length ? item.collector_modes : item.modes || []).join(', ') || '-'}</td>
-                        <td style={S.td}>{runtimeCoverageLabel(item)}</td>
+                        <td style={S.td}>{runtimeCoverageLabel(runtime, item)}</td>
                         <td style={S.td}>{runtimeProcessLabel(item)}</td>
                         <td style={S.td}>{runtimeReasonWithAdvice(runtime, item)}</td>
                     </tr>
@@ -1425,11 +1425,16 @@ function runtimeStatusLabel(item = {}) {
     return '缺少采集能力';
 }
 
-function runtimeCoverageLabel(item = {}) {
+function runtimeCoverageLabel(runtime, item = {}) {
     if (item.diagnostics_version >= 2 && item.sample_count > 0) {
-        const semantic = Number(item.semantic_frame_percent) || 0;
+        const semanticSample = Number(item.semantic_sample_percent) || 0;
+        const semanticFrame = Number(item.semantic_frame_percent) || 0;
         const unresolved = Number(item.unresolved_frame_percent) || 0;
-        return `语义 ${semantic.toFixed(1)}% · 未解析 ${unresolved.toFixed(1)}%`;
+        const targetUnresolved = Number(item.target_module_unresolved_percent) || 0;
+        const unresolvedLabel = runtime === 'native'
+            ? `目标模块未解析 ${targetUnresolved.toFixed(1)}%`
+            : `未解析 ${unresolved.toFixed(1)}%`;
+        return `语义样本 ${semanticSample.toFixed(1)}% · 语义帧 ${semanticFrame.toFixed(1)}% · ${unresolvedLabel}`;
     }
     return '-';
 }
@@ -1474,7 +1479,11 @@ function runtimeProcessLabel(item = {}) {
     const ready = Number(item.ready_count) || 0;
     const missing = Number(item.missing_count) || 0;
     const limited = Number(item.limited_count) || 0;
-    if (detected === 0) return '未检测到进程';
+    if (detected === 0) {
+        if (item.diagnostics_version >= 2 && item.runtime_detection === 'detected' && Number(item.sample_count) > 0)
+            return `已采样 ${Math.round(Number(item.sample_count))}`;
+        return '未检测到进程';
+    }
     return `已检测 ${detected} · 可采集 ${ready}${missing ? ` · 缺少 ${missing}` : ''}${limited ? ` · 受限 ${limited}` : ''}`;
 }
 

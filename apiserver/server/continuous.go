@@ -317,13 +317,17 @@ type runtimeDiagnosticAccumulator struct {
 	Reasons  map[string]bool
 	// 阶段四：v2 语言诊断（language_status）。任一窗口携带 v2 时 HasV2 置位，
 	// 输出优先采用 v2 口径；历史窗口继续走旧字段推导（兼容一个周期）。
-	HasV2               bool
-	RuntimeDetection    string
-	CollectorStatus     string
-	SymbolStatusV2      string
-	SemanticFrameWeight float64 // 按 sample_count 加权的语义覆盖累计
-	UnresolvedFrameWeight float64
-	V2SampleCount       float64
+	HasV2                        bool
+	RuntimeDetection             string
+	CollectorStatus              string
+	SymbolStatusV2               string
+	FrameWeight                  float64
+	SemanticFrameWeight          float64
+	UnresolvedFrameWeight        float64
+	SemanticSampleWeight         float64
+	TargetModuleFrameWeight      float64
+	TargetModuleUnresolvedWeight float64
+	V2SampleCount                float64
 }
 
 type continuousTreeNode struct {
@@ -2660,6 +2664,9 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 	continuousAggregateLanguageStatusV2(agg, refs)
 	runtimeMaps, _ := refs["runtime_maps"].(map[string]interface{})
 	for _, runtimeName := range []string{"java", "node", "python"} {
+		if existing := agg.RuntimeDiagnostics[runtimeName]; existing != nil && existing.HasV2 {
+			continue
+		}
 		raw, _ := runtimeMaps[runtimeName].(map[string]interface{})
 		if len(raw) == 0 {
 			continue
@@ -2706,7 +2713,8 @@ func continuousAggregateRuntimeMetadata(agg *continuousAggregate, refs map[strin
 		}
 		return python
 	}
-	if pythonHasSidecar {
+	pythonAlreadyV2 := agg.RuntimeDiagnostics["python"] != nil && agg.RuntimeDiagnostics["python"].HasV2
+	if pythonHasSidecar && !pythonAlreadyV2 {
 		py := getPython()
 		py.Limited += fallbackLimited
 		for _, field := range []string{"ready", "failed"} {
@@ -2789,12 +2797,22 @@ func continuousAggregateLanguageStatusV2(agg *continuousAggregate, refs map[stri
 			continue
 		}
 		acc := continuousRuntimeAccumulator(agg, name)
+		// 状态/进程/原因描述当前（最新）窗口；覆盖率权重仍在下方跨窗
+		// 累加。这样 PID 重启或瞬态缺图恢复后不会被旧身份永久拖成 partial。
+		acc.Modes = map[string]bool{}
+		acc.Detected = map[string]ProfileRuntimeProcessDiagnostic{}
+		acc.Ready = map[string]ProfileRuntimeProcessDiagnostic{}
+		acc.Missing = map[string]ProfileRuntimeProcessDiagnostic{}
+		acc.Reasons = map[string]bool{}
 		detection, _ := raw["runtime_detection"].(string)
 		collectorStatus, _ := raw["collector_status"].(string)
 		symbolStatus, _ := raw["symbol_status"].(string)
 		sampleCount := numberAsFloat64(raw["sample_count"])
 		semanticPercent := numberAsFloat64(raw["semantic_frame_percent"])
+		semanticSamplePercent, hasSemanticSamplePercent := raw["semantic_sample_percent"]
+		semanticSamplePercentValue := numberAsFloat64(semanticSamplePercent)
 		unresolvedPercent := numberAsFloat64(raw["unresolved_frame_percent"])
+		targetModuleUnresolvedPercent := numberAsFloat64(raw["target_module_unresolved_percent"])
 
 		if detection == "detected" || acc.RuntimeDetection == "" {
 			acc.RuntimeDetection = detection
@@ -2802,36 +2820,9 @@ func continuousAggregateLanguageStatusV2(agg *continuousAggregate, refs map[stri
 			acc.RuntimeDetection = detection
 		}
 		if collectorStatus != "" {
-			switch collectorStatus {
-			case "ready":
-				acc.CollectorStatus = "ready"
-			case "partial":
-				if acc.CollectorStatus != "ready" {
-					acc.CollectorStatus = "partial"
-				}
-			case "failed":
-				if acc.CollectorStatus == "" || acc.CollectorStatus == "missing" ||
-					acc.CollectorStatus == "pending" || acc.CollectorStatus == "not_applicable" {
-					acc.CollectorStatus = "failed"
-				}
-			case "pending":
-				if acc.CollectorStatus == "" || acc.CollectorStatus == "missing" ||
-					acc.CollectorStatus == "not_applicable" {
-					acc.CollectorStatus = "pending"
-				}
-			case "missing":
-				if acc.CollectorStatus == "" || acc.CollectorStatus == "not_applicable" {
-					acc.CollectorStatus = "missing"
-				}
-			case "not_applicable":
-				if acc.CollectorStatus == "" {
-					acc.CollectorStatus = "not_applicable"
-				}
-			default:
-				if acc.CollectorStatus == "" {
-					acc.CollectorStatus = collectorStatus
-				}
-			}
+			// 窗口按时间顺序聚合；采集状态采用最新窗口，避免一次瞬态
+			// attach 失败永久覆盖后来已经恢复的 ready 状态。
+			acc.CollectorStatus = collectorStatus
 		}
 		if symbolStatus != "" {
 			// symbol_status 聚合取最差（complete>partial>missing>unknown）。
@@ -2876,9 +2867,38 @@ func continuousAggregateLanguageStatusV2(agg *continuousAggregate, refs map[stri
 				}
 			}
 		}
-		// 百分比按 sample_count 加权跨窗合并。
-		acc.SemanticFrameWeight += semanticPercent * sampleCount
-		acc.UnresolvedFrameWeight += unresolvedPercent * sampleCount
+		// v2 新产物直接累加原始权重，避免用 sample_count 加权帧百分比
+		// 在平均栈深不同的窗口之间产生统计偏差。早期 v2 窗口没有原始
+		// 权重时才回退到百分比×sample_count。
+		frameWeight := numberAsFloat64(raw["frame_weight"])
+		semanticFrameWeight := numberAsFloat64(raw["semantic_frame_weight"])
+		unresolvedFrameWeight := numberAsFloat64(raw["unresolved_frame_weight"])
+		semanticSampleWeight := numberAsFloat64(raw["semantic_sample_weight"])
+		targetModuleFrameWeight := numberAsFloat64(raw["target_module_frame_weight"])
+		targetModuleUnresolvedWeight := numberAsFloat64(raw["target_module_unresolved_frame_weight"])
+		if frameWeight <= 0 && sampleCount > 0 {
+			frameWeight = sampleCount
+			semanticFrameWeight = semanticPercent * sampleCount / 100
+			unresolvedFrameWeight = unresolvedPercent * sampleCount / 100
+		}
+		if semanticSampleWeight <= 0 && sampleCount > 0 {
+			// 兼容阶段四早期 v2：当时只有帧覆盖率，没有样本覆盖率。
+			// 仅在字段完全不存在时用旧口径近似；显式的 0 必须保留。
+			if !hasSemanticSamplePercent {
+				semanticSamplePercentValue = semanticPercent
+			}
+			semanticSampleWeight = semanticSamplePercentValue * sampleCount / 100
+		}
+		if targetModuleFrameWeight <= 0 && targetModuleUnresolvedPercent > 0 && sampleCount > 0 {
+			targetModuleFrameWeight = sampleCount
+			targetModuleUnresolvedWeight = targetModuleUnresolvedPercent * sampleCount / 100
+		}
+		acc.FrameWeight += frameWeight
+		acc.SemanticFrameWeight += semanticFrameWeight
+		acc.UnresolvedFrameWeight += unresolvedFrameWeight
+		acc.SemanticSampleWeight += semanticSampleWeight
+		acc.TargetModuleFrameWeight += targetModuleFrameWeight
+		acc.TargetModuleUnresolvedWeight += targetModuleUnresolvedWeight
 		acc.V2SampleCount += sampleCount
 		acc.HasV2 = true
 	}
@@ -2910,24 +2930,56 @@ func continuousRuntimeDiagnostics(agg continuousAggregate) map[string]ProfileRun
 			Status: status, Modes: modes, DetectedCount: len(item.Detected), ReadyCount: len(item.Ready),
 			MissingCount: len(item.Missing), LimitedCount: item.Limited, Reasons: reasons, Processes: processes,
 		}
-		// 阶段四：优先输出 v2 口径（语义覆盖/未解析率/样本数按窗口样本量加权）。
+		// 阶段四：优先输出 v2 口径。原始帧/样本权重跨窗精确求和，
+		// 避免用 sample_count 平均不同栈深的帧百分比。
 		if item.HasV2 {
+			if item.RuntimeDetection != "detected" && item.V2SampleCount <= 0 &&
+				len(item.Detected) == 0 {
+				// Agent 每窗会带全部语言的 not_detected 占位行；查询
+				// API 不应把它们显示成虚假语言状态。
+				continue
+			}
 			diag.DiagnosticsVersion = 2
 			if item.RuntimeDetection != "" {
 				diag.RuntimeDetection = item.RuntimeDetection
 			}
-			if item.CollectorStatus != "" {
-				diag.CollectorStatus = item.CollectorStatus
-				diag.Status = v2CollectorToLegacyStatus(item.CollectorStatus)
-			}
-			if item.SymbolStatusV2 != "" {
+			diag.CollectorStatus = item.CollectorStatus
+			if item.FrameWeight > 0 {
+				diag.SemanticFramePercent = round2(item.SemanticFrameWeight * 100 / item.FrameWeight)
+				diag.UnresolvedFramePercent = round2(item.UnresolvedFrameWeight * 100 / item.FrameWeight)
+				diag.SymbolStatusV2 = symbolStatusForPercent(diag.UnresolvedFramePercent)
+			} else if item.SymbolStatusV2 != "" {
 				diag.SymbolStatusV2 = item.SymbolStatusV2
 			}
 			if item.V2SampleCount > 0 {
-				diag.SemanticFramePercent = round2(item.SemanticFrameWeight / item.V2SampleCount)
-				diag.UnresolvedFramePercent = round2(item.UnresolvedFrameWeight / item.V2SampleCount)
+				diag.SemanticSamplePercent = round2(item.SemanticSampleWeight * 100 / item.V2SampleCount)
+			}
+			if item.TargetModuleFrameWeight > 0 {
+				diag.TargetModuleFrameWeight = item.TargetModuleFrameWeight
+				diag.TargetModuleUnresolvedPercent = round2(
+					item.TargetModuleUnresolvedWeight * 100 / item.TargetModuleFrameWeight)
 			}
 			diag.SampleCount = item.V2SampleCount
+
+			qualityReady := diag.SemanticSamplePercent >= 70 && diag.UnresolvedFramePercent <= 20
+			if runtimeName == "native" && item.TargetModuleFrameWeight > 0 {
+				qualityReady = diag.SemanticSamplePercent >= 70 &&
+					diag.TargetModuleUnresolvedPercent < 5
+			}
+			if item.V2SampleCount > 0 {
+				switch {
+				case qualityReady && item.CollectorStatus != "failed" && len(item.Missing) == 0:
+					diag.CollectorStatus = "ready"
+				case item.CollectorStatus == "failed" && len(item.Ready) == 0:
+					diag.CollectorStatus = "failed"
+				case item.CollectorStatus == "missing" && len(item.Ready) == 0 &&
+					diag.SemanticSamplePercent == 0:
+					diag.CollectorStatus = "missing"
+				default:
+					diag.CollectorStatus = "partial"
+				}
+			}
+			diag.Status = v2CollectorToLegacyStatus(diag.CollectorStatus)
 		} else if len(item.Detected) == 0 && len(modes) == 0 && len(reasons) == 0 &&
 			item.Limited == 0 {
 			// 阶段四修复：没有检测到任何进程、没有任何模式与原因时不生成
@@ -2955,6 +3007,17 @@ func v2CollectorToLegacyStatus(collector string) string {
 
 func round2(value float64) float64 {
 	return math.Round(value*100) / 100
+}
+
+func symbolStatusForPercent(unresolved float64) string {
+	switch {
+	case unresolved <= 5:
+		return "complete"
+	case unresolved >= 100:
+		return "missing"
+	default:
+		return "partial"
+	}
 }
 
 func boolMapKeys(values map[string]bool) []string {
