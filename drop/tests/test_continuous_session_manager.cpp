@@ -54,9 +54,10 @@ struct ContinuousSessionManagerTestAccess
         manager.AdvanceStoppingSessions();
     }
 
-    static std::string BuildReconcileBody(const ContinuousSessionManager &manager)
+    static std::string BuildReconcileBody(const ContinuousSessionManager &manager,
+                                          const std::vector<drop::ContinuousTargetProcess> &processes = {})
     {
-        return manager.BuildReconcileBody({});
+        return manager.BuildReconcileBody(processes);
     }
 
     static void AddRuntimeReport(ContinuousSessionManager &manager,
@@ -499,11 +500,16 @@ TEST(ContinuousSessionManager, ReconcileBodyCarriesCgroupAndContainerId)
     std::atomic<bool> agentRunning{true};
     ContinuousSessionManager manager(config, "http://127.0.0.1:8191", "agent-test", agentRunning);
     ContinuousSessionManagerTestAccess::AddRuntimeReport(manager, "cps-cg", "running", "strict", "");
-    const std::string body = ContinuousSessionManagerTestAccess::BuildReconcileBody(manager);
-    // 空进程列表时 body 仍应包含 processes 数组与 cgroup 字段名（Agent 上报契约）。
-    EXPECT_NE(body.find("\"processes\":[]"), std::string::npos);
-    EXPECT_NE(body.find("\"cgroup_path\""), std::string::npos);
-    EXPECT_NE(body.find("\"container_id\""), std::string::npos);
+    std::vector<drop::ContinuousTargetProcess> processes = {
+        {42, 1000, "python", "/usr/bin/python3", "/system.slice/docker-abc123def456.scope", "abc123def456"},
+        {43, 2000, "nginx", "/usr/sbin/nginx", "/system.slice/nginx.service", ""},
+    };
+    const std::string body = ContinuousSessionManagerTestAccess::BuildReconcileBody(manager, processes);
+    // 进程条目必须携带 cgroup_path / container_id（Agent 上报契约）。
+    EXPECT_NE(body.find("\"cgroup_path\":\"/system.slice/docker-abc123def456.scope\""), std::string::npos);
+    EXPECT_NE(body.find("\"container_id\":\"abc123def456\""), std::string::npos);
+    EXPECT_NE(body.find("\"cgroup_path\":\"/system.slice/nginx.service\""), std::string::npos);
+    EXPECT_NE(body.find("\"container_id\":\"\""), std::string::npos);
 }
 
 // 阶段六：/proc/<pid>/cgroup 解析（v2 与 v1 格式）。
