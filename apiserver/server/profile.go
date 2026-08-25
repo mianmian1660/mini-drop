@@ -525,7 +525,7 @@ func (s *APIServer) profileDiffQueryFromRequest(c *gin.Context) (ProfileDiffQuer
 	if !ok {
 		return ProfileDiffQuery{}, false
 	}
-	if !s.validateProfileTimeRange(c, compareFrom, compareTo, profileRetentionDuration(target)) {
+	if !s.validateProfileTimeRange(c, compareFrom, compareTo, profileRetentionDuration(target), profileTimeAnchor(target)) {
 		return ProfileDiffQuery{}, false
 	}
 	if baseTo.Sub(baseFrom) != compareTo.Sub(compareFrom) {
@@ -557,6 +557,7 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) (Profi
 		return ProfileTarget{}, false
 	}
 	retention := profileRetentionDuration(target)
+	anchor := time.Time{}
 	if q.SessionSID != "" {
 		var session model.ContinuousSession
 		if err := s.DB.Where("sid = ?", q.SessionSID).First(&session).Error; err != nil || !s.canReadOwner(session.UID, s.AuthContext(c)) {
@@ -568,9 +569,12 @@ func (s *APIServer) validateProfileQuery(c *gin.Context, q *ProfileQuery) (Profi
 			return ProfileTarget{}, false
 		}
 		retention = time.Duration(firstNonZeroUint32(session.RetentionHours, 24)) * time.Hour
+		if session.StoppedAt != nil {
+			anchor = *session.StoppedAt
+		}
 		target.ContinuousSession = continuousSessionMeta(session)
 	}
-	if !s.validateProfileTimeRange(c, q.From, q.To, retention) {
+	if !s.validateProfileTimeRange(c, q.From, q.To, retention, anchor) {
 		return ProfileTarget{}, false
 	}
 	q.TargetID = target.ID
@@ -596,7 +600,7 @@ func profileRetentionDuration(target ProfileTarget) time.Duration {
 	return time.Duration(hours) * time.Hour
 }
 
-func (s *APIServer) validateProfileTimeRange(c *gin.Context, from, to time.Time, retention time.Duration) bool {
+func (s *APIServer) validateProfileTimeRange(c *gin.Context, from, to time.Time, retention time.Duration, anchor time.Time) bool {
 	if !from.Before(to) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "时间范围不合法")
 		return false
@@ -609,17 +613,26 @@ func (s *APIServer) validateProfileTimeRange(c *gin.Context, from, to time.Time,
 			fmt.Sprintf("查询时间窗口过大，当前 Session 最多支持 %s，请缩小时间范围", formatProfileDuration(retention)))
 		return false
 	}
-	now := time.Now()
-	if to.After(now.Add(time.Minute)) {
+	if anchor.IsZero() {
+		anchor = time.Now()
+	}
+	if to.After(anchor.Add(time.Minute)) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "结束时间不能晚于当前时间")
 		return false
 	}
-	if from.Before(now.Add(-retention).Add(-time.Minute)) {
+	if from.Before(anchor.Add(-retention).Add(-time.Minute)) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument,
 			fmt.Sprintf("开始时间已超出当前 Session 的 %s 数据保留期", formatProfileDuration(retention)))
 		return false
 	}
 	return true
+}
+
+func profileTimeAnchor(target ProfileTarget) time.Time {
+	if target.ContinuousSession != nil && target.ContinuousSession.StoppedAt != nil {
+		return *target.ContinuousSession.StoppedAt
+	}
+	return time.Time{}
 }
 
 func formatProfileDuration(value time.Duration) string {

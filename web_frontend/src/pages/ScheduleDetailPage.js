@@ -13,8 +13,9 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { schedules } from '../api';
 import ScheduleTimeline from '../components/ScheduleTimeline';
 import { collectorLabelFromTask, parseRequestParams } from '../utils/collectors';
-import { cronHumanLabel } from '../utils/cron';
+import { schedulePeriodLabel, schedulePeriodTitle, scheduleStatusText, scheduleUsesInterval, intervalHumanLabel } from '../utils/schedule';
 import { formatDateTime } from '../utils/time';
+import InfoTooltip from '../components/InfoTooltip';
 
 const S = {
     container: { width: '100%', maxWidth: 1320, minWidth: 0, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
@@ -136,17 +137,21 @@ export default function ScheduleDetailPage() {
 
             <section style={S.card}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 4 }}>
-                    <span style={{ ...S.badge, background: running ? '#16a34a' : '#64748b', color: '#fff' }}>{running ? '启用' : '停用'}</span>
-                    <span style={S.cron} title={schedule.cron_expr}>{cronHumanLabel(schedule.cron_expr)}</span>
+                    <span style={{ ...S.badge, background: running ? '#16a34a' : '#64748b', color: '#fff' }} title={scheduleStatusText(schedule)}>{running ? '启用' : '停用'}</span>
+                    <span style={S.cron} title={schedulePeriodTitle(schedule)}>{schedulePeriodLabel(schedule)}</span>
                 </div>
                 <div style={S.grid}>
-                    <ContextItem label="目标 IP" value={schedule.target_ip || '-'} />
-                    <ContextItem label="采集器" value={collector || '-'} />
-                    <ContextItem label="采样参数" value={paramSummary(params)} />
+                    <ContextItem label="目标 IP" value={schedule.target_ip || '-'} hint="采集目标主机的地址" />
+                    <ContextItem label="采集器" value={collector || '-'} hint="每次采样使用的采集器类型" />
+                    <ContextItem label="采样参数" value={paramSummary(params)} hint="采样时长 / 频率 / 事件等采集参数" />
+                    <ContextItem label="窗口时长" value={windowLabel(params)} hint="每个采集窗口持续多久；采样时长必须小于采样间隔，否则相邻窗口会重叠" />
+                    {scheduleUsesInterval(schedule) && (
+                        <ContextItem label="采样间隔" value={intervalHumanLabel(schedule.interval_seconds) || '-'} hint={`每隔 ${schedule.interval_seconds} 秒自动触发一次深度采样`} />
+                    )}
                     <ContextItem label="创建者" value={schedule.user_name || '系统'} />
                     <ContextItem label="创建时间" value={formatDateTime(schedule.created_at) || '-'} />
                     <ContextItem label="最近运行" value={formatDateTime(schedule.last_run_at) || '-'} />
-                    <ContextItem label="下次运行" value={running ? (formatDateTime(schedule.next_run_at) || '-') : '已停用'} />
+                    <ContextItem label="下次运行" value={running ? (formatDateTime(schedule.next_run_at) || '-') : '已停用'} hint={running ? '计划下一次自动触发的时间' : '计划已停用，启用后才会继续触发'} />
                 </div>
             </section>
 
@@ -155,10 +160,10 @@ export default function ScheduleDetailPage() {
     );
 }
 
-function ContextItem({ label, value }) {
+function ContextItem({ label, value, hint }) {
     return (
-        <div style={S.item}>
-            <div style={S.label}>{label}</div>
+        <div style={S.item} title={hint}>
+            <div style={S.label}>{label}{hint && <InfoTooltip>{hint}</InfoTooltip>}</div>
             <div style={S.value}>{value}</div>
         </div>
     );
@@ -166,11 +171,17 @@ function ContextItem({ label, value }) {
 
 function paramSummary(params) {
     const parts = [];
-    if (params.duration) parts.push(`${params.duration}s`);
+    if (params.duration) parts.push(`时长 ${params.duration}s`);
     if (params.frequency) parts.push(`${params.frequency}Hz`);
     if (params.event) parts.push(params.event);
     if (params.callgraph) parts.push(`callgraph=${params.callgraph}`);
     if (params.pprof_url) parts.push('pprof');
     if (params.target_pid) parts.push(`pid=${params.target_pid}`);
     return parts.length ? parts.join(' · ') : '默认';
+}
+
+function windowLabel(params) {
+    const duration = Number(params.duration);
+    if (Number.isFinite(duration) && duration > 0) return `每窗 ${duration}s`;
+    return '-';
 }

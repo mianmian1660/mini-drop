@@ -1,6 +1,13 @@
 // ============================================================
-// server/schedule.go — 周期性深度采样管理处理器（旧 schedule API 兼容）
-// 包含：创建/列表/删除定时任务 + cron 调度器
+// server/schedule.go — 周期性深度采样管理处理器
+// 包含：创建/列表/删除定时任务 + cron 兼容调度
+//
+// 两种计划模式：
+//   - 间隔型（新建默认）：interval_seconds + start_at，由 DB 周期轮询
+//     worker（schedule_worker.go）驱动，可靠性依赖 schedule_triggers 的
+//     (schedule_id, scheduled_at) 唯一约束。
+//   - 旧 cron 型（兼容）：cron_expr，继续走进程内 cron 调度器；仅用于
+//     历史任务兼容读取与运行，新任务不再创建。
 // ============================================================
 
 package server
@@ -22,39 +29,82 @@ import (
 	"github.com/mini-drop/apiserver/util"
 )
 
-// CreateScheduleReq 创建定时任务请求
+// CreateScheduleReq 创建定时任务请求。
+// 新任务使用"间隔 + 开始时间"：interval_seconds（秒，预设 1/5/10/30 分钟
+// 或自定义）+ start_at（可选，缺省立即开始）。cron_expr 仅旧客户端兼容，
+// 新任务不再要求填写。
 type CreateScheduleReq struct {
-	Name         string `json:"name" binding:"required"`
-	CronExpr     string `json:"cron_expr" binding:"required"` // 如 "*/5 * * * *"
-	TaskKind     string `json:"task_kind"`
-	TaskType     uint32 `json:"task_type"`
-	ProfilerType uint32 `json:"profiler_type"`
-	TargetIP     string `json:"target_ip" binding:"required"`
-	TargetPID    int32  `json:"target_pid"`
-	Duration     uint64 `json:"duration"`
-	Frequency    uint32 `json:"frequency"`
-	Callgraph    string `json:"callgraph"`
-	Event        string `json:"event"`
-	Subprocess   bool   `json:"subprocess"`
-	PprofURL     string `json:"pprof_url"`
-	// WindowSeconds 可选：前端按"窗口预设"下发时携带的窗口周期（秒），用于校验
-	// Duration 不会超出窗口本身，避免相邻窗口重叠。不下发则跳过该校验（自定义 cron 场景）。
+	Name           string     `json:"name" binding:"required"`
+	CronExpr       string     `json:"cron_expr"`       // 旧式 cron 表达式（仅兼容旧客户端）
+	IntervalSeconds uint64    `json:"interval_seconds"` // 采样间隔（秒），>0 走间隔型
+	StartAt        *time.Time `json:"start_at"`        // 首次采样开始时间（可选）
+	TaskKind       string     `json:"task_kind"`
+	TaskType       uint32     `json:"task_type"`
+	ProfilerType   uint32     `json:"profiler_type"`
+	TargetIP       string     `json:"target_ip" binding:"required"`
+	TargetPID      int32      `json:"target_pid"`
+	Duration       uint64     `json:"duration"`
+	Frequency      uint32     `json:"frequency"`
+	Callgraph      string     `json:"callgraph"`
+	Event          string     `json:"event"`
+	Subprocess     bool       `json:"subprocess"`
+	PprofURL       string     `json:"pprof_url"`
+	// WindowSeconds 旧字段：前端按"窗口预设"下发时携带的窗口周期（秒）。
+	// 间隔型计划下后端始终以最终的 interval_seconds 校验 duration < interval，
+	// 不信任前端传入的旧 window_seconds（防止配置漂移）。
 	WindowSeconds uint64 `json:"window_seconds"`
 }
 
+// scheduleUsesInterval 判断计划是否为"间隔 + 开始时间"型。
+func scheduleUsesInterval(sch model.ScheduleTask) bool {
+	return sch.IntervalSeconds > 0
+}
+
+// scheduleUsesCron 判断计划是否为旧式 cron 型（仅兼容路径）。
+func scheduleUsesCron(sch model.ScheduleTask) bool {
+	return sch.IntervalSeconds == 0 && strings.TrimSpace(sch.CronExpr) != ""
+}
+
+// intervalNextRun 计算间隔型计划的第一个未来运行槽位：
+//   - startAt 在未来 → 直接取 startAt（首个采样点）；
+//   - startAt 在过去/缺省 → 从 startAt（缺省 now）按 interval 对齐到
+//     严格晚于 now 的最近未来槽位。
+func intervalNextRun(startAt *time.Time, intervalSeconds uint64, now time.Time) time.Time {
+	anchor := now
+	if startAt != nil {
+		anchor = *startAt
+	}
+	if intervalSeconds == 0 {
+		return anchor
+	}
+	interval := time.Duration(intervalSeconds) * time.Second
+	if anchor.After(now) {
+		return anchor
+	}
+	// 已过期：从锚点逐槽推进，取第一个严格晚于 now 的槽位。
+	next := anchor
+	for !next.After(now) {
+		next = next.Add(interval)
+	}
+	return next
+}
+
 // ----------------------------------------------------------
-// initCron 初始化 cron 调度器并恢复已启用的定时任务（W5）
+// initCron 初始化 cron 调度器并恢复旧式 cron 定时任务（W5 兼容）。
+// 间隔型计划由 DB 周期轮询 worker（startScheduleWorker）驱动，不注册 cron。
 // ----------------------------------------------------------
 func (s *APIServer) initCron() {
 	s.Cron = cron.New() // 标准 5 字段 cron（分 时 日 月 周），无需秒级
 
-	// 从数据库恢复所有已启用的定时任务
+	// 从数据库恢复所有已启用的旧式 cron 定时任务
 	var schedules []model.ScheduleTask
 	if err := s.DB.Where("enabled = ?", true).Find(&schedules).Error; err != nil {
 		s.Logger.Warn("恢复定时任务失败", zap.Error(err))
 	} else {
 		for _, sch := range schedules {
-			s.addCronJob(sch)
+			if scheduleUsesCron(sch) {
+				s.addCronJob(sch)
+			}
 		}
 		s.Logger.Info("已恢复周期性深度采样计划", zap.Int("count", len(schedules)))
 	}
@@ -63,8 +113,12 @@ func (s *APIServer) initCron() {
 	s.Logger.Info("Cron 调度器已启动")
 }
 
-// addCronJob 向 cron 调度器添加一个定时任务，返回 EntryID
+// addCronJob 向 cron 调度器添加一个旧式 cron 定时任务，返回 EntryID。
+// 间隔型计划不会走到这里（新任务不注册 cron）。
 func (s *APIServer) addCronJob(sch model.ScheduleTask) cron.EntryID {
+	if !scheduleUsesCron(sch) {
+		return 0
+	}
 	entryID, err := s.Cron.AddFunc(sch.CronExpr, func() {
 		s.executeScheduledTask(sch)
 	})
@@ -84,7 +138,8 @@ func (s *APIServer) addCronJob(sch model.ScheduleTask) cron.EntryID {
 	return entryID
 }
 
-// removeCronJob 从 cron 调度器中移除定时任务
+// removeCronJob 从 cron 调度器中移除定时任务（幂等；间隔型计划无 cron 条目，
+// 直接返回）。
 func (s *APIServer) removeCronJob(sid string) {
 	if entryID, ok := s.CronJobs[sid]; ok {
 		s.Cron.Remove(entryID)
@@ -93,9 +148,15 @@ func (s *APIServer) removeCronJob(sid string) {
 	}
 }
 
-// executeScheduledTask 执行定时任务（创建实际的采集任务）
+// executeScheduledTask 执行定时任务（旧 cron 兼容入口：scheduledAt 取当前
+// 分钟截断，保持历史行为）。
 func (s *APIServer) executeScheduledTask(sch model.ScheduleTask) {
-	scheduledAt := time.Now().Truncate(time.Minute)
+	s.executeScheduledTaskAt(sch, time.Now().Truncate(time.Minute))
+}
+
+// executeScheduledTaskAt 在指定 scheduledAt 执行定时任务（创建实际的采集任务）。
+// 间隔型 worker 传入计划的 next_run_at；cron 兼容入口传入当前分钟。
+func (s *APIServer) executeScheduledTaskAt(sch model.ScheduleTask, scheduledAt time.Time) {
 	s.Logger.Info("触发定时任务",
 		zap.String("sid", sch.SID),
 		zap.String("name", sch.Name),
@@ -242,6 +303,8 @@ func (s *APIServer) claimScheduleTrigger(scheduleID string, scheduledAt time.Tim
 // ----------------------------------------------------------
 // CreateSchedule 创建定时任务
 // POST /api/v1/schedule/task
+// 新任务走"间隔 + 开始时间"：interval_seconds + start_at。
+// 旧客户端（cron_expr）仍兼容，仅用于历史路径。
 // ----------------------------------------------------------
 func (s *APIServer) CreateSchedule(c *gin.Context) {
 	auth := s.AuthContext(c)
@@ -255,17 +318,45 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	// 验证 cron 表达式（标准 5 字段：分 时 日 月 周）
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	if _, err := parser.Parse(req.CronExpr); err != nil {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "Cron 表达式无效: "+err.Error())
+	intervalMode := req.IntervalSeconds > 0
+	legacyCron := !intervalMode && strings.TrimSpace(req.CronExpr) != ""
+	if !intervalMode && !legacyCron {
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "请填写采样间隔（interval_seconds），或使用旧式 cron 表达式")
 		return
 	}
 
-	// 设置默认值
-	if req.Duration == 0 {
-		req.Duration = 10
+	// 间隔型校验：间隔 >= 1 分钟；采样时长必须小于间隔，否则相邻窗口重叠。
+	if intervalMode {
+		if req.IntervalSeconds < 60 {
+			s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, fmt.Sprintf("采样间隔(%ds)不能小于 1 分钟", req.IntervalSeconds))
+			return
+		}
+		if req.Duration == 0 {
+			req.Duration = 10
+		}
+		if req.Duration >= req.IntervalSeconds {
+			s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, fmt.Sprintf("采样时长(%ds)需小于采样间隔(%ds)，否则相邻窗口会重叠", req.Duration, req.IntervalSeconds))
+			return
+		}
+	} else {
+		// 旧式 cron：验证 cron 表达式（标准 5 字段：分 时 日 月 周）
+		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		if _, err := parser.Parse(req.CronExpr); err != nil {
+			s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "Cron 表达式无效: "+err.Error())
+			return
+		}
+		if req.Duration == 0 {
+			req.Duration = 10
+		}
+		// 窗口校验：周期深度采样的每次采样必须在窗口周期内结束，否则相邻窗口
+		// 会重叠，"回溯任意窗口"的语义就不成立了。
+		if req.WindowSeconds > 0 && req.Duration >= req.WindowSeconds {
+			s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, fmt.Sprintf("采样时长(%ds)需小于窗口周期(%ds)，否则相邻窗口会重叠", req.Duration, req.WindowSeconds))
+			return
+		}
 	}
+
+	// 设置默认值
 	if req.Frequency == 0 {
 		req.Frequency = 99
 	}
@@ -288,44 +379,58 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 	req.TaskKind, req.TaskType, req.ProfilerType = collectorReq.TaskKind, collectorReq.TaskType, collectorReq.ProfilerType
 	req.Event, req.PprofURL = collectorReq.Event, collectorReq.PprofURL
 
-	// 窗口校验：周期性深度采样的每次采样必须在窗口周期内结束，否则相邻窗口会重叠，
-	// "回溯任意窗口"的语义就不成立了。
-	if req.WindowSeconds > 0 && req.Duration >= req.WindowSeconds {
-		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, fmt.Sprintf("采样时长(%ds)需小于窗口周期(%ds)，否则相邻窗口会重叠", req.Duration, req.WindowSeconds))
-		return
-	}
-
 	sid := "sch-" + util.GenTID()[4:]
 	uid := auth.UID
 	userName := auth.Name
 
-	// 序列化采集参数
-	paramsJSON, _ := util.MarshalJSONB(PerfParams{
-		TargetPID:  req.TargetPID,
-		Duration:   req.Duration,
-		Frequency:  req.Frequency,
-		Callgraph:  req.Callgraph,
-		Event:      req.Event,
-		Subprocess: req.Subprocess,
-		PprofURL:   req.PprofURL,
-	})
-
 	now := time.Now()
-	sch := &model.ScheduleTask{
-		SID:           sid,
-		Name:          req.Name,
-		CronExpr:      req.CronExpr,
-		TaskKind:      req.TaskKind,
-		TaskType:      req.TaskType,
-		ProfilerType:  req.ProfilerType,
-		TargetIP:      req.TargetIP,
-		RequestParams: paramsJSON,
-		Enabled:       true,
-		UID:           uid,
-		UserName:      userName,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+
+	// 间隔型：计算首次采样时间；过去/缺省 start_at 对齐到最近未来槽位。
+	var startAt *time.Time
+	var nextRunAt *time.Time
+	if intervalMode {
+		if req.StartAt != nil {
+			startAt = req.StartAt
+		} else {
+			startAt = &now
+		}
+		computed := intervalNextRun(startAt, req.IntervalSeconds, now)
+		nextRunAt = &computed
 	}
+
+	// 序列化采集参数；间隔型把 interval_seconds/window_seconds 固化进
+	// request_params，保证创建后配置不可漂移（列表/详情/重放都以此为准）。
+	params := PerfParams{
+		TargetPID:       req.TargetPID,
+		Duration:        req.Duration,
+		Frequency:       req.Frequency,
+		Callgraph:       req.Callgraph,
+		Event:           req.Event,
+		Subprocess:      req.Subprocess,
+		PprofURL:        req.PprofURL,
+		IntervalSeconds: req.IntervalSeconds,
+		WindowSeconds:   req.IntervalSeconds,
+	}
+	paramsJSON, _ := util.MarshalJSONB(params)
+
+	sch := &model.ScheduleTask{
+		SID:             sid,
+		Name:            req.Name,
+		CronExpr:        req.CronExpr,
+		IntervalSeconds: req.IntervalSeconds,
+		StartAt:         startAt,
+		TaskKind:        req.TaskKind,
+		TaskType:        req.TaskType,
+		ProfilerType:    req.ProfilerType,
+		TargetIP:        req.TargetIP,
+		RequestParams:   paramsJSON,
+		Enabled:         true,
+		UID:             uid,
+		UserName:        userName,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	sch.NextRunAt = nextRunAt
 
 	if err := s.DB.Create(sch).Error; err != nil {
 		s.Logger.Error("创建定时任务失败", zap.Error(err))
@@ -333,10 +438,16 @@ func (s *APIServer) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	// 添加到 cron 调度器
-	s.addCronJob(*sch)
+	// 旧式 cron 计划注册到进程内 cron；间隔型计划由 DB 轮询 worker 驱动。
+	if legacyCron {
+		s.addCronJob(*sch)
+	}
 
-	s.Logger.Info("定时任务已创建", zap.String("sid", sid), zap.String("cron", req.CronExpr))
+	s.Logger.Info("定时任务已创建",
+		zap.String("sid", sid),
+		zap.Uint64("interval_seconds", req.IntervalSeconds),
+		zap.String("cron", req.CronExpr),
+	)
 	sch.CanManage = true
 	s.RespondOK(c, sch)
 }
@@ -424,11 +535,17 @@ func (s *APIServer) GetScheduleDetail(c *gin.Context) {
 	s.RespondOK(c, sch)
 }
 
-// scheduleNextRun 根据 cron 表达式计算下一次运行时间（仅 enabled 的计划）。
-// 用于列表/详情的"下次运行"展示；解析失败或计划停用时返回 nil。
+// scheduleNextRun 计算计划的"下次运行"展示值（仅 enabled 的计划）：
+//   - 间隔型：返回持久化的 next_run_at（worker 在每次触发后原子推进，重启
+//     后从 DB 恢复，不会漂移）；
+//   - 旧 cron 型：用 cron 解析器实时计算。
+// 计划停用或无法计算时返回 nil。
 func (s *APIServer) scheduleNextRun(sch model.ScheduleTask) *time.Time {
 	if !sch.Enabled {
 		return nil
+	}
+	if scheduleUsesInterval(sch) {
+		return sch.NextRunAt
 	}
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	sched, err := parser.Parse(sch.CronExpr)
@@ -488,7 +605,8 @@ func (s *APIServer) ToggleSchedule(c *gin.Context) {
 	newEnabled := !sch.Enabled
 	s.DB.Model(&sch).Update("enabled", newEnabled)
 
-	// 动态管理 cron 调度器：真正停止/启动
+	// 动态管理 cron 调度器：旧式 cron 计划真正停止/启动；
+	// 间隔型计划由 DB 轮询 worker 按 enabled 状态自动拾取/跳过。
 	if newEnabled {
 		sch.Enabled = true
 		s.addCronJob(sch)

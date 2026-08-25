@@ -2,6 +2,8 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks, agents, schedules, taskKinds } from '../api';
 import { capabilityLabel, parseStringList } from '../utils/collectors';
+import { intervalHumanLabel } from '../utils/schedule';
+import InfoTooltip from './InfoTooltip';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15, 23, 42, 0.45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '48px 16px 24px', overflowY: 'auto' },
@@ -37,12 +39,21 @@ const S = {
     }),
 };
 
-const WINDOW_PRESETS = [
-    { label: '5 分钟窗口(默认)', cron: '*/5 * * * *', windowSeconds: 300, duration: 290, frequency: 19 },
-    { label: '1 分钟窗口', cron: '*/1 * * * *', windowSeconds: 60, duration: 50, frequency: 19 },
-    { label: '10 分钟窗口', cron: '*/10 * * * *', windowSeconds: 600, duration: 580, frequency: 19 },
-    { label: '30 分钟窗口', cron: '*/30 * * * *', windowSeconds: 1800, duration: 1740, frequency: 19 },
+// 周期性深度采样的采样间隔预设（分钟 → 秒）。周期变化统一由
+// interval_seconds 驱动，采样时长默认 = 间隔 - 10 秒，保证窗口不重叠。
+const INTERVAL_PRESETS = [
+    { label: '每 1 分钟', intervalSeconds: 60, frequency: 19 },
+    { label: '每 5 分钟', intervalSeconds: 300, frequency: 19 },
+    { label: '每 10 分钟', intervalSeconds: 600, frequency: 19 },
+    { label: '每 30 分钟', intervalSeconds: 1800, frequency: 19 },
 ];
+
+// defaultDurationForInterval 间隔变化时自动推荐的采样时长（间隔 - 10 秒）。
+function defaultDurationForInterval(intervalSeconds) {
+    const value = Number(intervalSeconds);
+    if (!Number.isFinite(value) || value <= 0) return 10;
+    return Math.max(1, value - 10);
+}
 
 function valuesFromKind(kind) {
     const out = {};
@@ -110,8 +121,12 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
     const [f, setF] = useState({
         name: '', target_ip: initialTargetIP || '', task_kind: '', target_pid: 0, duration: 10, frequency: 99,
         callgraph: 'fp', event: 'cpu-clock', pprof_url: '',
-        continuous: false, cron_expr: '*/5 * * * *', window_seconds: 300,
+        // 周期计划：间隔（秒）+ 开始时间（立即或指定）；不再使用 cron。
+        continuous: false, interval_seconds: 300, start_mode: 'now', start_at: '', custom_interval_min: '',
     });
+    // durationTouched：用户手工调整过采样时长后，切换间隔不再自动覆盖时长，
+    // 立即显示重叠风险（时长 >= 间隔时禁止提交）。
+    const [durationTouched, setDurationTouched] = useState(false);
     const [sub, setSub] = useState(false);
     const [err, setErr] = useState('');
     const [ok, setOk] = useState('');
@@ -188,6 +203,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
     const up = (k, v) => {
         setErr('');
         if (k === 'target_ip' || k === 'task_kind') setTaskKindError('');
+        if (k === 'duration') setDurationTouched(true);
         setF(p => {
             if (k === 'task_kind') {
                 const kind = kindList.find(item => item.id === v);
@@ -195,23 +211,58 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
             }
             const n = { ...p, [k]: v };
             if (k === 'continuous' && v === true && !p.continuous) {
-                const preset = WINDOW_PRESETS[0];
-                n.cron_expr = preset.cron;
-                n.duration = preset.duration;
+                const preset = INTERVAL_PRESETS[1]; // 默认每 5 分钟
+                n.interval_seconds = preset.intervalSeconds;
+                n.duration = defaultDurationForInterval(preset.intervalSeconds);
                 n.frequency = preset.frequency;
-                n.window_seconds = preset.windowSeconds;
+                n.custom_interval_min = '';
             }
             return n;
         });
     };
 
-    const applyWindowPreset = (preset) => setF(p => ({
+    // 应用间隔预设：周期变化由 interval_seconds 驱动；未手工调整采样时长时
+    // 自动重算默认时长，否则保留用户值并显示重叠风险。
+    const applyIntervalPreset = (preset) => setF(p => ({
         ...p,
-        cron_expr: preset.cron,
-        duration: preset.duration,
+        interval_seconds: preset.intervalSeconds,
+        custom_interval_min: '',
+        duration: durationTouched ? p.duration : defaultDurationForInterval(preset.intervalSeconds),
         frequency: preset.frequency,
-        window_seconds: preset.windowSeconds,
     }));
+
+    const applyCustomInterval = (minutes) => {
+        const min = Number(minutes);
+        setF(p => {
+            if (!Number.isFinite(min) || min <= 0) return { ...p, custom_interval_min: minutes };
+            const intervalSeconds = Math.round(min * 60);
+            return {
+                ...p,
+                custom_interval_min: minutes,
+                interval_seconds: intervalSeconds,
+                duration: durationTouched ? p.duration : defaultDurationForInterval(intervalSeconds),
+            };
+        });
+    };
+
+    // 下一次采集时间预估：立即开始 → 当前时间 + 间隔；指定开始时间且在未来
+    // → 该时间；否则对齐到最近未来槽位（与后端 intervalNextRun 一致）。
+    const nextRunEstimate = useMemo(() => {
+        if (!f.continuous) return null;
+        const intervalMs = (Number(f.interval_seconds) || 0) * 1000;
+        if (intervalMs <= 0) return null;
+        const now = new Date();
+        let base = now;
+        if (f.start_mode === 'schedule' && f.start_at) {
+            const start = new Date(f.start_at);
+            if (!Number.isNaN(start.getTime()) && start > now) base = start;
+        }
+        let next = new Date(base.getTime());
+        while (next <= now) next = new Date(next.getTime() + intervalMs);
+        return next;
+    }, [f.continuous, f.interval_seconds, f.start_mode, f.start_at]);
+
+    const overlapRisk = f.continuous && Number(f.duration) >= Number(f.interval_seconds);
 
     const renderField = (field) => {
         const value = f[field.name] ?? field.default ?? '';
@@ -238,6 +289,8 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                     min={field.min}
                     max={field.max}
                     placeholder={field.placeholder || ''}
+                    id={field.name}
+                    name={field.name}
                     value={value}
                     onChange={e => up(field.name, coerceField(field, e.target.value))}
                 />
@@ -252,10 +305,17 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
         if (!selectedKind) { setErr('请选择任务类型'); return; }
         const dur = parseInt(f.duration, 10) || 10;
         if (dur < 1 || dur > selectedKind.max_duration) { setErr(`时长需为 1-${selectedKind.max_duration}s`); return; }
-        if (f.continuous && !f.cron_expr) { setErr('请输入 cron 表达式'); return; }
-        if (f.continuous && f.window_seconds && dur >= f.window_seconds) {
-            setErr(`采样时长(${dur}s)需小于窗口周期(${f.window_seconds}s)，否则相邻窗口会重叠`);
-            return;
+        if (f.continuous) {
+            const interval = Number(f.interval_seconds) || 0;
+            if (interval < 60) { setErr('采样间隔不能小于 1 分钟'); return; }
+            if (dur >= interval) {
+                setErr(`采样时长(${dur}s)需小于采样间隔(${interval}s)，否则相邻窗口会重叠`);
+                return;
+            }
+            if (f.start_mode === 'schedule' && f.start_at) {
+                const start = new Date(f.start_at);
+                if (Number.isNaN(start.getTime())) { setErr('开始时间格式无效，请重新选择'); return; }
+            }
         }
         if (selectedKind.id === 'async_profiler_java' && (parseInt(f.target_pid, 10) || 0) < 1) {
             setErr('Java async-profiler 需要填写大于 0 的 Java 目标 PID');
@@ -292,7 +352,16 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
 
         try {
             if (f.continuous) {
-                const r = await schedules.create({ ...payload, cron_expr: f.cron_expr, window_seconds: f.window_seconds });
+                let startAt;
+                if (f.start_mode === 'schedule' && f.start_at) {
+                    // datetime-local 无时区，按浏览器本地时区转 ISO（UTC）后提交
+                    startAt = new Date(f.start_at).toISOString();
+                }
+                const r = await schedules.create({
+                    ...payload,
+                    interval_seconds: Number(f.interval_seconds),
+                    start_at: startAt,
+                });
                 if (r.code === 0) {
                     setCid(r.data?.sid || ''); setIsSch(true); setOk('周期性深度采样已创建！');
                     setTimeout(() => onSuccess?.(), 3000);
@@ -407,16 +476,52 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                     </label>
                     {f.continuous && (
                         <div>
-                            <label style={S.label}>周期性深度采样窗口预设</label>
-                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-                                {WINDOW_PRESETS.map(p => (
-                                    <button key={p.cron} style={S.presetBtn(f.cron_expr === p.cron && f.window_seconds === p.windowSeconds)}
-                                        onClick={() => applyWindowPreset(p)}>{p.label}</button>
+                            <label style={S.label}>采样间隔（每隔多久采集一次）<InfoTooltip>系统会按这个间隔自动创建一次深度采样窗口，采样时长必须短于间隔。</InfoTooltip></label>
+                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8, alignItems: 'center' }}>
+                                {INTERVAL_PRESETS.map(p => (
+                                    <button key={p.intervalSeconds} style={S.presetBtn(f.interval_seconds === p.intervalSeconds && !f.custom_interval_min)}
+                                        onClick={() => applyIntervalPreset(p)}>{p.label}</button>
                                 ))}
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        style={{ width: 64, padding: '4px 8px', border: '1px solid #ddd', borderRadius: 4, fontSize: 12 }}
+                                        placeholder="自定义"
+                                        value={f.custom_interval_min}
+                                        aria-label="自定义采样间隔（分钟）"
+                                        onChange={e => applyCustomInterval(e.target.value)}
+                                    />
+                                    <span style={{ fontSize: 12, color: '#667085' }}>分钟</span>
+                                </span>
                             </div>
-                            <label style={S.label}>Cron 周期</label>
-                            <input style={S.input} value={f.cron_expr} onChange={e => up('cron_expr', e.target.value)} placeholder="*/5 * * * *" />
-                            <p style={S.hint}>窗口时长 {f.duration}s / 采样频率 {f.frequency}Hz。</p>
+
+                            <label style={S.label}>开始时间<InfoTooltip>选择立即开始，或指定第一次采集的时间；选择过去的时间会尽快开始。</InfoTooltip></label>
+                            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+                                <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: 13 }}>
+                                    <input type="radio" name="start-mode" checked={f.start_mode === 'now'} onChange={() => up('start_mode', 'now')} />立即开始
+                                </label>
+                                <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: 13 }}>
+                                    <input type="radio" name="start-mode" checked={f.start_mode === 'schedule'} onChange={() => up('start_mode', 'schedule')} />指定时间
+                                </label>
+                                {f.start_mode === 'schedule' && (
+                                    <input
+                                        type="datetime-local"
+                                        style={{ padding: '6px 10px', border: '1px solid #ddd', borderRadius: 4, fontSize: 13 }}
+                                        value={f.start_at}
+                                        onChange={e => up('start_at', e.target.value)}
+                                        aria-label="计划开始时间"
+                                    />
+                                )}
+                            </div>
+
+                            <p style={S.hint}>每个采集窗口持续 {f.duration}s / 采样频率 {f.frequency}Hz。采样时长必须小于采样间隔，否则相邻窗口会重叠。<InfoTooltip>窗口是一次实际采样的持续时间；间隔是两次采样开始之间的时间。</InfoTooltip></p>
+                            {nextRunEstimate && (
+                                <p style={S.ok}>下一次采集：{nextRunEstimate.toLocaleString()}（{intervalHumanLabel(f.interval_seconds)}一次）</p>
+                            )}
+                            {overlapRisk && (
+                                <p style={S.warn}>采样时长（{f.duration}s）大于或等于采样间隔（{f.interval_seconds}s），相邻窗口会重叠：请调短采样时长，或加长采样间隔。</p>
+                            )}
                         </div>
                     )}
                 </div>

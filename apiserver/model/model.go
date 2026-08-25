@@ -200,24 +200,30 @@ type AnalysisSuggestion struct {
 // ScheduleTask — 定时任务表（W5）
 // ----------------------------------------------------------
 type ScheduleTask struct {
-	ID            uint           `gorm:"primaryKey" json:"id"`
-	SID           string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
-	Name          string         `gorm:"column:name;size:256" json:"name"`
-	CronExpr      string         `gorm:"column:cron_expr;size:128" json:"cron_expr"` // cron 表达式
-	TaskKind      string         `gorm:"column:task_kind;size:64" json:"task_kind"`
-	TaskType      uint32         `gorm:"column:task_type;default:0" json:"task_type"`
-	ProfilerType  uint32         `gorm:"column:profiler_type;default:0" json:"profiler_type"`
-	TargetIP      string         `gorm:"column:target_ip;size:45" json:"target_ip"`
-	RequestParams []byte         `gorm:"column:request_params;type:jsonb" json:"request_params"`
-	Enabled       bool           `gorm:"column:enabled;default:true" json:"enabled"`
-	LastRunAt     *time.Time     `gorm:"column:last_run_at" json:"last_run_at"`
-	NextRunAt     *time.Time     `gorm:"column:next_run_at" json:"next_run_at"`
-	UID           string         `gorm:"column:uid;size:64" json:"uid"`
-	UserName      string         `gorm:"column:user_name;size:128" json:"user_name"`
-	CreatedAt     time.Time      `gorm:"column:created_at" json:"created_at"`
-	UpdatedAt     time.Time      `gorm:"column:updated_at" json:"updated_at"`
-	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
-	CanManage     bool           `gorm:"-" json:"can_manage"`
+	ID              uint           `gorm:"primaryKey" json:"id"`
+	SID             string         `gorm:"column:sid;uniqueIndex;size:64" json:"sid"`
+	Name            string         `gorm:"column:name;size:256" json:"name"`
+	CronExpr        string         `gorm:"column:cron_expr;size:128" json:"cron_expr"` // 旧式 cron 表达式（仅旧任务兼容读取，新任务不写入）
+	// IntervalSeconds 采样间隔（秒）。>0 表示"间隔 + 开始时间"型周期计划
+	//（新建默认路径）；0 且 CronExpr 非空表示旧式 cron 计划（兼容读取）。
+	IntervalSeconds uint64         `gorm:"column:interval_seconds;default:0" json:"interval_seconds"`
+	// StartAt 首次采样开始时间（仅间隔型计划）。过去的时间在创建时对齐到
+	// 下一个未来槽位，作为 next_run_at 的锚点。
+	StartAt         *time.Time     `gorm:"column:start_at" json:"start_at"`
+	TaskKind        string         `gorm:"column:task_kind;size:64" json:"task_kind"`
+	TaskType        uint32         `gorm:"column:task_type;default:0" json:"task_type"`
+	ProfilerType    uint32         `gorm:"column:profiler_type;default:0" json:"profiler_type"`
+	TargetIP        string         `gorm:"column:target_ip;size:45" json:"target_ip"`
+	RequestParams   []byte         `gorm:"column:request_params;type:jsonb" json:"request_params"`
+	Enabled         bool           `gorm:"column:enabled;default:true" json:"enabled"`
+	LastRunAt       *time.Time     `gorm:"column:last_run_at" json:"last_run_at"`
+	NextRunAt       *time.Time     `gorm:"column:next_run_at" json:"next_run_at"`
+	UID             string         `gorm:"column:uid;size:64" json:"uid"`
+	UserName        string         `gorm:"column:user_name;size:128" json:"user_name"`
+	CreatedAt       time.Time      `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt       time.Time      `gorm:"column:updated_at" json:"updated_at"`
+	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index" json:"deleted_at"`
+	CanManage       bool           `gorm:"-" json:"can_manage"`
 }
 
 // ScheduleTrigger — 定时任务触发表。

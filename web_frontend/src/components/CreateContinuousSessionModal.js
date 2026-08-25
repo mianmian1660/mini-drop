@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { continuous, sentinelRules } from '../api';
 import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, SENTINEL_SIGNALS, formatBytes, selectorModeLabel, signalLabel } from '../utils/continuous';
+import InfoTooltip from './InfoTooltip';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(16,24,40,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
@@ -31,6 +32,7 @@ const S = {
     cancel: { background: '#fff', color: '#475467', border: '1px solid #d0d5dd', borderRadius: 6, padding: '8px 14px', fontWeight: 700, cursor: 'pointer' },
     submit: disabled => ({ background: disabled ? '#e5e7eb' : '#315efb', color: disabled ? '#98a2b3' : '#fff', border: 0, borderRadius: 6, padding: '9px 14px', fontWeight: 700, cursor: disabled ? 'not-allowed' : 'pointer' }),
     grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))', gap: 12, marginTop: 12 },
+    fieldHint: { color: '#667085', fontSize: 11, lineHeight: 1.4, margin: '4px 0 0' },
 };
 
 export default function CreateContinuousSessionModal({ target, onClose, onSuccess }) {
@@ -133,7 +135,8 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
     const numericSettingsValid = Number(sampleRate) >= 1 && Number(sampleRate) <= 999
         && Number(aggregationWindow) >= 5 && Number(aggregationWindow) <= 300
         && Number(uploadBatch) >= Number(aggregationWindow) && Number(uploadBatch) <= 3600
-        && Number(retentionHours) >= 1 && Number(retentionHours) <= 720;
+        // 保留时间与后端一致：原始数据最长保留 24 小时（后端 1–24h 校验）。
+        && Number(retentionHours) >= 1 && Number(retentionHours) <= 24;
     const eligibleSentinelSignals = useMemo(
         () => selectedSignals.filter(signal => SENTINEL_SIGNALS.includes(signal)),
         [selectedSignals],
@@ -310,7 +313,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                 {eligibleSentinelSignals.length === 0
                     ? <div style={S.subtle}>当前勾选的信号暂不支持自动告警（仅调度延迟 / IO 延迟支持哨兵规则）。</div>
                     : <>
-                        <label style={S.sentinelToggle}>
+                        <label style={S.sentinelToggle} title="哨兵规则：后台持续监控告警信号，超过阈值时自动触发一次 60 秒的深度诊断采样">
                             <input type="checkbox" checked={sentinelEnabled} disabled={Boolean(createdSession)}
                                 onChange={event => setSentinelEnabled(event.target.checked)} style={{ marginTop: 2 }} />
                             <span>创建后台哨兵，超过阈值自动触发一次深度诊断</span>
@@ -331,17 +334,31 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
 
             <details style={S.section}>
                 <summary style={{ cursor: 'pointer', color: '#344054', fontSize: 13, fontWeight: 700 }}>高级设置</summary>
+                <p style={S.fieldHint}>下方数值保持技术单位（Hz / 秒 / 小时），点击或悬停旁边的 i 可查看含义。</p>
                 <div style={S.grid}>
-                    <NumberField label="采样频率 Hz" value={sampleRate} onChange={setSampleRate} min={1} max={999} />
-                    <NumberField label="聚合窗口 s" value={aggregationWindow} onChange={setAggregationWindow} min={5} max={300} />
-                    <NumberField label="上传周期 s" value={uploadBatch} onChange={setUploadBatch} min={5} max={3600} />
-                    <NumberField label="保留时间 h" value={retentionHours} onChange={setRetentionHours} min={1} max={720} />
+                    <NumberField
+                        label="采样频率（每秒采集多少次）" hint="采样频率 Hz：数值越高火焰图越精细，但 CPU 开销越大（1–999）"
+                        value={sampleRate} onChange={setSampleRate} min={1} max={999} fieldId="cps-sample-rate"
+                    />
+                    <NumberField
+                        label="聚合窗口（多久汇总一次）" hint="聚合窗口 s：每多少秒把采样结果汇总成一条记录（5–300）"
+                        value={aggregationWindow} onChange={setAggregationWindow} min={5} max={300} fieldId="cps-agg-window"
+                    />
+                    <NumberField
+                        label="上传周期（多久上传一次）" hint="上传周期 s：每多少秒把汇总结果上传到服务端，需不小于聚合窗口（最长 3600）"
+                        value={uploadBatch} onChange={setUploadBatch} min={5} max={3600} fieldId="cps-upload-batch"
+                    />
+                    <NumberField
+                        label="保留时间（原始数据保存多久）" hint="保留时间 h：原始采样数据最长保留 24 小时（1–24）"
+                        value={retentionHours} onChange={setRetentionHours} min={1} max={24} fieldId="cps-retention"
+                    />
                 </div>
             </details>
 
             {!loading && !agentFresh && <div style={S.error}>目标 Agent 尚未连接持续采集控制面，当前不能创建持续任务。请确认 Agent 在线且已启用 Native Continuous Profiling。</div>}
-            {needsDegradedConfirmation && <div style={S.warn}>
+            {needsDegradedConfirmation && <div style={S.warn} role="note" aria-label="降级模式说明">
                 当前 Agent 尚未提供严格的常驻 perf + CO-RE 无缝切窗能力，将使用 PID 范围受限的滚动 perf/bpftrace 回退。任务不会退化为整机采集，但窗口切换可能产生短暂空档。
+                <p style={{ ...S.fieldHint, margin: '8px 0 0', color: '#b54708' }}>严格模式：常驻 perf + CO-RE 无缝切窗，无采集空档；降级模式：滚动 perf/bpftrace 回退，窗口切换可能有短暂空档。</p>
                 <label style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'flex-start', fontWeight: 700 }}><input type="checkbox" checked={allowDegraded} onChange={event => setAllowDegraded(event.target.checked)} />我已了解并允许降级运行</label>
             </div>}
             {error && <div style={S.error}>{error}</div>}
@@ -354,8 +371,26 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
     </div>;
 }
 
-function NumberField({ label, value, onChange, min, max, disabled }) {
-    return <label><span style={S.label}>{label}</span><input type="number" style={S.input} min={min} max={max} value={value} disabled={disabled} onChange={event => onChange(event.target.value)} /></label>;
+function NumberField({ label, hint, value, onChange, min, max, disabled, fieldId }) {
+    const id = fieldId || `field-${label}`;
+    return (
+        <label>
+            <span style={S.label}>{label}{hint && <InfoTooltip>{hint}</InfoTooltip>}</span>
+            <input
+                type="number"
+                style={S.input}
+                min={min}
+                max={max}
+                value={value}
+                disabled={disabled}
+                id={id}
+                title={hint}
+                aria-describedby={hint ? `${id}-hint` : undefined}
+                onChange={event => onChange(event.target.value)}
+            />
+            {hint && <p style={S.fieldHint} id={`${id}-hint`}>{hint}</p>}
+        </label>
+    );
 }
 
 function formatStart(value) {

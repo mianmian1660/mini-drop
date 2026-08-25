@@ -258,3 +258,47 @@ test('窗口列表状态列只显示状态，不带 task_kind/有结果；超过
     act(() => root.unmount());
     container.remove();
 });
+
+// 间隔型计划详情：顶部周期显示"每 X 分钟"（来自 interval_seconds），
+// 新增"采样间隔/窗口时长"项，悬停 title 提供原始值与含义；不展示内部 cron。
+test('间隔型计划详情展示"每 X 分钟"、采样间隔与窗口时长，无内部 Cron 字段', async () => {
+    const intervalDetail = {
+        sid: 'sch-int',
+        name: '间隔计划',
+        interval_seconds: 300,
+        cron_expr: '',
+        target_ip: '1.2.3.4',
+        task_kind: 'perf_cpu',
+        enabled: true,
+        can_manage: true,
+        user_name: 'user-a',
+        created_at: '2026-08-22T00:00:00Z',
+        last_run_at: '2026-08-22T00:05:00Z',
+        next_run_at: '2026-08-22T00:10:00Z',
+        request_params: JSON.stringify({ duration: 290, frequency: 19 }),
+    };
+    schedules.detail.mockResolvedValue({ code: 0, data: intervalDetail });
+    tasks.timeline.mockResolvedValue({ code: 0, data: { points: [], trends: null } });
+
+    const { container, root } = await renderAt('/schedules/sch-int');
+
+    // 周期显示"每 5 分钟"（来自 interval_seconds），不显示 cron
+    expect(container.textContent).toContain('每 5 分钟');
+    expect(container.textContent).not.toContain('*/5 * * * *');
+    // 新增采样间隔 / 窗口时长项（parseRequestParams 被 mock 为 duration:10）
+    expect(container.textContent).toContain('采样间隔');
+    expect(container.textContent).toContain('窗口时长');
+    expect(container.textContent).toContain('每窗 10s');
+
+    // 周期悬停 title：说明自动触发 + 间隔秒数
+    const periodSpan = Array.from(container.querySelectorAll('span')).find(s => s.title && s.title.includes('自动触发一次深度采样'));
+    expect(periodSpan).toBeTruthy();
+    expect(periodSpan.title).toContain('300');
+
+    // 状态徽章 tooltip：可执行解释
+    const statusSpan = Array.from(container.querySelectorAll('span')).find(s => s.title && s.title.includes('计划运行中'));
+    expect(statusSpan).toBeTruthy();
+
+    act(() => root.unmount());
+    container.remove();
+});

@@ -63,6 +63,10 @@ type PerfParams struct {
 	Event      string `json:"event"`
 	Subprocess bool   `json:"subprocess"`
 	PprofURL   string `json:"pprof_url"`
+	// IntervalSeconds / WindowSeconds 仅周期深度采样计划写入：固化"采样间隔"
+	// 与"窗口时长"到每个采集窗口的 request_params，保证创建后配置不可漂移。
+	IntervalSeconds uint64 `json:"interval_seconds,omitempty"`
+	WindowSeconds   uint64 `json:"window_seconds,omitempty"`
 }
 
 const (

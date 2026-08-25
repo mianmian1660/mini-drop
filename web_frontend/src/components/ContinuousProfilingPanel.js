@@ -136,7 +136,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [customTo, setCustomTo] = useState(() => initialWindow ? toLocalDateTimeInput(initialWindow.to) : '');
     const [customAnchorNow, setCustomAnchorNow] = useState(() => new Date().toISOString());
     const [appliedCustomWindow, setAppliedCustomWindow] = useState(null);
-    const [profileType, setProfileType] = useState(() => initialQuery?.profileType || 'cpu');
+    // Memory profiling is not currently supported by continuous collection.
+    // Keep legacy links/query state on the supported CPU view.
+    const [profileType, setProfileType] = useState('cpu');
     const [signalTab, setSignalTab] = useState('cpu');
     const [stackScope, setStackScope] = useState(() => initialQuery?.stackScope || 'all');
     const [flamegraph, setFlamegraph] = useState(null);
@@ -193,10 +195,15 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [symbolChecking, setSymbolChecking] = useState(false);
     const [symbolCheckError, setSymbolCheckError] = useState('');
     const querySequence = useRef(0);
+    const initializedSessionWindow = useRef('');
     const targetKey = target?.id || '';
     const targetHost = target?.ip || '';
     const targetService = target?.service_name || 'hotmethod';
     const targetTitle = target?.hostname || target?.ip || '';
+    const sessionTimeAnchor = useMemo(() => {
+        const parsed = fixedSession?.stopped_at ? new Date(fixedSession.stopped_at) : new Date();
+        return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+    }, [fixedSession?.stopped_at]);
     const targetProfileURL = target?.profile_url || '';
     const profileURL = flamegraph?.profile_url || topn?.profile_url || targetProfileURL;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
@@ -232,6 +239,26 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 		? `进程持续采集 / ${fixedSession?.selector_exe || '-'} / ${selectedInstance ? '单实例' : '全部实例'} / ${stackScopeLabel}`
 		: activeFilters.comm ? `整机任务查询过滤 / ${activeFilterText} / ${stackScopeLabel}` : `整机持续采集 / ${stackScopeLabel}`;
     const activeFiltersKey = useMemo(() => JSON.stringify(activeFilters), [activeFilters]);
+
+    // 已停止的历史 session 默认查看其自身的最后保留窗口，而不是“最近 30 分钟”。
+    // 否则任务详情打开在很久以后时，查询时间段已经落在 session 结束之后，历史样本会看起来像丢失。
+    useEffect(() => {
+        const stoppedAt = fixedSession?.stopped_at;
+        if (!sessionSID || !stoppedAt || initializedSessionWindow.current === sessionSID || initialWindow) return;
+        const end = new Date(stoppedAt);
+        if (Number.isNaN(end.getTime())) return;
+        const retentionHours = Math.max(1, numberOrDefault(fixedSession?.retention_hours, 24));
+        const started = fixedSession?.started_at ? new Date(fixedSession.started_at) : null;
+        const retentionStart = new Date(end.getTime() - retentionHours * 60 * 60 * 1000);
+        const start = started && !Number.isNaN(started.getTime()) && started > retentionStart ? started : retentionStart;
+        if (!(start < end)) return;
+        const historicalWindow = { from: start.toISOString(), to: end.toISOString() };
+        initializedSessionWindow.current = sessionSID;
+        setRange('custom');
+        setTimeWindow(historicalWindow);
+        setCustomFrom(toLocalDateTimeInput(historicalWindow.from));
+        setCustomTo(toLocalDateTimeInput(historicalWindow.to));
+    }, [fixedSession?.retention_hours, fixedSession?.started_at, fixedSession?.stopped_at, initialWindow, sessionSID]);
     // 阶段九：当前选中信号（v1 signal_type），timeline 按信号独立计算覆盖率。
     const currentSignal = SIGNAL_TAB_OPTIONS.find(option => option.tab === signalTab)?.signal;
     const coverageAlert = useMemo(() => coverageAlertForReliability(reliability, currentSignal), [reliability, currentSignal]);
@@ -251,12 +278,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         if (range !== 'custom' && !rangeOptions.some(([value]) => value === range)) {
             const fallback = rangeOptions.some(([value]) => value === '30m') ? '30m' : rangeOptions[0]?.[0] || '15m';
             setRange(fallback);
-            setTimeWindow(makeTimeWindow(fallback));
+            setTimeWindow(makeTimeWindow(fallback, sessionTimeAnchor));
         }
         if (!diffRangeOptions.some(([value]) => value === diffRange)) {
             setDiffRange(diffRangeOptions[0]?.[0] || '15m');
         }
-    }, [diffRange, diffRangeOptions, range, rangeOptions]);
+    }, [diffRange, diffRangeOptions, range, rangeOptions, sessionTimeAnchor.getTime()]);
 
     const queryProfiles = useCallback(async (queryWindow) => {
         if (!targetKey || !targetHost) return;
@@ -384,8 +411,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             queryProfiles(timeWindow);
             return;
         }
-        setTimeWindow(makeTimeWindow(range));
-    }, [queryProfiles, range, timeWindow]);
+        setTimeWindow(makeTimeWindow(range, sessionTimeAnchor));
+    }, [queryProfiles, range, sessionTimeAnchor, timeWindow]);
 
     const changeRange = useCallback((nextRange) => {
         setRange(nextRange);
@@ -397,11 +424,11 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setCustomTo(toLocalDateTimeInput(source.to));
             return;
         }
-        setTimeWindow(makeTimeWindow(nextRange));
-    }, [appliedCustomWindow, timeWindow]);
+        setTimeWindow(makeTimeWindow(nextRange, sessionTimeAnchor));
+    }, [appliedCustomWindow, sessionTimeAnchor.getTime(), timeWindow]);
 
     const applyCustomRange = useCallback(() => {
-        const result = validateCustomTimeWindow(customFrom, customTo, sessionMeta.retentionHours);
+        const result = validateCustomTimeWindow(customFrom, customTo, sessionMeta.retentionHours, '', sessionTimeAnchor);
         if (result.error) {
             setError(result.error);
             return;
@@ -410,7 +437,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         setRange('custom');
         setAppliedCustomWindow(result.window);
         setTimeWindow(result.window);
-    }, [customFrom, customTo, sessionMeta.retentionHours]);
+    }, [customFrom, customTo, sessionMeta.retentionHours, sessionTimeAnchor.getTime()]);
 
     // Load recent Go pprof heap tasks for the Memory tab link.
     const loadHeapTasks = useCallback(async () => {
@@ -744,9 +771,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         </select>
                     </Field>
                     <Field label="Profile 类型">
-                        <select style={S.select} value={profileType} onChange={e => { setProfileType(e.target.value); if (e.target.value === 'memory') setSignalTab('cpu'); }}>
+                        <select style={S.select} value={profileType} onChange={e => setProfileType(e.target.value)}>
                             <option value="cpu">CPU</option>
-                            <option value="memory">Memory</option>
                         </select>
                     </Field>
                     <Field label="语言">

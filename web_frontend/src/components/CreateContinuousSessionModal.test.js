@@ -219,3 +219,55 @@ test('container_id selector picks from snapshot', async () => {
     act(() => root.unmount());
     container.remove();
 });
+
+// 保留时间与后端一致：原始数据最长保留 24 小时。24h 可提交，25h 不可提交，
+// UI 不再出现 1–720h 的旧限制。
+test('保留时间限制为 24 小时：24h 可提交、25h 不可提交', async () => {
+    continuous.processes.mockResolvedValue({
+        code: 0,
+        data: {
+            fresh: true,
+            agent_state: { strict_capable: true },
+            processes: [
+                { pid: 42, process_start_ms: 1000, comm: 'api', exe: '/opt/api', rss_bytes: 1024 },
+            ],
+        },
+    });
+    continuous.createSession.mockResolvedValue({ code: 0, data: { session: { sid: 'cps-ret' } } });
+    const onSuccess = jest.fn();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<CreateContinuousSessionModal target={{ ip: '10.0.0.8', hostname: 'node' }} onClose={() => {}} onSuccess={onSuccess} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    // 高级设置中的保留时间输入框：max 为 24（不再 720）
+    const retentionInput = container.querySelector('#cps-retention');
+    expect(retentionInput).toBeTruthy();
+    expect(retentionInput.getAttribute('max')).toBe('24');
+    // 悬停说明提到 1–24
+    expect(container.textContent).toContain('最长保留 24 小时');
+    expect(container.textContent).not.toContain('1–720');
+
+    const name = container.querySelector('input[placeholder="例如：API 服务持续剖析"]');
+    act(() => Simulate.change(name, { target: { value: '保留测试' } }));
+    const radio = container.querySelector('input[type="radio"]');
+    act(() => Simulate.change(radio, { target: { checked: true } }));
+    const submit = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '创建并开始采集');
+
+    // 25h → 无效，提交禁用
+    act(() => Simulate.change(retentionInput, { target: { value: '25' } }));
+    expect(submit.disabled).toBe(true);
+
+    // 24h → 有效，可提交
+    act(() => Simulate.change(retentionInput, { target: { value: '24' } }));
+    expect(submit.disabled).toBe(false);
+    await act(async () => Simulate.click(submit));
+    expect(continuous.createSession).toHaveBeenCalledWith(expect.objectContaining({ retention_hours: 24 }));
+    expect(onSuccess).toHaveBeenCalledWith({ sid: 'cps-ret' });
+
+    act(() => root.unmount());
+    container.remove();
+});
