@@ -85,6 +85,9 @@ func pqSampleFromCPURow(row pqCPURow) ContinuousStackSample {
 		StackScope:     "continuous",
 		Backend:        row.Backend,
 		Runtime:        row.Runtime,
+		// 阶段七：profile_id 随行保留，供 v2 查询按与 v1 相同的
+		// (profile_id + 进程身份) 键跨窗口去重。
+		ProfileID: row.ProfileID,
 	}
 	if len(row.Frames) > 0 {
 		frames := make([]ContinuousStackFrame, 0, len(row.Frames))
@@ -210,6 +213,15 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 				sample := pqSampleFromCPURow(*row)
 				if !continuousSampleMatches(sample, pqLabelsInterface(row.Labels), q.Filters) {
 					continue
+				}
+				// 阶段七：v2 与 v1 同一 profile 去重语义。同一 profile 的
+				// 样本可能因共享引擎/窗口边界出现在多个小时块，按
+				// (profile_id + pid + start + exe) 只消费一次，防止跨层
+				// 双计。旧 Parquet 无 profile_id（空串）不参与去重。
+				if row.ProfileID != "" {
+					if continuousProfileSeen(agg.SeenProfileIDs, row.ProfileID, []ContinuousStackSample{sample}) {
+						continue
+					}
 				}
 				continuousAddSample(&agg, sample, pqLabelsInterface(row.Labels))
 				agg.WindowCount++

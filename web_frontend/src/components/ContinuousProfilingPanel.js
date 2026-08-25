@@ -152,6 +152,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [selectedRuntime, setSelectedRuntime] = useState(() => String(initialFilters.runtime || ''));
     const [runtimeValues, setRuntimeValues] = useState([]);
     const [rssSeries, setRssSeries] = useState([]);
+    const [rssMeta, setRssMeta] = useState(null);
+    const [memoryProfiles, setMemoryProfiles] = useState([]);
+    const [memoryProfilesLoading, setMemoryProfilesLoading] = useState(false);
     const [maxNodes, setMaxNodes] = useState(5000);
     const [flameSearchInput, setFlameSearchInput] = useState('');
     const [flameSearchText, setFlameSearchText] = useState('');
@@ -260,11 +263,13 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setTopn(null);
             setHistogram(null);
             setRssSeries([]);
+            setRssMeta(null);
         } else {
             setFlamegraph(null);
             setTopn(null);
             setHistogram(null);
             setRssSeries([]);
+            setRssMeta(null);
         }
         const parsedFilters = activeFiltersKey ? JSON.parse(activeFiltersKey) : {};
 		const params = {
@@ -302,7 +307,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 const [fgRes, topRes, rssRes] = profileResults;
                 if (fgRes.code === 0) setFlamegraph(fgRes.data);
                 if (topRes.code === 0) setTopn(topRes.data);
-                if (profileType === 'memory') setRssSeries(rssRes?.code === 0 ? (rssRes.data?.series || []) : []);
+                if (profileType === 'memory') {
+                    setRssSeries(rssRes?.code === 0 ? (rssRes.data?.series || []) : []);
+                    setRssMeta(rssRes?.code === 0 ? rssRes.data : null);
+                }
                 if (fgRes.code !== 0 || topRes.code !== 0) {
                     setError(fgRes.message || topRes.message || 'Native Continuous Profiling 查询失败');
                 }
@@ -336,6 +344,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setHistogram(null);
             setDbSnapshot(null);
             setRssSeries([]);
+            setRssMeta(null);
             setReliability(null);
             setError(err?.message || 'Native Continuous Profiling 查询失败');
         } finally {
@@ -411,9 +420,40 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         }
     }, [targetHost]);
 
+    // 阶段七：Memray allocation profile 元数据（SDK 接入状态/时间范围/错误）。
+    const loadMemoryProfiles = useCallback(async (queryWindow) => {
+        if (!targetKey || !targetHost) return;
+        setMemoryProfilesLoading(true);
+        try {
+            const res = await profiles.memoryProfiles({
+                target_id: targetKey,
+                host: targetHost,
+                service: targetService,
+                session_sid: sessionSID,
+                profile_type: 'memory',
+                from: queryWindow.from,
+                to: queryWindow.to,
+            });
+            if (res.code === 0) {
+                setMemoryProfiles(res.data?.profiles || []);
+            } else {
+                setMemoryProfiles([]);
+            }
+        } catch (e) {
+            // Silent: Memory tab is best-effort.
+            setMemoryProfiles([]);
+        } finally {
+            setMemoryProfilesLoading(false);
+        }
+    }, [targetKey, targetHost, targetService, sessionSID]);
+
     useEffect(() => {
         if (profileType === 'memory') loadHeapTasks();
     }, [profileType, loadHeapTasks]);
+
+    useEffect(() => {
+        if (profileType === 'memory') loadMemoryProfiles(timeWindow);
+    }, [profileType, loadMemoryProfiles, timeWindow]);
 
     // buildDiffParams 是表格 diff 和火焰图 diff 共用的部分——算 baseline/compare
     // 时间窗、拼 target/filters 这些查询参数，两条路径只在要不要加
@@ -809,6 +849,15 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         </span>
                         <span style={S.metaItem}><span style={S.metaKey}>Session</span>{shortSessionID(sessionMeta.sid)}</span>
                         <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
+                        <span style={S.metaItem} title="本次查询实际使用的存储层与最粗分辨率（v1=分钟 JSON 热窗口，v2=Parquet 历史块）">
+                            <span style={S.metaKey}>存储来源</span>{storageSourceLabel(flamegraph?.storage_source || topn?.storage_source || rssMeta?.storage_source || 'parquet_v1')}
+                        </span>
+                        <span style={S.metaItem} title="查询使用的最粗时间分辨率（秒）">
+                            <span style={S.metaKey}>分辨率</span>{resolutionLabel(flamegraph?.resolution_seconds || topn?.resolution_seconds || rssMeta?.resolution_seconds || 60)}
+                        </span>
+                        {(flamegraph?.mixed_resolution || topn?.mixed_resolution || rssMeta?.mixed_resolution) && (
+                            <span style={S.metaItem}><span style={S.metaKey}>混合分辨率</span>是</span>
+                        )}
                     </div>
                     <LabelChips target={target} />
                 </details>
@@ -890,7 +939,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 
             {signalTab === 'cpu' && <RuntimeDiagnostics diagnostics={flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics} />}
 
-            {profileType === 'memory' && signalTab === 'cpu' && <RSSTrend series={rssSeries} loading={querying} />}
+            {profileType === 'memory' && signalTab === 'cpu' && <RSSTrend series={rssSeries} meta={rssMeta} loading={querying} />}
 
             {signalTab === 'cpu' && <section style={S.card}>
                 <div style={S.sectionHead}>
@@ -997,6 +1046,51 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                                     />
                                 </div>
                             )}
+                        </div>
+                    )}
+                </section>
+            )}
+
+            {profileType === 'memory' && (
+                <section style={S.card}>
+                    <div style={S.sectionHead}>
+                        <h3 style={S.title}>Memray Allocation Profiles</h3>
+                        <span style={S.subtle}>显式 Mini-Drop/Memray SDK 上报 · {memoryProfilesLoading ? '加载中...' : `${memoryProfiles.length} profiles`}</span>
+                    </div>
+                    <div style={{ ...S.info, marginTop: 8 }}>
+                        以下为所选时间范围内 SDK 上报的 allocation profile（峰值存活字节）。状态 ready 表示已正常消费；duplicate 表示同一 profile 在多个窗口重复出现（已去重，不双计）；failed 表示 profile 存在但无可用样本。
+                    </div>
+                    {memoryProfilesLoading ? <div style={S.empty}>正在查询 Memray profiles...</div> : memoryProfiles.length === 0 ? (
+                        <div style={S.empty}>所选范围没有 Memray allocation profile（Mini-Drop/Memray SDK 未启用，或最近没有完整 profile）</div>
+                    ) : (
+                        <div className="table-scroll" style={{ ...S.tableWrap, marginTop: 12 }}>
+                            <table style={{ ...S.table, width: '100%' }}>
+                                <thead>
+                                    <tr>
+                                        <th style={S.th}>Profile ID</th>
+                                        <th style={S.th}>时间窗口</th>
+                                        <th style={S.th}>进程</th>
+                                        <th style={S.th}>样本</th>
+                                        <th style={S.th}>状态</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {memoryProfiles.slice(0, 50).map((profile, index) => (
+                                        <tr key={`${profile.profile_id}-${profile.window_start}-${index}`}>
+                                            <td style={S.td}><code>{profile.profile_id}</code></td>
+                                            <td style={S.td}>{formatTime(profile.window_start)} - {formatTime(profile.window_end)}</td>
+                                            <td style={S.td}>{profile.comm || 'python'} · PID {profile.pid || '-'}{profile.exe ? ` · ${profile.exe}` : ''}</td>
+                                            <td style={S.td}>{formatMetricValue(profile.sample_count || 0, 'bytes')}</td>
+                                            <td style={S.td}>
+                                                <span style={{ ...S.stateBadge, ...(profile.status === 'ready' ? { background: '#ecfdf3', color: '#067647' } : profile.status === 'duplicate' ? { background: '#FEF3C7', color: '#B54708' } : { background: '#FEE4E2', color: '#B42318' }) }}>
+                                                    {profile.status}
+                                                </span>
+                                                {profile.reason && <div style={{ ...S.subtle, marginTop: 4 }}>{profile.reason}</div>}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
                         </div>
                     )}
                 </section>
@@ -1519,7 +1613,7 @@ function symbolCheckSummary(check = {}) {
     return parts.join(' · ');
 }
 
-function RSSTrend({ series = [], loading }) {
+function RSSTrend({ series = [], meta = null, loading }) {
     const width = 900;
     const height = 240;
     const allPoints = series.flatMap(item => item.points || []);
@@ -1528,10 +1622,20 @@ function RSSTrend({ series = [], loading }) {
     const minTime = times.length ? Math.min(...times) : 0;
     const maxTime = times.length ? Math.max(...times) : 1;
     const colors = ['#315efb', '#067647', '#b54708', '#b42318', '#6941c6', '#026aa2'];
+    const diagnostics = Array.isArray(meta?.diagnostics) ? meta.diagnostics : [];
     return (
         <section style={S.card}>
-            <div style={S.sectionHead}><h3 style={S.title}>Python RSS 趋势</h3><span style={S.subtle}>{series.length} processes · bytes</span></div>
-            {loading ? <div style={S.empty}>正在查询 RSS...</div> : series.length === 0 ? <div style={S.empty}>所选范围没有 Python RSS 数据</div> : (
+            <div style={S.sectionHead}><h3 style={S.title}>Python RSS 趋势</h3><span style={S.subtle}>{series.length} processes · bytes{meta?.rss_truncated ? ` · 已截断 ${meta.rss_truncated}` : ''}</span></div>
+            {loading ? <div style={S.empty}>正在查询 RSS...</div> : series.length === 0 ? (
+                <div style={S.empty}>
+                    所选范围没有 Python RSS 数据
+                    {diagnostics.length > 0 && (
+                        <ul style={{ marginTop: 8, paddingLeft: 18, color: '#475467', fontSize: 12, textAlign: 'left' }}>
+                            {diagnostics.map((diag, index) => <li key={index}>{diag}</li>)}
+                        </ul>
+                    )}
+                </div>
+            ) : (
                 <>
                     <svg role="img" aria-label="Python RSS 趋势图" viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', height: 240, border: '1px solid #eaecf0', background: '#fff' }}>
                         {[0.25, 0.5, 0.75].map(value => <line key={value} x1="0" x2={width} y1={height * value} y2={height * value} stroke="#eaecf0" />)}
@@ -1546,6 +1650,11 @@ function RSSTrend({ series = [], loading }) {
                         })}
                     </svg>
                     <div style={{ ...S.chipWrap, marginTop: 10 }}>{series.slice(0, 20).map((item, index) => <span style={S.chip} key={`${item.pid}-${item.process_start_ms || 0}-${item.exe}`}><span style={{ width: 8, height: 8, background: colors[index % colors.length] }} />{item.comm || 'python'} · PID {item.pid} · peak {formatMetricValue(item.peak || 0, 'bytes')}</span>)}</div>
+                    {diagnostics.length > 0 && (
+                        <div style={{ ...S.info, marginTop: 10 }}>
+                            {diagnostics.map((diag, index) => <div key={index}>{diag}</div>)}
+                        </div>
+                    )}
                 </>
             )}
         </section>
@@ -1554,6 +1663,30 @@ function RSSTrend({ series = [], loading }) {
 
 export function runtimeLabel(runtime) {
     return ({ python: 'Python', java: 'Java/JVM', node: 'Node.js', go: 'Go', native: 'Native', kernel: 'Kernel', unknown: 'Unknown' })[runtime] || runtime;
+}
+
+// 阶段八：存储来源与分辨率展示（前端统一使用 API 的 storage_source /
+// resolution_seconds / mixed_resolution 字段，不再自行猜测）。
+export function storageSourceLabel(source) {
+    switch (String(source || '').toLowerCase()) {
+        case 'parquet_v2':
+            return 'Parquet v2';
+        case 'parquet_v1':
+            return 'Parquet v1（热窗口）';
+        case 'v1':
+            return 'v1 热窗口';
+        default:
+            return source || 'Parquet v1（热窗口）';
+    }
+}
+
+export function resolutionLabel(seconds) {
+    const value = Number(seconds) || 0;
+    if (value <= 0) return '-';
+    if (value < 60) return `${value}s`;
+    if (value % 3600 === 0) return `${value / 3600}h`;
+    if (value % 60 === 0) return `${value / 60}m`;
+    return `${value}s`;
 }
 
 function Field({ label, children, wide = false }) {

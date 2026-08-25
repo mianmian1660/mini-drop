@@ -205,6 +205,12 @@ type ContinuousStackSample struct {
 	// Frames 阶段五结构化栈（Agent 兼容期同时发送 stack+frames；v2-only
 	// 且回滚窗口结束后仅发送 frames）。apiserver 优先使用 frames。
 	Frames []ContinuousStackFrame `json:"frames,omitempty"`
+	// ProfileID 阶段七：样本所属 profile 的幂等 ID（memray 等显式 profile
+	// 载体）。由 continuousProfileSamplesForQuery/ForIngest 从
+	// ContinuousProfileIngest 填充，供 v1/v2 查询按
+	// (profile_id + pid + process_start_ms + exe) 跨窗口去重，并写入
+	// Parquet 保留（v2 降采样/查询与 v1 同一 dedupe 语义）。
+	ProfileID string `json:"profile_id,omitempty"`
 }
 
 type ContinuousProfileIngest struct {
@@ -2356,7 +2362,7 @@ func (s *APIServer) GetProfileTimeseries(c *gin.Context) {
 		maxSeries = 128
 	}
 	// 阶段六：prefer/enforce 逐小时混合（v2 历史小时 + v1 热小时）
-	series, found, err := s.pqQueryTimeseriesMixed(c.Request.Context(), q, metric, maxSeries)
+	series, rssTruncated, found, err := s.pqQueryTimeseriesMixed(c.Request.Context(), q, metric, maxSeries)
 	if err != nil {
 		s.respondProfileDependencyError(c, err)
 		return
@@ -2365,39 +2371,70 @@ func (s *APIServer) GetProfileTimeseries(c *gin.Context) {
 		series = []ProfileTimeseriesSeries{}
 	}
 	stats := s.pqQueryStatsFor(c.Request.Context(), q)
+	// 阶段七：RSS 空数据诊断。"显示可查询但实际为空"的根因分两类：
+	// ① 该范围根本没有 python_rss 窗口（未启用信号/无 Python 进程）；
+	// ② 有窗口但被过滤条件排除（comm/pid/实例过滤不匹配）。
+	diagnostics := []string{}
+	if len(series) == 0 {
+		hasRSSWindow, _ := s.continuousHasSignalWindow(c.Request.Context(), q, "python_rss")
+		if !hasRSSWindow {
+			diagnostics = append(diagnostics, "该时间范围没有 python_rss 采集窗口（Session 未启用 Python RSS 信号，或目标上无 Python 进程）")
+		} else if len(q.Filters) > 0 {
+			diagnostics = append(diagnostics, "存在 python_rss 窗口，但当前过滤条件（comm/pid/实例/exe）没有匹配到任何进程")
+		} else {
+			diagnostics = append(diagnostics, "存在 python_rss 窗口，但窗口内没有 rss_bytes 采样点（进程可能已退出或采样被截断）")
+		}
+	}
+	if rssTruncated > 0 {
+		diagnostics = append(diagnostics, fmt.Sprintf("Agent 侧进程数超过上限，RSS 采样被截断（最多 %d 个进程）", rssTruncated))
+	}
 	s.RespondOK(c, gin.H{
 		"series": series, "metric": metric, "unit": "bytes", "empty": len(series) == 0, "generated_at": time.Now(),
 		"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
 		"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
+		"rss_truncated": rssTruncated, "process_count": len(series), "diagnostics": diagnostics,
 	})
 }
 
-func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q ProfileQuery, metricName string, maxSeries int) ([]ProfileTimeseriesSeries, bool, error) {
+// continuousHasSignalWindow 判断 [from,to] 内是否存在某信号的 profile_windows 行
+// （供空数据诊断区分"没采集"与"采集了但被过滤"）。
+func (s *APIServer) continuousHasSignalWindow(ctx context.Context, q ProfileQuery, signalType string) (bool, error) {
+	var count int64
+	err := s.DB.WithContext(ctx).Model(&model.ProfileWindow{}).
+		Where("session_sid IN (?)", s.continuousSessionSelection(q)).
+		Where("signal_type = ?", signalType).
+		Where("window_end >= ? AND window_start <= ?", q.From, q.To).
+		Count(&count).Error
+	return count > 0, err
+}
+
+func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q ProfileQuery, metricName string, maxSeries int) ([]ProfileTimeseriesSeries, int, bool, error) {
 	var windows []model.ProfileWindow
 	sessionQuery := s.continuousSessionSelection(q)
 	err := s.DB.Where("session_sid IN (?)", sessionQuery).Where("signal_type = ?", "python_rss").
 		Where("window_end >= ? AND window_start <= ?", q.From, q.To).Order("window_start ASC").
 		Limit(continuousMaxWindowCount + 1).Find(&windows).Error
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	if len(windows) > continuousMaxWindowCount {
-		return nil, true, errContinuousWindowLimit
+		return nil, 0, true, errContinuousWindowLimit
 	}
 	if len(windows) == 0 {
-		return []ProfileTimeseriesSeries{}, false, nil
+		return []ProfileTimeseriesSeries{}, 0, false, nil
 	}
 	if !s.StorageConnected() {
-		return nil, true, errProfileUnavailable
+		return nil, 0, true, errProfileUnavailable
 	}
 
 	byKey := map[string]*ProfileTimeseriesSeries{}
+	rssTruncated := 0
 	objectOrder, byObject := continuousGroupWindowsByObject(windows)
 	for _, objectKey := range objectOrder {
 		// 阶段三：块只解压一次，再按 DB 行选中的 batch 关联
 		batches, err := s.loadContinuousBatches(ctx, objectKey)
 		if err != nil {
-			return nil, true, err
+			return nil, 0, true, err
 		}
 		batchByID := continuousBatchIndex(batches)
 		seenBatch := map[string]bool{}
@@ -2410,6 +2447,10 @@ func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q Profi
 			for _, window := range batch.Windows {
 				if !windowOverlaps(window.WindowStart, window.WindowEnd, q.From, q.To) {
 					continue
+				}
+				// 阶段七：Agent 侧进程数截断诊断（窗口级 RSSTruncated 取最大）。
+				if window.RSSTruncated > rssTruncated {
+					rssTruncated = window.RSSTruncated
 				}
 				for _, metric := range window.Metrics {
 					if metric.Metric != metricName || metric.Timestamp.Before(q.From) || metric.Timestamp.After(q.To) {
@@ -2448,7 +2489,7 @@ func (s *APIServer) queryNativeContinuousTimeseries(ctx context.Context, q Profi
 	if len(out) > maxSeries {
 		out = out[:maxSeries]
 	}
-	return out, true, nil
+	return out, rssTruncated, true, nil
 }
 
 func continuousMetricSeriesKey(metric ContinuousMetricIngest) string {
@@ -3501,10 +3542,14 @@ func continuousProfileSamplesForQuery(window ContinuousWindowIngest, q ProfileQu
 			continue
 		}
 		if profile.ProfileID != "" && seenProfileIDs != nil {
-			if seenProfileIDs[profile.ProfileID] {
+			// 阶段七：profile 去重键 = profile_id + 完整进程身份。Memray
+			// profile_id 是 "memray-<namespacePid>-<startTicks>"，namespace
+			// PID 跨容器可能相同（容器内都是 1），仅用 profile_id 会把不同
+			// 容器的两个 profile 误判为重复；加上 pid/start/exe 后与
+			// process Session 的实例归属语义一致。
+			if continuousProfileSeen(seenProfileIDs, profile.ProfileID, profile.Samples) {
 				continue
 			}
-			seenProfileIDs[profile.ProfileID] = true
 		}
 		profileScope := strings.ToLower(strings.TrimSpace(profile.StackScope))
 		if scope != "" && profileScope != "" && profileScope != scope {
@@ -3523,10 +3568,31 @@ func continuousProfileSamplesForQuery(window ContinuousWindowIngest, q ProfileQu
 			if sample.Runtime == "" && wantedSignal == "python_memory" {
 				sample.Runtime = "python"
 			}
+			if sample.ProfileID == "" {
+				sample.ProfileID = profile.ProfileID
+			}
 			out = append(out, sample)
 		}
 	}
 	return out
+}
+
+// continuousProfileSeen 按 (profile_id + pid + process_start_ms + exe) 判断
+// profile 是否已消费并登记。profile 内多个样本共享同一身份时只登记一次；
+// 无进程身份的 profile（pid=0）退化为仅按 profile_id 去重。
+func continuousProfileSeen(seen map[string]bool, profileID string, samples []ContinuousStackSample) bool {
+	key := profileID
+	for _, sample := range samples {
+		if sample.PID > 0 {
+			key = profileID + "|" + strconv.Itoa(sample.PID) + "|" + strconv.FormatInt(sample.ProcessStartMs, 10) + "|" + sample.Exe
+			break
+		}
+	}
+	if seen[key] {
+		return true
+	}
+	seen[key] = true
+	return false
 }
 
 func continuousSampleLabel(sample ContinuousStackSample, windowLabels map[string]interface{}, key string) string {

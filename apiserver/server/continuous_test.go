@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -299,6 +300,99 @@ func TestFailedMemoryProfileCreatesQueryableSignalRow(t *testing.T) {
 	}
 	if count := continuousWindowSampleCount(window, "python_memory"); count != 0 {
 		t.Fatalf("diagnostic-only memory window count=%d, want 0", count)
+	}
+}
+
+// 阶段七：Memray profile_id 是 "memray-<namespacePid>-<startTicks>"，namespace
+// PID 跨容器可能相同（容器内都是 1）。去重键必须包含完整进程身份，否则两个
+// 不同容器的 profile 会被误判为重复而丢数据。
+func TestProfileSeenKeySeparatesSameProfileIDAcrossContainers(t *testing.T) {
+	seen := map[string]bool{}
+	// 同一 profile_id（namespace pid=1, ticks=100），但 host pid/start/exe 不同
+	// （两个容器）→ 不重复。
+	containerA := []ContinuousStackSample{{PID: 1001, ProcessStartMs: 1000, Exe: "/usr/bin/python3"}}
+	containerB := []ContinuousStackSample{{PID: 2001, ProcessStartMs: 2000, Exe: "/usr/bin/python3"}}
+	if continuousProfileSeen(seen, "memray-1-100", containerA) {
+		t.Fatal("first container profile must not be seen")
+	}
+	if continuousProfileSeen(seen, "memray-1-100", containerB) {
+		t.Fatal("same profile_id with different process identity must not dedupe")
+	}
+	// 同一 profile_id + 同一进程身份 → 重复。
+	if !continuousProfileSeen(seen, "memray-1-100", containerA) {
+		t.Fatal("same profile_id + same process identity must dedupe")
+	}
+	// 无进程身份（pid=0）退化为仅按 profile_id 去重。
+	seen2 := map[string]bool{}
+	if continuousProfileSeen(seen2, "memray-1-100", []ContinuousStackSample{{PID: 0}}) {
+		t.Fatal("first anonymous profile must not be seen")
+	}
+	if !continuousProfileSeen(seen2, "memray-1-100", []ContinuousStackSample{{PID: 0}}) {
+		t.Fatal("anonymous profile must dedupe by profile_id only")
+	}
+}
+
+// 阶段七：v1 查询按 (profile_id + 进程身份) 跨窗口去重——同一 profile 出现在
+// 两个窗口（共享引擎投递/窗口边界）只消费一次；不同进程身份不误去重。
+func TestProfileSamplesForQueryDedupesAcrossWindows(t *testing.T) {
+	windowA := ContinuousWindowIngest{Profiles: []ContinuousProfileIngest{{
+		SignalType: "python_memory", ProfileID: "memray-1-100", Backend: "memray",
+		Samples: []ContinuousStackSample{{PID: 1001, ProcessStartMs: 1000, Exe: "/usr/bin/python3", Count: 4096, Stack: []string{"allocA"}}},
+	}}}
+	windowB := ContinuousWindowIngest{Profiles: []ContinuousProfileIngest{{
+		SignalType: "python_memory", ProfileID: "memray-1-100", Backend: "memray",
+		Samples: []ContinuousStackSample{{PID: 1001, ProcessStartMs: 1000, Exe: "/usr/bin/python3", Count: 4096, Stack: []string{"allocA"}}},
+	}}}
+	seen := map[string]bool{}
+	fromA := continuousProfileSamplesForQuery(windowA, ProfileQuery{ProfileType: "memory"}, seen)
+	fromB := continuousProfileSamplesForQuery(windowB, ProfileQuery{ProfileType: "memory"}, seen)
+	if len(fromA) != 1 || len(fromB) != 0 {
+		t.Fatalf("cross-window dedupe failed: A=%d B=%d", len(fromA), len(fromB))
+	}
+	if fromA[0].ProfileID != "memray-1-100" {
+		t.Fatalf("sample must carry profile_id, got %q", fromA[0].ProfileID)
+	}
+	// 不同进程身份（PID 复用后的新实例）→ 不重复。
+	windowC := ContinuousWindowIngest{Profiles: []ContinuousProfileIngest{{
+		SignalType: "python_memory", ProfileID: "memray-1-100", Backend: "memray",
+		Samples: []ContinuousStackSample{{PID: 1001, ProcessStartMs: 9999, Exe: "/usr/bin/python3", Count: 4096, Stack: []string{"allocB"}}},
+	}}}
+	fromC := continuousProfileSamplesForQuery(windowC, ProfileQuery{ProfileType: "memory"}, seen)
+	if len(fromC) != 1 {
+		t.Fatalf("PID-reused new instance must not dedupe, got %d", len(fromC))
+	}
+}
+
+// 阶段七：v2 写入侧（ingest）与查询侧同一去重语义。
+func TestProfileSamplesForIngestDedupesByProfileIdentity(t *testing.T) {
+	window := model.ProfileWindow{SignalType: "python_memory"}
+	ingest := ContinuousWindowIngest{Profiles: []ContinuousProfileIngest{
+		{SignalType: "python_memory", ProfileID: "memray-1-100", Backend: "memray",
+			Samples: []ContinuousStackSample{{PID: 1001, ProcessStartMs: 1000, Exe: "/usr/bin/python3", Count: 1, Stack: []string{"allocA"}}}},
+		{SignalType: "python_memory", ProfileID: "memray-1-100", Backend: "memray",
+			Samples: []ContinuousStackSample{{PID: 1001, ProcessStartMs: 1000, Exe: "/usr/bin/python3", Count: 1, Stack: []string{"allocA"}}}},
+		{SignalType: "python_memory", ProfileID: "memray-1-100", Backend: "memray",
+			Samples: []ContinuousStackSample{{PID: 2001, ProcessStartMs: 2000, Exe: "/usr/bin/python3", Count: 1, Stack: []string{"allocB"}}}},
+	}}
+	out := continuousProfileSamplesForIngest(window, &ingest)
+	if len(out) != 2 {
+		t.Fatalf("ingest dedupe failed: got %d samples, want 2 (same identity deduped, different identity kept)", len(out))
+	}
+	ids := map[string]bool{}
+	for _, sample := range out {
+		if sample.ProfileID != "memray-1-100" {
+			t.Fatalf("sample must carry profile_id, got %q", sample.ProfileID)
+		}
+		ids[strconv.Itoa(sample.PID)+"|"+strconv.FormatInt(sample.ProcessStartMs, 10)] = true
+	}
+	if !ids["1001|1000"] || !ids["2001|2000"] {
+		t.Fatalf("unexpected surviving samples: %#v", ids)
+	}
+	// 信号不匹配的 profile 不混入（cpu_profile 窗口不消费 python_memory）。
+	cpuWindow := model.ProfileWindow{SignalType: "cpu_profile"}
+	cpuOut := continuousProfileSamplesForIngest(cpuWindow, &ingest)
+	if len(cpuOut) != 0 {
+		t.Fatalf("cpu_profile window must not consume python_memory profiles, got %d", len(cpuOut))
 	}
 }
 
