@@ -426,6 +426,32 @@ func TestMergeStatusIntervalsDoesNotDoubleCountOverlap(t *testing.T) {
 	}
 }
 
+func TestContinuousStatusIntervalsRepresentToleranceGapsAsGray(t *testing.T) {
+	base := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
+	session := coverageTestSession(base)
+	merged := []model.ProfileWindow{
+		{WindowStart: base, WindowEnd: base.Add(10 * time.Second), SampleCount: 10},
+		{WindowStart: base.Add(12 * time.Second), WindowEnd: base.Add(20 * time.Second), SignalStatus: "target_idle"},
+	}
+	intervals := continuousStatusIntervalsFor(merged, base, base.Add(20*time.Second), base.Add(20*time.Second), session,
+		continuousSessionBoundaries{})
+	mergedIntervals := mergeStatusIntervals(intervals, pqCoverageMergeTolerance)
+	stats := continuousCoverageStatsOf(mergedIntervals)
+	if stats.coveredSeconds+stats.redSeconds+stats.graySeconds+stats.pendingSeconds != 20 {
+		t.Fatalf("status seconds do not cover query: covered=%v red=%v gray=%v pending=%v", stats.coveredSeconds,
+			stats.redSeconds, stats.graySeconds, stats.pendingSeconds)
+	}
+	foundUnknown := false
+	for _, iv := range mergedIntervals {
+		if iv.status == continuousCoverageUnknown && iv.end.Sub(iv.start) == 2*time.Second {
+			foundUnknown = true
+		}
+	}
+	if !foundUnknown {
+		t.Fatalf("tolerance gap missing explicit unknown interval: %+v", mergedIntervals)
+	}
+}
+
 func TestContinuousCoverageBandsUseFullBucketVisualDuration(t *testing.T) {
 	base := time.Date(2026, 8, 25, 0, 3, 0, 0, time.UTC)
 	from, to := base, base.Add(2*time.Hour)

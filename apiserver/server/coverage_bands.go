@@ -346,25 +346,34 @@ func continuousStatusIntervalsFor(merged []model.ProfileWindow, from, to, finali
 	}
 
 	// 真实缺口：最终化域内、grace 之外、无数据。非缺口区间（数据+grace+
-	// pending）合并后取补集，间隔 ≤ tolerance 的缝隙不视为缺口。
+	// pending）合并后取补集。间隔 ≤ tolerance 的缝隙不视为真实缺口，
+	// 但仍显式标成 unknown 灰色，避免色带出现未统计的空白。
 	nonGap := mergeStatusIntervals(intervals, pqCoverageMergeTolerance)
 	cursor := from
 	for _, iv := range nonGap {
-		if iv.start.Sub(cursor) > pqCoverageMergeTolerance {
+		if iv.start.After(cursor) && cursor.Before(finalTo) {
 			s, e := cursor, iv.start
 			if e.After(finalTo) {
 				e = finalTo
 			}
 			if s.Before(e) {
-				intervals = append(intervals, continuousStatusInterval{start: s, end: e, status: continuousCoverageRealGap})
+				status := continuousCoverageUnknown
+				if e.Sub(s) > pqCoverageMergeTolerance {
+					status = continuousCoverageRealGap
+				}
+				intervals = append(intervals, continuousStatusInterval{start: s, end: e, status: status})
 			}
 		}
 		if iv.end.After(cursor) {
 			cursor = iv.end
 		}
 	}
-	if finalTo.Sub(cursor) > pqCoverageMergeTolerance {
-		intervals = append(intervals, continuousStatusInterval{start: cursor, end: finalTo, status: continuousCoverageRealGap})
+	if cursor.Before(finalTo) {
+		status := continuousCoverageUnknown
+		if finalTo.Sub(cursor) > pqCoverageMergeTolerance {
+			status = continuousCoverageRealGap
+		}
+		intervals = append(intervals, continuousStatusInterval{start: cursor, end: finalTo, status: status})
 	}
 	return intervals
 }
