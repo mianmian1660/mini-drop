@@ -198,6 +198,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const targetHost = target?.ip || '';
     const targetService = target?.service_name || 'hotmethod';
     const targetTitle = target?.hostname || target?.ip || '';
+    const sessionTimeAnchor = useMemo(() => {
+        const parsed = fixedSession?.stopped_at ? new Date(fixedSession.stopped_at) : new Date();
+        return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+    }, [fixedSession?.stopped_at]);
     const targetProfileURL = target?.profile_url || '';
     const profileURL = flamegraph?.profile_url || topn?.profile_url || targetProfileURL;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
@@ -272,12 +276,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         if (range !== 'custom' && !rangeOptions.some(([value]) => value === range)) {
             const fallback = rangeOptions.some(([value]) => value === '30m') ? '30m' : rangeOptions[0]?.[0] || '15m';
             setRange(fallback);
-            setTimeWindow(makeTimeWindow(fallback));
+            setTimeWindow(makeTimeWindow(fallback, sessionTimeAnchor));
         }
         if (!diffRangeOptions.some(([value]) => value === diffRange)) {
             setDiffRange(diffRangeOptions[0]?.[0] || '15m');
         }
-    }, [diffRange, diffRangeOptions, range, rangeOptions]);
+    }, [diffRange, diffRangeOptions, range, rangeOptions, sessionTimeAnchor.getTime()]);
 
     const queryProfiles = useCallback(async (queryWindow) => {
         if (!targetKey || !targetHost) return;
@@ -405,8 +409,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             queryProfiles(timeWindow);
             return;
         }
-        setTimeWindow(makeTimeWindow(range));
-    }, [queryProfiles, range, timeWindow]);
+        setTimeWindow(makeTimeWindow(range, sessionTimeAnchor));
+    }, [queryProfiles, range, sessionTimeAnchor, timeWindow]);
 
     const changeRange = useCallback((nextRange) => {
         setRange(nextRange);
@@ -418,11 +422,11 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             setCustomTo(toLocalDateTimeInput(source.to));
             return;
         }
-        setTimeWindow(makeTimeWindow(nextRange));
-    }, [appliedCustomWindow, timeWindow]);
+        setTimeWindow(makeTimeWindow(nextRange, sessionTimeAnchor));
+    }, [appliedCustomWindow, sessionTimeAnchor.getTime(), timeWindow]);
 
     const applyCustomRange = useCallback(() => {
-        const result = validateCustomTimeWindow(customFrom, customTo, sessionMeta.retentionHours);
+        const result = validateCustomTimeWindow(customFrom, customTo, sessionMeta.retentionHours, '', sessionTimeAnchor);
         if (result.error) {
             setError(result.error);
             return;
@@ -431,7 +435,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         setRange('custom');
         setAppliedCustomWindow(result.window);
         setTimeWindow(result.window);
-    }, [customFrom, customTo, sessionMeta.retentionHours]);
+    }, [customFrom, customTo, sessionMeta.retentionHours, sessionTimeAnchor.getTime()]);
 
     // Load recent Go pprof heap tasks for the Memory tab link.
     const loadHeapTasks = useCallback(async () => {
