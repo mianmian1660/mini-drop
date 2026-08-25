@@ -1202,8 +1202,8 @@ TEST(SharedContinuousEngine, RefusesUnapprovedDegradedFallback)
 // ---- 首轮只建立基线 ----
 TEST(ContinuousSampler, DigestDeltaFirstSeenBaselineOnly)
 {
-    DigestCounterState first{100, 5000000000ULL, 50};
-    DigestDeltaResult delta = compute_digest_delta(nullptr, first);
+    DigestCounterState first{100, 5000000000ULL, 50, 0};
+    DigestDeltaResult delta = compute_digest_delta(nullptr, first, 1000, 15000);
     EXPECT_EQ(delta.kind, DigestDeltaKind::FirstSeen);
     EXPECT_EQ(delta.deltaCalls, 0u);
     EXPECT_EQ(delta.deltaLatencyUs, 0u);
@@ -1213,9 +1213,9 @@ TEST(ContinuousSampler, DigestDeltaFirstSeenBaselineOnly)
 // ---- 后续仅上报窗口增量，latency 从 ps 换算成 us ----
 TEST(ContinuousSampler, DigestDeltaReportsWindowIncrement)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{120, 5200000000ULL, 60};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{120, 5200000000ULL, 60, 11000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 11000, 15000);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
     EXPECT_EQ(delta.deltaCalls, 20u);
     // (5.2e12 - 5.0e12) ps = 200000000 ps = 200 us（ps -> us 除以 1e6）
@@ -1226,9 +1226,9 @@ TEST(ContinuousSampler, DigestDeltaReportsWindowIncrement)
 // ---- 零增量不输出（deltaCalls == 0）----
 TEST(ContinuousSampler, DigestDeltaZeroCallsNotEmitted)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{100, 5100000000ULL, 55};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{100, 5100000000ULL, 55, 11000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 11000, 15000);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
     EXPECT_EQ(delta.deltaCalls, 0u);
     // 调用方应据此跳过上报
@@ -1237,18 +1237,18 @@ TEST(ContinuousSampler, DigestDeltaZeroCallsNotEmitted)
 // ---- countStar 回退：重建基线，本轮不上报 ----
 TEST(ContinuousSampler, DigestDeltaCounterResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{3, 5000000000ULL, 50};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{3, 5000000000ULL, 50, 11000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 11000, 15000);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
 }
 
 // ---- sumTimerWaitPs 回退：重建基线，避免无符号下溢 ----
 TEST(ContinuousSampler, DigestDeltaLatencyResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{120, 4000000000ULL, 60};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{120, 4000000000ULL, 60, 11000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 11000, 15000);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
     // 旧实现只检查 countStar，这里 sumTimerWaitPs 回退会触发无符号下溢
 }
@@ -1256,10 +1256,32 @@ TEST(ContinuousSampler, DigestDeltaLatencyResetRebuildsBaseline)
 // ---- sumRowsExamined 回退：重建基线，避免无符号下溢 ----
 TEST(ContinuousSampler, DigestDeltaRowsResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50};
-    DigestCounterState cur{120, 5200000000ULL, 10};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{120, 5200000000ULL, 10, 11000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 11000, 15000);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
+}
+
+// ---- 缺席过久（跌出 TOP 50 又重新进来）：即使数值正常递增，间隔超过
+// maxGapMs 也要当成新基线，不能把缺席期间攒的调用当成这一个窗口的增量 ----
+TEST(ContinuousSampler, DigestDeltaStaleGapRebuildsBaseline)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    // cur 数值上是正常递增（不会被"回退"分支拦下），但 nowMs 距 prev.lastSeenMs
+    // 已经过去 20000ms，超过 maxGapMs=15000，应该被当成缺席过久重新计基线。
+    DigestCounterState cur{100000, 5000000000000ULL, 99999, 21000};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 21000, 15000);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
+}
+
+// ---- 间隔在容忍范围内（未超过 maxGapMs）：正常按增量上报，不应被误判为缺席 ----
+TEST(ContinuousSampler, DigestDeltaWithinGapStillIncrements)
+{
+    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
+    DigestCounterState cur{110, 5100000000ULL, 55, 14999}; // 间隔 13999ms < maxGapMs=15000
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 14999, 15000);
+    EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
+    EXPECT_EQ(delta.deltaCalls, 10u);
 }
 
 // ---- 跨 Session / 跨实例状态隔离 ----

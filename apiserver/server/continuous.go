@@ -3251,6 +3251,7 @@ func (s *APIServer) QueryContinuousDBSnapshot(c *gin.Context) {
 			"generated_at":   time.Now(),
 			"digests":        []gin.H{},
 			"lock_waits":     []gin.H{},
+			"deadlocks":      []gin.H{},
 			"metrics":        []gin.H{},
 			"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
 			"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
@@ -3302,6 +3303,9 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 	}
 	digests := map[string]*digestAgg{}
 	lockWaits := []gin.H{}
+	deadlocks := []gin.H{}
+	seenDeadlock := map[string]bool{} // instance_label|digest_text 去重：agent 侧只在内容变化时才上报新的 deadlock 样本，
+	// 但同一起死锁仍可能被拆进相邻两个窗口各上报一次（采集边界问题），这里再去重一道。
 	metricSeriesByKey := map[string]*metricSeries{}
 	objectKeys := []string{}
 	seenObject := map[string]bool{}
@@ -3356,6 +3360,19 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 							"wait_seconds":   snap.WaitSeconds,
 							"locked_table":   snap.LockedTable,
 						})
+					case "deadlock":
+						// digestText 复用为死锁原始报告文本（agent 侧的取舍，见
+						// ContinuousSampler.cpp collect_mysql_target_deadlock 注释）。
+						dedupKey := snap.InstanceLabel + "|" + snap.DigestText
+						if seenDeadlock[dedupKey] {
+							continue
+						}
+						seenDeadlock[dedupKey] = true
+						deadlocks = append(deadlocks, gin.H{
+							"instance_label": snap.InstanceLabel,
+							"timestamp":      snap.Timestamp,
+							"report":         snap.DigestText,
+						})
 					}
 				}
 				// 阶段一标量指标（db_active_connections/db_questions_total/
@@ -3403,6 +3420,9 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 	sort.Slice(lockWaits, func(i, j int) bool {
 		return lockWaits[i]["wait_seconds"].(uint64) > lockWaits[j]["wait_seconds"].(uint64)
 	})
+	sort.Slice(deadlocks, func(i, j int) bool {
+		return deadlocks[i]["timestamp"].(time.Time).After(deadlocks[j]["timestamp"].(time.Time))
+	})
 
 	metricList := make([]gin.H, 0, len(metricSeriesByKey))
 	for _, series := range metricSeriesByKey {
@@ -3423,7 +3443,7 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 		return metricList[i]["runtime"].(string) < metricList[j]["runtime"].(string)
 	})
 
-	empty := len(digestList) == 0 && len(lockWaits) == 0 && len(metricList) == 0
+	empty := len(digestList) == 0 && len(lockWaits) == 0 && len(metricList) == 0 && len(deadlocks) == 0
 	message := ""
 	if empty {
 		message = "该时间范围暂无数据库快照数据"
@@ -3433,6 +3453,7 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 		"signal_type":  "db_snapshot",
 		"digests":      digestList,
 		"lock_waits":   lockWaits,
+		"deadlocks":    deadlocks,
 		"metrics":      metricList,
 		"empty":        empty,
 		"message":      message,

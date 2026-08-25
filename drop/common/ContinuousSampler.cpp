@@ -2947,6 +2947,35 @@ static bool write_mysql_defaults_file(const std::string &path, const std::string
     return ok;
 }
 
+// 生成安全的临时 mysql defaults 文件并写入内容。之前是拼
+// "/tmp/mini_drop_db_" + instanceLabel + "_" + 毫秒时间戳，有两个隐患：
+// (1) instanceLabel 直接拼进文件路径，没做路径穿越校验；(2) 同一毫秒内两
+// 个线程轮询同一 instanceLabel 可能撞名互相覆盖。mkstemp 是 POSIX 标准的
+// "安全创建临时文件"方案，文件名由内核保证唯一、原子创建（O_CREAT|O_EXCL
+// 语义），不依赖任何外部输入拼路径。
+// user/password 若含换行符，理论上能在 [client] 这段 ini 文本里注入额外
+// 配置指令——比设计转义规则更简单可靠的做法是直接拒绝这类输入，正常账号
+// 密码不该含换行。
+static bool stage_mysql_defaults_file(const DBTargetConfig &target, const std::string &password,
+                                      std::string *outPath)
+{
+    if (target.user.find('\n') != std::string::npos || target.user.find('\r') != std::string::npos ||
+        password.find('\n') != std::string::npos || password.find('\r') != std::string::npos)
+        return false;
+    char pathTemplate[] = "/tmp/mini_drop_db_XXXXXX";
+    int fd = ::mkstemp(pathTemplate);
+    if (fd < 0)
+        return false;
+    ::close(fd);
+    if (!write_mysql_defaults_file(pathTemplate, target.user, password))
+    {
+        ::unlink(pathTemplate);
+        return false;
+    }
+    *outPath = pathTemplate;
+    return true;
+}
+
 // 单个 MySQL 目标的一次标量指标轮询：SHOW GLOBAL STATUS 一次性拿全量
 // 计数器，本地过滤出关心的几项，换算成 MetricPayload。查询超时/失败只
 // 标记 unavailable，不能拖垮整个采集循环（沿用 HistogramPayload 已有的
@@ -2961,8 +2990,8 @@ static void collect_mysql_target_metrics(const ContinuousSamplerConfig &cfg, con
                   << " failed to read password_ref=" << target.passwordRef << std::endl;
         return;
     }
-    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
-    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+    std::string defaultsPath;
+    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
     {
         std::cout << "[native-cp] db target=" << target.instanceLabel << " failed to stage mysql defaults file"
                   << std::endl;
@@ -3037,9 +3066,51 @@ struct DigestCounterState
     uint64_t countStar = 0;
     uint64_t sumTimerWaitPs = 0;
     uint64_t sumRowsExamined = 0;
+    int64_t lastSeenMs = 0; // 上一次刷新这条状态的时间，驱动过期判定和清理
 };
 static std::mutex g_digestStateMutex;
 static std::unordered_map<std::string, DigestCounterState> g_digestState;
+
+// _locked 后缀 = 调用方必须已经持有 g_digestStateMutex，不再自己加锁（避免
+// 和 collect_mysql_target_digests 里已经持有的 lock_guard 重复加锁死锁）。
+// 2026-08-24 这段(连同 lastSeenMs/mkstemp 安全加固)曾被组员一次不相关的重构
+// 提交（"修复共享采集与会话分流正确性"）无意撤销过一次，这次重新补上。
+
+static void clear_digest_state_for_session_locked(const std::string &sessionSID)
+{
+    if (sessionSID.empty())
+        return;
+    const std::string prefix = sessionSID + "|";
+    for (auto it = g_digestState.begin(); it != g_digestState.end();)
+    {
+        if (it->first.compare(0, prefix.size(), prefix) == 0)
+            it = g_digestState.erase(it);
+        else
+            ++it;
+    }
+}
+
+// Session 停止时按 sessionSID 前缀精确清理（确定性路径），供 DBSnapshotSampler::Stop() 调用。
+static void clear_digest_state_for_session(const std::string &sessionSID)
+{
+    std::lock_guard<std::mutex> lock(g_digestStateMutex);
+    clear_digest_state_for_session_locked(sessionSID);
+}
+
+// 兜底清理：Session 没有走正常 Stop 路径（比如进程被杀）时，上面那个精确
+// 清理捡不到残留状态。每次采集顺手扫一遍，删掉太久没刷新的条目（阈值给得
+// 比"跌出 TOP 50 又重新进来"要宽松得多，只为回收内存，不影响
+// compute_digest_delta 的过期判定——那个判定用的是更短的窗口级阈值）。
+static void sweep_stale_digest_state_locked(int64_t nowMs, int64_t staleAfterMs)
+{
+    for (auto it = g_digestState.begin(); it != g_digestState.end();)
+    {
+        if (nowMs - it->second.lastSeenMs > staleAfterMs)
+            it = g_digestState.erase(it);
+        else
+            ++it;
+    }
+}
 
 // ---- digest 增量状态的纯逻辑（与 mysql 命令行解耦，便于单测） ----
 
@@ -3108,10 +3179,20 @@ struct DigestDeltaResult
 // 纯函数：由上一轮状态与当前计数计算窗口增量。prev 为空指针表示首轮
 // （FirstSeen，只建立基线）。任一累计计数器回退都视为新基线（Reset），
 // 避免无符号整数下溢把 (cur - prev) 变成一个天文数字。
-static DigestDeltaResult compute_digest_delta(const DigestCounterState *prev, const DigestCounterState &cur)
+//
+// maxGapMs 处理另一类问题：digest 查询只取 ORDER BY SUM_TIMER_WAIT DESC
+// LIMIT 50，某个 digest 可能这一轮排进前 50、下一轮被挤出去、再下一轮又
+// 冲回来——如果只按"数值有没有回退"判断，回来的时候会把它缺席期间累积的
+// 全部调用当成这一个窗口的增量，产生虚假尖峰。这里借鉴 Prometheus 处理累
+// 计计数器（rate()/increase()）的思路：不是无脑做减法，而是先看采样点之
+// 间的间隔是否正常连续，间隔太大就当成需要重新计基线，不当增量上报。
+static DigestDeltaResult compute_digest_delta(const DigestCounterState *prev, const DigestCounterState &cur,
+                                              int64_t nowMs, int64_t maxGapMs)
 {
     if (prev == nullptr)
         return DigestDeltaResult{};
+    if (prev->lastSeenMs > 0 && nowMs - prev->lastSeenMs > maxGapMs)
+        return DigestDeltaResult{DigestDeltaKind::Reset, 0, 0, 0};
     if (cur.countStar < prev->countStar || cur.sumTimerWaitPs < prev->sumTimerWaitPs ||
         cur.sumRowsExamined < prev->sumRowsExamined)
         return DigestDeltaResult{DigestDeltaKind::Reset, 0, 0, 0};
@@ -3142,8 +3223,8 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
     std::string password;
     if (!read_db_target_password(target, &password))
         return;
-    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
-    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+    std::string defaultsPath;
+    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
         return;
     const std::string query =
         "SELECT SCHEMA_NAME, DIGEST, "
@@ -3185,15 +3266,18 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
         {
             // 第一次见到这个 digest：只记基线，不上报（否则会把"自服务器启动
             // 以来的全部历史调用"当成本窗口发生的调用，数字会失真）。
-            g_digestState[stateKey] = {row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
+            g_digestState[stateKey] = {row.countStar, row.sumTimerWaitPs, row.sumRowsExamined, nowMillis};
             continue;
         }
         DigestCounterState prev = it->second;
-        const DigestCounterState cur{row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
+        const DigestCounterState cur{row.countStar, row.sumTimerWaitPs, row.sumRowsExamined, nowMillis};
         it->second = cur;
-        DigestDeltaResult delta = compute_digest_delta(&prev, cur);
+        // 1.5x 窗口时长：正常相邻两轮之间的间隔应该约等于 aggregationWindowSec，
+        // 给 50% 冗余容忍单次调度抖动，超过这个还判定为"缺席过久，重新计基线"。
+        const int64_t maxGapMs = static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1500;
+        DigestDeltaResult delta = compute_digest_delta(&prev, cur, nowMillis, maxGapMs);
         if (delta.kind != DigestDeltaKind::Increment)
-            continue; // 首轮基线或任一计数器回退（TRUNCATE/重启）：本轮不上报
+            continue; // 首轮基线、计数器回退（TRUNCATE/重启）或缺席过久：本轮不上报
         if (delta.deltaCalls == 0)
             continue; // 零增量：不上报，但状态已更新为当前累计值
 
@@ -3208,6 +3292,10 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
         sample.rowsExaminedTotal = delta.deltaRows;
         window->dbSnapshots.push_back(std::move(sample));
     }
+
+    // 兜底清理：非正常停止路径下（进程被杀等）不会经过 Stop() 里的确定性
+    // 清理，这里顺手扫一遍过期条目回收内存。
+    sweep_stale_digest_state_locked(nowMillis, static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 20000);
 }
 
 // 锁等待链：直接查 MySQL 内置的 sys.innodb_lock_waits 视图（5.7.7+ 默认启
@@ -3221,8 +3309,8 @@ static void collect_mysql_target_lock_waits(const ContinuousSamplerConfig &cfg, 
     std::string password;
     if (!read_db_target_password(target, &password))
         return;
-    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
-    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
+    std::string defaultsPath;
+    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
         return;
     const std::string query =
         "SELECT waiting_pid, "
@@ -3280,6 +3368,443 @@ static void collect_mysql_target_lock_waits(const ContinuousSamplerConfig &cfg, 
     }
 }
 
+// 死锁可观测性：死锁瞬间可能只持续 1-2 秒，10 秒轮询周期完全可能撞不上——
+// 这不是靠调高轮询频率能解决的问题（调太快又会把生产库打崩，本末倒置）。
+// MySQL 自己给了答案：SHOW ENGINE INNODB STATUS 的 LATEST DETECTED DEADLOCK
+// 段落记录的是"最近一次检测到的死锁"，不依赖轮询时机撞见死锁那一刻，随
+// 时查都能看到最近一次。这正是 Percona Toolkit 的 pt-deadlock-logger 采用
+// 的思路——定期解析这段输出，而不是指望撞见死锁发生的瞬间。
+static std::mutex g_lastDeadlockMutex;
+static std::unordered_map<std::string, uint64_t> g_lastDeadlockHash; // key: sessionSID|instanceLabel
+
+static void clear_deadlock_state_for_session(const std::string &sessionSID)
+{
+    if (sessionSID.empty())
+        return;
+    const std::string prefix = sessionSID + "|";
+    std::lock_guard<std::mutex> lock(g_lastDeadlockMutex);
+    for (auto it = g_lastDeadlockHash.begin(); it != g_lastDeadlockHash.end();)
+    {
+        if (it->first.compare(0, prefix.size(), prefix) == 0)
+            it = g_lastDeadlockHash.erase(it);
+        else
+            ++it;
+    }
+}
+
+// 从 SHOW ENGINE INNODB STATUS 的 Status 全文里摘出 LATEST DETECTED DEADLOCK
+// 这一段（含起始的 "----" 分隔线之后到下一个分隔线之前的原始文本），没有
+// 死锁记录（正常情况）返回 false。
+static bool extract_latest_deadlock_section(const std::string &status, std::string *out)
+{
+    const std::string marker = "LATEST DETECTED DEADLOCK";
+    size_t markerPos = status.find(marker);
+    if (markerPos == std::string::npos)
+        return false;
+    size_t bodyStart = status.find('\n', markerPos);
+    if (bodyStart == std::string::npos)
+        return false;
+    bodyStart += 1;
+    // marker 后紧跟一行分隔线（"------------------------"），跳过它，正文
+    // 从下一行开始。
+    if (status.compare(bodyStart, 4, "----") == 0)
+    {
+        size_t afterDashes = status.find('\n', bodyStart);
+        if (afterDashes != std::string::npos)
+            bodyStart = afterDashes + 1;
+    }
+    size_t bodyEnd = status.find("\n------------\n", bodyStart);
+    if (bodyEnd == std::string::npos)
+        bodyEnd = status.size();
+    *out = status.substr(bodyStart, bodyEnd - bodyStart);
+    while (!out->empty() && (out->back() == '\n' || out->back() == ' '))
+        out->pop_back();
+    // 长度上限保护：防止解析异常（比如没找到正确的结束分隔符）把整段几百
+    // KB 的 InnoDB 状态文本都塞进 batch。
+    if (out->size() > 8000)
+        out->resize(8000);
+    return !out->empty();
+}
+
+static void collect_mysql_target_deadlock(const ContinuousSamplerConfig &cfg, const DBTargetConfig &target,
+                                          WindowPayload *window)
+{
+    std::string password;
+    if (!read_db_target_password(target, &password))
+        return;
+    std::string defaultsPath;
+    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
+        return;
+    std::vector<std::string> argv = {
+        "mysql", "--defaults-extra-file=" + defaultsPath,
+        "-h", target.host, "-P", std::to_string(target.port),
+        "--connect-timeout=2", "--batch", "--skip-column-names",
+        "-e", "SHOW ENGINE INNODB STATUS"};
+    std::string output;
+    int rc = drop::exec_capture(argv, &output, 512 * 1024);
+    ::unlink(defaultsPath.c_str());
+    if (rc != 0)
+    {
+        std::cout << "[native-cp] db target=" << target.instanceLabel << " innodb status query failed rc=" << rc
+                  << std::endl;
+        return;
+    }
+    // 输出只有一行数据："Type\tName\tStatus"，Status 本身是含内部换行的多
+    // 行文本——从第二个制表符往后的全部内容（含后续所有行）都属于 Status。
+    size_t firstTab = output.find('\t');
+    size_t secondTab = firstTab == std::string::npos ? std::string::npos : output.find('\t', firstTab + 1);
+    if (secondTab == std::string::npos)
+        return;
+    const std::string status = output.substr(secondTab + 1);
+
+    std::string deadlockText;
+    if (!extract_latest_deadlock_section(status, &deadlockText))
+        return; // 没有死锁记录，正常情况，不是错误
+
+    const std::string stateKey = cfg.sessionSID + "|" + target.instanceLabel;
+    const uint64_t hash = stable_string_hash(deadlockText);
+    {
+        std::lock_guard<std::mutex> lock(g_lastDeadlockMutex);
+        auto it = g_lastDeadlockHash.find(stateKey);
+        if (it != g_lastDeadlockHash.end() && it->second == hash)
+            return; // 跟上次上报的是同一起死锁（InnoDB 状态在下一次死锁前不会变），不重复上报
+        g_lastDeadlockHash[stateKey] = hash;
+    }
+
+    DBSnapshotSample sample;
+    sample.kind = "deadlock";
+    sample.instanceLabel = target.instanceLabel;
+    sample.timestampMs = now_ms();
+    // 复用 digestText 字段存原始死锁报告文本，不额外拆 pid/SQL 结构化字
+    // 段——MySQL 这段自由文本格式跨版本措辞有差异，硬解析容易碎，原样展
+    // 示给人读更稳妥（同样的取舍在 lock_wait 那边是反过来的，因为
+    // sys.innodb_lock_waits 给的是结构化列，不是自由文本）。
+    sample.digestText = deadlockText;
+    window->dbSnapshots.push_back(std::move(sample));
+}
+
+// ---------- PostgreSQL 分支 ----------
+// 架构上和 MySQL 完全对称：同一个 collect_db_window 入口按 engine 分支，
+// 复用同一套 DBSnapshotSample/digest 增量状态/节流骨架，只是各自的查询语
+// 句和凭据格式不同。credential 用 .pgpass 文件（PostgreSQL 官方的非交互
+// 认证机制），跟 MySQL 的 --defaults-extra-file 是同一个思路："密码写进一
+// 个 0600 临时文件，不走命令行参数"。
+//
+// **本次未接入真实 PostgreSQL 实例验证**——这一点在合入前必须让读这段代
+// 码的人知道：MySQL 阶段一/阶段二当初是在真实故障注入环境里跑通、修过好
+// 几轮真实 bug 才定型的（时间戳/权限/SCHEMA_NAME 过滤……），PostgreSQL 这
+// 段只经过了本地代码走查和编译验证，字段名、psql 参数、pg_stat_statements
+// 版本兼容性都可能在真实环境里暴露新问题，不能假设它和 MySQL 那边一样可
+// 靠。
+
+// psql 不支持像 mysql --defaults-extra-file 那样直接传一个自包含的凭据文
+// 件路径，PostgreSQL 的非交互认证机制是 .pgpass 文件 + PGPASSFILE 环境变
+// 量。exec_capture() 只接受 argv、不支持传子进程环境变量，为了不改这个被
+// 广泛复用的公共工具函数，这里退化成"设置当前线程所在进程的环境变量→执
+// 行→复原"，用一个专门的 mutex 把这一小段serialize 掉——避免同一进程内
+// 另一个 DBSnapshotSampler 线程（另一个 Session）在环境变量生效期间也发
+// 起 psql 调用，读到错误的 PGPASSFILE。这是已知的简化实现，真正的解法是
+// 让 exec_capture 支持传 envp，这次没有为了一个 PostgreSQL 分支去改一个
+// 十几个调用方共用的工具函数。
+static std::mutex g_pgPassEnvMutex;
+
+static bool stage_postgres_pass_file(const DBTargetConfig &target, const std::string &password,
+                                     const std::string &database, std::string *outPath)
+{
+    // .pgpass 每行格式 hostname:port:database:username:password，冒号/反
+    // 斜杠是这个格式的分隔符，理论上需要转义——这几个字段正常不会出现冒
+    // 号，直接拒绝比实现转义规则更简单可靠（和 mysql 那边拒绝换行符是同
+    // 一个取舍）。
+    if (target.host.find(':') != std::string::npos || target.user.find(':') != std::string::npos ||
+        database.find(':') != std::string::npos || password.find(':') != std::string::npos ||
+        password.find('\n') != std::string::npos)
+        return false;
+    char pathTemplate[] = "/tmp/mini_drop_pg_XXXXXX";
+    int fd = ::mkstemp(pathTemplate);
+    if (fd < 0)
+        return false;
+    std::ostringstream line;
+    line << target.host << ":" << target.port << ":" << database << ":" << target.user << ":" << password << "\n";
+    const std::string content = line.str();
+    size_t written = 0;
+    bool ok = true;
+    while (written < content.size())
+    {
+        ssize_t count = ::write(fd, content.data() + written, content.size() - written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+        {
+            ok = false;
+            break;
+        }
+        written += static_cast<size_t>(count);
+    }
+    ::close(fd);
+    if (!ok)
+    {
+        ::unlink(pathTemplate);
+        return false;
+    }
+    *outPath = pathTemplate;
+    return true;
+}
+
+static int exec_psql_capture(const std::vector<std::string> &argv, const std::string &pgpassPath,
+                             std::string *output, size_t maxLen)
+{
+    std::lock_guard<std::mutex> lock(g_pgPassEnvMutex);
+    ::setenv("PGPASSFILE", pgpassPath.c_str(), 1);
+    int rc = drop::exec_capture(argv, output, maxLen);
+    ::unsetenv("PGPASSFILE");
+    return rc;
+}
+
+static std::vector<std::string> psql_base_argv(const DBTargetConfig &target, const std::string &database)
+{
+    return {"psql", "-h", target.host, "-p", std::to_string(target.port),
+            "-U", target.user, "-d", database,
+            "--no-password", // 非交互：凭据缺失/错误直接报错返回，绝不等 tty 输入卡死采集线程
+            "-t", "-A", "-F", "\t"};
+}
+
+// 标量指标：pg_stat_database 是 PostgreSQL 内置系统视图（不是第三方工
+// 具），跟 MySQL 的 SHOW GLOBAL STATUS 一样"服务器自带、查询零成本"。跨库
+// 求和给出一个实例级汇总，排除 template0/1 这两个模板库。指标名沿用
+// MySQL 那三个（db_active_connections/db_questions_total/
+// db_innodb_buffer_pool_hit_ratio_bps）而不是另起 postgres 专属命名——代
+// 价是 "innodb" 这个词对 postgres 不准确，好处是前端 DBMetricTrends 三张
+// 图不用为每个引擎单独判断字段名，两个引擎的数据能画进同一张图对比。
+static void collect_postgres_target_metrics(const ContinuousSamplerConfig &cfg, const DBTargetConfig &target,
+                                             WindowPayload *window)
+{
+    std::string password;
+    if (!read_db_target_password(target, &password))
+        return;
+    const std::string database = target.database.empty() ? "postgres" : target.database;
+    std::string pgpassPath;
+    if (!stage_postgres_pass_file(target, password, database, &pgpassPath))
+        return;
+    auto argv = psql_base_argv(target, database);
+    argv.push_back("-c");
+    argv.push_back(
+        "SELECT COALESCE(SUM(numbackends),0), COALESCE(SUM(xact_commit)+SUM(xact_rollback),0), "
+        "COALESCE(SUM(blks_hit),0), COALESCE(SUM(blks_read),0) "
+        "FROM pg_stat_database WHERE datname NOT IN ('template0','template1')");
+    std::string output;
+    int rc = exec_psql_capture(argv, pgpassPath, &output, 4096);
+    ::unlink(pgpassPath.c_str());
+    if (rc != 0)
+    {
+        std::cout << "[native-cp] db target=" << target.instanceLabel << " pg_stat_database query failed rc=" << rc
+                  << std::endl;
+        return;
+    }
+    std::vector<std::string> cols;
+    size_t start = 0;
+    for (size_t i = 0; i <= output.size(); ++i)
+    {
+        if (i == output.size() || output[i] == '\t' || output[i] == '\n')
+        {
+            if (i > start || !cols.empty())
+                cols.push_back(output.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (cols.size() < 4)
+        return;
+    char *end = nullptr;
+    const uint64_t connections = std::strtoull(cols[0].c_str(), &end, 10);
+    const uint64_t transactions = std::strtoull(cols[1].c_str(), &end, 10);
+    const uint64_t blksHit = std::strtoull(cols[2].c_str(), &end, 10);
+    const uint64_t blksRead = std::strtoull(cols[3].c_str(), &end, 10);
+
+    const int64_t nowMillis = now_ms();
+    auto pushMetric = [&](const std::string &name, uint64_t value, const std::string &unit) {
+        MetricPayload metric;
+        metric.metric = name;
+        metric.unit = unit;
+        metric.runtime = "postgres:" + target.instanceLabel;
+        metric.timestampMs = nowMillis;
+        metric.value = value;
+        window->metrics.push_back(std::move(metric));
+    };
+    pushMetric("db_active_connections", connections, "count");
+    pushMetric("db_questions_total", transactions, "count");
+    const uint64_t total = blksHit + blksRead;
+    uint64_t hitRatioBps = total == 0 ? 10000
+                                      : static_cast<uint64_t>((static_cast<double>(blksHit) / static_cast<double>(total)) * 10000.0);
+    pushMetric("db_innodb_buffer_pool_hit_ratio_bps", hitRatioBps, "ratio_bps");
+}
+
+// digest：pg_stat_statements 是 PostgreSQL 官方扩展（不是第三方工具），但
+// 和 MySQL 的 performance_schema 不同——**默认不启用**，需要 DBA 在
+// postgresql.conf 里配置 shared_preload_libraries='pg_stat_statements' 并
+// 重启实例、再 CREATE EXTENSION。这是验收前必须让运维知道的前置条件，查
+// 询失败大概率就是这个扩展没装。
+// 复用和 MySQL 完全相同的增量 diff 状态机（g_digestState/compute_digest_delta/
+// digest_state_key），因为这套逻辑本来就是引擎无关的"给一个 digest 标识
+// +累计计数器，算窗口内增量"，不需要为 postgres 另写一遍。唯一要注意的
+// 是单位：pg_stat_statements.total_exec_time 是毫秒（float），MySQL 那边
+// 是皮秒（int），复用同一个 sumTimerWaitPs 字段前要换算成"皮秒当量"
+// （ms * 1e9），这样 compute_digest_delta 里"/1e6 得到微秒"的换算对两个
+// 引擎都成立，不用在共享逻辑里加 engine 分支。
+static void collect_postgres_target_digests(const ContinuousSamplerConfig &cfg, const DBTargetConfig &target,
+                                            WindowPayload *window)
+{
+    std::string password;
+    if (!read_db_target_password(target, &password))
+        return;
+    const std::string database = target.database.empty() ? "postgres" : target.database;
+    std::string pgpassPath;
+    if (!stage_postgres_pass_file(target, password, database, &pgpassPath))
+        return;
+    auto argv = psql_base_argv(target, database);
+    argv.push_back("-c");
+    argv.push_back(
+        "SELECT queryid::text, "
+        "LEFT(REPLACE(REPLACE(query, E'\\n', ' '), E'\\t', ' '), 500), "
+        "calls, total_exec_time, rows "
+        "FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 50");
+    std::string output;
+    int rc = exec_psql_capture(argv, pgpassPath, &output, 256 * 1024);
+    ::unlink(pgpassPath.c_str());
+    if (rc != 0)
+    {
+        // 最常见原因：扩展没装（见上方注释），只记日志，不影响标量指标继续采。
+        std::cout << "[native-cp] db target=" << target.instanceLabel
+                  << " pg_stat_statements query failed rc=" << rc << " (扩展可能未启用)" << std::endl;
+        return;
+    }
+
+    const int64_t nowMillis = now_ms();
+    std::istringstream lines(output);
+    std::string line;
+    std::lock_guard<std::mutex> lock(g_digestStateMutex);
+    while (std::getline(lines, line))
+    {
+        std::vector<std::string> cols;
+        size_t start = 0;
+        for (size_t i = 0; i <= line.size(); ++i)
+        {
+            if (i == line.size() || line[i] == '\t')
+            {
+                cols.push_back(line.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (cols.size() != 5)
+            continue;
+        char *end = nullptr;
+        const std::string queryid = cols[0];
+        const std::string queryText = cols[1];
+        const uint64_t calls = std::strtoull(cols[2].c_str(), &end, 10);
+        if (end == cols[2].c_str())
+            continue;
+        const double totalExecMs = std::strtod(cols[3].c_str(), &end);
+        if (end == cols[3].c_str())
+            continue;
+        const uint64_t rowsExamined = std::strtoull(cols[4].c_str(), &end, 10);
+
+        const std::string stateKey = digest_state_key(cfg.sessionSID, target.instanceLabel, queryid);
+        auto it = g_digestState.find(stateKey);
+        const uint64_t sumTimerWaitPs = static_cast<uint64_t>(totalExecMs * 1000000000.0); // ms -> "皮秒当量"
+        if (it == g_digestState.end())
+        {
+            g_digestState[stateKey] = {calls, sumTimerWaitPs, rowsExamined, nowMillis};
+            continue;
+        }
+        DigestCounterState prev = it->second;
+        const DigestCounterState cur{calls, sumTimerWaitPs, rowsExamined, nowMillis};
+        it->second = cur;
+        const int64_t maxGapMs = static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1500;
+        DigestDeltaResult delta = compute_digest_delta(&prev, cur, nowMillis, maxGapMs);
+        if (delta.kind != DigestDeltaKind::Increment || delta.deltaCalls == 0)
+            continue;
+
+        DBSnapshotSample sample;
+        sample.kind = "digest";
+        sample.instanceLabel = target.instanceLabel;
+        sample.timestampMs = nowMillis;
+        sample.schemaName = database;
+        sample.digestText = queryText;
+        sample.callCount = delta.deltaCalls;
+        sample.totalLatencyUs = delta.deltaLatencyUs;
+        sample.rowsExaminedTotal = delta.deltaRows;
+        window->dbSnapshots.push_back(std::move(sample));
+    }
+    sweep_stale_digest_state_locked(nowMillis, static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 20000);
+}
+
+// 锁等待：不手写 pg_locks 自连接（经典但容易写错的写法），用 PostgreSQL
+// 9.6+ 自带的 pg_blocking_pids(pid) 函数——给一个后端 pid，直接返回"谁在
+// 堵它"的 pid 数组，官方就是为了简化这个常见运维需求加的，跟 MySQL 那边
+// 用 sys.innodb_lock_waits 代替手写三表 join 是同一个思路。locked_table
+// 拿不到（pg_blocking_pids 不暴露锁定的具体对象，要拿到还得再关联
+// pg_locks 查 relation OID），留空，是已知的简化。
+static void collect_postgres_target_lock_waits(const ContinuousSamplerConfig &cfg, const DBTargetConfig &target,
+                                               WindowPayload *window)
+{
+    std::string password;
+    if (!read_db_target_password(target, &password))
+        return;
+    const std::string database = target.database.empty() ? "postgres" : target.database;
+    std::string pgpassPath;
+    if (!stage_postgres_pass_file(target, password, database, &pgpassPath))
+        return;
+    auto argv = psql_base_argv(target, database);
+    argv.push_back("-c");
+    argv.push_back(
+        "SELECT a.pid, "
+        "LEFT(REPLACE(REPLACE(COALESCE(a.query,''), E'\\n',' '), E'\\t',' '), 300), "
+        "b.pid, "
+        "LEFT(REPLACE(REPLACE(COALESCE(b.query,''), E'\\n',' '), E'\\t',' '), 300), "
+        "GREATEST(0, EXTRACT(EPOCH FROM (now() - a.query_start))::bigint) "
+        "FROM pg_stat_activity a "
+        "JOIN LATERAL unnest(pg_blocking_pids(a.pid)) AS bp(pid) ON true "
+        "JOIN pg_stat_activity b ON b.pid = bp.pid "
+        "WHERE cardinality(pg_blocking_pids(a.pid)) > 0");
+    std::string output;
+    int rc = exec_psql_capture(argv, pgpassPath, &output, 128 * 1024);
+    ::unlink(pgpassPath.c_str());
+    if (rc != 0)
+    {
+        std::cout << "[native-cp] db target=" << target.instanceLabel << " pg lock wait query failed rc=" << rc
+                  << std::endl;
+        return;
+    }
+
+    const int64_t nowMillis = now_ms();
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+        std::vector<std::string> cols;
+        size_t start = 0;
+        for (size_t i = 0; i <= line.size(); ++i)
+        {
+            if (i == line.size() || line[i] == '\t')
+            {
+                cols.push_back(line.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (cols.size() != 5)
+            continue;
+        char *end = nullptr;
+        DBSnapshotSample sample;
+        sample.kind = "lock_wait";
+        sample.instanceLabel = target.instanceLabel;
+        sample.timestampMs = nowMillis;
+        sample.waitingPid = std::strtoll(cols[0].c_str(), &end, 10);
+        sample.waitingQuery = cols[1];
+        sample.blockingPid = std::strtoll(cols[2].c_str(), &end, 10);
+        sample.blockingQuery = cols[3];
+        sample.waitSeconds = std::strtoull(cols[4].c_str(), &end, 10);
+        window->dbSnapshots.push_back(std::move(sample));
+    }
+}
+
 static WindowPayload collect_db_window(const ContinuousSamplerConfig &cfg)
 {
     WindowPayload window;
@@ -3293,9 +3818,18 @@ static WindowPayload collect_db_window(const ContinuousSamplerConfig &cfg)
             collect_mysql_target_metrics(cfg, target, &window);
             collect_mysql_target_digests(cfg, target, &window);
             collect_mysql_target_lock_waits(cfg, target, &window);
+            collect_mysql_target_deadlock(cfg, target, &window);
         }
-        // PostgreSQL 标量指标 + digest/锁查询留待后续子任务，架构上两者共
-        // 用同一个 collect_db_window 入口，按 engine 分支接入即可。
+        else if (target.engine == "postgres")
+        {
+            collect_postgres_target_metrics(cfg, target, &window);
+            collect_postgres_target_digests(cfg, target, &window);
+            collect_postgres_target_lock_waits(cfg, target, &window);
+            // PostgreSQL 没有 MySQL 那种"最近一次死锁摘要"内置视图；PG 的
+            // deadlock_timeout 触发后只写 postgresql 日志文件，不落在任何系
+            // 统视图里，要采集就得读日志文件（另一套采集路径，非查询式），
+            // 留作后续，不在这次范围。
+        }
     }
 
     // run_continuous_spool_loop 对所有 collector 一视同仁地紧邻着循环调
@@ -3372,6 +3906,9 @@ void DBSnapshotSampler::Stop()
     running_ = false;
     if (worker_.joinable())
         worker_.join();
+    // 确定性清理这个 Session 名下的 digest 增量状态，不用等兜底的过期扫描。
+    clear_digest_state_for_session(config_.sessionSID);
+    clear_deadlock_state_for_session(config_.sessionSID);
 }
 
 bool DBSnapshotSampler::Running() const

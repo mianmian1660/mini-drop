@@ -308,7 +308,9 @@ MVP（§9 第一行）已落地，但只覆盖 `sched_latency`/`io_latency`/`io_
 > `lock_wait`（静态下限）/`digest`（环比上一等长窗口，复用 `KFactor` 字段）。命中只写
 > `DetectionEvent{status: fired_no_action}`，不建诊断任务——`TaskKindScriptDiagnostic`
 > 现状是"仅声明契约，Runner 未接入"（task_kind.go:199-205），建出来的任务永远跑不完，
-> 不做一个"能触发但触发了也没用"的假功能，等 Runner 接入后再补上建任务这一步。
+> 不做一个"能触发但触发了也没用"的假功能。**补上这一步的设计方案见
+> `docs/db-script-diagnostic-design.md`（借鉴 Percona pt-stalk 的固定诊断配方思路，尚未
+> 实施）。**
 
 `evaluateSentinelRule`（detection.go:79-82）查不到 `db_snapshot` 的 TaskKind 映射直接
 `return`——数据库锁等待/慢查询这类"凌晨偶发、事后不可复现、最需要自动报警"的场景，恰恰是
