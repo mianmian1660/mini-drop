@@ -13,7 +13,7 @@ import { Link } from 'react-router-dom';
 import { schedules } from '../api';
 import Pagination from './Pagination';
 import { collectorLabelFromTask } from '../utils/collectors';
-import { cronHumanLabel } from '../utils/cron';
+import { schedulePeriodLabel, schedulePeriodTitle, scheduleStatusText } from '../utils/schedule';
 import { formatDateTime } from '../utils/time';
 
 const S = {
@@ -172,12 +172,12 @@ export default function ScheduleList({ targetIp, detailPrefix, compact = false, 
                                             <div style={S.subtle}>{collectorLabelFromTask({ task_kind: sch.task_kind, type: sch.task_type, profiler_type: sch.profiler_type, request_params: sch.request_params })}</div>
                                         </td>
                                         <td style={S.td}>
-                                            <span style={{ ...S.badge, background: running ? '#16a34a' : '#64748b', color: '#fff' }}>
+                                            <span style={{ ...S.badge, background: running ? '#16a34a' : '#64748b', color: '#fff' }} title={scheduleStatusText(sch)}>
                                                 {running ? '启用' : '停用'}
                                             </span>
                                         </td>
                                         <td style={S.td}>
-                                            <span style={S.cron} title={sch.cron_expr}>{cronHumanLabel(sch.cron_expr)}</span>
+                                            <span style={S.cron} title={schedulePeriodTitle(sch)}>{schedulePeriodLabel(sch)}</span>
                                         </td>
                                         <td style={S.td}>{formatDateTime(sch.last_run_at) || '-'}</td>
                                         <td style={S.td}>{running ? (formatDateTime(sch.next_run_at) || '-') : '已停用'}</td>
