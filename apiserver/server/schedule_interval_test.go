@@ -216,6 +216,11 @@ func TestIntervalSchedulePollSkipsDisabled(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatalf("seed schedule: %v", err)
 	}
+	// Enabled 带 gorm:"default:true"，Create 时零值 false 会被省略落库为 true；
+	// 停用状态与生产一致地通过显式 Update 写入（见 TestListSchedulesFiltersAndPagination）。
+	if err := s.DB.Model(&model.ScheduleTask{}).Where("sid = ?", "sch-off").Update("enabled", false).Error; err != nil {
+		t.Fatalf("disable sch-off: %v", err)
+	}
 	s.pollDueSchedules()
 	var childCount int64
 	s.DB.Model(&model.HotmethodTask{}).Where("master_task_tid = ?", "sch-off").Count(&childCount)
