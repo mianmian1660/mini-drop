@@ -124,7 +124,8 @@ run_stage E2E bash scripts/e2e_smoke.sh
 # （Native/Go/Java/Node/Python 业务热点、v2 语言状态、runtime 筛选一致性、
 # 窗口幂等）。任何质量门槛失败都使部署失败。
 if [[ "${TEST_SCOPE}" == "full" ]]; then
-  run_stage E2E_MULTILANG bash scripts/continuous_process_multilang_e2e.sh
+  # full 验收同时验证 Agent 容器重建后的 Session 原地恢复。
+  run_stage E2E_MULTILANG env RESTART_AGENT=1 bash scripts/continuous_process_multilang_e2e.sh
 fi
 check_clean_tree
 printf '[STAGE:ALL] PASS branch=%s sha=%s\n' "${DEPLOY_BRANCH}" "${TARGET_SHA:0:12}"

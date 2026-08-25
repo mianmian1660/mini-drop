@@ -155,14 +155,14 @@ get_session_json() {
 # 阶段四修复：把"所有 Session 已 attach（running/degraded 且带 PID）"的判定
 # 提取为单一函数，消除启动等待与 Agent 重启恢复两处重复嵌套的循环体。
 sessions_attached() {
-    local ready=1
+    local ready=0
     local index payload state active
     for index in "${!SIDS[@]}"; do
         payload="$(get_session_json "${SIDS[$index]}")"
         state="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["session"].get("observed_state",""))')"
         active="$(printf '%s' "$payload" | python3 -c 'import base64,json,sys; x=json.load(sys.stdin)["data"]["session"].get("active_processes",""); print(base64.b64decode(x).decode() if isinstance(x,str) else json.dumps(x))')"
-        [[ "$state" == "running" || "$state" == "degraded" ]] || ready=0
-        grep -q '"pid":' <<<"$active" || ready=0
+        [[ "$state" == "running" || "$state" == "degraded" ]] || ready=1
+        grep -q '"pid":' <<<"$active" || ready=1
         printf '[state] %s sid=%s observed=%s active=%s\n' "${NAMES[$index]}" "${SIDS[$index]}" "$state" "$active" >&2
     done
     return "$ready"
@@ -339,12 +339,17 @@ assert_language_status() {
     local index="$1"
     local sid="${SIDS[$index]}"
     local expect_runtime="${EXPECT_RUNTIMES[$index]}"
-    api_from_to
+    local deadline=$((SECONDS + WAIT_VALID_DATA_SEC))
     local topn
-    topn="$(fetch_topn "$sid" || true)"
-    RUNTIME_JSON="$topn" EXPECT_RUNTIME="$expect_runtime" SESSION_NAME="${NAMES[$index]}" python3 <<'PY'
+    while (( SECONDS < deadline )); do
+        api_from_to
+        topn="$(fetch_topn "$sid" || true)"
+        if RUNTIME_JSON="$topn" EXPECT_RUNTIME="$expect_runtime" SESSION_NAME="${NAMES[$index]}" python3 <<'PY'
 import json, os, sys
-data = (json.loads(os.environ["RUNTIME_JSON"]) or {}).get("data") or {}
+try:
+    data = (json.loads(os.environ["RUNTIME_JSON"]) or {}).get("data") or {}
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
 expected = os.environ["EXPECT_RUNTIME"]
 name = os.environ["SESSION_NAME"]
 diagnostics = data.get("runtime_diagnostics") or {}
@@ -357,28 +362,37 @@ if version < 2:
     print(f"FAIL {name}: {expected} diagnostics missing v2 contract (diagnostics_version={version})")
     raise SystemExit(1)
 collector = entry.get("collector_status", "")
-if collector in ("failed",):
-    print(f"FAIL {name}: {expected} collector_status=failed reasons={entry.get('reasons')}")
-    raise SystemExit(1)
-if expected in ("java", "node", "python", "go"):
-    if collector not in ("ready", "partial", "pending"):
-        # node-plain 场景允许 missing（缺 --perf-basic-prof）
-        if name == "node-plain" and collector == "missing":
-            pass
-        else:
-            print(f"FAIL {name}: {expected} collector_status={collector} (want ready/partial/pending) reasons={entry.get('reasons')}")
-            raise SystemExit(1)
 if name == "node-plain":
     reasons = " ".join(entry.get("reasons") or [])
-    if collector not in ("missing", "not_applicable") and "--perf-basic-prof" not in reasons:
+    if collector != "missing" or "--perf-basic-prof" not in reasons:
         print(f"FAIL node-plain must report missing --perf-basic-prof, got status={collector} reasons={entry.get('reasons')}")
         raise SystemExit(1)
-if name != "node-plain":
-    print(f"OK {name}: {expected} v2 status={collector} semantic={entry.get('semantic_frame_percent')}% unresolved={entry.get('unresolved_frame_percent')}% samples={entry.get('sample_count')}")
-else:
     print(f"OK node-plain: {expected} v2 status={collector} reasons={entry.get('reasons')}")
+    raise SystemExit(0)
+
+semantic_sample = float(entry.get("semantic_sample_percent") or 0)
+unresolved = float(entry.get("unresolved_frame_percent") or 0)
+samples = float(entry.get("sample_count") or 0)
+if collector != "ready" or samples <= 0 or semantic_sample < 70:
+    print(f"WAIT {name}: status={collector} semantic_sample={semantic_sample}% samples={samples} reasons={entry.get('reasons')}")
+    raise SystemExit(1)
+if expected == "native":
+    target_unresolved = float(entry.get("target_module_unresolved_percent") or 0)
+    target_frames = float(entry.get("target_module_frame_weight") or 0)
+    if target_frames <= 0 or target_unresolved >= 5:
+        print(f"WAIT {name}: native target-module frames={target_frames} unresolved={target_unresolved}% (want frames>0 and unresolved<5%)")
+        raise SystemExit(1)
+elif unresolved > 20:
+    print(f"WAIT {name}: unresolved={unresolved}% (want <=20%)")
+    raise SystemExit(1)
+print(f"OK {name}: {expected} v2 ready semantic_sample={semantic_sample}% semantic_frame={entry.get('semantic_frame_percent')}% unresolved={unresolved}% target_unresolved={entry.get('target_module_unresolved_percent')}% samples={samples}")
 PY
-    [[ $? -eq 0 ]] || fail "${NAMES[$index]} language status gate failed"
+        then
+            return 0
+        fi
+        sleep 4
+    done
+    fail "${NAMES[$index]} language status did not reach the production quality gate"
 }
 for index in "${!SIDS[@]}"; do assert_language_status "$index"; done
 pass "all Sessions expose truthful v2 language status"
