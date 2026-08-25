@@ -4,6 +4,7 @@ import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegrap
 import HistogramTrendChart from './HistogramTrendChart';
 import { localDateTimeToISO } from '../utils/time';
 import { SENTINEL_SIGNALS, decodeJSONField, signalLabel } from '../utils/continuous';
+import InfoTooltip from './InfoTooltip';
 import {
     formatMetricValue,
     formatRawMetric,
@@ -1855,7 +1856,7 @@ function Field({ label, children, wide = false }) {
 }
 
 function Metric({ label, value, hint }) {
-    return <div style={S.metric} title={hint || undefined}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value || '-'}</div></div>;
+    return <div style={S.metric}><div style={S.metricLabel}>{label}{hint && <InfoTooltip>{hint}</InfoTooltip>}</div><div style={S.metricValue}>{value || '-'}</div></div>;
 }
 
 function continuousSessionMeta(target, fixedSession = null) {
