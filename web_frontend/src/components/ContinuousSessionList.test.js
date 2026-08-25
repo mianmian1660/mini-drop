@@ -21,7 +21,9 @@ test('list renders waiting process tasks and stop writes desired state through t
             total: 1,
             sessions: [{
                 sid: 'cps-worker', name: 'Worker', scope: 'process', selector_exe: '/opt/worker',
+                selector_mode: 'pid_instance', selector_params: { pid: 42, process_start_ms: 1724160000000, exe: '/opt/worker' },
                 desired_state: 'running', observed_state: 'waiting', continuity_mode: 'degraded',
+                degradation_reason: 'target pid 42 is not currently present; collection stays waiting and will NOT follow a reused PID or a new process at the same path',
                 signals: ['cpu_profile', 'io_latency'], active_processes: [], started_at: '2026-08-20T00:00:00Z',
                 can_manage: true,
             }],
@@ -38,7 +40,10 @@ test('list renders waiting process tasks and stop writes desired state through t
     await act(async () => { await Promise.resolve(); });
 
     expect(container.textContent).toContain('等待进程');
+    expect(container.textContent).toContain('单进程实例');
     expect(container.textContent).toContain('/opt/worker');
+    expect(container.textContent).toContain('PID 42');
+    expect(container.textContent).toContain('target pid 42 is not currently present');
     expect(container.querySelector('.table-scroll')).not.toBeNull();
     expect(container.querySelector('.table-scroll').style.maxWidth).toBe('100%');
     expect(container.textContent).toContain('共 1 条');

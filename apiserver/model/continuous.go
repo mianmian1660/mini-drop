@@ -55,7 +55,16 @@ type ContinuousSession struct {
 	Status               string `gorm:"column:status;size:32;default:running;index" json:"status"`
 	Scope                string `gorm:"column:scope;size:16;default:host;index" json:"scope"`
 	SelectorExe          string `gorm:"column:selector_exe;size:4096;index" json:"selector_exe"`
-	SelectorMode         string `gorm:"column:selector_mode;size:32;default:all_instances" json:"selector_mode"`
+	SelectorMode         string `gorm:"column:selector_mode;size:32;default:exe_all_instances" json:"selector_mode"`
+	// SelectorParams 阶段六：selector 的结构化参数（jsonb）。按 selector_mode
+	// 保存不同字段：
+	//   - pid_instance:      {pid, process_start_ms, exe}
+	//   - exe_all_instances: {exe}
+	//   - cgroup:            {cgroup}
+	//   - container_id:      {container_id}
+	// 进程实例身份统一使用 pid + process_start_ms + exe 三元组，避免 PID 复用
+	// 导致旧 Session 采集到新进程。selector_exe 保留为兼容字段（exe 的镜像）。
+	SelectorParams       []byte `gorm:"column:selector_params;type:jsonb" json:"selector_params"`
 	Signals              []byte `gorm:"column:signals;type:jsonb" json:"signals"`
 	// RequestedSignals 是 signals 的显式字符串数组镜像（阶段一）：Reconcile
 	// 下发 assignment 时按字符串数组返回，避免 GORM 对 jsonb 的 []byte 自动
@@ -98,7 +107,11 @@ type ContinuousProcessSnapshot struct {
 	Comm           string    `gorm:"column:comm;size:256" json:"comm"`
 	Exe            string    `gorm:"column:exe;size:4096;index" json:"exe"`
 	RSSBytes       uint64    `gorm:"column:rss_bytes" json:"rss_bytes"`
-	ObservedAt     time.Time `gorm:"column:observed_at;index" json:"observed_at"`
+	// 阶段六：cgroup 路径与解析出的 container ID（Agent 从 /proc/<pid>/cgroup
+	// 读取并识别），供 cgroup/container_id selector 选择与匹配。
+	CgroupPath string    `gorm:"column:cgroup_path;size:1024;index" json:"cgroup_path"`
+	ContainerID string  `gorm:"column:container_id;size:128;index" json:"container_id"`
+	ObservedAt time.Time `gorm:"column:observed_at;index" json:"observed_at"`
 }
 
 type ContinuousAgentState struct {

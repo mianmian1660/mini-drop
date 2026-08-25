@@ -3,7 +3,7 @@ import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { continuous, profiles } from '../api';
 import ContinuousProfilingPanel from '../components/ContinuousProfilingPanel';
 import SentinelCard from '../components/SentinelCard';
-import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime } from '../utils/continuous';
+import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel } from '../utils/continuous';
 
 const S = {
     container: { width: '100%', maxWidth: 1320, minWidth: 0, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
@@ -78,6 +78,7 @@ export default function ContinuousSessionDetailPage() {
 
     const activeProcesses = useMemo(() => decodeJSONField(session?.active_processes, []), [session?.active_processes]);
     const sessionSignals = useMemo(() => decodeJSONField(session?.signals, ['cpu_profile']), [session?.signals]);
+    const identity = useMemo(() => selectorIdentity(session), [session]);
 
     const stop = async () => {
         if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
@@ -112,7 +113,7 @@ export default function ContinuousSessionDetailPage() {
             <div style={S.meta}>
                 <Metric label="期望状态" value={session.desired_state === 'running' ? '持续运行' : '已请求停止'} />
                 <Metric label="实际状态" value={continuousStateLabel(state)} />
-                <Metric label="采集范围" value={session.scope === 'process' ? '进程 · 全部实例' : '整机'} />
+                <Metric label="采集范围" value={session.scope === 'process' ? `进程 · ${selectorModeLabel(identity.mode)}` : '整机'} />
                 <Metric label="创建者" value={session.user_name || '系统'} />
                 <Metric label="最近上传" value={formatRelativeTime(session.last_upload_at)} />
                 <Metric label="连续性" value={session.continuity_mode === 'strict' ? '严格连续' : '降级'} />
@@ -120,8 +121,15 @@ export default function ContinuousSessionDetailPage() {
             </div>
             {session.scope === 'process' && <details style={S.details}>
                 <summary style={S.summary}>进程实例明细</summary>
-                <div style={{ ...S.label, marginTop: 12 }}>跟随 exe</div>
-                <div style={S.value}>{session.selector_exe}</div>
+                <div style={{ ...S.label, marginTop: 12 }}>selector 类型</div>
+                <div style={S.value}>{selectorModeLabel(identity.mode)}</div>
+                <div style={{ ...S.label, marginTop: 12 }}>精确身份</div>
+                <div style={S.value}>{identity.exe || identity.detail}</div>
+                {identity.detail && identity.mode !== 'exe_all_instances' && <div style={{ ...S.label, marginTop: 8 }}>{identity.detail}</div>}
+                <div style={{ ...S.label, marginTop: 12 }}>重启跟随策略</div>
+                <div style={S.value}>{identity.follow}</div>
+                {state === 'waiting' && session.degradation_reason && <div style={{ ...S.label, marginTop: 12 }}>等待原因</div>}
+                {state === 'waiting' && session.degradation_reason && <div style={S.value}>{session.degradation_reason}</div>}
                 <div style={S.instances}>{activeProcesses.length ? activeProcesses.map(process => <span key={`${process.pid}-${process.process_start_ms}`} style={S.instance}>PID {process.pid} · {formatStart(process.process_start_ms)}</span>) : <span style={S.instance}>等待匹配进程</span>}</div>
             </details>}
         </section>

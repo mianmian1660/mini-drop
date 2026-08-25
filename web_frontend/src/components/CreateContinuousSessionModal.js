@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { continuous, sentinelRules } from '../api';
-import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, SENTINEL_SIGNALS, formatBytes, signalLabel } from '../utils/continuous';
+import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, SENTINEL_SIGNALS, formatBytes, selectorModeLabel, signalLabel } from '../utils/continuous';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(16,24,40,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
@@ -41,6 +41,12 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
     const [agentFresh, setAgentFresh] = useState(false);
     const [keyword, setKeyword] = useState('');
     const [selectedExe, setSelectedExe] = useState('');
+    // 阶段六：selector 类型与精确身份。默认选择单个具体进程实例
+    //（pid_instance），可切换 exe 全实例 / cgroup / container_id。
+    const [selectorMode, setSelectorMode] = useState('pid_instance');
+    const [selectedInstance, setSelectedInstance] = useState(null);
+    const [selectedCgroup, setSelectedCgroup] = useState('');
+    const [selectedContainerId, setSelectedContainerId] = useState('');
     const [loading, setLoading] = useState(true);
     const [submitting, setSubmitting] = useState(false);
     const [allowDegraded, setAllowDegraded] = useState(false);
@@ -80,6 +86,37 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
     useEffect(() => { loadProcesses(); }, [loadProcesses]);
 
     const groups = useMemo(() => {
+        const query = keyword.trim().toLowerCase();
+        const matches = process => !query || `${process.comm || ''} ${process.exe || ''} ${process.cgroup_path || ''} ${process.container_id || ''}`.toLowerCase().includes(query);
+        if (selectorMode === 'pid_instance') {
+            // 默认模式：每个具体进程实例一行（PID + 启动时间 + exe）。
+            return processes.filter(matches).sort((a, b) => (Number(b.rss_bytes) || 0) - (Number(a.rss_bytes) || 0) || a.pid - b.pid);
+        }
+        if (selectorMode === 'cgroup') {
+            const byCgroup = new Map();
+            processes.forEach(process => {
+                if (!process.cgroup_path) return;
+                const current = byCgroup.get(process.cgroup_path) || { cgroup: process.cgroup_path, instances: [], rss: 0 };
+                current.instances.push(process);
+                current.rss += Number(process.rss_bytes) || 0;
+                byCgroup.set(process.cgroup_path, current);
+            });
+            return Array.from(byCgroup.values()).filter(group => !query || group.cgroup.toLowerCase().includes(query))
+                .sort((a, b) => b.rss - a.rss || a.cgroup.localeCompare(b.cgroup));
+        }
+        if (selectorMode === 'container_id') {
+            const byContainer = new Map();
+            processes.forEach(process => {
+                if (!process.container_id) return;
+                const current = byContainer.get(process.container_id) || { container: process.container_id, instances: [], rss: 0 };
+                current.instances.push(process);
+                current.rss += Number(process.rss_bytes) || 0;
+                byContainer.set(process.container_id, current);
+            });
+            return Array.from(byContainer.values()).filter(group => !query || group.container.toLowerCase().includes(query))
+                .sort((a, b) => b.rss - a.rss || a.container.localeCompare(b.container));
+        }
+        // exe_all_instances：按 exe 分组（原有逻辑）。
         const byExe = new Map();
         processes.forEach(process => {
             if (!process.exe) return;
@@ -88,10 +125,9 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
             current.rss += Number(process.rss_bytes) || 0;
             byExe.set(process.exe, current);
         });
-        const query = keyword.trim().toLowerCase();
         return Array.from(byExe.values()).filter(group => !query || `${group.comm} ${group.exe}`.toLowerCase().includes(query))
             .sort((a, b) => b.rss - a.rss || a.exe.localeCompare(b.exe));
-    }, [processes, keyword]);
+    }, [processes, keyword, selectorMode]);
 
     const needsDegradedConfirmation = !agentState?.strict_capable;
     const numericSettingsValid = Number(sampleRate) >= 1 && Number(sampleRate) <= 999
@@ -113,7 +149,11 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
         if (!eligibleSentinelSignals.includes(sentinelSignal)) setSentinelSignal(eligibleSentinelSignals[0]);
     }, [eligibleSentinelSignals, sentinelSignal]);
     const sentinelFieldsValid = !sentinelEnabled || (sentinelSignal && Number(sentinelFloor) > 0 && Number(sentinelCooldownMin) > 0);
-    const valid = agentFresh && numericSettingsValid && name.trim() && selectedSignals.length > 0 && (scope === 'host' || selectedExe)
+    const selectorValid = scope === 'host' || (selectorMode === 'pid_instance' ? Boolean(selectedInstance)
+        : selectorMode === 'exe_all_instances' ? Boolean(selectedExe)
+            : selectorMode === 'cgroup' ? Boolean(selectedCgroup)
+                : Boolean(selectedContainerId));
+    const valid = agentFresh && numericSettingsValid && name.trim() && selectedSignals.length > 0 && selectorValid
         && (!needsDegradedConfirmation || allowDegraded) && sentinelFieldsValid;
 
     const toggleSignal = useCallback((signal) => {
@@ -136,9 +176,19 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
             // 会话已经建好（上一次提交时创建成功，这次只是在重试哨兵规则）：跳过重复建会话。
             let session = createdSession;
             if (!session) {
+                // 阶段六：按 selector 类型构造 payload。默认 pid_instance 选择
+                // 具体进程实例；exe_all_instances 跟随同路径全部实例；
+                // cgroup/container_id 从 Agent 快照选择。
+                const selectorParams = scope === 'process' ? (selectorMode === 'pid_instance' ? {
+                    pid: selectedInstance.pid, process_start_ms: selectedInstance.process_start_ms, exe: selectedInstance.exe,
+                } : selectorMode === 'cgroup' ? { cgroup: selectedCgroup }
+                    : selectorMode === 'container_id' ? { container_id: selectedContainerId }
+                        : { exe: selectedExe }) : null;
                 const response = await continuous.createSession({
                     name: name.trim(), target_ip: target.ip, hostname: target.hostname || '', service_name: target.service_name || 'hotmethod',
-                    scope, selector_exe: scope === 'process' ? selectedExe : '', selector_mode: 'all_instances',
+                    scope, selector_exe: scope === 'process' ? (selectorMode === 'pid_instance' ? selectedInstance.exe : selectorMode === 'exe_all_instances' ? selectedExe : '') : '',
+                    selector_mode: scope === 'process' ? selectorMode : 'exe_all_instances',
+                    selector_params: selectorParams,
                     signals: selectedSignals, continuity_mode: 'strict', allow_degraded: allowDegraded,
                     sample_rate_hz: Number(sampleRate), aggregation_window_sec: Number(aggregationWindow),
                     upload_batch_sec: Number(uploadBatch), retention_hours: Number(retentionHours),
@@ -187,22 +237,55 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                     <button type="button" style={S.segment(scope === 'host')} onClick={() => setScope('host')}>整机</button>
                     <button type="button" style={{ ...S.segment(scope === 'process'), borderRight: 0 }} onClick={() => setScope('process')}>按进程</button>
                 </span>
-                <p style={S.subtle}>{scope === 'process' ? '按可执行文件路径跟随全部实例；PID 变化和进程重启后会自动重新附着。' : '采集该主机全部进程，详情中仍可按进程查询。'}</p>
+                <p style={S.subtle}>{scope === 'process' ? '默认选择单个具体进程实例；可切换为同路径全部实例、cgroup 或容器。' : '采集该主机全部进程，详情中仍可按进程查询。'}</p>
             </div>
 
             {scope === 'process' && <div style={S.section}>
+                <label style={S.label}>selector 类型 *</label>
+                <span style={S.segmented}>
+                    {['pid_instance', 'exe_all_instances', 'cgroup', 'container_id'].map((mode, index) => (
+                        <button key={mode} type="button" style={{ ...S.segment(selectorMode === mode), borderRight: index === 3 ? 0 : '1px solid #d0d5dd' }}
+                            onClick={() => setSelectorMode(mode)}>{selectorModeLabel(mode)}</button>
+                    ))}
+                </span>
+                <p style={S.subtle}>{selectorMode === 'pid_instance' ? '只采集这一个进程实例；进程退出后进入等待，PID 复用不会误采新进程。'
+                    : selectorMode === 'exe_all_instances' ? '自动跟随同路径的全部实例（含重启后的新进程）。'
+                        : selectorMode === 'cgroup' ? '采集该 cgroup 内的全部进程，跟随组内进程变化。'
+                            : '采集该容器内的全部进程，跟随容器内进程变化。'}</p>
                 <div className="continuous-modal-toolbar" style={S.toolbar}>
-                    <input style={{ ...S.input, flex: 1 }} value={keyword} onChange={event => setKeyword(event.target.value)} placeholder="搜索进程名或 exe 路径" />
+                    <input style={{ ...S.input, flex: 1 }} value={keyword} onChange={event => setKeyword(event.target.value)} placeholder="搜索进程名 / exe / cgroup / 容器 ID" />
                     <button style={S.cancel} onClick={loadProcesses} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
                 </div>
                 <div style={S.processList}>
                     {loading ? <div style={{ padding: 24, textAlign: 'center', ...S.subtle }}>正在读取 Agent 进程列表...</div>
-                        : groups.length === 0 ? <div style={{ padding: 24, textAlign: 'center', ...S.subtle }}>当前没有可选择的进程</div>
-                            : groups.map(group => <label className="continuous-process-row" key={group.exe} style={S.process(selectedExe === group.exe)}>
-                                <input type="radio" name="continuous-exe" checked={selectedExe === group.exe} onChange={() => setSelectedExe(group.exe)} />
-                                <span><strong>{group.comm || group.exe.split('/').pop()}</strong><div style={S.mono}>{group.exe}</div><div style={S.subtle}>跟随该 exe 的全部实例</div></span>
-                                <span className="continuous-process-meta" style={{ textAlign: 'right', ...S.subtle }}>{group.instances.length} 个实例<br />{formatBytes(group.rss)}</span>
-                            </label>)}
+                        : groups.length === 0 ? <div style={{ padding: 24, textAlign: 'center', ...S.subtle }}>当前没有可选择的{selectorMode === 'cgroup' ? ' cgroup' : selectorMode === 'container_id' ? ' 容器' : '进程'}</div>
+                            : selectorMode === 'pid_instance' ? groups.map(process => {
+                                const selected = selectedInstance?.pid === process.pid && selectedInstance?.process_start_ms === process.process_start_ms;
+                                return <label className="continuous-process-row" key={`${process.pid}-${process.process_start_ms}`} style={S.process(selected)}>
+                                    <input type="radio" name="continuous-instance" checked={selected} onChange={() => setSelectedInstance(process)} />
+                                    <span><strong>{process.comm || (process.exe || '').split('/').pop()}</strong><div style={S.mono}>{process.exe}</div><div style={S.subtle}>PID {process.pid} · 启动 {formatStart(process.process_start_ms)} · 不跟随重启</div></span>
+                                    <span className="continuous-process-meta" style={{ textAlign: 'right', ...S.subtle }}>{formatBytes(process.rss_bytes)}</span>
+                                </label>;
+                            })
+                                : selectorMode === 'cgroup' ? groups.map(group => (
+                                    <label className="continuous-process-row" key={group.cgroup} style={S.process(selectedCgroup === group.cgroup)}>
+                                        <input type="radio" name="continuous-cgroup" checked={selectedCgroup === group.cgroup} onChange={() => setSelectedCgroup(group.cgroup)} />
+                                        <span><strong>{group.cgroup.split('/').pop() || group.cgroup}</strong><div style={S.mono}>{group.cgroup}</div><div style={S.subtle}>跟随组内 {group.instances.length} 个进程</div></span>
+                                        <span className="continuous-process-meta" style={{ textAlign: 'right', ...S.subtle }}>{group.instances.length} 个实例<br />{formatBytes(group.rss)}</span>
+                                    </label>
+                                ))
+                                    : selectorMode === 'container_id' ? groups.map(group => (
+                                        <label className="continuous-process-row" key={group.container} style={S.process(selectedContainerId === group.container)}>
+                                            <input type="radio" name="continuous-container" checked={selectedContainerId === group.container} onChange={() => setSelectedContainerId(group.container)} />
+                                            <span><strong>容器 {group.container.slice(0, 12)}</strong><div style={S.mono}>{group.container}</div><div style={S.subtle}>跟随容器内 {group.instances.length} 个进程</div></span>
+                                            <span className="continuous-process-meta" style={{ textAlign: 'right', ...S.subtle }}>{group.instances.length} 个实例<br />{formatBytes(group.rss)}</span>
+                                        </label>
+                                    ))
+                                        : groups.map(group => <label className="continuous-process-row" key={group.exe} style={S.process(selectedExe === group.exe)}>
+                                            <input type="radio" name="continuous-exe" checked={selectedExe === group.exe} onChange={() => setSelectedExe(group.exe)} />
+                                            <span><strong>{group.comm || group.exe.split('/').pop()}</strong><div style={S.mono}>{group.exe}</div><div style={S.subtle}>跟随该 exe 的全部实例</div></span>
+                                            <span className="continuous-process-meta" style={{ textAlign: 'right', ...S.subtle }}>{group.instances.length} 个实例<br />{formatBytes(group.rss)}</span>
+                                        </label>)}
                 </div>
             </div>}
 
@@ -273,4 +356,11 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
 
 function NumberField({ label, value, onChange, min, max, disabled }) {
     return <label><span style={S.label}>{label}</span><input type="number" style={S.input} min={min} max={max} value={value} disabled={disabled} onChange={event => onChange(event.target.value)} /></label>;
+}
+
+function formatStart(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms <= 0) return 'start 未知';
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? `start ${value}` : date.toLocaleString();
 }

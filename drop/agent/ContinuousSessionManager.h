@@ -19,6 +19,17 @@ struct ContinuousAssignment
     std::string sid;
     std::string scope = "host";
     std::string selectorExe;
+    // 阶段六：selector 模式与结构化参数。
+    //   - pid_instance:      {pid, process_start_ms, exe}
+    //   - exe_all_instances: {exe}
+    //   - cgroup:            {cgroup}
+    //   - container_id:      {container_id}
+    // 进程实例身份统一使用 pid + process_start_ms + exe 三元组。
+    std::string selectorMode = "exe_all_instances";
+    int selectorPid = 0;
+    int64_t selectorProcessStartMs = 0;
+    std::string selectorCgroup;
+    std::string selectorContainerId;
     std::string desiredState = "running";
     std::string continuityMode = "degraded";
     bool allowDegraded = false;
@@ -38,6 +49,24 @@ struct ContinuousAssignment
 std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesByExe(
     const std::vector<drop::ContinuousTargetProcess> &processes,
     const std::string &selectorExe);
+
+// 阶段六：按 selector 模式匹配进程。
+//   - pid_instance:      精确匹配 pid + process_start_ms + exe 三元组；
+//   - exe_all_instances: 按 exe 匹配全部实例；
+//   - cgroup:            按 cgroup 路径匹配组内进程；
+//   - container_id:      按解析出的 container ID 匹配。
+// 返回匹配的进程列表；无法匹配时返回空列表（调用方进入 waiting）。
+std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesBySelector(
+    const std::vector<drop::ContinuousTargetProcess> &processes,
+    const ContinuousAssignment &assignment);
+
+// 阶段六：读取 /proc/<pid>/cgroup 的 cgroup 路径（去掉控制器前缀，以 / 开头；
+// 无法读取时返回空字符串）。
+std::string process_cgroup_path(int pid);
+
+// 阶段六：从 cgroup 路径提取 container ID（docker/containerd/CRI-O/kubepods/
+// systemd scope 常见模式；无法识别时返回空字符串）。
+std::string extract_container_id(const std::string &cgroupPath);
 
 class ContinuousSessionManager
 {

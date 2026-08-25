@@ -25,24 +25,114 @@ func continuousControlRouter(s *APIServer) *gin.Engine {
 }
 
 func TestContinuousActiveSetRules(t *testing.T) {
-	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "process"}}, "host", ""); err != errContinuousModeConflict {
+	hostReq := CreateContinuousSessionReq{Scope: "host"}
+	processReq := func(exe string) CreateContinuousSessionReq {
+		return CreateContinuousSessionReq{Scope: "process", SelectorExe: exe, SelectorMode: "exe_all_instances"}
+	}
+	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "process"}}, hostReq); err != errContinuousModeConflict {
 		t.Fatalf("host/process conflict=%v", err)
 	}
-	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "host"}}, "host", ""); err != errContinuousHostLimitReached {
+	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "host"}}, hostReq); err != errContinuousHostLimitReached {
 		t.Fatalf("host limit=%v", err)
 	}
-	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "host"}}, "process", "/opt/api"); err != errContinuousModeConflict {
+	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "host"}}, processReq("/opt/api")); err != errContinuousModeConflict {
 		t.Fatalf("process/host conflict=%v", err)
 	}
-	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "process", SelectorExe: "/opt/api"}}, "process", "/opt/api"); err != errContinuousDuplicateSelector {
+	if err := validateContinuousActiveSet([]model.ContinuousSession{{Scope: "process", SelectorExe: "/opt/api"}}, processReq("/opt/api")); err != errContinuousDuplicateSelector {
 		t.Fatalf("duplicate selector=%v", err)
 	}
 	active := make([]model.ContinuousSession, 16)
 	for index := range active {
 		active[index] = model.ContinuousSession{Scope: "process", SelectorExe: "/opt/worker-" + string(rune('a'+index))}
 	}
-	if err := validateContinuousActiveSet(active, "process", "/opt/new"); err != errContinuousLimitReached {
+	if err := validateContinuousActiveSet(active, processReq("/opt/new")); err != errContinuousLimitReached {
 		t.Fatalf("process limit=%v", err)
+	}
+}
+
+// TestContinuousActiveSetPidInstanceAllowsSameExe 阶段六：同一 exe 下允许创建
+// 不同 PID instance Session（身份 = pid + process_start_ms）。
+func TestContinuousActiveSetPidInstanceAllowsSameExe(t *testing.T) {
+	active := []model.ContinuousSession{{
+		Scope: "process", SelectorExe: "/opt/api", SelectorMode: "pid_instance",
+		SelectorParams: []byte(`{"pid":100,"process_start_ms":1724160000000,"exe":"/opt/api"}`),
+	}}
+	// 不同 PID instance：允许。
+	req := CreateContinuousSessionReq{
+		Scope: "process", SelectorExe: "/opt/api", SelectorMode: "pid_instance",
+		SelectorParams: &ContinuousSelectorParams{PID: 200, ProcessStartMs: 1724160001000, Exe: "/opt/api"},
+	}
+	if err := validateContinuousActiveSet(active, req); err != nil {
+		t.Fatalf("different pid_instance should be allowed, got %v", err)
+	}
+	// 相同 PID instance：冲突。
+	reqSame := CreateContinuousSessionReq{
+		Scope: "process", SelectorExe: "/opt/api", SelectorMode: "pid_instance",
+		SelectorParams: &ContinuousSelectorParams{PID: 100, ProcessStartMs: 1724160000000, Exe: "/opt/api"},
+	}
+	if err := validateContinuousActiveSet(active, reqSame); err != errContinuousDuplicateSelector {
+		t.Fatalf("same pid_instance should conflict, got %v", err)
+	}
+	// 同 exe 的 exe_all_instances 与 pid_instance 不冲突（身份不同）。
+	exeReq := CreateContinuousSessionReq{Scope: "process", SelectorExe: "/opt/api", SelectorMode: "exe_all_instances"}
+	if err := validateContinuousActiveSet(active, exeReq); err != nil {
+		t.Fatalf("exe_all_instances vs pid_instance should be allowed, got %v", err)
+	}
+}
+
+// TestContinuousActiveSetCgroupContainer 阶段六：cgroup/container_id 按各自
+// 身份判断冲突。
+func TestContinuousActiveSetCgroupContainer(t *testing.T) {
+	active := []model.ContinuousSession{{
+		Scope: "process", SelectorMode: "cgroup",
+		SelectorParams: []byte(`{"cgroup":"/system.slice/docker-abc123.scope"}`),
+	}}
+	cgroupReq := CreateContinuousSessionReq{
+		Scope: "process", SelectorMode: "cgroup",
+		SelectorParams: &ContinuousSelectorParams{Cgroup: "/system.slice/docker-abc123.scope"},
+	}
+	if err := validateContinuousActiveSet(active, cgroupReq); err != errContinuousDuplicateSelector {
+		t.Fatalf("same cgroup should conflict, got %v", err)
+	}
+	containerReq := CreateContinuousSessionReq{
+		Scope: "process", SelectorMode: "container_id",
+		SelectorParams: &ContinuousSelectorParams{ContainerID: "abc123def456"},
+	}
+	if err := validateContinuousActiveSet(active, containerReq); err != nil {
+		t.Fatalf("cgroup vs container_id should be allowed, got %v", err)
+	}
+}
+
+// TestValidateContinuousSelector 阶段六：selector 参数组合校验。
+func TestValidateContinuousSelector(t *testing.T) {
+	cases := []struct {
+		name    string
+		req     CreateContinuousSessionReq
+		wantErr bool
+	}{
+		{"pid_instance ok", CreateContinuousSessionReq{SelectorMode: "pid_instance", SelectorParams: &ContinuousSelectorParams{PID: 1, ProcessStartMs: 1000, Exe: "/opt/api"}}, false},
+		{"pid_instance missing pid", CreateContinuousSessionReq{SelectorMode: "pid_instance", SelectorParams: &ContinuousSelectorParams{ProcessStartMs: 1000, Exe: "/opt/api"}}, true},
+		{"pid_instance missing start", CreateContinuousSessionReq{SelectorMode: "pid_instance", SelectorParams: &ContinuousSelectorParams{PID: 1, Exe: "/opt/api"}}, true},
+		{"pid_instance relative exe", CreateContinuousSessionReq{SelectorMode: "pid_instance", SelectorParams: &ContinuousSelectorParams{PID: 1, ProcessStartMs: 1000, Exe: "api"}}, true},
+		{"exe_all_instances ok", CreateContinuousSessionReq{SelectorMode: "exe_all_instances", SelectorExe: "/opt/api"}, false},
+		{"exe_all_instances relative", CreateContinuousSessionReq{SelectorMode: "exe_all_instances", SelectorExe: "api"}, true},
+		{"cgroup ok", CreateContinuousSessionReq{SelectorMode: "cgroup", SelectorParams: &ContinuousSelectorParams{Cgroup: "/system.slice/docker-abc.scope"}}, false},
+		{"cgroup missing", CreateContinuousSessionReq{SelectorMode: "cgroup"}, true},
+		{"cgroup relative", CreateContinuousSessionReq{SelectorMode: "cgroup", SelectorParams: &ContinuousSelectorParams{Cgroup: "docker-abc.scope"}}, true},
+		{"container_id ok", CreateContinuousSessionReq{SelectorMode: "container_id", SelectorParams: &ContinuousSelectorParams{ContainerID: "abc123def456"}}, false},
+		{"container_id too short", CreateContinuousSessionReq{SelectorMode: "container_id", SelectorParams: &ContinuousSelectorParams{ContainerID: "abc"}}, true},
+		{"unknown mode", CreateContinuousSessionReq{SelectorMode: "systemd_unit"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateContinuousSelector(tc.req)
+			if tc.wantErr && err == "" {
+				t.Fatalf("expected error, got none")
+			}
+			if !tc.wantErr && err != "" {
+				t.Fatalf("unexpected error: %s", err)
+			}
+		})
 	}
 }
 

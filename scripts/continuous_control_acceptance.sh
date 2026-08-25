@@ -63,7 +63,7 @@ body = {
 }
 if scope == "process":
     body["selector_exe"] = selector
-    body["selector_mode"] = "all_instances"
+    body["selector_mode"] = "exe_all_instances"
 json.dump(body, open(path, "w", encoding="utf-8"), separators=(",", ":"))
 PY
 }
