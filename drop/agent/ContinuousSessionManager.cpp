@@ -652,6 +652,7 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
                             target.port = dbItem.value("port", 0);
                             target.user = dbItem.value("user", "");
                             target.passwordRef = dbItem.value("password_ref", "");
+                            target.database = dbItem.value("database", ""); // 仅 postgres 用，空则采集器回退 "postgres"
                             target.pollIntervalSec = dbItem.value("poll_interval_sec", assignment.aggregationWindowSec);
                             target.queryTimeoutMs = dbItem.value("query_timeout_ms", 500);
                             if (!target.engine.empty() && !target.host.empty())

@@ -78,6 +78,13 @@ export default function ContinuousSessionDetailPage() {
 
     const activeProcesses = useMemo(() => decodeJSONField(session?.active_processes, []), [session?.active_processes]);
     const sessionSignals = useMemo(() => decodeJSONField(session?.signals, ['cpu_profile']), [session?.signals]);
+    // session.signals 是 ContinuousSamplerConfig 的固定采集集合，不含 db_snapshot——
+    // 是否可用取决于 session.labels.db_targets 有没有配（同 ContinuousProfilingPanel.js
+    // 里 continuousSessionMeta 的判断方式），单独解出来传给 SentinelCard。
+    const hasDBTargets = useMemo(() => {
+        const targets = decodeJSONField(session?.labels, {}).db_targets;
+        return Array.isArray(targets) && targets.length > 0;
+    }, [session?.labels]);
     const identity = useMemo(() => selectorIdentity(session), [session]);
 
     const stop = async () => {
@@ -133,7 +140,7 @@ export default function ContinuousSessionDetailPage() {
                 <div style={S.instances}>{activeProcesses.length ? activeProcesses.map(process => <span key={`${process.pid}-${process.process_start_ms}`} style={S.instance}>PID {process.pid} · {formatStart(process.process_start_ms)}</span>) : <span style={S.instance}>等待匹配进程</span>}</div>
             </details>}
         </section>
-        <section style={S.card}><SentinelCard targetIP={session.target_ip} signals={sessionSignals} /></section>
+        <section style={S.card}><SentinelCard targetIP={session.target_ip} signals={sessionSignals} hasDBTargets={hasDBTargets} /></section>
         <ContinuousProfilingPanel target={target} fixedSession={session} initialQuery={initialQuery} />
     </div>;
 }

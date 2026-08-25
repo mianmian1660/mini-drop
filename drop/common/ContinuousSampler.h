@@ -48,6 +48,11 @@ struct DBTargetConfig
     std::string passwordRef;      // agent 本机文件路径，指向密码
     int pollIntervalSec = 10;     // 默认对齐 aggregationWindowSec
     int queryTimeoutMs = 500;     // 单条查询超时熔断
+    // 仅 postgres 用：要连接的数据库名。MySQL 的 SHOW GLOBAL STATUS/
+    // performance_schema 不依赖连接到哪个库，postgres 的 pg_stat_database/
+    // pg_stat_statements 必须先连上某个库才能查，默认给 "postgres"（标准维
+    // 护库，一定存在）。
+    std::string database;
 };
 
 struct ContinuousSamplerConfig
