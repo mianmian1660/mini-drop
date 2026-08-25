@@ -2935,6 +2935,7 @@ func (s *APIServer) QueryContinuousDBSnapshot(c *gin.Context) {
 			"generated_at":   time.Now(),
 			"digests":        []gin.H{},
 			"lock_waits":     []gin.H{},
+			"metrics":        []gin.H{},
 			"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
 			"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
 		})
@@ -2973,8 +2974,19 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 		TotalLatencyUs uint64
 		RowsExamined   uint64
 	}
+	type metricPoint struct {
+		Timestamp time.Time
+		Value     uint64
+	}
+	type metricSeries struct {
+		Metric  string
+		Runtime string
+		Unit    string
+		Points  []metricPoint
+	}
 	digests := map[string]*digestAgg{}
 	lockWaits := []gin.H{}
+	metricSeriesByKey := map[string]*metricSeries{}
 	objectKeys := []string{}
 	seenObject := map[string]bool{}
 
@@ -3030,6 +3042,22 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 						})
 					}
 				}
+				// 阶段一标量指标（db_active_connections/db_questions_total/
+				// db_innodb_buffer_pool_hit_ratio_bps）走的是通用 window.Metrics，
+				// 不是 window.DBSnapshots——之前这里完全没扫过，标量指标采了但
+				// 这个接口从来没返回过，前端自然也没有地方能展示。
+				for _, metric := range window.Metrics {
+					if !continuousMetricIsDB(metric.Metric) {
+						continue
+					}
+					key := metric.Metric + "|" + metric.Runtime
+					series := metricSeriesByKey[key]
+					if series == nil {
+						series = &metricSeries{Metric: metric.Metric, Runtime: metric.Runtime, Unit: metric.Unit}
+						metricSeriesByKey[key] = series
+					}
+					series.Points = append(series.Points, metricPoint{Timestamp: metric.Timestamp, Value: metric.Value})
+				}
 			}
 		}
 	}
@@ -3060,7 +3088,26 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 		return lockWaits[i]["wait_seconds"].(uint64) > lockWaits[j]["wait_seconds"].(uint64)
 	})
 
-	empty := len(digestList) == 0 && len(lockWaits) == 0
+	metricList := make([]gin.H, 0, len(metricSeriesByKey))
+	for _, series := range metricSeriesByKey {
+		sort.Slice(series.Points, func(i, j int) bool { return series.Points[i].Timestamp.Before(series.Points[j].Timestamp) })
+		points := make([]gin.H, 0, len(series.Points))
+		for _, point := range series.Points {
+			points = append(points, gin.H{"timestamp": point.Timestamp, "value": point.Value})
+		}
+		metricList = append(metricList, gin.H{
+			"metric": series.Metric, "runtime": series.Runtime, "unit": series.Unit, "points": points,
+		})
+	}
+	sort.Slice(metricList, func(i, j int) bool {
+		mi, mj := metricList[i]["metric"].(string), metricList[j]["metric"].(string)
+		if mi != mj {
+			return mi < mj
+		}
+		return metricList[i]["runtime"].(string) < metricList[j]["runtime"].(string)
+	})
+
+	empty := len(digestList) == 0 && len(lockWaits) == 0 && len(metricList) == 0
 	message := ""
 	if empty {
 		message = "该时间范围暂无数据库快照数据"
@@ -3070,6 +3117,7 @@ func (s *APIServer) queryNativeContinuousDBSnapshot(ctx context.Context, q Profi
 		"signal_type":  "db_snapshot",
 		"digests":      digestList,
 		"lock_waits":   lockWaits,
+		"metrics":      metricList,
 		"empty":        empty,
 		"message":      message,
 		"source":       "mini-drop-native",
@@ -3772,16 +3820,35 @@ func continuousWindowSignalRows(window ContinuousWindowIngest) []continuousSigna
 	for _, hist := range window.Histograms {
 		add(hist.SignalType, firstNonEmpty(hist.Backend, window.Backend))
 	}
-	if len(window.Metrics) > 0 {
+	hasDBMetric, hasOtherMetric := false, false
+	for _, metric := range window.Metrics {
+		if continuousMetricIsDB(metric.Metric) {
+			hasDBMetric = true
+		} else {
+			hasOtherMetric = true
+		}
+	}
+	if hasOtherMetric {
 		add("python_rss", "procfs")
 	}
-	if len(window.DBSnapshots) > 0 {
+	if hasDBMetric || len(window.DBSnapshots) > 0 {
 		add("db_snapshot", "db_system_views")
 	}
 	if len(rows) == 0 {
 		add(firstNonEmpty(window.SignalType, "cpu_profile"), window.Backend)
 	}
 	return rows
+}
+
+// continuousMetricIsDB 判断一条 MetricPayload 是不是 DBSnapshotSampler 阶段一
+// 采的标量指标（db_active_connections/db_questions_total/
+// db_innodb_buffer_pool_hit_ratio_bps 这类，agent 侧命名统一带 db_ 前缀）。
+// 用来把 window.Metrics 里的数据库标量和 Python RSS 内存采样区分开——之前
+// 两者被 continuousWindowSignalRows 混在一起，只要 Metrics 非空就无条件标
+// 成 python_rss，导致数据库标量指标的窗口在 profile_windows 里查不到
+// signal_type=db_snapshot 的记录，前端/查询接口都拿不到数据。
+func continuousMetricIsDB(name string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "db_")
 }
 
 // continuousBatchSignalSet 返回 batch 内所有窗口实际携带的信号类型集合。
@@ -3834,10 +3901,18 @@ func continuousWindowSignalRowsV3(window ContinuousWindowIngest) []continuousSig
 	for _, hist := range window.Histograms {
 		add(hist.SignalType, firstNonEmpty(hist.Backend, window.Backend))
 	}
-	if len(window.Metrics) > 0 {
+	hasDBMetric, hasOtherMetric := false, false
+	for _, metric := range window.Metrics {
+		if continuousMetricIsDB(metric.Metric) {
+			hasDBMetric = true
+		} else {
+			hasOtherMetric = true
+		}
+	}
+	if hasOtherMetric {
 		add("python_rss", "procfs")
 	}
-	if len(window.DBSnapshots) > 0 {
+	if hasDBMetric || len(window.DBSnapshots) > 0 {
 		add("db_snapshot", "db_system_views")
 	}
 	if len(rows) == 0 {
@@ -3871,6 +3946,11 @@ func continuousWindowSampleCount(window ContinuousWindowIngest, signalType strin
 	}
 	if signalType == "db_snapshot" {
 		count = addContinuousCount(count, uint64(len(window.DBSnapshots)))
+		for _, metric := range window.Metrics {
+			if continuousMetricIsDB(metric.Metric) {
+				count = addContinuousCount(count, 1)
+			}
+		}
 	}
 	for _, hist := range window.Histograms {
 		if strings.ToLower(strings.TrimSpace(hist.SignalType)) == signalType {

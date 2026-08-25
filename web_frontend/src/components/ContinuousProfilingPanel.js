@@ -1766,6 +1766,81 @@ export function HistogramPanel({ data, loading, title, targetIP, signal, timeWin
     );
 }
 
+// db_questions_total 是累计计数器（自数据库启动以来的总请求数），直接画出
+// 来看不出速率变化——QPS 骤降场景要看的是斜率，不是绝对值。这里在前端把相
+// 邻两个窗口的差值除以时间差换算成瞬时 qps，和 Prometheus rate() 处理累计
+// 计数器是同一个思路。
+function computeQPS(points) {
+    const out = [];
+    for (let i = 1; i < points.length; i++) {
+        const dtSec = (new Date(points[i].timestamp) - new Date(points[i - 1].timestamp)) / 1000;
+        const dv = Number(points[i].value) - Number(points[i - 1].value);
+        out.push({ timestamp: points[i].timestamp, value: dtSec > 0 && dv >= 0 ? dv / dtSec : 0 });
+    }
+    return out;
+}
+
+function Sparkline({ points, color, unit, digits = 0 }) {
+    if (!points || points.length === 0) return <div style={S.empty}>暂无数据</div>;
+    const width = 200, height = 60, pad = 6;
+    const values = points.map(p => Number(p.value) || 0);
+    const max = Math.max(...values), min = Math.min(...values);
+    const range = (max - min) || 1;
+    const step = values.length > 1 ? (width - pad * 2) / (values.length - 1) : 0;
+    const coords = values.map((v, i) => {
+        const x = pad + i * step;
+        const y = height - pad - ((v - min) / range) * (height - pad * 2);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    const last = values[values.length - 1];
+    return (
+        <div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: '#101828' }}>
+                {last.toFixed(digits)}<span style={{ fontSize: 12, color: '#667085', fontWeight: 400 }}> {unit}</span>
+            </div>
+            <svg viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', height, display: 'block', marginTop: 6 }}>
+                <polyline points={coords} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+            </svg>
+        </div>
+    );
+}
+
+// 只有 db_active_connections/db_questions_total/db_innodb_buffer_pool_hit_ratio_bps
+// 三个信号一直没有界面能看——它们走 window.metrics 不是 window.dbSnapshots，
+// 之前 queryNativeContinuousDBSnapshot 完全没有扫描/返回过这部分数据。同名指标
+// 可能来自多个数据库实例（runtime 不同），这里简化处理只取第一个匹配到的
+// runtime，多实例场景后续再拆分单独展示。
+function DBMetricTrends({ metrics }) {
+    const conn = metrics.find(m => m.metric === 'db_active_connections');
+    const questions = metrics.find(m => m.metric === 'db_questions_total');
+    const hitRatio = metrics.find(m => m.metric === 'db_innodb_buffer_pool_hit_ratio_bps');
+    const qpsPoints = questions ? computeQPS(questions.points || []) : [];
+    // 命中率存成整数（0~10000 代表 0%~100%，见 ContinuousSampler.cpp 的换算注释），这里换算回百分比。
+    const hitRatioPoints = hitRatio ? (hitRatio.points || []).map(p => ({ timestamp: p.timestamp, value: Number(p.value) / 100 })) : [];
+    return (
+        <div style={{ marginTop: 16 }}>
+            <div style={S.sectionHead}>
+                <h3 style={S.title}>标量指标趋势</h3>
+                <span style={S.subtle}>连接数 / QPS（相邻窗口增量换算）/ 缓冲池命中率</span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginTop: 8 }}>
+                <div style={{ background: '#f8fafc', borderRadius: 8, padding: 12 }}>
+                    <div style={S.subtle}>连接数</div>
+                    <Sparkline points={conn?.points} color="#315efb" unit="" />
+                </div>
+                <div style={{ background: '#f8fafc', borderRadius: 8, padding: 12 }}>
+                    <div style={S.subtle}>QPS</div>
+                    <Sparkline points={qpsPoints} color="#d85a30" unit="qps" />
+                </div>
+                <div style={{ background: '#f8fafc', borderRadius: 8, padding: 12 }}>
+                    <div style={S.subtle}>缓冲池命中率</div>
+                    <Sparkline points={hitRatioPoints} color="#1d9e75" unit="%" digits={1} />
+                </div>
+            </div>
+        </div>
+    );
+}
+
 // 锁等待链单独成表而不是并进 digest 表：digest 是"这段时间哪些 SQL 累计
 // 最慢"（聚合量），锁等待是"某一时刻谁在等谁"（时点事实），两者聚合口径不
 // 同，合并展示会让人误以为锁等待也是累计值。
@@ -1795,7 +1870,7 @@ export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
                 <span style={S.subtle}>{digests.length} 条 digest · {lockWaits.length} 条锁等待</span>
             </div>
             {firedEvents.length > 0 && <DBSentinelEvents events={firedEvents} />}
-            {data?.empty || (digests.length === 0 && lockWaits.length === 0) ? (
+            {data?.empty || (digests.length === 0 && lockWaits.length === 0 && !(data?.metrics?.length > 0)) ? (
                 <ProfileEmpty message={data?.message || '该时间范围暂无数据库快照数据'} url={data?.profile_url} />
             ) : (
                 <>
@@ -1804,6 +1879,7 @@ export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
                         <Metric label="锁等待事件" value={String(lockWaits.length)} />
                         <Metric label="最长锁等待" value={lockWaits.length ? `${Math.max(...lockWaits.map(w => Number(w.wait_seconds) || 0))} s` : '-'} />
                     </div>
+                    {data?.metrics?.length > 0 && <DBMetricTrends metrics={data.metrics} />}
                     <div style={{ marginTop: 16 }}>
                         <div style={S.sectionHead}>
                             <h3 style={S.title}>锁等待链</h3>

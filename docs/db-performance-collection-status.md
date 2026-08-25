@@ -164,11 +164,35 @@ for i in $(seq 1 300); do docker exec fault-mysql mysql -uroot -proot orders -N 
 ### 3.5 已知未做的功能缺口(设计上明确推迟,不是 bug)
 
 - PostgreSQL 分支未实现(阶段一、阶段二都只有 MySQL)。
-- **db 标量指标无查询/展示接口(2026-08-23 连接风暴验收发现)**:`db_active_connections`/`db_questions_total`/`db_innodb_buffer_pool_hit_ratio_bps` 被 agent 采集进 `window.metrics`(信号标成 `python_rss`,见 [ContinuousSampler.cpp:1889](../drop/common/ContinuousSampler.cpp:1889)),上传到 minio batch,但 `/api/v1/profile/timeseries`([continuous.go:1774](../apiserver/server/continuous.go:1774))硬编码仅支持 `profile_type=memory&metric=rss_bytes`,前端 `DBSnapshotPanel` 也只展示 digest/lock_wait——**标量指标采了但前端/接口都看不了**,验收只能从 minio batch 原始 JSON 验证。
-- 阶段二"看到数据"和"判断异常"是两回事——现在只是记录事实(digest/锁等待数据),没有任何阈值/基线异常检测逻辑,时间轴预警功能还在方案讨论阶段(见对话中方案 A/B/C),没有代码。
-- 前端建 Session 表单没有 `db_targets` 输入框,会话列表页看不出哪个 Session 配了数据库巡检(见 1.3)。
 - 冷热分层(`ContinuousWindowSummary` 7 天摘要)只覆盖 `cpu_profile`,`db_snapshot` 没有对应的冷层摘要方案。
-- `pollIntervalSec` 字段设计了但没有真正按 target 粒度生效,本次节流修复统一用 `aggregationWindowSec`,是已知简化。
+- `pollIntervalSec` 字段设计了但没有真正按 target 粒度生效,节流修复统一用 `aggregationWindowSec`,是已知简化。
+- ~~db 标量指标无查询/展示接口~~ —— **2026-08-24 已解决**,见下方"已完成内容"。
+- ~~阶段二异常检测/预警~~ —— **部分已解决**:已发现有人把 `db_snapshot` 接进了现成的 `SentinelRule` 机制(`DBSentinelEvents`,前端 `sentinelRules.events({signal:'db_snapshot',...})`),具体判异规则覆盖到什么程度还需要单独核实,不算完全空白了。
+- ~~前端建 Session 表单没有 db_targets 输入框 / 会话列表页看不出哪个 Session 配了数据库巡检~~ —— **已解决**,见下方"已完成内容"(数据库账号页面 + 会话列表 chip)。
+
+---
+
+## 5. 已完成内容(2026-08-24 更新)
+
+- **数据库账号管理页面**:顶部头像 → `/db-accounts`,选一个已有 Session 编辑 `db_targets`(实例标签/主机/端口/用户名/密码文件路径,密码不经过页面明文)。后端新增 `PATCH /api/v1/continuous/sessions/:sid/labels`([continuous.go](../apiserver/server/continuous.go) `UpdateContinuousSessionLabels`)。**发现并纠正了一处认知错误**:最初以为改 `db_targets` 必须停止重建 Session 才生效,后来确认 `ReconcileDBSampler` 只在"已经在跑"时才跳过——给**原本 db_targets 为空**的 Session 后补配置,下一次 reconcile(约 5 秒)会自动启动,不需要重建;只有改一个**已经在跑**的 db_targets 才需要重建。
+- **会话列表数据库标识**:`ContinuousSessionList.js` 信号列加"数据库 · N"chip,不用点进详情页就能看出哪些 Session 配了数据库巡检。
+- **digest 假尖峰修复**:`DigestCounterState` 加 `lastSeenMs`,`compute_digest_delta` 按距上次刷新的时间间隔(1.5× `aggregationWindowSec`)判断是否要重新计基线,避免 digest 掉出 TOP 50 又重新进来时把缺席期间的调用全算成一个窗口的增量。思路借鉴 Prometheus `rate()`/`increase()` 处理累计计数器的方式。
+- **`g_digestState` 内存泄漏修复**:`DBSnapshotSampler::Stop()` 时按 sessionSID 前缀确定性清理 + 每次采集顺手做一次过期扫描兜底(阈值 20 倍窗口时长)。
+- **临时密码配置文件安全加固**:三处拼路径的地方统一收敛成 `stage_mysql_defaults_file()`,用 `mkstemp()` 消除撞名/路径穿越风险,写入前拒绝含换行符的账号密码(防 ini 注入)。
+- **标量指标可视化补全**:发现 `queryNativeContinuousDBSnapshot` 里已经有人写了从 `window.metrics` 扫 `db_` 前缀指标、按 metric+runtime 分组成时间序列的逻辑,但收集了却没放进最终返回值——补上排序+序列化,加进响应的 `metrics` 字段。前端 `DBSnapshotPanel` 新增"标量指标趋势"区块(连接数/QPS/缓冲池命中率三张小折线图),QPS 是前端用相邻窗口累计值差分换算出来的瞬时速率。同时修了一处判空逻辑漏洞:原来"digests 和 lock_waits 都空就显示空态"会把"只有标量指标、没有慢查询/锁等待"的正常情况误判成空。
+
+**验收清单更新**:第 2 节的 7 类故障场景里,连接风暴、QPS 骤降(现在有专门的折线图可以直接看拐点)、buffer pool 命中率骤降 三项现在有界面可以直接验收,不用再翻 minio 原始 JSON;慢查询堆积、锁等待、死锁、数据库不可达 四项仍按原表验收方式(digest 表 / 锁等待表 / 日志确认)。
+
+## 6. 采集层(Agent, C++)待办优先级
+
+| 优先级 | 任务 | 理由 |
+|---|---|---|
+| **P0** | **编译验证 2026-08-24 三处修复**(digest 假尖峰 / `g_digestState` 清理 / 临时文件安全) | 这三处改动已经在跑的代码路径上,`sweep_stale_digest_state_locked`/`clear_digest_state_for_session_locked` 的"调用方必须已持锁"约定只靠命名和注释保证,没有单测覆盖。本地无 Linux 工具链没法自己验,但这是当前唯一"已合并但正确性未经验证"的代码,必须排在最前面——不确认不死锁/不数据竞争,后面所有基于这份代码的验收结果都不可信。**动作**:`docker compose build drop_agent` 编译通过 + 起一个真实场景跑几轮 digest 采集,观察 agent 进程有没有卡死或 CPU 异常(死锁的典型表现是某个线程再也不产出新数据)。 |
+| **P1** | **死锁场景可观测性缺口** | 不是简单 bug,是采样频率和故障时长的根本性错配:10 秒轮询周期 vs 1-2 秒的死锁生命周期。直接调低 `aggregationWindowSec` 治标不治本(死锁可能更短,而且会显著加大对生产库的轮询压力)。**正确方向**:MySQL 的 `SHOW ENGINE INNODB STATUS` 输出里有一段 `LATEST DETECTED DEADLOCK`,记录的是"最近一次检测到的死锁"，不依赖轮询时机去撞见死锁瞬间——这是 MySQL 自己解决"死锁转瞬即逝"这个问题的标准方案,行业里 Percona Toolkit 的 `pt-deadlock-logger` 就是靠定期解析这段输出实现死锁记录的。可以在阶段二里加一个新的 `kind="deadlock"` 采集分支,复用同样的连接建立流程。 |
+| **P1** | **PostgreSQL 分支未实现** | 功能完整性缺口,MySQL 这条路径走通、模式验证过之后,理论上是照抄阶段一/阶段二的思路换一套查询(`pg_stat_database`/`pg_stat_statements`/`pg_blocking_pids()`),工作量可预估,但目前还没排期动手。 |
+| **P2** | `pollIntervalSec` 未按 target 粒度生效 | 已知简化,不影响正确性,只是没做到设计文档里"每个目标可以配不同轮询间隔"这个粒度。多个数据库目标轮询频率需求差异明显之前,不算紧迫。 |
+
+**建议顺序**:P0 必须先做且优先级不可协商(正确性风险);P1 的两项可以并行讨论方案(死锁可观测性需要先定"要不要加新的 deadlock 采集分支"这个方案,PostgreSQL 需要先确认要不要投入);P2 排最后。
 
 ---
 
@@ -181,6 +205,8 @@ for i in $(seq 1 300); do docker exec fault-mysql mysql -uroot -proot orders -N 
 **2026-08-23 09:00(链路打通)**:digest 采不到的最终根因 = 测试流量不带默认库导致 `SCHEMA_NAME=NULL`,被 agent 的 `WHERE SCHEMA_NAME IS NOT NULL` 过滤(见 3.4,测试侧修复非代码)。修复后 `profile_windows` 出现 `db_snapshot` 窗口,**数据库采集完整链路打通**。下一步:四类故障注入验收(QPS 骤降/连接风暴/慢查询堆积/锁等待死锁)+ 端到端开销对比测试。
 
 **2026-08-23 14:50(7 场景验收 + 开销对比全部完成)**:四类故障 7 场景验收(见第 2 节表格,锁等待/QPS 骤降/连接风暴/buffer pool 骤降/慢查询堆积/不可达全部 PASS,死锁部分验证属时序限制)。**端到端开销对比测试完成**(见 2.5):db 采集额外开销 CPU +3.6pp、内存 +7.7MiB,不挤占主链路。剩余已知缺口:db 标量指标无查询接口(3.5)、PostgreSQL 分支未实现(3.5)。
+
+**2026-08-24(前端补全 + 三处修复 + 标量指标可视化)**:数据库账号管理页面(创建/编辑 `db_targets`,顶部头像入口)+ 会话列表数据库 chip 上线,后端加了对应的 `PATCH /continuous/sessions/:sid/labels`。digest 假尖峰、`g_digestState` 内存泄漏、临时密码文件安全三处代码缺陷修复完成(见第 5 节)。补全了标量指标(连接数/QPS/命中率)的查询与可视化,发现 `queryNativeContinuousDBSnapshot` 已经有半成品聚合逻辑但从没接进返回值,补完即可,前端加了三张趋势折线图。**下一步(见第 6 节优先级)**:P0 是把今天三处修复过一遍 Linux 编译 + 实跑验证有没有死锁/竞态;P1 是死锁可观测性方案(借鉴 `SHOW ENGINE INNODB STATUS`/`pt-deadlock-logger` 思路)和 PostgreSQL 分支要不要排期。
 
 ---
 
