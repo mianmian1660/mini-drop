@@ -292,6 +292,7 @@ SegmentProcessResult ProcessScript(
     bool pythonReplaced = false;
     merge_python_sidecar_samples(&window.samples, pythonResults, &pythonReplaced,
                                  window.startMs, window.endMs);
+    result.pythonFallbackApplied = pythonReplaced;
 
     // 10. unresolved/frame 诊断
     uint64_t totalFrames = 0;

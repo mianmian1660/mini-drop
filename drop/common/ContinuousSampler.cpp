@@ -3979,6 +3979,12 @@ struct SharedDualTrackContinuousSampler::Impl
                                            env_enabled_default("DROP_CONTINUOUS_PYSPY_FALLBACK", true) &&
                                            env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
         const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
+        // Rolling perf cuts immutable segments every two seconds.  Match the
+        // py-spy capture interval to that physical segment instead of the
+        // logical aggregation window (commonly five seconds); otherwise one
+        // five-second sidecar replaced only one two-second segment and left
+        // roughly 40% generic perf samples in every Python query.
+        const int pythonCaptureSec = env_positive_int("DROP_NATIVE_CP_PYTHON_CAPTURE_SEC", 2);
         // 阶段四：host Session 默认只 attach 最热 2 个 Python 实例；process
         // Session 精确目标最多 4 个。
         const int pythonMaxProcesses =
@@ -4124,7 +4130,7 @@ struct SharedDualTrackContinuousSampler::Impl
                 if (!sidecarInFlight && pendingSidecarResults.empty())
                 {
                     sidecarCapture = drop::start_python_fallback_capture(
-                        physical.sessionSID, std::max(1, physical.aggregationWindowSec),
+                        physical.sessionSID, pythonCaptureSec,
                         pythonRateHz, pythonMaxProcesses);
                     sidecarInFlight = true;
                 }
@@ -4182,12 +4188,30 @@ struct SharedDualTrackContinuousSampler::Impl
                 consecutiveProcessorFailures = 0;
                 processedSegments++;
                 recorder.Confirm(segment.path); // 仅处理成功后删除
-                // py-spy sidecar 结果只应用于这一个 segment 的窗口（不跨段
-                // 双计数）；下一轮 capture 完成后再产生新结果。
+                // 只有真正替换了时间重叠且身份一致的 perf 样本后才能消费
+                // sidecar。Drain 可能先返回 capture 之前的旧 segment；旧实现
+                // 在这种情况下也清空结果，导致 fallback 间歇性失效。
                 if (!pendingSidecarResults.empty())
                 {
-                    pendingSidecarResults.clear();
-                    sidecarLimitedCount = 0;
+                    bool hasReady = false;
+                    bool hasFailure = false;
+                    int64_t newestCaptureEnd = 0;
+                    for (const auto &sidecar : pendingSidecarResults)
+                    {
+                        hasReady = hasReady || sidecar.ready;
+                        hasFailure = hasFailure || !sidecar.ready;
+                        newestCaptureEnd = std::max(newestCaptureEnd, sidecar.captureEndMs);
+                    }
+                    int64_t segmentStart = 0;
+                    if (!processed.windows.empty())
+                        segmentStart = processed.windows.front().startMs;
+                    const bool expired = hasReady && newestCaptureEnd > 0 &&
+                                         segmentStart > newestCaptureEnd;
+                    if (processed.pythonFallbackApplied || (!hasReady && hasFailure) || expired)
+                    {
+                        pendingSidecarResults.clear();
+                        sidecarLimitedCount = 0;
+                    }
                 }
 
                 // 阶段二：strict readiness = 至少一个真实 segment 已被统一

@@ -405,6 +405,10 @@ struct SegmentProcessResult
 {
     std::vector<WindowPayload> windows;
     PhysicalDiagnostics diagnostics;
+    // true only when a ready py-spy capture actually replaced matching perf
+    // samples in this segment.  The rolling sampler uses this to avoid dropping
+    // a capture on an older, non-overlapping segment.
+    bool pythonFallbackApplied = false;
     bool success = false;
     std::string failureReason;
 };
