@@ -7,6 +7,7 @@ import ContinuousSessionList from '../components/ContinuousSessionList';
 import ScheduleList from '../components/ScheduleList';
 import Pagination from '../components/Pagination';
 import TaskCancelButton from '../components/TaskCancelButton';
+import InfoTooltip from '../components/InfoTooltip';
 import { capabilityDescription, capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel, signalLabel } from '../utils/continuous';
 import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
@@ -578,22 +579,24 @@ function OverviewPanel({ target, agent, stat, detailLoading, tasks: taskItems, o
                 <div style={S.metricGrid}>
                     <Metric
                         label="当前是否可采集"
+                        hint="这台机器上的采集器（Agent）是否在线、能否接受新的采样任务。"
                         value={
                             <span style={{ color: agent.online ? '#16a34a' : (target.drop_agent_status === 'offline' ? '#dc2626' : '#64748b'), fontWeight: 700 }}>
                                 {agent.online ? '可采集' : statusLabel(target.drop_agent_status, 'drop')}
                             </span>
                         }
                     />
-                    <Metric label="Agent 版本" value={agent.version || '--'} />
-                    <Metric label="最近心跳" value={agent.last_seen ? formatRelativeTime(agent.last_seen) : '--'} />
-                    <Metric label="主机指标采集" value={hostCollectedMs ? formatRelativeTime(stat.host.collected_at) : '--'} />
+                    <Metric label="Agent 版本" value={agent.version || '--'} hint="采集器（Agent）程序的版本号。版本过旧可能缺少新功能。" />
+                    <Metric label="最近心跳" value={agent.last_seen ? formatRelativeTime(agent.last_seen) : '--'} hint="采集器上一次主动向服务器报平安的时间。长时间没更新说明采集器可能已离线。" />
+                    <Metric label="主机指标采集" value={hostCollectedMs ? formatRelativeTime(stat.host.collected_at) : '--'} hint="上一次成功采集到整机资源数据（CPU / 内存 / 磁盘）的时间。" />
                     <Metric
                         label="指标新鲜度"
+                        hint="主机资源数据是否还在有效期内（90 秒内算新鲜）。显示“数据已过期”说明采集器可能离线或采集异常。"
                         value={hostFresh === null ? '--' : <span style={{ color: hostFresh ? '#16a34a' : '#dc2626', fontWeight: 700 }}>{hostFresh ? '数据新鲜' : '数据已过期'}</span>}
                     />
-                    <Metric label="最近单次任务" value={taskItems.length} />
-                    <Metric label="运行中持续采集" value={runningSessions.length} />
-                    <Metric label="任务成功 / 失败" value={`${successCount} / ${failedCount}`} />
+                    <Metric label="最近单次任务" value={taskItems.length} hint="这台机器最近执行过的一次性采样任务数量。" />
+                    <Metric label="运行中持续采集" value={runningSessions.length} hint="当前正在持续运行的采集会话数量（常驻后台，直到手动停止）。" />
+                    <Metric label="任务成功 / 失败" value={`${successCount} / ${failedCount}`} hint="最近任务的执行结果：成功数 / 失败数。失败数不为 0 时需要关注。" />
                 </div>
                 <div style={{ ...S.subtle, marginTop: 10 }}>数据来源：{stat.source === 'grpc' ? '实时 gRPC' : '数据库快照'}</div>
 
@@ -604,10 +607,10 @@ function OverviewPanel({ target, agent, stat, detailLoading, tasks: taskItems, o
                     </button>
                     {diagOpen && (
                         <div style={S.metricGrid}>
-                            <Metric label="采集器进程 CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
-                            <Metric label="采集器进程内存" value={formatCapacity(stat.memory_kb * 1024)} />
-                            <Metric label="读取吞吐" value={`${formatMetric(stat.read_kb_per_s, 0)} KB/s`} />
-                            <Metric label="写入吞吐" value={`${formatMetric(stat.write_kb_per_s, 0)} KB/s`} />
+                            <Metric label="采集器进程 CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} hint="采集器（Agent）程序自身占用的 CPU 比例，不是整台机器的 CPU。数值高说明采集本身在消耗计算资源。" />
+                            <Metric label="采集器进程内存" value={formatCapacity(stat.memory_kb * 1024)} hint="采集器（Agent）程序自身占用的内存大小。" />
+                            <Metric label="读取吞吐" value={`${formatMetric(stat.read_kb_per_s, 0)} KB/s`} hint="采集器每秒从磁盘读取的数据量。" />
+                            <Metric label="写入吞吐" value={`${formatMetric(stat.write_kb_per_s, 0)} KB/s`} hint="采集器每秒向磁盘写入的数据量（如采样结果、日志）。" />
                         </div>
                     )}
                 </div>
@@ -873,8 +876,8 @@ function ContextItem({ label, value, wide = false }) {
     return <div style={wide ? { ...S.contextItem, ...S.contextItemWide } : S.contextItem}><div style={S.contextLabel}>{label}</div><div style={S.contextValue}>{value}</div></div>;
 }
 
-function Metric({ label, value }) {
-    return <div style={S.metric}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value}</div></div>;
+function Metric({ label, value, hint }) {
+    return <div style={S.metric}><div style={S.metricLabel}>{label}{hint && <InfoTooltip>{hint}</InfoTooltip>}</div><div style={S.metricValue}>{value}</div></div>;
 }
 
 function StatusPill({ value, kind = '' }) {
