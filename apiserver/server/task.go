@@ -802,6 +802,16 @@ func (s *APIServer) ListTasks(c *gin.Context) {
 	if host := strings.TrimSpace(firstNonEmpty(c.Query("host"), c.Query("target_ip"))); host != "" {
 		query = query.Where("target_ip = ?", host)
 	}
+	if raw := strings.TrimSpace(c.Query("from")); raw != "" {
+		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+			query = query.Where("create_time >= ?", parsed)
+		}
+	}
+	if raw := strings.TrimSpace(c.Query("to")); raw != "" {
+		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+			query = query.Where("create_time <= ?", parsed)
+		}
+	}
 
 	// 按状态筛选
 	if status := c.Query("status"); status != "" {

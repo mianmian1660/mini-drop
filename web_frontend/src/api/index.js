@@ -104,6 +104,8 @@ export const profiles = {
     diff: (params = {}) => client.get('/api/v1/profile/diff', { params }),
     labelValues: (params = {}) => client.get('/api/v1/profile/label-values', { params }),
     timeseries: (params = {}) => client.get('/api/v1/profile/timeseries', { params }),
+    // 阶段七：Memray allocation profile 元数据（状态/时间窗口/进程身份）。
+    memoryProfiles: (params = {}) => client.get('/api/v1/continuous/memory/profiles', { params }),
     // Fetch recent Go pprof heap tasks for the Memory tab link.
     heapTasks: (params = {}) => client.get('/api/v1/tasks', { params: { ...params, task_kind: 'go_pprof_heap' } }),
 };

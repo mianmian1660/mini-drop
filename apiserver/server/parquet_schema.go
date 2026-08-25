@@ -67,6 +67,13 @@ type pqCPURow struct {
 	Value          uint64            `parquet:"value"`
 	Unit           string            `parquet:"unit,dict"`
 	ProfileType    string            `parquet:"profile_type,dict"`
+	// ProfileID 阶段七：样本所属 profile 的幂等 ID（memray 等显式 profile）。
+	// 查询侧按 (profile_id + pid + process_start_ms + exe) 跨窗口去重，
+	// 与 v1 的 SeenProfileIDs 语义一致；旧 Parquet 文件无此列（空串），
+	// 查询按无 profile 处理（不参与去重）。
+	ProfileID     string `parquet:"profile_id,dict"`
+	ProfileStatus string `parquet:"profile_status,dict"`
+	ProfileReason string `parquet:"profile_reason,dict"`
 }
 
 func (r pqCPURow) pqSortKey() pqSortKey {
@@ -95,6 +102,7 @@ type pqMetricRow struct {
 	Delta          uint64            `parquet:"delta"`
 	Unit           string            `parquet:"unit,dict"`
 	Labels         map[string]string `parquet:"labels"`
+	RSSTruncated   int32             `parquet:"rss_truncated"`
 }
 
 func (r pqMetricRow) pqSortKey() pqSortKey {

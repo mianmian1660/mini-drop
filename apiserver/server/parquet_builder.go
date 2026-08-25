@@ -78,6 +78,10 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 	labels := sanitizeContinuousLabels(windowLabelsMap(window.Labels, in.Labels))
 	sessionSID := window.SessionSID
 
+	// 阶段八：按 DB 行信号（window.SignalType）决定消费内容。同一窗口可
+	// 同时携带 cpu samples 与 memray profile：cpu_profile 行只消费 samples，
+	// python_memory 行只消费 memray profile（continuousProfileSamplesForIngest
+	// 内部按行信号过滤）。
 	switch window.SignalType {
 	case "cpu_profile", "cpu", "python_memory", "memory":
 		for _, sample := range continuousProfileSamplesForIngest(window, in) {
@@ -98,8 +102,22 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 				Value:          firstNonZeroUint64(sample.Count, 1),
 				Unit:           "samples",
 				ProfileType:    window.SignalType,
+				// 阶段七：profile_id 写入 Parquet，v2 查询与 v1 同一
+				// (profile_id + 进程身份) 去重语义，跨层不双计。
+				ProfileID: sample.ProfileID,
 			}
 			rows.CPU = append(rows.CPU, row)
+		}
+		if window.SignalType == "python_memory" || window.SignalType == "memory" {
+			for _, profile := range in.Profiles {
+				if continuousNormalizeProfileSignal(profile.SignalType) != "python_memory" || len(profile.Samples) > 0 || profile.ProfileID == "" {
+					continue
+				}
+				rows.CPU = append(rows.CPU, pqCPURow{Timestamp: ts, SessionSID: sessionSID,
+					Service: firstNonEmpty(inServiceName(s, sessionSID), "hotmethod"), Agent: firstNonEmpty(inLabelsString(in, "agent_id"), ""),
+					Labels: labels, Unit: firstNonEmpty(profile.Unit, "bytes"), ProfileType: window.SignalType,
+					ProfileID: profile.ProfileID, ProfileStatus: "failed", ProfileReason: "profile 无可用样本（转换失败或无峰值分配）"})
+			}
 		}
 	case "metrics", "python_rss":
 		for _, metric := range in.Metrics {
@@ -126,6 +144,7 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 				Last:           metric.Value,
 				Unit:           metric.Unit,
 				Labels:         sanitizeContinuousLabels(metric.Labels),
+				RSSTruncated:   int32(in.RSSTruncated),
 			}
 			rows.Metrics = append(rows.Metrics, row)
 		}
@@ -229,21 +248,50 @@ func framesToParquet(frames []ContinuousStackFrame) []pqCPUFrame {
 }
 
 // continuousProfileSamplesForIngest 返回 window 内应计入 CPU/profile 的样本
-// （samples + profiles 合并，按 (profile_id) 去重）。
+// （samples + profiles 合并，按 (profile_id + 进程身份) 去重）。
+// 只取与窗口信号类型匹配的 profiles：cpu_profile 窗口不混入 python_memory
+// 样本（否则 v2 CPU 块会把 Memray 样本当 CPU 样本，查询 Total 双计）。
 func continuousProfileSamplesForIngest(window model.ProfileWindow, in *ContinuousWindowIngest) []ContinuousStackSample {
+	windowSignal := continuousNormalizeProfileSignal(window.SignalType)
 	out := make([]ContinuousStackSample, 0, len(in.Samples)+len(in.Profiles))
-	out = append(out, in.Samples...)
+	// 窗口级 samples 只属于 cpu_profile 信号；python_memory 行不携带 CPU 样本。
+	if windowSignal == "cpu_profile" {
+		out = append(out, in.Samples...)
+	}
 	seen := map[string]bool{}
 	for _, profile := range in.Profiles {
+		if continuousNormalizeProfileSignal(profile.SignalType) != windowSignal {
+			continue
+		}
 		if profile.ProfileID != "" {
-			if seen[profile.ProfileID] {
+			// 阶段七：与查询侧同一 dedupe 语义（profile_id + 进程身份），
+			// 保证 v2 写入与 v1 查询对同一 profile 的消费口径一致。
+			if continuousProfileSeen(seen, profile.ProfileID, profile.Samples) {
 				continue
 			}
-			seen[profile.ProfileID] = true
 		}
-		out = append(out, profile.Samples...)
+		for _, sample := range profile.Samples {
+			if sample.ProfileID == "" {
+				sample.ProfileID = profile.ProfileID
+			}
+			out = append(out, sample)
+		}
 	}
 	return out
+}
+
+// continuousNormalizeProfileSignal 归一化 profile 信号名（旧别名兼容）：
+// "cpu" → "cpu_profile"，"memory" → "python_memory"。
+func continuousNormalizeProfileSignal(signal string) string {
+	signal = strings.ToLower(strings.TrimSpace(signal))
+	switch signal {
+	case "cpu":
+		return "cpu_profile"
+	case "memory":
+		return "python_memory"
+	default:
+		return signal
+	}
 }
 
 // windowLabelsMap 合并 window 行 labels（DB JSONB）与请求内 labels。
@@ -362,17 +410,17 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 			continue
 		}
 		batchByID := continuousBatchIndex(batches)
-		// 阶段六修正：按 (batch, signal) 去重而非按 batch——同一 batch 的
-		// window 可能混合多种信号，若只处理第一个 DB 行（单一信号），其它
-		// 信号数据会被整批丢弃。每个 (batch, signal) 处理一次即可覆盖该
-		// batch 内该信号的全部 payload 窗口，且避免同信号多行双计。
+		// 阶段八修正：按 (batch, 原始行信号) 去重而非映射后的 v2 信号——
+		// 同一 batch 的 cpu_profile 行与 python_memory 行都映射到 CPU 信号，
+		// 若按映射后信号去重，后处理的行会被跳过，Memray profile 永远
+		// 不被消费（v2 块丢失内存数据）。
 		seenSignal := map[string]bool{}
 		for _, row := range byObject[objectKey] {
 			signal := pqLedgerSignalForWindow(row.SignalType)
 			if signal == "" {
 				continue
 			}
-			groupKey := row.BatchBID + "|" + signal
+			groupKey := row.BatchBID + "|" + row.SignalType
 			if seenSignal[groupKey] {
 				continue
 			}
@@ -390,6 +438,12 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 			}
 			for _, in := range batch.Windows {
 				if !windowOverlaps(in.WindowStart, in.WindowEnd, hourStart, hourEnd) {
+					continue
+				}
+				// 阶段八：只处理包含该行信号数据的窗口。同一窗口可同时携带
+				// cpu samples 与 memray profile（Agent 协议），cpu_profile 行
+				// 只消费 samples，python_memory 行只消费 memray profile。
+				if !continuousWindowSignalHasData(in, row.SignalType) {
 					continue
 				}
 				rows := pqCollectWindowRows(s, row, batch, &in)
@@ -424,6 +478,18 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 	// 不同：空 samples 回退 agent 计数/metrics 只数 rss/histogram 数 EventCount）。
 	// 已登记 migration failure 的窗口（missing_object/source_mismatch）视为审计
 	// 缺口，不参与完整性判据。
+	profileSeen := map[string]int64{}
+	for i := range cpuRows {
+		if cpuRows[i].ProfileID == "" || cpuRows[i].ProfileStatus == "failed" {
+			continue
+		}
+		sample := pqSampleFromCPURow(cpuRows[i])
+		if continuousProfileSampleSeenAt(profileSeen, sample, cpuRows[i].Timestamp) {
+			cpuRows[i].ProfileStatus = "duplicate"
+			cpuRows[i].Value = 0
+		}
+	}
+
 	failedWindows := s.pqFailedWindowSet(ctx)
 	for _, signal := range []string{
 		model.ContinuousParquetSignalCPU,
@@ -1212,9 +1278,9 @@ func pqStackKey(frames []pqCPUFrame) string {
 // downsampleCPURows 按 (bucket, series labels, stack, unit) 聚合 value=sum。
 func downsampleCPURows(rows []pqCPURow, targetResolution string) []pqCPURow {
 	type key struct {
-		bucket, session, backend, runtime, labels, stack, unit, profileType string
-		pid                                                                 int32
-		processStartMs                                                      int64
+		bucket, session, backend, runtime, labels, stack, unit, profileType, profileID, profileStatus string
+		pid                                                                                           int32
+		processStartMs                                                                                int64
 	}
 	acc := map[key]*pqCPURow{}
 	order := []key{}
@@ -1222,14 +1288,19 @@ func downsampleCPURows(rows []pqCPURow, targetResolution string) []pqCPURow {
 		row := &rows[i]
 		bucket := pqBucketStart(time.UnixMilli(row.Timestamp), targetResolution).UnixMilli()
 		k := key{
-			bucket:         strconv.FormatInt(bucket, 10),
-			session:        row.SessionSID,
-			backend:        row.Backend,
-			runtime:        row.Runtime,
-			labels:         pqSortedLabelKey(row.Labels),
-			stack:          pqStackKey(row.Frames),
-			unit:           row.Unit,
-			profileType:    row.ProfileType,
+			bucket:      strconv.FormatInt(bucket, 10),
+			session:     row.SessionSID,
+			backend:     row.Backend,
+			runtime:     row.Runtime,
+			labels:      pqSortedLabelKey(row.Labels),
+			stack:       pqStackKey(row.Frames),
+			unit:        row.Unit,
+			profileType: row.ProfileType,
+			// 阶段七：profile_id 参与降采样分组——同一 profile 的样本在
+			// 同一桶内合并，不同 profile 不合并（查询侧按 profile 去重，
+			// 合并会破坏去重键的区分度）。
+			profileID:      row.ProfileID,
+			profileStatus:  row.ProfileStatus,
 			pid:            row.PID,
 			processStartMs: row.ProcessStartMs,
 		}
@@ -1290,6 +1361,9 @@ func downsampleMetricRows(rows []pqMetricRow, targetResolution string) []pqMetri
 		}
 		if row.Value > a.Max {
 			a.Max = row.Value
+		}
+		if row.RSSTruncated > a.RSSTruncated {
+			a.RSSTruncated = row.RSSTruncated
 		}
 		if row.MetricKind == "counter" {
 			// reset-aware：只累加正向增量；回绕/重启后从 0 起。

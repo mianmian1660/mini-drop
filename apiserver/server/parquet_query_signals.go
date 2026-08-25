@@ -105,17 +105,20 @@ func (s *APIServer) pqStorageSourceForSignal(ctx context.Context, q ProfileQuery
 // ---------------------------------------------------------------------------
 
 // pqQueryTimeseriesMixed RSS/metrics 时序逐小时混合查询。
-func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, metricName string, maxSeries int) ([]ProfileTimeseriesSeries, bool, error) {
+// 返回 (series, rssTruncated, found, err)。rssTruncated 来自 v1 热窗口的
+// Agent 截断诊断（v2 历史小时无此字段，为 0）。
+func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, metricName string, maxSeries int) ([]ProfileTimeseriesSeries, int, bool, error) {
 	if !pqModeQueryV2(s.pqModeOf()) {
 		return s.queryNativeContinuousTimeseries(ctx, q, metricName, maxSeries)
 	}
 	authorized, err := s.pqAuthorizedSIDs(ctx, q)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	tenant := s.Config.ContinuousParquet.Tenant
 	byKey := map[string]*ProfileTimeseriesSeries{}
 	seriesOrder := []string{}
+	rssTruncated := 0
 	addPoint := func(pid int32, processStartMs int64, comm, exe, runtime string, ts time.Time, value uint64) {
 		key := strconv.Itoa(int(pid)) + "|" + strconv.FormatInt(processStartMs, 10) + "|" + exe
 		series := byKey[key]
@@ -140,16 +143,19 @@ func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, 
 		block, err := s.pqFindBestBlock(ctx, tenant, hour, model.ContinuousParquetSignalMetrics)
 		if err != nil {
 			incParquetQueryError()
-			return nil, true, err
+			return nil, 0, true, err
 		}
 		if block == nil {
 			incParquetV1Fallback()
 			sub := q
 			sub.From, sub.To = hFrom, hTo
-			series, _, err := s.queryNativeContinuousTimeseries(ctx, sub, metricName, maxSeries)
+			series, truncated, _, err := s.queryNativeContinuousTimeseries(ctx, sub, metricName, maxSeries)
 			if err != nil {
 				incParquetQueryError()
-				return nil, true, err
+				return nil, 0, true, err
+			}
+			if truncated > rssTruncated {
+				rssTruncated = truncated
 			}
 			for i := range series {
 				// 按 timestamp 过滤到 [hFrom, hTo)，消除小时边界窗口双计
@@ -180,6 +186,9 @@ func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, 
 				if row.Metric != metricName || row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
 					continue
 				}
+				if int(row.RSSTruncated) > rssTruncated {
+					rssTruncated = int(row.RSSTruncated)
+				}
 				sample := ContinuousStackSample{
 					PID: int(row.PID), Comm: row.Comm, Exe: row.Exe, Runtime: row.Runtime,
 					Labels: pqLabelsInterface(row.Labels),
@@ -194,9 +203,12 @@ func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, 
 			incParquetQueryError()
 			sub := q
 			sub.From, sub.To = hFrom, hTo
-			series, _, v1Err := s.queryNativeContinuousTimeseries(ctx, sub, metricName, maxSeries)
+			series, truncated, _, v1Err := s.queryNativeContinuousTimeseries(ctx, sub, metricName, maxSeries)
 			if v1Err == nil {
 				incParquetV1Fallback()
+				if truncated > rssTruncated {
+					rssTruncated = truncated
+				}
 				for i := range series {
 					series[i].Points = filterTimeseriesPoints(series[i].Points, hFrom, hTo)
 					key := strconv.Itoa(int(series[i].PID)) + "|" + strconv.FormatInt(series[i].ProcessStartMs, 10) + "|" + series[i].Exe
@@ -215,7 +227,7 @@ func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, 
 				}
 				continue
 			}
-			return nil, true, fmt.Errorf("%w: hour %s metrics 读取失败且 v1 回退不可用: %v",
+			return nil, 0, true, fmt.Errorf("%w: hour %s metrics 读取失败且 v1 回退不可用: %v",
 				errPartialCoverage, hour.UTC().Format(time.RFC3339), readErr)
 		}
 	}
@@ -236,7 +248,7 @@ func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, 
 	if len(out) > maxSeries {
 		out = out[:maxSeries]
 	}
-	return out, len(out) > 0, nil
+	return out, rssTruncated, len(out) > 0, nil
 }
 
 // pqHourBoundary 返回某小时与查询范围的交集 [hFrom, hTo)。

@@ -33,6 +33,8 @@ func profileRouter(s *APIServer) *gin.Engine {
 	api.GET("/profile/topn", s.GetProfileTopN)
 	api.GET("/profile/diff", s.GetProfileDiff)
 	api.GET("/profile/label-values", s.GetProfileLabelValues)
+	api.GET("/profile/timeseries", s.GetProfileTimeseries)
+	api.GET("/continuous/memory/profiles", s.GetContinuousMemoryProfiles)
 	api.POST("/internal/continuous/sessions", s.CreateInternalContinuousSession)
 	api.POST("/internal/continuous/batches", s.IngestContinuousBatch)
 	api.GET("/continuous/raw", s.ViewContinuousProfileObject)
@@ -627,6 +629,247 @@ func TestLegacyInternalContinuousCreateIsDisabledAndHistoricalSystemSessionIsRea
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"batch_id":"cpb-system"`) {
 		t.Fatalf("raw continuous object status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// 阶段七：RSS 时序 API 返回 rss_truncated / process_count / 空数据诊断，
+// 不再出现"显示可查询但实际为空"的哑状态。
+func TestProfileTimeseriesRSSDiagnostics(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	router := profileRouter(s)
+	_ = s.DB.Create(&model.AgentInfo{
+		Hostname: "node-a", IPAddr: "10.0.0.1", UID: "owner", Online: true, LastSeen: now,
+	}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID: "cps-rss", Name: "rss session", TargetIP: "10.0.0.1", ServiceName: "hotmethod",
+		SampleRateHz: 19, AggregationWindowSec: 10, UploadBatchSec: 60, RetentionHours: 24,
+		Status: model.ContinuousSessionStatusRunning, UID: "owner",
+		StartedAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
+	}).Error
+
+	// 1) 无任何 python_rss 窗口 → 空 + "没有采集窗口"诊断。
+	queryRange := "&from=" + url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339)) + "&to=" + url.QueryEscape(now.Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/profile/timeseries?target_id=10.0.0.1:hotmethod&profile_type=memory&metric=rss_bytes"+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("timeseries status=%d body=%s", w.Code, w.Body.String())
+	}
+	var emptyResp struct {
+		Data struct {
+			Series       []ProfileTimeseriesSeries `json:"series"`
+			Empty        bool                      `json:"empty"`
+			RSSTruncated int                       `json:"rss_truncated"`
+			ProcessCount int                       `json:"process_count"`
+			Diagnostics  []string                  `json:"diagnostics"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &emptyResp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !emptyResp.Data.Empty || len(emptyResp.Data.Series) != 0 {
+		t.Fatalf("expected empty series: %+v", emptyResp.Data)
+	}
+	if len(emptyResp.Data.Diagnostics) == 0 || !strings.Contains(emptyResp.Data.Diagnostics[0], "没有 python_rss 采集窗口") {
+		t.Fatalf("expected no-window diagnostic, got %v", emptyResp.Data.Diagnostics)
+	}
+
+	// 2) 有 python_rss 窗口（含截断标记）→ 返回 series + rss_truncated。
+	start := now.Add(-20 * time.Second)
+	end := now.Add(-10 * time.Second)
+	batchBody := fmt.Sprintf(`{
+		"session_sid":"cps-rss",
+		"batch_id":"cpb-rss",
+		"start_time":%q,
+		"end_time":%q,
+		"windows":[{
+			"window_start":%q,
+			"window_end":%q,
+			"rss_truncated":3,
+			"metrics":[
+				{"metric":"rss_bytes","timestamp":%q,"pid":123,"process_start_ms":1724160000123,"comm":"python3","exe":"/usr/bin/python3","runtime":"python","value":1048576,"unit":"bytes"},
+				{"metric":"rss_bytes","timestamp":%q,"pid":234,"process_start_ms":1724160000234,"comm":"bash","exe":"/usr/bin/bash","runtime":"python","value":2097152,"unit":"bytes"}
+			]
+		}]
+	}`, start.Format(time.RFC3339), end.Format(time.RFC3339), start.Format(time.RFC3339), end.Format(time.RFC3339),
+		start.Add(5*time.Second).Format(time.RFC3339), start.Add(5*time.Second).Format(time.RFC3339))
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(batchBody))
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ingest rss batch status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/timeseries?target_id=10.0.0.1:hotmethod&profile_type=memory&metric=rss_bytes"+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("timeseries status=%d body=%s", w.Code, w.Body.String())
+	}
+	var dataResp struct {
+		Data struct {
+			Series       []ProfileTimeseriesSeries `json:"series"`
+			Empty        bool                      `json:"empty"`
+			RSSTruncated int                       `json:"rss_truncated"`
+			ProcessCount int                       `json:"process_count"`
+			Diagnostics  []string                  `json:"diagnostics"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &dataResp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if dataResp.Data.Empty || len(dataResp.Data.Series) != 2 {
+		t.Fatalf("expected 2 series, got %+v", dataResp.Data)
+	}
+	if dataResp.Data.RSSTruncated != 3 {
+		t.Fatalf("rss_truncated=%d want 3", dataResp.Data.RSSTruncated)
+	}
+	if dataResp.Data.ProcessCount != 2 {
+		t.Fatalf("process_count=%d want 2", dataResp.Data.ProcessCount)
+	}
+	hasTruncateDiag := false
+	for _, diag := range dataResp.Data.Diagnostics {
+		if strings.Contains(diag, "截断") {
+			hasTruncateDiag = true
+		}
+	}
+	if !hasTruncateDiag {
+		t.Fatalf("expected truncation diagnostic, got %v", dataResp.Data.Diagnostics)
+	}
+
+	// 3) 有窗口但过滤条件不匹配 → 空 + "过滤条件没有匹配"诊断。
+	filter := `{"comm":"nonexistent"}`
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/profile/timeseries?target_id=10.0.0.1:hotmethod&profile_type=memory&metric=rss_bytes&filters="+url.QueryEscape(filter)+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("timeseries status=%d body=%s", w.Code, w.Body.String())
+	}
+	var filteredResp struct {
+		Data struct {
+			Empty       bool     `json:"empty"`
+			Diagnostics []string `json:"diagnostics"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &filteredResp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !filteredResp.Data.Empty {
+		t.Fatalf("expected empty filtered result: %+v", filteredResp.Data)
+	}
+	if len(filteredResp.Data.Diagnostics) == 0 || !strings.Contains(filteredResp.Data.Diagnostics[0], "过滤条件") {
+		t.Fatalf("expected filter diagnostic, got %v", filteredResp.Data.Diagnostics)
+	}
+}
+
+// 阶段七：Memray profile 元数据 API——ready/duplicate/failed 状态、
+// 进程身份、时间窗口与 CPU 范围关联。
+func TestContinuousMemoryProfilesAPI(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	now := time.Now().UTC()
+	router := profileRouter(s)
+	_ = s.DB.Create(&model.AgentInfo{
+		Hostname: "node-a", IPAddr: "10.0.0.1", UID: "owner", Online: true, LastSeen: now,
+	}).Error
+	_ = s.DB.Create(&model.ContinuousSession{
+		SID: "cps-mem", Name: "mem session", TargetIP: "10.0.0.1", ServiceName: "hotmethod",
+		SampleRateHz: 19, AggregationWindowSec: 10, UploadBatchSec: 60, RetentionHours: 24,
+		Status: model.ContinuousSessionStatusRunning, UID: "owner",
+		StartedAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
+	}).Error
+
+	start := now.Add(-20 * time.Second)
+	end := now.Add(-10 * time.Second)
+	// 两个窗口：窗口 A 有 ready profile（memray-1-100）+ 无样本 failed profile；
+	// 窗口 B 重复投递同一 ready profile（应标 duplicate）。
+	body := fmt.Sprintf(`{
+		"session_sid":"cps-mem",
+		"batch_id":"cpb-mem",
+		"start_time":%q,
+		"end_time":%q,
+		"windows":[
+			{
+				"window_start":%q,
+				"window_end":%q,
+				"profiles":[
+					{"signal_type":"python_memory","profile_id":"memray-1-100","backend":"memray","unit":"bytes",
+					 "samples":[{"stack":["allocA"],"count":4096,"pid":1001,"process_start_ms":1724160000123,"exe":"/usr/bin/python3","comm":"python3"}]},
+					{"signal_type":"python_memory","profile_id":"memray-1-200","backend":"memray","unit":"bytes","samples":[]}
+				]
+			},
+			{
+				"window_start":%q,
+				"window_end":%q,
+				"profiles":[
+					{"signal_type":"python_memory","profile_id":"memray-1-100","backend":"memray","unit":"bytes",
+					 "samples":[{"stack":["allocA"],"count":4096,"pid":1001,"process_start_ms":1724160000123,"exe":"/usr/bin/python3","comm":"python3"}]}
+				]
+			}
+		]
+	}`, start.Format(time.RFC3339), end.Format(time.RFC3339),
+		start.Format(time.RFC3339), end.Format(time.RFC3339),
+		start.Add(1*time.Second).Format(time.RFC3339), end.Add(1*time.Second).Format(time.RFC3339))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/continuous/batches", strings.NewReader(body))
+	req.Header.Set("Drop-User-Uid", "owner")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ingest status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	queryRange := "&from=" + url.QueryEscape(now.Add(-30*time.Second).Format(time.RFC3339)) + "&to=" + url.QueryEscape(now.Format(time.RFC3339))
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/continuous/memory/profiles?target_id=10.0.0.1:hotmethod&profile_type=memory"+queryRange, nil)
+	req.Header.Set("Drop-User-Uid", "owner")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("memory profiles status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Profiles []ContinuousMemoryProfileInfo `json:"profiles"`
+			Total    int                           `json:"total"`
+			Empty    bool                          `json:"empty"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if resp.Data.Empty || resp.Data.Total != 3 {
+		t.Fatalf("expected 3 profiles, got %+v", resp.Data)
+	}
+	byID := map[string]ContinuousMemoryProfileInfo{}
+	for _, profile := range resp.Data.Profiles {
+		byID[profile.ProfileID+"|"+profile.Status] = profile
+	}
+	ready, ok := byID["memray-1-100|ready"]
+	if !ok {
+		t.Fatalf("expected ready memray-1-100, got %+v", byID)
+	}
+	if ready.PID != 1001 || ready.ProcessStartMs != 1724160000123 || ready.Exe != "/usr/bin/python3" || ready.SampleCount != 4096 {
+		t.Fatalf("unexpected ready profile metadata: %+v", ready)
+	}
+	if ready.WindowStart.IsZero() || ready.WindowEnd.IsZero() {
+		t.Fatalf("profile must carry time window: %+v", ready)
+	}
+	if _, ok := byID["memray-1-100|duplicate"]; !ok {
+		t.Fatalf("expected duplicate memray-1-100, got %+v", byID)
+	}
+	failed, ok := byID["memray-1-200|failed"]
+	if !ok {
+		t.Fatalf("expected failed memray-1-200, got %+v", byID)
+	}
+	if failed.Reason == "" {
+		t.Fatalf("failed profile must carry reason: %+v", failed)
 	}
 }
 

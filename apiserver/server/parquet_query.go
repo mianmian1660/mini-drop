@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mini-drop/apiserver/model"
@@ -85,6 +86,9 @@ func pqSampleFromCPURow(row pqCPURow) ContinuousStackSample {
 		StackScope:     "continuous",
 		Backend:        row.Backend,
 		Runtime:        row.Runtime,
+		// 阶段七：profile_id 随行保留，供 v2 查询按与 v1 相同的
+		// (profile_id + 进程身份) 键跨窗口去重。
+		ProfileID: row.ProfileID,
 	}
 	if len(row.Frames) > 0 {
 		frames := make([]ContinuousStackFrame, 0, len(row.Frames))
@@ -103,6 +107,43 @@ func pqSampleFromCPURow(row pqCPURow) ContinuousStackSample {
 		sample.Stack = stack
 	}
 	return sample
+}
+
+func continuousProfileSampleSeen(seen map[string]bool, sample ContinuousStackSample) bool {
+	if sample.ProfileID == "" {
+		return false
+	}
+	key := sample.ProfileID + "|" + strconv.Itoa(sample.PID) + "|" + strconv.FormatInt(sample.ProcessStartMs, 10) + "|" + sample.Exe + "|"
+	if len(sample.Frames) > 0 {
+		key += pqStackKey(framesToParquet(sample.Frames))
+	} else {
+		key += strings.Join(sample.Stack, "\x00") + "|" + sample.StackString
+	}
+	if seen[key] {
+		return true
+	}
+	seen[key] = true
+	return false
+}
+
+func continuousProfileSampleKey(sample ContinuousStackSample) string {
+	key := sample.ProfileID + "|" + strconv.Itoa(sample.PID) + "|" + strconv.FormatInt(sample.ProcessStartMs, 10) + "|" + sample.Exe + "|"
+	if len(sample.Frames) > 0 {
+		return key + pqStackKey(framesToParquet(sample.Frames))
+	}
+	return key + strings.Join(sample.Stack, "\x00") + "|" + sample.StackString
+}
+
+func continuousProfileSampleSeenAt(seen map[string]int64, sample ContinuousStackSample, timestamp int64) bool {
+	if sample.ProfileID == "" {
+		return false
+	}
+	key := continuousProfileSampleKey(sample)
+	if _, ok := seen[key]; ok {
+		return true
+	}
+	seen[key] = timestamp
+	return false
 }
 
 // pqLabelsInterface map[string]string → map[string]interface{}。
@@ -153,6 +194,7 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 		Unit:               map[bool]string{true: "bytes", false: "samples"}[q.ProfileType == "memory"],
 		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
 		SeenProfileIDs:     map[string]bool{},
+		SeenProfileSamples: map[string]int64{},
 	}
 
 	hours := pqHourlyRange(q.From, q.To)
@@ -208,8 +250,20 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 					continue
 				}
 				sample := pqSampleFromCPURow(*row)
+				if row.ProfileStatus == "failed" || row.ProfileStatus == "duplicate" {
+					continue
+				}
 				if !continuousSampleMatches(sample, pqLabelsInterface(row.Labels), q.Filters) {
 					continue
+				}
+				// 阶段七：v2 与 v1 同一 profile 去重语义。同一 profile 的
+				// 样本可能因共享引擎/窗口边界出现在多个小时块，按
+				// (profile_id + pid + start + exe) 只消费一次，防止跨层
+				// 双计。旧 Parquet 无 profile_id（空串）不参与去重。
+				if row.ProfileID != "" {
+					if continuousProfileSampleSeenAt(agg.SeenProfileSamples, sample, row.Timestamp) {
+						continue
+					}
 				}
 				continuousAddSample(&agg, sample, pqLabelsInterface(row.Labels))
 				agg.WindowCount++

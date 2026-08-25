@@ -495,6 +495,30 @@ TEST(ContinuousSessionManager, NormalizesLegacyAllInstancesMode)
     EXPECT_EQ(assignments[0].selectorMode, "exe_all_instances");
 }
 
+// 阶段八：host scope 无 selector 时服务端可能返回 selector_params=""（旧
+// 服务端 nil []byte 序列化）或 null（新服务端 omitempty）。空字符串必须
+// 视为无参数，不进入 base64/JSON 解析（否则 json::parse("") 抛异常导致
+// reconcile 失败、Session 卡 error）。
+TEST(ContinuousSessionManager, EmptySelectorParamsStringIsTolerated)
+{
+    AgentConfig config;
+    config.ipAddr = "127.0.0.1";
+    config.hostname = "test-host";
+    config.uid = "agent-test";
+    std::atomic<bool> agentRunning{true};
+    ContinuousSessionManager manager(config, "http://127.0.0.1:8191", "agent-test", agentRunning);
+    const std::string response =
+        R"({"code":0,"data":{"revision":13,"assignments":[{"sid":"cps-host","scope":"host","selector_mode":"exe_all_instances","selector_params":"","desired_state":"running","revision":13}]}})";
+    std::vector<ContinuousAssignment> assignments;
+    uint64_t revision = 0;
+    ASSERT_TRUE(ContinuousSessionManagerTestAccess::ParseAssignments(manager, response, &assignments, &revision));
+    ASSERT_EQ(assignments.size(), 1u);
+    EXPECT_EQ(assignments[0].scope, "host");
+    EXPECT_EQ(assignments[0].selectorPid, 0);
+    EXPECT_EQ(assignments[0].selectorProcessStartMs, 0);
+    EXPECT_EQ(assignments[0].selectorExe, "");
+}
+
 // 阶段六：Reconcile 上报进程快照携带 cgroup/container_id。
 TEST(ContinuousSessionManager, ReconcileBodyCarriesCgroupAndContainerId)
 {

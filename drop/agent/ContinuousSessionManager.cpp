@@ -581,17 +581,32 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
             if (item.contains("selector_params") && !item.at("selector_params").is_null())
             {
                 const std::string paramsB64 = item.value("selector_params", std::string());
+                // 阶段八：防御空字符串（旧服务端 nil []byte 序列化为 ""），
+                // 空串视为无 selector 参数，不进入 base64/JSON 解析。
                 if (!paramsB64.empty())
                 {
                     try
                     {
                         json params = json::parse(base64_decode(paramsB64));
-                        assignment.selectorPid = params.value("pid", 0);
-                        assignment.selectorProcessStartMs = params.value("process_start_ms", static_cast<int64_t>(0));
-                        if (params.contains("exe") && params.at("exe").is_string())
-                            assignment.selectorExe = params.value("exe", assignment.selectorExe);
-                        assignment.selectorCgroup = params.value("cgroup", "");
-                        assignment.selectorContainerId = params.value("container_id", "");
+                        // 阶段八：防御服务端 jsonb 序列化 nil 产生的 "null"
+                        // 字符串（base64 解码后 parse 得到 null json），null
+                        // 视为无 selector 参数，不访问字段。
+                        if (params.is_null())
+                        {
+                            assignment.selectorPid = 0;
+                            assignment.selectorProcessStartMs = 0;
+                            assignment.selectorCgroup = "";
+                            assignment.selectorContainerId = "";
+                        }
+                        else
+                        {
+                            assignment.selectorPid = params.value("pid", 0);
+                            assignment.selectorProcessStartMs = params.value("process_start_ms", static_cast<int64_t>(0));
+                            if (params.contains("exe") && params.at("exe").is_string())
+                                assignment.selectorExe = params.value("exe", assignment.selectorExe);
+                            assignment.selectorCgroup = params.value("cgroup", "");
+                            assignment.selectorContainerId = params.value("container_id", "");
+                        }
                     }
                     catch (const std::exception &error)
                     {

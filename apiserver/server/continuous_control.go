@@ -163,7 +163,9 @@ type continuousAssignmentDTO struct {
 	SelectorMode         string `json:"selector_mode"`
 	// 阶段六：selector 结构化参数（pid/process_start_ms/exe/cgroup/
 	// container_id），Agent 侧按 selector_mode 解析匹配。
-	SelectorParams      []byte     `json:"selector_params"`
+	// 阶段八修复：omitempty——host scope 无 selector 时 nil 序列化为 null
+	// （Agent 已处理 null），避免空字符串让 Agent base64 解码后 parse 失败。
+	SelectorParams      []byte     `json:"selector_params,omitempty"`
 	Signals             []string   `json:"signals"`
 	RequestedSignals    []string   `json:"requested_signals"`
 	DesiredState        string     `json:"desired_state"`
@@ -201,7 +203,11 @@ func continuousAssignmentDTOs(sessions []model.ContinuousSession) []continuousAs
 			Labels:               session.Labels,
 			Capabilities:         session.Capabilities,
 			Status:               session.Status,
-			SelectorParams:       session.SelectorParams,
+			// 阶段八修复：GORM jsonb 序列化器把 nil []byte 写成字符串 "null"
+			// （4 字节），Agent 解码后 json::parse("null") 得到 null json，
+			// value() 抛 type_error.306。清洗为 nil 后 omitempty 生效，字段
+			// 省略（Agent contains 检查 false）。
+			SelectorParams:       cleanContinuousSelectorParams(session.SelectorParams),
 			Scope:                session.Scope,
 			SelectorExe:          session.SelectorExe,
 			SelectorMode:         session.SelectorMode,
@@ -222,6 +228,19 @@ func continuousAssignmentDTOs(sessions []model.ContinuousSession) []continuousAs
 		})
 	}
 	return out
+}
+
+// cleanContinuousSelectorParams 清洗 selector_params：nil、空、或字符串
+// "null"（GORM jsonb 序列化 nil 的产物）一律归一化为 nil，保证 omitempty
+// 生效（host scope 无 selector 时字段省略，Agent 不解析）。
+func cleanContinuousSelectorParams(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	if string(raw) == "null" {
+		return nil
+	}
+	return raw
 }
 
 func validateContinuousCreateRequest(req CreateContinuousSessionReq) string {
