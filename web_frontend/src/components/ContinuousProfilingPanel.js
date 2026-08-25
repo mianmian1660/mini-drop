@@ -1918,6 +1918,7 @@ export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
     if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询数据库快照...</div></section>;
     const digests = data?.digests || [];
     const lockWaits = data?.lock_waits || [];
+    const deadlocks = data?.deadlocks || [];
     const firedEvents = events.filter(e => e.status === 'fired_no_action');
     return (
         <section style={S.card}>
@@ -1926,10 +1927,10 @@ export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
                     <h3 style={S.title}>数据库快照</h3>
                     <div style={S.subtle}>{data?.source || 'mini-drop-native'} · 数据库系统视图轮询</div>
                 </div>
-                <span style={S.subtle}>{digests.length} 条 digest · {lockWaits.length} 条锁等待</span>
+                <span style={S.subtle}>{digests.length} 条 digest · {lockWaits.length} 条锁等待{deadlocks.length > 0 ? ` · ${deadlocks.length} 起死锁` : ''}</span>
             </div>
             {firedEvents.length > 0 && <DBSentinelEvents events={firedEvents} />}
-            {data?.empty || (digests.length === 0 && lockWaits.length === 0 && !(data?.metrics?.length > 0)) ? (
+            {data?.empty || (digests.length === 0 && lockWaits.length === 0 && deadlocks.length === 0 && !(data?.metrics?.length > 0)) ? (
                 <ProfileEmpty message={data?.message || '该时间范围暂无数据库快照数据'} url={data?.profile_url} />
             ) : (
                 <>
@@ -1939,6 +1940,22 @@ export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
                         <Metric label="最长锁等待" value={lockWaits.length ? `${Math.max(...lockWaits.map(w => Number(w.wait_seconds) || 0))} s` : '-'} />
                     </div>
                     {data?.metrics?.length > 0 && <DBMetricTrends metrics={data.metrics} />}
+                    {deadlocks.length > 0 && (
+                        <div style={{ marginTop: 16 }}>
+                            <div style={S.sectionHead}>
+                                <h3 style={S.title}>死锁记录</h3>
+                                <span style={S.subtle}>按最近发生时间排序 · 原始 InnoDB 状态报告，未做结构化解析</span>
+                            </div>
+                            {deadlocks.map((item, index) => (
+                                <details key={`${item.instance_label}-${index}`} style={{ marginTop: index === 0 ? 0 : 8, border: '1px solid #fda29b', borderRadius: 6, padding: '8px 12px', background: '#fff6f5' }}>
+                                    <summary style={{ cursor: 'pointer', fontWeight: 700, color: '#b42318', fontSize: 13 }}>
+                                        {formatTime(item.timestamp)} · 实例 {item.instance_label || '-'}
+                                    </summary>
+                                    <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, color: '#344054' }}>{item.report}</pre>
+                                </details>
+                            ))}
+                        </div>
+                    )}
                     <div style={{ marginTop: 16 }}>
                         <div style={S.sectionHead}>
                             <h3 style={S.title}>锁等待链</h3>
