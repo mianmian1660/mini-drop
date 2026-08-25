@@ -581,6 +581,8 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
             if (item.contains("selector_params") && !item.at("selector_params").is_null())
             {
                 const std::string paramsB64 = item.value("selector_params", std::string());
+                // 阶段八：防御空字符串（旧服务端 nil []byte 序列化为 ""），
+                // 空串视为无 selector 参数，不进入 base64/JSON 解析。
                 if (!paramsB64.empty())
                 {
                     try

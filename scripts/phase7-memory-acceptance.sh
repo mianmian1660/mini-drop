@@ -38,8 +38,12 @@ else
   RSS_WINDOWS=$(PG "SELECT count(*) FROM profile_windows WHERE created_at >= ${SINCE} AND signal_type='python_rss'")
   RSS_SESSIONS=$(PG "SELECT count(DISTINCT session_sid) FROM profile_windows WHERE created_at >= ${SINCE} AND signal_type='python_rss'")
 fi
-echo "  rss_windows=${RSS_WINDOWS} sessions=${RSS_SESSIONS}"
-if [ "${RSS_WINDOWS:-0}" -gt 0 ]; then pass "存在 python_rss 窗口（${RSS_SESSIONS} 个 Session）"; else bad "无 python_rss 窗口（需启用 python_rss 信号且目标有 Python 进程）"; fi
+# 运行中 Session 是否启用 python_rss 信号（未启用时无窗口属正常，不算失败）
+RSS_ENABLED=$(PG "SELECT count(*) FROM continuous_sessions WHERE desired_state='running' AND signals::text LIKE '%python_rss%'")
+echo "  rss_windows=${RSS_WINDOWS} sessions=${RSS_SESSIONS} enabled_sessions=${RSS_ENABLED}"
+if [ "${RSS_WINDOWS:-0}" -gt 0 ]; then pass "存在 python_rss 窗口（${RSS_SESSIONS} 个 Session）"; 
+elif [ "${RSS_ENABLED:-0}" -gt 0 ]; then bad "有 Session 启用 python_rss 但无窗口（需检查 Agent 采集）";
+else echo "  ⚠️ 无运行中 Session 启用 python_rss（跳过，属正常）"; fi
 echo
 
 # ---- [2] process selector 不泄漏其他 PID ----
@@ -113,7 +117,7 @@ echo
 
 # ---- [6] Go Heap 按需任务保留 ----
 echo "--- [6] go_pprof_heap task kind 可用 ---"
-KIND=$(curl -s "${API}/api/v1/task-kinds" -H "${UID_HEADER}" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(1 if any(k.get("id")=="go_pprof_heap" for k in d.get("data",{}).get("kinds",[])) else 0)' 2>/dev/null || echo 0)
+KIND=$(curl -s "${API}/api/v1/task-kinds" -H "${UID_HEADER}" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(1 if any(k.get("id")=="go_pprof_heap" for k in d.get("data",{}).get("task_kinds",[])) else 0)' 2>/dev/null || echo 0)
 if [ "${KIND}" = "1" ]; then pass "go_pprof_heap 任务类型可用"; else bad "go_pprof_heap 任务类型缺失"; fi
 echo
 

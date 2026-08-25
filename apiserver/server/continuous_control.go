@@ -163,7 +163,9 @@ type continuousAssignmentDTO struct {
 	SelectorMode         string `json:"selector_mode"`
 	// 阶段六：selector 结构化参数（pid/process_start_ms/exe/cgroup/
 	// container_id），Agent 侧按 selector_mode 解析匹配。
-	SelectorParams      []byte     `json:"selector_params"`
+	// 阶段八修复：omitempty——host scope 无 selector 时 nil 序列化为 null
+	// （Agent 已处理 null），避免空字符串让 Agent base64 解码后 parse 失败。
+	SelectorParams      []byte     `json:"selector_params,omitempty"`
 	Signals             []string   `json:"signals"`
 	RequestedSignals    []string   `json:"requested_signals"`
 	DesiredState        string     `json:"desired_state"`
