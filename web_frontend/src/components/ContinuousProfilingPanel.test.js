@@ -6,7 +6,6 @@ jest.mock('../api', () => ({
     continuous: {
         timeline: jest.fn(),
         histogram: jest.fn(),
-        dbTestScenarios: jest.fn(() => Promise.resolve({ code: 0, data: { scenarios: [] } })),
         updateLabels: jest.fn(() => Promise.resolve({ code: 0, data: {} })),
     },
     profiles: {
@@ -62,7 +61,6 @@ import {
     sliderMinutesToInputs,
     runtimeLabel,
     validateCustomTimeWindow,
-    DBSnapshotPanel,
     signalTabsForSession,
     storageSourceLabel,
     resolutionLabel,
@@ -73,10 +71,6 @@ global.IS_REACT_ACT_ENVIRONMENT = true;
 
 beforeEach(() => {
     jest.clearAllMocks();
-    // react-scripts 的 jest 预设开了 resetMocks，jest.mock 工厂里给 dbTestScenarios
-    // 设的默认返回值每个测试前都会被清空，DBSnapshotPanel 现在无条件挂载
-    // TestScenarioCard 会调用它，这里统一给个空场景列表兜底，不影响各测试自己的断言。
-    continuous.dbTestScenarios.mockResolvedValue({ code: 0, data: { scenarios: [] } });
 });
 
 test('diagnostic JSON uses two-space indentation for nested values', () => {
@@ -732,164 +726,8 @@ test('采集元信息展示 storage_source / resolution / mixed_resolution', asy
     container.remove();
 });
 
-// ============================================================
-// 数据库快照面板（3a6230f 专项）
-// ============================================================
-
-test('数据库快照面板：加载态显示正在查询', () => {
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    act(() => {
-        root.render(<DBSnapshotPanel data={null} loading />);
-    });
-    expect(container.textContent).toContain('正在查询数据库快照');
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('数据库快照面板：空态显示暂无数据', () => {
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    act(() => {
-        root.render(<DBSnapshotPanel data={{ empty: true, message: '该时间范围暂无数据库快照数据' }} loading={false} />);
-    });
-    expect(container.textContent).toContain('该时间范围暂无数据库快照数据');
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('数据库快照面板：digest 表渲染各列', () => {
-    const data = {
-        digests: [{
-            instance_label: 'mysql-a',
-            schema_name: 'mydb',
-            digest_text: 'SELECT * FROM t WHERE id = ?',
-            call_count: 42,
-            total_latency_us: 1000000,
-            avg_latency_us: 23809,
-            rows_examined: 100,
-        }],
-        lock_waits: [],
-    };
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    act(() => {
-        root.render(<DBSnapshotPanel data={data} loading={false} />);
-    });
-    expect(container.textContent).toContain('慢查询 digest');
-    expect(container.textContent).toContain('SELECT * FROM t WHERE id = ?');
-    expect(container.textContent).toContain('mysql-a');
-    expect(container.textContent).toContain('mydb');
-    expect(container.textContent).toContain('调用次数');
-    expect(container.textContent).toContain('累计耗时');
-    expect(container.textContent).toContain('平均耗时');
-    expect(container.textContent).toContain('扫描行数');
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('数据库快照面板：锁等待表渲染阻塞关系', () => {
-    const data = {
-        digests: [],
-        lock_waits: [{
-            instance_label: 'mysql-a',
-            timestamp: '2026-08-22T00:00:00Z',
-            waiting_pid: 1001,
-            waiting_query: 'UPDATE t SET x=1',
-            blocking_pid: 1002,
-            blocking_query: 'SELECT * FROM t FOR UPDATE',
-            wait_seconds: 12,
-            locked_table: 'db.t',
-        }],
-    };
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    act(() => {
-        root.render(<DBSnapshotPanel data={data} loading={false} />);
-    });
-    expect(container.textContent).toContain('锁等待链');
-    expect(container.textContent).toContain('最长锁等待');
-    expect(container.textContent).toContain('1001');
-    expect(container.textContent).toContain('1002');
-    expect(container.textContent).toContain('12 s');
-    expect(container.textContent).toContain('db.t');
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('数据库快照面板：空 digest/锁等待 显示对应空态文案', () => {
-    const data = { digests: [], lock_waits: [], source: 'mini-drop-native' };
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    act(() => {
-        root.render(<DBSnapshotPanel data={data} loading={false} />);
-    });
-    // 无 digests 且无 lock_waits -> 空态
-    expect(container.textContent).toContain('该时间范围暂无数据库快照数据');
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('数据库快照面板：哨兵触发列表只展示文案，不做可点击链接', async () => {
-    sentinelRules.events.mockResolvedValueOnce({
-        code: 0,
-        data: {
-            events: [
-                { rule_sid: 'sr-1', metric: 'lock_wait', status: 'fired_no_action', observed_value: 8, floor_value: 3, evaluated_at: '2026-08-24T13:05:00Z' },
-                { rule_sid: 'sr-2', metric: 'digest', status: 'fired_no_action', observed_value: 600000, floor_value: 50000, evaluated_at: '2026-08-24T14:32:00Z' },
-                { rule_sid: 'sr-1', metric: 'lock_wait', status: 'skipped_cooldown', observed_value: 4, floor_value: 3, evaluated_at: '2026-08-24T13:10:00Z' },
-            ],
-        },
-    });
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    await act(async () => {
-        root.render(<DBSnapshotPanel data={{ empty: true }} loading={false} targetIP="10.0.0.9" timeWindow={{ from: '2026-08-24T12:00:00Z', to: '2026-08-24T15:00:00Z' }} />);
-    });
-    await act(async () => { await Promise.resolve(); });
-
-    expect(sentinelRules.events).toHaveBeenCalledWith({ target_ip: '10.0.0.9', signal: 'db_snapshot', from: '2026-08-24T12:00:00Z', to: '2026-08-24T15:00:00Z' });
-    // 只展示 fired_no_action，skipped_cooldown 不应出现
-    expect(container.textContent).toContain('近期哨兵触发');
-    expect(container.textContent).toContain('锁等待');
-    expect(container.textContent).toContain('慢SQL环比');
-    expect(container.textContent).toContain('等待 8 s（阈值 3 s）');
-    expect((container.textContent.match(/已记录异常，当前无自动诊断/g) || []).length).toBe(2);
-    // 不能做成可点击链接（child_tid 永远为空，点进去会是不存在的任务）
-    expect(container.querySelectorAll('a, button[onclick]').length).toBe(0);
-
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('数据库快照面板：没有哨兵触发记录时不展示该区块', async () => {
-    sentinelRules.events.mockResolvedValueOnce({ code: 0, data: { events: [] } });
-    const container = document.createElement('div');
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    await act(async () => {
-        root.render(<DBSnapshotPanel data={{ empty: true }} loading={false} targetIP="10.0.0.9" timeWindow={{ from: '2026-08-24T12:00:00Z', to: '2026-08-24T15:00:00Z' }} />);
-    });
-    await act(async () => { await Promise.resolve(); });
-
-    expect(container.textContent).not.toContain('近期哨兵触发');
-
-    act(() => root.unmount());
-    container.remove();
-});
-
-test('signalTabsForSession 始终包含数据库 tab', () => {
+test('signalTabsForSession 按信号集过滤 Tab', () => {
     const tabs = signalTabsForSession('cpu_profile|io_latency');
-    const dbTab = tabs.find(t => t.tab === 'db');
-    expect(dbTab).toBeTruthy();
-    expect(dbTab.label).toBe('数据库');
-    // 纯 db_snapshot 信号也至少给出数据库 tab
-    const dbOnly = signalTabsForSession('db_snapshot');
-    expect(dbOnly.some(t => t.tab === 'db')).toBe(true);
+    expect(tabs.map(t => t.tab)).toEqual(expect.arrayContaining(['cpu', 'io']));
+    expect(tabs.some(t => t.tab === 'db')).toBe(false);
 });
