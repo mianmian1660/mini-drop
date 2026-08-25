@@ -59,7 +59,7 @@ import {
     DBSnapshotPanel,
     signalTabsForSession,
 } from './ContinuousProfilingPanel';
-import { continuous, profiles } from '../api';
+import { continuous, profiles, sentinelRules } from '../api';
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -523,6 +523,55 @@ test('数据库快照面板：空 digest/锁等待 显示对应空态文案', ()
     });
     // 无 digests 且无 lock_waits -> 空态
     expect(container.textContent).toContain('该时间范围暂无数据库快照数据');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('数据库快照面板：哨兵触发列表只展示文案，不做可点击链接', async () => {
+    sentinelRules.events.mockResolvedValueOnce({
+        code: 0,
+        data: {
+            events: [
+                { rule_sid: 'sr-1', metric: 'lock_wait', status: 'fired_no_action', observed_value: 8, floor_value: 3, evaluated_at: '2026-08-24T13:05:00Z' },
+                { rule_sid: 'sr-2', metric: 'digest', status: 'fired_no_action', observed_value: 600000, floor_value: 50000, evaluated_at: '2026-08-24T14:32:00Z' },
+                { rule_sid: 'sr-1', metric: 'lock_wait', status: 'skipped_cooldown', observed_value: 4, floor_value: 3, evaluated_at: '2026-08-24T13:10:00Z' },
+            ],
+        },
+    });
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<DBSnapshotPanel data={{ empty: true }} loading={false} targetIP="10.0.0.9" timeWindow={{ from: '2026-08-24T12:00:00Z', to: '2026-08-24T15:00:00Z' }} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(sentinelRules.events).toHaveBeenCalledWith({ target_ip: '10.0.0.9', signal: 'db_snapshot', from: '2026-08-24T12:00:00Z', to: '2026-08-24T15:00:00Z' });
+    // 只展示 fired_no_action，skipped_cooldown 不应出现
+    expect(container.textContent).toContain('近期哨兵触发');
+    expect(container.textContent).toContain('锁等待');
+    expect(container.textContent).toContain('慢SQL环比');
+    expect(container.textContent).toContain('等待 8 s（阈值 3 s）');
+    expect((container.textContent.match(/已记录异常，当前无自动诊断/g) || []).length).toBe(2);
+    // 不能做成可点击链接（child_tid 永远为空，点进去会是不存在的任务）
+    expect(container.querySelectorAll('a, button[onclick]').length).toBe(0);
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('数据库快照面板：没有哨兵触发记录时不展示该区块', async () => {
+    sentinelRules.events.mockResolvedValueOnce({ code: 0, data: { events: [] } });
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<DBSnapshotPanel data={{ empty: true }} loading={false} targetIP="10.0.0.9" timeWindow={{ from: '2026-08-24T12:00:00Z', to: '2026-08-24T15:00:00Z' }} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(container.textContent).not.toContain('近期哨兵触发');
+
     act(() => root.unmount());
     container.remove();
 });

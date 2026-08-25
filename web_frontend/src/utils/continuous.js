@@ -1,8 +1,13 @@
 export const CONTINUOUS_SIGNALS = ['cpu_profile', 'io_latency', 'io_syscall_latency', 'sched_latency'];
 export const DEFAULT_CONTINUOUS_SIGNALS = ['cpu_profile'];
-// 哨兵规则目前只支持 eBPF histogram 类信号的固定阈值判异，与后端
+// 哨兵规则里 histogram 类信号（能配 p50/p95/p99 固定阈值），与后端
 // detectionSignalTaskKind（apiserver/server/detection.go）保持一致。
 export const SENTINEL_SIGNALS = ['sched_latency', 'io_latency', 'io_syscall_latency'];
+// db_snapshot 信号的判异方式（锁等待 / 慢SQL环比），与后端
+// sentinelValidDBSnapshotMetrics（apiserver/server/sentinel_rule.go）保持一致。
+// 语义和 SENTINEL_SIGNALS 完全不同（不是"哪些信号"，是"db_snapshot 信号下
+// 有哪几种判异方式"），故意不塞进同一个常量。
+export const DB_SENTINEL_METRICS = ['lock_wait', 'digest'];
 
 export function decodeJSONField(value, fallback = []) {
     if (value == null || value === '') return fallback;

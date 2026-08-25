@@ -860,7 +860,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 />
                 {sampleNotice && <div style={{ ...S.info, marginTop: 12 }}>{sampleNotice}</div>}
                 {coverageAlert && <CoverageAlert alert={coverageAlert} />}
-			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} />
+			</section> : signalTab === 'db' ? <DBSnapshotPanel data={dbSnapshot} loading={querying} targetIP={target?.ip} timeWindow={timeWindow} />
                 : <HistogramPanel
                     data={histogram} loading={querying}
                     title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'}
@@ -1769,10 +1769,22 @@ export function HistogramPanel({ data, loading, title, targetIP, signal, timeWin
 // 锁等待链单独成表而不是并进 digest 表：digest 是"这段时间哪些 SQL 累计
 // 最慢"（聚合量），锁等待是"某一时刻谁在等谁"（时点事实），两者聚合口径不
 // 同，合并展示会让人误以为锁等待也是累计值。
-export function DBSnapshotPanel({ data, loading }) {
+export function DBSnapshotPanel({ data, loading, targetIP, timeWindow }) {
+    const [events, setEvents] = useState([]);
+
+    useEffect(() => {
+        if (!targetIP || !timeWindow?.from || !timeWindow?.to) { setEvents([]); return; }
+        let cancelled = false;
+        sentinelRules.events({ target_ip: targetIP, signal: 'db_snapshot', from: timeWindow.from, to: timeWindow.to })
+            .then(response => { if (!cancelled && response.code === 0) setEvents(response.data?.events || []); })
+            .catch(() => { if (!cancelled) setEvents([]); });
+        return () => { cancelled = true; };
+    }, [targetIP, timeWindow?.from, timeWindow?.to]);
+
     if (loading && !data) return <section style={S.card}><div style={S.empty}>正在查询数据库快照...</div></section>;
     const digests = data?.digests || [];
     const lockWaits = data?.lock_waits || [];
+    const firedEvents = events.filter(e => e.status === 'fired_no_action');
     return (
         <section style={S.card}>
             <div style={S.sectionHead}>
@@ -1782,6 +1794,7 @@ export function DBSnapshotPanel({ data, loading }) {
                 </div>
                 <span style={S.subtle}>{digests.length} 条 digest · {lockWaits.length} 条锁等待</span>
             </div>
+            {firedEvents.length > 0 && <DBSentinelEvents events={firedEvents} />}
             {data?.empty || (digests.length === 0 && lockWaits.length === 0) ? (
                 <ProfileEmpty message={data?.message || '该时间范围暂无数据库快照数据'} url={data?.profile_url} />
             ) : (
@@ -1872,6 +1885,39 @@ export function DBSnapshotPanel({ data, loading }) {
                 </>
             )}
         </section>
+    );
+}
+
+// DBSentinelEvents 数据库Tab的"近期哨兵触发"列表。db_snapshot 命中后端写的是
+// status=fired_no_action、child_tid 永远为空（script_diagnostic 的 Runner 还没接入，
+// 见 apiserver/server/detection.go 里 evaluateDBSnapshotRule 的注释）——HistogramTrendChart
+// 那套"红点可点击跳转诊断任务"的交互在这里不成立，做成可点击链接会点进一个不存在的
+// 任务，是误导性 UI，所以这里只展示纯文案，不接 onClick/Link。
+function DBSentinelEvents({ events }) {
+    return (
+        <div style={{ marginBottom: 16 }}>
+            <div style={S.sectionHead}>
+                <h3 style={S.title}>近期哨兵触发</h3>
+                <span style={S.subtle}>{events.length} 条</span>
+            </div>
+            <div style={{ display: 'grid', gap: 6 }}>
+                {events.slice(0, 20).map((event, index) => (
+                    <div key={`${event.rule_sid}-${index}`} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#f9fafb' }}>
+                        <div>
+                            <div style={{ fontSize: 13, color: '#101828' }}>
+                                {event.metric === 'lock_wait' ? '锁等待' : event.metric === 'digest' ? '慢SQL环比' : event.metric} · {formatTime(event.evaluated_at)}
+                            </div>
+                            <div style={S.subtle}>
+                                {event.metric === 'lock_wait'
+                                    ? `等待 ${event.observed_value} s（阈值 ${event.floor_value} s）`
+                                    : `当前耗时 ${formatLatency(event.observed_value, 'us')}（下限 ${formatLatency(event.floor_value, 'us')}）`}
+                            </div>
+                        </div>
+                        <span style={{ fontSize: 12, color: '#98a2b3' }}>已记录异常，当前无自动诊断</span>
+                    </div>
+                ))}
+            </div>
+        </div>
     );
 }
 
