@@ -48,6 +48,50 @@ std::string comm_memray(int pid)
     return trim(value);
 }
 
+// /proc/<pid>/stat 第 22 字段（starttime，单位 clock ticks）+ btime 换算成
+// wall-clock 毫秒。读不到返回 0（身份不完整，process Session 不得归属）。
+int64_t runtime_process_start_ms_memray(int pid)
+{
+    if (pid <= 0)
+        return 0;
+    std::ifstream statFile("/proc/" + std::to_string(pid) + "/stat");
+    std::string statLine;
+    if (!std::getline(statFile, statLine))
+        return 0;
+    size_t close = statLine.rfind(')');
+    if (close == std::string::npos || close + 2 >= statLine.size())
+        return 0;
+    std::istringstream fields(statLine.substr(close + 2));
+    std::string value;
+    uint64_t ticks = 0;
+    for (int field = 3; field <= 22; ++field)
+    {
+        if (!(fields >> value))
+            return 0;
+        if (field == 22)
+            ticks = std::strtoull(value.c_str(), nullptr, 10);
+    }
+    long hz = ::sysconf(_SC_CLK_TCK);
+    if (hz <= 0 || ticks == 0)
+        return 0;
+    std::ifstream stat("/proc/stat");
+    std::string key;
+    int64_t bootSeconds = 0;
+    while (stat >> key)
+    {
+        if (key == "btime")
+        {
+            stat >> bootSeconds;
+            break;
+        }
+        std::string rest;
+        std::getline(stat, rest);
+    }
+    if (bootSeconds <= 0)
+        return 0;
+    return bootSeconds * 1000 + static_cast<int64_t>(ticks * 1000 / static_cast<uint64_t>(hz));
+}
+
 std::string inode_identity_memray(const std::string &path)
 {
     struct stat st{};
@@ -109,6 +153,9 @@ MemrayProfileResult convert_profile(const std::string &path, int hostPid, const 
     result.pid = hostPid;
     result.comm = comm;
     result.exe = exe;
+    // 阶段三：Memray sample 补齐 process_start_ms（/proc/<pid>/stat 第 22
+    // 字段 + btime 换算），供 process Session 按完整实例身份归属。
+    result.processStartMs = runtime_process_start_ms_memray(hostPid);
     MemrayProfileIdentity identity;
     if (parse_memray_profile_identity(path, &identity))
         result.profileID = identity.profileID;

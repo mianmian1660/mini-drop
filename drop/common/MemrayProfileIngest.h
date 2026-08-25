@@ -13,6 +13,9 @@ struct MemrayProfileResult
     std::string profileID;
     std::string readyPath;
     int pid = 0;
+    // 阶段三：Memray sample 必须携带完整进程身份（pid + process_start_ms +
+    // exe），process Session fan-out 才能按实例精确归属，防止 PID 复用串流。
+    int64_t processStartMs = 0;
     std::string comm;
     std::string exe;
     bool ready = false;

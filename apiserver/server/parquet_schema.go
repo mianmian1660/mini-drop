@@ -104,28 +104,35 @@ func (r pqMetricRow) pqSortKey() pqSortKey {
 // pqHistogramRow 一行 = 一个 histogram bucket。EventCount 只写在同一
 // histogram 的第一条 bucket row，避免查询聚合时按 bucket 数量倍增。
 // 粗粒度层合并相同 (low,high) 边界后重算 P50/P95/P99。
+// 阶段三：增加完整进程身份（pid/process_start_ms/exe/comm），strict CO-RE
+// 直方图可按实例过滤；旧 Parquet 文件无这些字段（零值），兼容 reader 只
+// 允许 host 无过滤查询。
 type pqHistogramRow struct {
-	Timestamp   int64             `parquet:"timestamp"`
-	SessionSID  string            `parquet:"session_sid,dict"`
-	SignalType  string            `parquet:"signal_type,dict"`
-	Backend     string            `parquet:"backend,dict"`
-	Unit        string            `parquet:"unit,dict"`
-	BucketLow   float64           `parquet:"bucket_low"`
-	BucketHigh  float64           `parquet:"bucket_high"`
-	Count       uint64            `parquet:"count"`
-	EventCount  uint64            `parquet:"event_count"`
-	Min         float64           `parquet:"min"`
-	Max         float64           `parquet:"max"`
-	P50         float64           `parquet:"p50"`
-	P95         float64           `parquet:"p95"`
-	P99         float64           `parquet:"p99"`
-	Unavailable bool              `parquet:"unavailable"`
-	Reason      string            `parquet:"reason,dict"`
-	Labels      map[string]string `parquet:"labels"`
+	Timestamp      int64             `parquet:"timestamp"`
+	SessionSID     string            `parquet:"session_sid,dict"`
+	SignalType     string            `parquet:"signal_type,dict"`
+	Backend        string            `parquet:"backend,dict"`
+	Unit           string            `parquet:"unit,dict"`
+	PID            int32             `parquet:"pid"`
+	ProcessStartMs int64             `parquet:"process_start_ms"`
+	Exe            string            `parquet:"exe,dict"`
+	Comm           string            `parquet:"comm,dict"`
+	BucketLow      float64           `parquet:"bucket_low"`
+	BucketHigh     float64           `parquet:"bucket_high"`
+	Count          uint64            `parquet:"count"`
+	EventCount     uint64            `parquet:"event_count"`
+	Min            float64           `parquet:"min"`
+	Max            float64           `parquet:"max"`
+	P50            float64           `parquet:"p50"`
+	P95            float64           `parquet:"p95"`
+	P99            float64           `parquet:"p99"`
+	Unavailable    bool              `parquet:"unavailable"`
+	Reason         string            `parquet:"reason,dict"`
+	Labels         map[string]string `parquet:"labels"`
 }
 
 func (r pqHistogramRow) pqSortKey() pqSortKey {
-	return pqSortKey{Timestamp: r.Timestamp, SessionSID: r.SessionSID}
+	return pqSortKey{Timestamp: r.Timestamp, SessionSID: r.SessionSID, PID: r.PID, ProcessStartMs: r.ProcessStartMs}
 }
 
 // pqDBRow 一行 = 一个 db digest 聚合增量 或 lock wait 事件聚合。

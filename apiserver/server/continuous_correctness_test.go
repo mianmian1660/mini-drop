@@ -52,6 +52,10 @@ func makeV3Batch(sid, batchID string, windows []map[string]interface{}) string {
 	return body
 }
 
+func makeV4Batch(sid, batchID string, windows []map[string]interface{}) string {
+	return strings.Replace(makeV3Batch(sid, batchID, windows), `"schema_version":3`, `"schema_version":4`, 1)
+}
+
 func createCorrectnessSession(t *testing.T, s *APIServer, sid, signals string) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Millisecond)
@@ -316,6 +320,55 @@ func TestV3CpuOnlySessionStoresOnlyCPU(t *testing.T) {
 		t.Fatalf("cpu-only session has non-cpu windows: %d", ioCount)
 	}
 	_ = schedCount // keep var referenced
+}
+
+func TestV4StatusOnlyWindowCreatesEverySignalRow(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	createCorrectnessSession(t, s, "cps-v4-status", "cpu_profile,io_latency")
+	window := map[string]interface{}{
+		"window_id": "cpw-v4-status", "collector_generation": "gen-test-1", "target_fingerprint": "fp-v4",
+		"content_sha256": strings.Repeat("9", 64),
+		"window_start":   time.Now().UTC().Add(-20 * time.Second).Format(time.RFC3339Nano),
+		"window_end":     time.Now().UTC().Add(-10 * time.Second).Format(time.RFC3339Nano),
+		"signal_statuses": map[string]interface{}{
+			"cpu_profile": map[string]interface{}{"status": "target_idle"},
+			"io_latency":  map[string]interface{}{"status": "no_events"},
+		},
+	}
+	body := makeV4Batch("cps-v4-status", "cpb-v4-status", []map[string]interface{}{window})
+	if w := postContinuousBatch(t, s, body, "cps-v4-status"); w.Code != http.StatusOK {
+		t.Fatalf("v4 status ingest=%d body=%s", w.Code, w.Body.String())
+	}
+	var rows []model.ProfileWindow
+	if err := s.DB.Where("session_sid = ?", "cps-v4-status").Order("signal_type").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].SignalType != "cpu_profile" || rows[1].SignalType != "io_latency" {
+		t.Fatalf("status rows=%+v", rows)
+	}
+	if rows[0].SignalStatus != "target_idle" || rows[1].SignalStatus != "no_events" {
+		t.Fatalf("status values=%+v", rows)
+	}
+}
+
+func TestV4RejectsUnrequestedSideChannelSignal(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	createCorrectnessSession(t, s, "cps-v4-cpu", "cpu_profile")
+	window := map[string]interface{}{
+		"window_id": "cpw-v4-side", "collector_generation": "gen-test-1", "target_fingerprint": "fp-v4",
+		"content_sha256": strings.Repeat("b", 64),
+		"window_start":   time.Now().UTC().Add(-20 * time.Second).Format(time.RFC3339Nano),
+		"window_end":     time.Now().UTC().Add(-10 * time.Second).Format(time.RFC3339Nano),
+		"signal_statuses": map[string]interface{}{
+			"python_rss": map[string]interface{}{"status": "no_events"},
+		},
+	}
+	w := postContinuousBatch(t, s, makeV4Batch("cps-v4-cpu", "cpb-v4-side", []map[string]interface{}{window}), "cps-v4-cpu")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("unrequested v4 side signal status=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func TestContinuousFinalizationStateRunningPendingAndStalled(t *testing.T) {

@@ -150,23 +150,29 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 					labels["_window_end_ms"] = strconv.FormatInt(in.WindowEnd.UnixMilli(), 10)
 				}
 				row := pqHistogramRow{
-					Timestamp:   ts,
-					SessionSID:  sessionSID,
-					SignalType:  window.SignalType,
-					Backend:     firstNonEmpty(histogram.Backend, window.Backend),
-					Unit:        histogram.Unit,
-					BucketLow:   bucket.Low,
-					BucketHigh:  bucket.High,
-					Count:       bucket.Count,
-					EventCount:  eventCount,
-					Min:         histogram.Summary.Min,
-					Max:         histogram.Summary.Max,
-					P50:         histogram.Summary.P50,
-					P95:         histogram.Summary.P95,
-					P99:         histogram.Summary.P99,
-					Unavailable: histogram.Unavailable,
-					Reason:      histogram.Reason,
-					Labels:      labels,
+					Timestamp:  ts,
+					SessionSID: sessionSID,
+					SignalType: window.SignalType,
+					Backend:    firstNonEmpty(histogram.Backend, window.Backend),
+					Unit:       histogram.Unit,
+					// 阶段三：histogram 完整进程身份（strict CO-RE 按 TGID
+					// 归属；degraded 无法安全归属时 pid=0）。
+					PID:            int32(histogram.PID),
+					ProcessStartMs: histogram.ProcessStartMs,
+					Exe:            histogram.Exe,
+					Comm:           histogram.Comm,
+					BucketLow:      bucket.Low,
+					BucketHigh:     bucket.High,
+					Count:          bucket.Count,
+					EventCount:     eventCount,
+					Min:            histogram.Summary.Min,
+					Max:            histogram.Summary.Max,
+					P50:            histogram.Summary.P50,
+					P95:            histogram.Summary.P95,
+					P99:            histogram.Summary.P99,
+					Unavailable:    histogram.Unavailable,
+					Reason:         histogram.Reason,
+					Labels:         labels,
 				}
 				rows.Histogram = append(rows.Histogram, row)
 			}
@@ -1314,6 +1320,9 @@ func downsampleMetricRows(rows []pqMetricRow, targetResolution string) []pqMetri
 func downsampleHistogramRows(rows []pqHistogramRow, targetResolution string) []pqHistogramRow {
 	type key struct {
 		bucket, session, signal, backend, unit, reason string
+		exe, comm, labels                              string
+		pid                                            int32
+		processStartMs                                 int64
 		low, high                                      float64
 	}
 	type acc struct {
@@ -1332,7 +1341,9 @@ func downsampleHistogramRows(rows []pqHistogramRow, targetResolution string) []p
 		k := key{
 			bucket: strconv.FormatInt(bucket, 10), session: row.SessionSID,
 			signal: row.SignalType, backend: row.Backend, unit: row.Unit, reason: row.Reason,
-			low: row.BucketLow, high: row.BucketHigh,
+			pid: row.PID, processStartMs: row.ProcessStartMs, exe: row.Exe, comm: row.Comm,
+			labels: pqHistogramIdentityLabelKey(row.Labels),
+			low:    row.BucketLow, high: row.BucketHigh,
 		}
 		item := accs[k]
 		if item == nil {

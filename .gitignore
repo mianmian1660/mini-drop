@@ -68,6 +68,12 @@ Thumbs.db
 # ----- 敏感配置（不要把密码提交到 Git！）-----
 .env
 .env.local
+# 本地环境切换/备份快照
+.env.bak
+.env.pre-final-switch-*
+
+# Codex 本地前端 Compose 覆盖文件
+.codex-frontend-compose.yml
 
 # ----- 日志文件 -----
 *.log
@@ -90,3 +96,9 @@ skills-lock.json
 
 # ----- WorkBuddy 项目数据（记忆/临时分析文件，不入库）-----
 .workbuddy/
+
+# ----- opencode 本地配置（个人工具，不入库）-----
+opencode.json
+
+# ----- 服务器部署参数（仅含 SSH 主机与路径，不入库）-----
+sync.env

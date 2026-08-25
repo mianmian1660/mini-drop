@@ -1,5 +1,12 @@
 # Mini-Drop 运维 Runbook
 
+## 测试服务器部署
+
+源码修改只允许发生在本地。提交并 push 后，从本地运行 `./deploy.sh <branch>`，例如
+`./deploy.sh main` 或 `./deploy.sh fix/continuous-session`。部署器会拒绝脏工作树，只从
+`origin/<branch>` 获取代码并依次执行测试、构建、启动、健康检查和 E2E。禁止在服务器
+编辑源码、commit、push、rsync 或复制本地代码；测试失败时回到本地修复并推送新提交。
+
 ## 快速入口
 
 - 存活检查：`curl -fsS http://<api>/livez`

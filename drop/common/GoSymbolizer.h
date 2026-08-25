@@ -22,6 +22,8 @@ struct GoSymbolReport
     std::vector<GoSymbolItem> ready;
     std::vector<GoSymbolItem> pending;
     std::vector<GoSymbolItem> failed;
+    // 阶段四：DROP_CONTINUOUS_GORESYM 关闭等全局状态（空 = 正常）。
+    std::string disabled;
 };
 
 struct GoRecoveredFunction
@@ -33,6 +35,10 @@ struct GoRecoveredFunction
 
 /// Cheaply detects the Go build-info marker without depending on a symbol table.
 bool go_binary_has_build_info(const std::string &path);
+
+/// 阶段四：检测 ELF 是否携带 .gopclntab 段（Go 运行时元数据）。stripped /
+/// 重命名的 Go 二进制仍可被识别；非 ELF 或读取失败返回 false。
+bool go_binary_has_pclntab(const std::string &path);
 
 /// Reads the GNU build-id from an ELF PT_NOTE segment as lowercase hex.
 bool elf_gnu_build_id(const std::string &path, std::string *buildId);

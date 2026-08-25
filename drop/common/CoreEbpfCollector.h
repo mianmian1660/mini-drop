@@ -26,6 +26,10 @@ public:
 
     bool Start(const std::vector<ContinuousTargetProcess> &targets, std::string *error);
     bool UpdateTargets(const std::vector<ContinuousTargetProcess> &targets, std::string *error);
+    // 阶段三：host/process 混合共享。hostWildcard=true 时 target map 同时
+    // 写入 key 0（整机 wildcard）与目标 TGID（process Session 的 sched
+    // histogram 仍能归属到 TGID）；false 时只写目标 TGID。
+    void SetHostWildcard(bool hostWildcard);
     std::vector<CoreHistogramSample> Drain(uint64_t *lost);
     std::vector<CoreHistogramSample> StopAndDrain(uint64_t *lost);
     void Stop();

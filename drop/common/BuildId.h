@@ -56,4 +56,23 @@ namespace drop
     /// 返回可读路径；两者都读不到返回空字符串。
     std::string resolve_via_pid(const std::string &dsoPath, int pid);
 
+    // ============================================================
+    // 阶段四：Native build-id 预热报告与容器 DSO 深度解析
+    // ============================================================
+
+    struct DsoResolveReportEntry
+    {
+        std::string dsoPath;
+        std::string buildId;
+        std::string status;       // ready | missing | failed
+        std::string resolvedPath; // ready 时为本地缓存或解析出的可读路径
+        std::string reason;       // missing/failed 的具体原因
+        bool cached = false;      // 命中本地缓存，无需重新解析
+    };
+
+    /// 容器 DSO 依次尝试宿主路径 → /proc/<pid>/root/<path> → deleted mapping
+    /// 通过 /proc/<pid>/map_files/<start>-<end> 恢复。返回可读路径；全部失败
+    /// 返回空串。
+    std::string resolve_dso_deep(int pid, const std::string &dsoPath);
+
 } // namespace drop

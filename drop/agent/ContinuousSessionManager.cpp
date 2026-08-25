@@ -1,6 +1,7 @@
 #include "agent/ContinuousSessionManager.h"
 
 #include "agent/AgentUtils.h"
+#include "common/ContinuousSegmentProcessor.h"
 #include "common/Utils.h"
 
 #include <nlohmann/json.hpp>
@@ -447,6 +448,8 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
             for (const auto &signal : item.value("signals", json::array()))
                 if (signal.is_string() && !signal.get<std::string>().empty())
                     assignment.requestedSignals.push_back(signal.get<std::string>());
+            if (assignment.requestedSignals.empty())
+                assignment.requestedSignals = {"cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"};
             // labels 是 base64 包一层 JSON（见 base64_decode 上方注释），解码失败
             // 或不含 db_targets 时静默跳过——数据库巡检是可选能力，不能因为
             // labels 格式问题拖垮整条 CPU/IO/sched 采集链路。labels 可能为
@@ -611,9 +614,12 @@ drop::ContinuousSamplerConfig ContinuousSessionManager::BuildSamplerConfig(const
 // （那是为了绕开 perf_event/eBPF 单一物理挂载点限制），每个 Session 独立持有
 // 自己的 DBSnapshotSampler。当前实现是启动一次不再热更新配置——db_targets
 // 变化需要重新创建 Session 才会生效，这个限制记在设计文档，不是本次要解决的点。
+// 阶段三：只有显式请求 db_snapshot 信号且配置有效 db_targets 时才启动
+// （"不选就不采、不存"）。
 void ContinuousSessionManager::ReconcileDBSampler(Runtime &runtime)
 {
-    if (runtime.assignment.dbTargets.empty())
+    const bool dbRequested = drop::logical_signal_requested(runtime.assignment.requestedSignals, "db_snapshot");
+    if (runtime.assignment.dbTargets.empty() || !dbRequested)
     {
         if (runtime.dbSampler)
         {
