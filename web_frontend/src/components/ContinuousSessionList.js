@@ -157,7 +157,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
             </div>
         </div>
         {loading ? <div style={S.empty}>正在加载持续采集任务...</div> : sessions.length === 0 ? <div style={S.empty}>{total ? '当前页暂无持续采集任务' : '暂无匹配的持续采集任务。'}</div> : <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
-            <thead><tr><th style={S.th}>名称</th><th style={S.th}>范围与目标</th><th style={S.th}>状态</th><th style={S.th}>信号</th><th style={S.th}>最近上传</th><th style={S.th}>持续时间 / 创建人</th><th style={S.th}>操作</th></tr></thead>
+            <thead><tr><th style={S.th}>名称</th><th style={S.th}>范围与目标</th><th style={S.th} title="会话当前所处阶段：运行中 / 等待进程 / 已停止 / 离线等">状态</th><th style={S.th} title="这个持续采集会话采集了哪些数据（CPU / 块 IO / 调度延迟等）">信号</th><th style={S.th} title="距上一次成功把数据上传到服务器的时间；如果很久没更新，说明采集或上传可能有问题">最近上传</th><th style={S.th} title="会话已运行/已存在的时间，以及创建它的账号">持续时间 / 创建人</th><th style={S.th}>操作</th></tr></thead>
             <tbody>{sessions.map(session => {
                 const state = session.observed_state || 'pending';
                 const [background, color] = continuousStateColor(state);

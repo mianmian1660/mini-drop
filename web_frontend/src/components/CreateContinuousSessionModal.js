@@ -27,7 +27,6 @@ const S = {
     error: { marginTop: 12, color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: 10, fontSize: 13 },
     sentinelToggle: { display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 13, fontWeight: 700, color: '#344054', cursor: 'pointer' },
     sentinelFields: { marginTop: 12, padding: 14, border: '1px solid #c7d2fe', background: '#eef2ff', borderRadius: 8, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 },
-    sentinelHint: { gridColumn: '1/-1', color: '#475467', fontSize: 12, margin: 0 },
     actions: { display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 },
     cancel: { background: '#fff', color: '#475467', border: '1px solid #d0d5dd', borderRadius: 6, padding: '8px 14px', fontWeight: 700, cursor: 'pointer' },
     submit: disabled => ({ background: disabled ? '#e5e7eb' : '#315efb', color: disabled ? '#98a2b3' : '#fff', border: 0, borderRadius: 6, padding: '9px 14px', fontWeight: 700, cursor: disabled ? 'not-allowed' : 'pointer' }),
@@ -306,7 +305,6 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                         </label>
                     ))}
                 </div>
-                <div style={{ ...S.subtle, marginTop: 8 }}>只会创建你勾选的信号；CPU 是最常用的默认项。</div>
             </div>
 
             <div style={S.section}>
@@ -327,29 +325,27 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                             </label>
                             <NumberField label="告警阈值 ms" value={sentinelFloor} onChange={setSentinelFloor} min={0.1} max={100000} disabled={Boolean(createdSession)} />
                             <NumberField label="冷却期（分钟）" value={sentinelCooldownMin} onChange={setSentinelCooldownMin} min={1} max={1440} disabled={Boolean(createdSession)} />
-                            <p style={S.sentinelHint}>触发的是一次 60 秒短时深度诊断，不会常驻运行；冷却期内不会重复触发。</p>
                         </div>}
                     </>}
             </div>
 
             <details style={S.section}>
                 <summary style={{ cursor: 'pointer', color: '#344054', fontSize: 13, fontWeight: 700 }}>高级设置</summary>
-                <p style={S.fieldHint}>下方数值保持技术单位（Hz / 秒 / 小时），点击或悬停旁边的 i 可查看含义。</p>
                 <div style={S.grid}>
                     <NumberField
-                        label="采样频率（每秒采集多少次）" hint="采样频率 Hz：数值越高火焰图越精细，但 CPU 开销越大（1–999）"
+                        label="采样频率" hint="采样频率 Hz：数值越高火焰图越精细，但 CPU 开销越大（1–999）"
                         value={sampleRate} onChange={setSampleRate} min={1} max={999} fieldId="cps-sample-rate"
                     />
                     <NumberField
-                        label="聚合窗口（多久汇总一次）" hint="聚合窗口 s：每多少秒把采样结果汇总成一条记录（5–300）"
+                        label="聚合窗口" hint="聚合窗口 s：每多少秒把采样结果汇总成一条记录（5–300）"
                         value={aggregationWindow} onChange={setAggregationWindow} min={5} max={300} fieldId="cps-agg-window"
                     />
                     <NumberField
-                        label="上传周期（多久上传一次）" hint="上传周期 s：每多少秒把汇总结果上传到服务端，需不小于聚合窗口（最长 3600）"
+                        label="上传周期" hint="上传周期 s：每多少秒把汇总结果上传到服务端，需不小于聚合窗口（最长 3600）"
                         value={uploadBatch} onChange={setUploadBatch} min={5} max={3600} fieldId="cps-upload-batch"
                     />
                     <NumberField
-                        label="保留时间（原始数据保存多久）" hint="保留时间 h：原始采样数据最长保留 24 小时（1–24）"
+                        label="保留时间" hint="保留时间 h：原始采样数据最长保留 24 小时（1–24）"
                         value={retentionHours} onChange={setRetentionHours} min={1} max={24} fieldId="cps-retention"
                     />
                 </div>
@@ -385,10 +381,8 @@ function NumberField({ label, hint, value, onChange, min, max, disabled, fieldId
                 disabled={disabled}
                 id={id}
                 title={hint}
-                aria-describedby={hint ? `${id}-hint` : undefined}
                 onChange={event => onChange(event.target.value)}
             />
-            {hint && <p style={S.fieldHint} id={`${id}-hint`}>{hint}</p>}
         </label>
     );
 }

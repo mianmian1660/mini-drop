@@ -7,6 +7,7 @@ import ContinuousSessionList from '../components/ContinuousSessionList';
 import ScheduleList from '../components/ScheduleList';
 import Pagination from '../components/Pagination';
 import TaskCancelButton from '../components/TaskCancelButton';
+import InfoTooltip from '../components/InfoTooltip';
 import { capabilityDescription, capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel, signalLabel } from '../utils/continuous';
 import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
@@ -384,18 +385,21 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                     percent={host?.cpu_percent}
                     available={cpuAvailable}
                     detail={cpuAvailable ? `使用率（0–100%）· 采集于 ${collectedAt}` : null}
+                    hint="整台机器所有 CPU 核心的平均使用率（0–100%）。长期接近 100% 说明计算资源紧张。"
                 />
                 <HostResourceBlock
                     title="整机内存"
                     percent={host?.memory_percent}
                     available={memAvailable}
                     detail={memAvailable ? `已用 ${formatCapacity(host.memory_used_bytes)} / 总量 ${formatCapacity(host.memory_total_bytes)} · 采集于 ${collectedAt}` : null}
+                    hint="整台机器的内存使用情况。接近总量说明内存紧张，可能影响程序运行速度。"
                 />
                 <HostResourceBlock
                     title={`系统盘 ${host?.disk_mount || '/'}`}
                     percent={host?.disk_percent}
                     available={diskAvailable}
                     detail={diskAvailable ? `已用 ${formatCapacity(host.disk_used_bytes)} / 总量 ${formatCapacity(host.disk_total_bytes)} · 采集于 ${collectedAt}` : null}
+                    hint="这台服务器磁盘的占用情况。磁盘快满会影响服务运行和日志写入。"
                 />
             </div>
 
@@ -484,13 +488,13 @@ function StoragePressureBanner({ alert }) {
 
 // 单个整机资源块（CPU / 内存 / 系统盘）。细进度条颜色按使用率：
 // <70% 品牌蓝，70-89% 警告橙，>=90% 危险红。
-function HostResourceBlock({ title, percent, available, detail }) {
+function HostResourceBlock({ title, percent, available, detail, hint }) {
     const pct = clampPercent(percent);
     const color = usageColor(pct);
     return (
         <div style={S.hostResource}>
             <div style={S.hostResourceHead}>
-                <span style={S.hostResourceTitle}>{title}</span>
+                <span style={S.hostResourceTitle} title={hint}>{title}</span>
                 <span style={S.hostResourcePct}>{available ? `${formatMetric(pct, 1)}%` : '--'}</span>
             </div>
             <div style={S.hostBarTrack}>
@@ -575,22 +579,24 @@ function OverviewPanel({ target, agent, stat, detailLoading, tasks: taskItems, o
                 <div style={S.metricGrid}>
                     <Metric
                         label="当前是否可采集"
+                        hint="这台机器上的采集器（Agent）是否在线、能否接受新的采样任务。"
                         value={
                             <span style={{ color: agent.online ? '#16a34a' : (target.drop_agent_status === 'offline' ? '#dc2626' : '#64748b'), fontWeight: 700 }}>
                                 {agent.online ? '可采集' : statusLabel(target.drop_agent_status, 'drop')}
                             </span>
                         }
                     />
-                    <Metric label="Agent 版本" value={agent.version || '--'} />
-                    <Metric label="最近心跳" value={agent.last_seen ? formatRelativeTime(agent.last_seen) : '--'} />
-                    <Metric label="主机指标采集" value={hostCollectedMs ? formatRelativeTime(stat.host.collected_at) : '--'} />
+                    <Metric label="Agent 版本" value={agent.version || '--'} hint="采集器（Agent）程序的版本号。版本过旧可能缺少新功能。" />
+                    <Metric label="最近心跳" value={agent.last_seen ? formatRelativeTime(agent.last_seen) : '--'} hint="采集器上一次主动向服务器报平安的时间。长时间没更新说明采集器可能已离线。" />
+                    <Metric label="主机指标采集" value={hostCollectedMs ? formatRelativeTime(stat.host.collected_at) : '--'} hint="上一次成功采集到整机资源数据（CPU / 内存 / 磁盘）的时间。" />
                     <Metric
                         label="指标新鲜度"
+                        hint="主机资源数据是否还在有效期内（90 秒内算新鲜）。显示“数据已过期”说明采集器可能离线或采集异常。"
                         value={hostFresh === null ? '--' : <span style={{ color: hostFresh ? '#16a34a' : '#dc2626', fontWeight: 700 }}>{hostFresh ? '数据新鲜' : '数据已过期'}</span>}
                     />
-                    <Metric label="最近单次任务" value={taskItems.length} />
-                    <Metric label="运行中持续采集" value={runningSessions.length} />
-                    <Metric label="任务成功 / 失败" value={`${successCount} / ${failedCount}`} />
+                    <Metric label="最近单次任务" value={taskItems.length} hint="这台机器最近执行过的一次性采样任务数量。" />
+                    <Metric label="运行中持续采集" value={runningSessions.length} hint="当前正在持续运行的采集会话数量（常驻后台，直到手动停止）。" />
+                    <Metric label="任务成功 / 失败" value={`${successCount} / ${failedCount}`} hint="最近任务的执行结果：成功数 / 失败数。失败数不为 0 时需要关注。" />
                 </div>
                 <div style={{ ...S.subtle, marginTop: 10 }}>数据来源：{stat.source === 'grpc' ? '实时 gRPC' : '数据库快照'}</div>
 
@@ -601,10 +607,10 @@ function OverviewPanel({ target, agent, stat, detailLoading, tasks: taskItems, o
                     </button>
                     {diagOpen && (
                         <div style={S.metricGrid}>
-                            <Metric label="采集器进程 CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
-                            <Metric label="采集器进程内存" value={formatCapacity(stat.memory_kb * 1024)} />
-                            <Metric label="读取吞吐" value={`${formatMetric(stat.read_kb_per_s, 0)} KB/s`} />
-                            <Metric label="写入吞吐" value={`${formatMetric(stat.write_kb_per_s, 0)} KB/s`} />
+                            <Metric label="采集器进程 CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} hint="采集器（Agent）程序自身占用的 CPU 比例，不是整台机器的 CPU。数值高说明采集本身在消耗计算资源。" />
+                            <Metric label="采集器进程内存" value={formatCapacity(stat.memory_kb * 1024)} hint="采集器（Agent）程序自身占用的内存大小。" />
+                            <Metric label="读取吞吐" value={`${formatMetric(stat.read_kb_per_s, 0)} KB/s`} hint="采集器每秒从磁盘读取的数据量。" />
+                            <Metric label="写入吞吐" value={`${formatMetric(stat.write_kb_per_s, 0)} KB/s`} hint="采集器每秒向磁盘写入的数据量（如采样结果、日志）。" />
                         </div>
                     )}
                 </div>
@@ -676,9 +682,9 @@ function RunningSessionsCard({ target, onTab, sessions, loading, stopping, onSto
                             <tr>
                                 <th style={S.th}>名称</th>
                                 <th style={S.th}>范围与目标</th>
-                                <th style={S.th}>状态</th>
-                                <th style={S.th}>信号</th>
-                                <th style={S.th}>最近上传</th>
+                                <th style={S.th} title="会话当前所处阶段：运行中 / 等待进程 / 已停止 / 离线等">状态</th>
+                                <th style={S.th} title="这个持续采集会话采集了哪些数据（CPU / 块 IO / 调度延迟等）">信号</th>
+                                <th style={S.th} title="距上一次成功把数据上传到服务器的时间">最近上传</th>
                                 <th style={S.th}>操作</th>
                             </tr>
                         </thead>
@@ -870,14 +876,28 @@ function ContextItem({ label, value, wide = false }) {
     return <div style={wide ? { ...S.contextItem, ...S.contextItemWide } : S.contextItem}><div style={S.contextLabel}>{label}</div><div style={S.contextValue}>{value}</div></div>;
 }
 
-function Metric({ label, value }) {
-    return <div style={S.metric}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value}</div></div>;
+function Metric({ label, value, hint }) {
+    return <div style={S.metric}><div style={S.metricLabel}>{label}{hint && <InfoTooltip>{hint}</InfoTooltip>}</div><div style={S.metricValue}>{value}</div></div>;
 }
 
 function StatusPill({ value, kind = '' }) {
     const status = String(value || 'unknown');
     const color = isProfileReady(status) ? '#16a34a' : status === 'offline' ? '#dc2626' : (status === 'unconfigured' || status === 'no_session') ? '#64748b' : '#7c3aed';
-    return <span style={{ ...S.badge, background: color, color: '#fff' }}>{statusLabel(status, kind)}</span>;
+    return <span style={{ ...S.badge, background: color, color: '#fff' }} title={statusHint(status, kind)}>{statusLabel(status, kind)}</span>;
+}
+
+// 面向非技术人员：把状态值翻译成一句通俗解释（hover 显示）。
+function statusHint(status, kind = '') {
+    if (status === 'online_with_samples') return '采集器在线，且已采集到样本数据，可以查看火焰图 / TopN';
+    if (status === 'online_no_samples') return '采集器在线，但当前没有样本数据（目标进程可能空闲，稍等或制造负载后刷新）';
+    if (status === 'online') return '采集器在线';
+    if (status === 'offline') return kind === 'drop' ? '按需采集器离线：不能新建一次性采样任务；已运行的持续采集会话不受影响' : '采集器离线，无法上报数据';
+    if (status === 'unconfigured') return '尚未配置持续采集';
+    if (status === 'no_session') return '该主机还没有创建持续采集会话';
+    if (status === 'running') return '持续采集中';
+    if (status === 'stopped') return '持续采集已停止，仍可查看历史数据';
+    if (status === 'query_unsupported') return '当前版本不支持查询该数据';
+    return status || '未知';
 }
 
 function isProfileReady(status) {
