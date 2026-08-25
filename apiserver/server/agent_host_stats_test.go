@@ -367,7 +367,7 @@ func TestAgentDetailIncludesHostMetadata(t *testing.T) {
 	if !ok {
 		t.Fatalf("host_metadata object missing: %#v", stat["host_metadata"])
 	}
-	if meta["os_name"] != "Ubuntu" || meta["os_version"] != "24.04" || meta["cpu_cores"] != int32(8) {
+	if meta["os_name"] != "Ubuntu" || meta["os_version"] != "24.04" || meta["cpu_cores"] != float64(8) {
 		t.Fatalf("host_metadata wrong: %#v", meta)
 	}
 	if meta["collected_at"] != "2026-08-25T10:30:00Z" {
@@ -452,7 +452,7 @@ func TestAgentDetailHostMetadataDBFallback(t *testing.T) {
 	if !ok {
 		t.Fatalf("db host_metadata missing: %#v", stat["host_metadata"])
 	}
-	if meta["os_name"] != "Ubuntu" || meta["cpu_cores"] != int32(8) {
+	if meta["os_name"] != "Ubuntu" || meta["cpu_cores"] != float64(8) {
 		t.Fatalf("db host_metadata wrong: %#v", meta)
 	}
 }
