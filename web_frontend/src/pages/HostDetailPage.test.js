@@ -332,6 +332,27 @@ test('运行状态显示任务计数和数据新鲜度', async () => {
     container.remove();
 });
 
+test('运行中的持续采集数量只统计 desired_state=running', async () => {
+    await setupApiMocks();
+    continuous.sessions.mockResolvedValue({
+        code: 0,
+        data: {
+            sessions: [
+                { sid: 'running-1', name: '运行中', desired_state: 'running', observed_state: 'running', scope: 'host', signals: '["cpu_profile"]' },
+                { sid: 'stopped-1', name: '已停止', desired_state: 'stopped', observed_state: 'stopped', scope: 'host', signals: '["cpu_profile"]' },
+            ],
+        },
+    });
+    const { container, root } = await renderHost();
+
+    expect(container.textContent).toContain('运行中的持续采集');
+    expect(container.textContent).toContain('共 1 个');
+    expect(container.textContent).not.toContain('共 2 个');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
 test('采集器 CPU/内存只出现在诊断区域', async () => {
     await setupApiMocks();
     const { container, root } = await renderHost();

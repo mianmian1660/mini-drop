@@ -602,14 +602,15 @@ function OverviewPanel({ target, agent, stat, detailLoading, tasks: taskItems, o
 // 数据加载由 OverviewPanel 统一负责，本组件为纯展示。
 // ============================================================
 function RunningSessionsCard({ target, onTab, sessions, loading, stopping, onStop }) {
-    const running = sessions.filter(session => session.desired_state === 'running').slice(0, 5);
+    const activeSessions = sessions.filter(session => session.desired_state === 'running');
+    const running = activeSessions.slice(0, 5);
 
     return (
         <section style={S.card}>
             <div style={S.sectionHead}>
                 <h3 style={S.sectionTitle}>运行中的持续采集</h3>
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <span style={S.subtle}>共 {sessions.length} 个</span>
+                    <span style={S.subtle}>共 {activeSessions.length} 个</span>
                     <button style={S.btnSm} onClick={() => onTab('profiling')}>进入持续采集</button>
                 </div>
             </div>
