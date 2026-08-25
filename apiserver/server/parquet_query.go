@@ -139,8 +139,8 @@ func continuousProfileSampleSeenAt(seen map[string]int64, sample ContinuousStack
 		return false
 	}
 	key := continuousProfileSampleKey(sample)
-	if previous, ok := seen[key]; ok {
-		return previous != timestamp
+	if _, ok := seen[key]; ok {
+		return true
 	}
 	seen[key] = timestamp
 	return false
