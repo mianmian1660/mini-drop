@@ -351,3 +351,196 @@ func TestContinuousFrameLooksUnresolved(t *testing.T) {
 		}
 	}
 }
+
+func TestContinuousLanguageStatusV2PreferredOverLegacy(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+	refs := map[string]interface{}{
+		"diagnostics_version": 2,
+		"language_status": map[string]interface{}{
+			"java": map[string]interface{}{
+				"runtime_detection":        "detected",
+				"collector_modes":          []interface{}{"perf-map"},
+				"collector_status":         "ready",
+				"symbol_status":            "complete",
+				"semantic_frame_percent":   92.4,
+				"unresolved_frame_percent": 4.1,
+				"sample_count":             1234,
+				"reasons":                  []interface{}{},
+				"processes": []interface{}{map[string]interface{}{
+					"pid": 7, "process_start_ms": 1000, "exe": "/usr/bin/java",
+					"mode": "perf-map", "status": "ready",
+				}},
+			},
+			"python": map[string]interface{}{
+				"runtime_detection": "not_detected",
+				"collector_status":  "not_applicable",
+			},
+		},
+	}
+	continuousAggregateRuntimeMetadata(agg, refs)
+	diag := continuousRuntimeDiagnostics(*agg)
+
+	java, ok := diag["java"]
+	if !ok {
+		t.Fatalf("expected java diagnostics, got %#v", diag)
+	}
+	if java.DiagnosticsVersion != 2 || java.CollectorStatus != "ready" {
+		t.Fatalf("unexpected v2 java fields: %#v", java)
+	}
+	if java.RuntimeDetection != "detected" || java.SymbolStatusV2 != "complete" {
+		t.Fatalf("unexpected v2 java detection/symbol: %#v", java)
+	}
+	if java.SemanticFramePercent != 92.4 || java.UnresolvedFramePercent != 4.1 ||
+		java.SampleCount != 1234 {
+		t.Fatalf("unexpected v2 java metrics: %#v", java)
+	}
+	if len(java.Processes) != 1 || java.Processes[0].PID != 7 || java.ReadyCount != 1 {
+		t.Fatalf("unexpected v2 java processes: %#v", java)
+	}
+
+	// 未检测到 Python 时不得生成虚假 Python 行。
+	if python, exists := diag["python"]; exists {
+		t.Fatalf("expected no fake python row, got %#v", python)
+	}
+}
+
+func TestContinuousLanguageStatusV2AggregatesRawWeights(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+	window := func(sampleCount, frameWeight, semanticFrameWeight, unresolvedFrameWeight,
+		semanticSampleWeight float64) map[string]interface{} {
+		return map[string]interface{}{
+			"diagnostics_version": 2,
+			"language_status": map[string]interface{}{
+				"java": map[string]interface{}{
+					"runtime_detection":       "detected",
+					"collector_status":        "ready",
+					"sample_count":            sampleCount,
+					"frame_weight":            frameWeight,
+					"semantic_frame_weight":   semanticFrameWeight,
+					"unresolved_frame_weight": unresolvedFrameWeight,
+					"semantic_sample_weight":  semanticSampleWeight,
+				},
+			},
+		}
+	}
+	// 两个窗口的平均栈深相差 10 倍；按 sample_count 平均百分比会得到错误结果。
+	continuousAggregateRuntimeMetadata(agg, window(10, 100, 10, 10, 10))
+	continuousAggregateRuntimeMetadata(agg, window(90, 90, 90, 0, 90))
+	java := continuousRuntimeDiagnostics(*agg)["java"]
+	if java.SemanticFramePercent != 52.63 || java.UnresolvedFramePercent != 5.26 {
+		t.Fatalf("expected exact frame-weight aggregation, got %#v", java)
+	}
+	if java.SemanticSamplePercent != 100 || java.CollectorStatus != "ready" {
+		t.Fatalf("expected semantic sample coverage to drive ready, got %#v", java)
+	}
+}
+
+func TestContinuousLanguageStatusV2LatestProcessStateReplacesStaleFailure(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+	window := func(status, processStatus, reason string) map[string]interface{} {
+		return map[string]interface{}{
+			"diagnostics_version": 2,
+			"language_status": map[string]interface{}{
+				"node": map[string]interface{}{
+					"runtime_detection":       "detected",
+					"collector_status":        status,
+					"sample_count":            10,
+					"frame_weight":            10,
+					"semantic_frame_weight":   10,
+					"semantic_sample_weight":  10,
+					"unresolved_frame_weight": 0,
+					"reasons":                 []interface{}{reason},
+					"processes": []interface{}{map[string]interface{}{
+						"pid": 7, "process_start_ms": 1000, "exe": "/usr/bin/node",
+						"mode": "perf-map", "status": processStatus,
+					}},
+				},
+			},
+		}
+	}
+	continuousAggregateRuntimeMetadata(agg, window("failed", "failed", "temporary attach failure"))
+	continuousAggregateRuntimeMetadata(agg, window("ready", "ready", ""))
+	node := continuousRuntimeDiagnostics(*agg)["node"]
+	if node.CollectorStatus != "ready" || node.ReadyCount != 1 || node.MissingCount != 0 {
+		t.Fatalf("latest ready state must replace stale failure: %#v", node)
+	}
+	if len(node.Reasons) != 0 {
+		t.Fatalf("stale failure reason leaked into recovered state: %#v", node.Reasons)
+	}
+}
+
+func TestContinuousLanguageStatusV2MissingCollectorCannotBePromotedByFrames(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
+		Top:                map[string]*ProfileTopItem{},
+		Root:               &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
+		LabelValue:         map[string]map[string]bool{},
+		Backends:           map[string]bool{}}
+	refs := map[string]interface{}{
+		"diagnostics_version": 2,
+		"language_status": map[string]interface{}{
+			"node": map[string]interface{}{
+				"runtime_detection":       "detected",
+				"collector_modes":         []interface{}{"perf-map"},
+				"collector_status":        "missing",
+				"sample_count":            10,
+				"frame_weight":            10,
+				"semantic_frame_weight":   8,
+				"semantic_sample_weight":  10,
+				"unresolved_frame_weight": 0,
+				"processes": []interface{}{map[string]interface{}{
+					"pid": 7, "process_start_ms": 1000, "exe": "/usr/bin/node",
+					"mode": "perf-map", "status": "missing",
+				}},
+			},
+		},
+	}
+	continuousAggregateRuntimeMetadata(agg, refs)
+	continuousAddSample(agg, ContinuousStackSample{
+		PID: 7, Exe: "/usr/bin/node", Runtime: "node", Backend: "perf_rolling",
+		Count: 10, Stack: []string{"node", "0x1234"},
+	}, nil)
+	node := continuousRuntimeDiagnostics(*agg)["node"]
+	if node.CollectorStatus != "missing" || node.SemanticSamplePercent != 100 {
+		t.Fatalf("semantic frames must not promote a missing collector: %#v", node)
+	}
+	if node.ReadyCount != 0 || node.MissingCount != 1 || len(node.Processes) != 1 {
+		t.Fatalf("generic perf samples must not invent a v2-ready collector: %#v", node)
+	}
+	if len(node.Modes) != 1 || node.Modes[0] != "perf-map" {
+		t.Fatalf("generic perf backend must not leak into v2 collector modes: %#v", node.Modes)
+	}
+}
+
+func TestContinuousLanguageStatusLegacyWindowsKeepOldDerivation(t *testing.T) {
+	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+	refs := map[string]interface{}{
+		// 没有 diagnostics_version → 历史窗口走 v1 推导
+		"runtime_maps": map[string]interface{}{
+			"node": map[string]interface{}{
+				"detected": true, "ready": false,
+				"missing": []interface{}{3}, "ready_pids": []interface{}{},
+				"reason": "missing --perf-basic-prof flag",
+			},
+		},
+	}
+	continuousAggregateRuntimeMetadata(agg, refs)
+	diag := continuousRuntimeDiagnostics(*agg)
+	node, ok := diag["node"]
+	if !ok {
+		t.Fatalf("expected node diagnostics from legacy fields, got %#v", diag)
+	}
+	if node.DiagnosticsVersion != 0 {
+		t.Fatalf("legacy windows must not claim v2: %#v", node)
+	}
+	if node.Status != "missing" || node.MissingCount != 1 {
+		t.Fatalf("unexpected legacy node status: %#v", node)
+	}
+	if len(node.Reasons) != 1 || node.Reasons[0] != "missing --perf-basic-prof flag" {
+		t.Fatalf("unexpected legacy reasons: %#v", node.Reasons)
+	}
+}

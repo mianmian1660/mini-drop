@@ -1386,13 +1386,15 @@ function RuntimeDiagnostics({ diagnostics }) {
         <section style={S.card}>
             <div style={S.sectionHead}><h3 style={S.title}>语言采集状态</h3><span style={S.subtle}>{entries.length} runtimes</span></div>
             <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
-                <thead><tr><th style={S.th}>语言</th><th style={S.th}>状态</th><th style={S.th}>模式</th><th style={S.th}>进程</th><th style={S.th}>诊断</th></tr></thead>
+                <thead><tr><th style={S.th}>语言</th><th style={S.th}>采集状态</th><th style={S.th}>模式</th><th style={S.th}>覆盖率 / 未解析</th><th style={S.th}>进程</th><th style={S.th}>诊断与修复建议</th></tr></thead>
                 <tbody>{entries.map(([runtime, item]) => (
                     <tr key={runtime}>
-                        <td style={S.td}>{runtimeLabel(runtime)}</td><td style={S.td}>{runtimeStatusLabel(item)}</td>
-                        <td style={S.td}>{(item.modes || []).join(', ') || '-'}</td>
+                        <td style={S.td}>{runtimeLabel(runtime)}</td>
+                        <td style={S.td}>{runtimeStatusLabel(item)}</td>
+                        <td style={S.td}>{((item.collector_modes || []).length ? item.collector_modes : item.modes || []).join(', ') || '-'}</td>
+                        <td style={S.td}>{runtimeCoverageLabel(runtime, item)}</td>
                         <td style={S.td}>{runtimeProcessLabel(item)}</td>
-                        <td style={S.td}>{(item.reasons || []).join('; ') || runtimeReasonLabel(item) || '-'}</td>
+                        <td style={S.td}>{runtimeReasonWithAdvice(runtime, item)}</td>
                     </tr>
                 ))}</tbody>
             </table></div>
@@ -1400,7 +1402,19 @@ function RuntimeDiagnostics({ diagnostics }) {
     );
 }
 
+// 阶段四：v2 collector_status（ready/partial/missing/pending/failed）文案。
+// 旧数据（无 diagnostics_version）继续走 detected/missing 计数推导。
 function runtimeStatusLabel(item = {}) {
+    if (item.diagnostics_version >= 2 && item.collector_status) {
+        return ({
+            ready: '就绪',
+            partial: '部分可用',
+            missing: '缺少采集能力',
+            pending: '处理中',
+            failed: '采集失败',
+            not_applicable: '未检测到',
+        })[item.collector_status] || item.collector_status;
+    }
     const detected = Number(item.detected_count) || 0;
     const ready = Number(item.ready_count) || 0;
     const missing = Number(item.missing_count) || 0;
@@ -1411,21 +1425,66 @@ function runtimeStatusLabel(item = {}) {
     return '缺少采集能力';
 }
 
+function runtimeCoverageLabel(runtime, item = {}) {
+    if (item.diagnostics_version >= 2 && item.sample_count > 0) {
+        const semanticSample = Number(item.semantic_sample_percent) || 0;
+        const semanticFrame = Number(item.semantic_frame_percent) || 0;
+        const unresolved = Number(item.unresolved_frame_percent) || 0;
+        const targetUnresolved = Number(item.target_module_unresolved_percent) || 0;
+        const unresolvedLabel = runtime === 'native'
+            ? `目标模块未解析 ${targetUnresolved.toFixed(1)}%`
+            : `未解析 ${unresolved.toFixed(1)}%`;
+        return `语义样本 ${semanticSample.toFixed(1)}% · 语义帧 ${semanticFrame.toFixed(1)}% · ${unresolvedLabel}`;
+    }
+    return '-';
+}
+
+// 阶段四：按状态/reason 给出可执行修复建议（不再只显示"缺少能力"）。
+function runtimeFixAdvice(runtime, item = {}) {
+    const reasonsText = (item.reasons || []).join(' ');
+    if (item.diagnostics_version >= 2 && item.collector_status === 'failed')
+        return reasonsText.includes('permission') ? '检查 Agent 容器权限（--privileged 或 SYS_PTRACE）后重试'
+            : '查看 Agent 日志中该语言的确定性失败原因';
+    if (item.collector_status === 'pending' || (item.reasons || []).some(r => r.includes('GoReSym background')))
+        return 'GoReSym 正在后台提取符号，稍后刷新；结果会在后续窗口生效';
+    switch (runtime) {
+        case 'node':
+            return '使用 --perf-basic-prof 启动 Node.js 以生成 JIT perf map';
+        case 'python':
+            if (reasonsText.includes('-X perf'))
+                return 'Python 3.12+ 使用 -X perf 启动可直接生成 perf map，否则自动回退 py-spy';
+            return '确认 py-spy 已安装且 Agent 有 ptrace 权限';
+        case 'java':
+            return '确认 asprof 可用且 Agent 对 JVM 有 attach 权限（同 UID 或 SYS_PTRACE）';
+        case 'go':
+            return 'stripped Go 程序依赖 GoReSym 提取符号；保持 DROP_CONTINUOUS_GORESYM 开启并等待缓存生成';
+        case 'native':
+            if ((item.reasons || []).some(r => r.includes('frame pointer')))
+                return '目标程序需保留 frame pointer（-fno-omit-frame-pointer），或将 DROP_NATIVE_CP_CALL_GRAPH 设为 dwarf';
+            return '上传对应 build-id 的二进制到符号库可降低未解析率';
+        default:
+            return '';
+    }
+}
+
+function runtimeReasonWithAdvice(runtime, item = {}) {
+    const reasons = (item.reasons || []).join('; ');
+    const advice = runtimeFixAdvice(runtime, item);
+    if (!reasons && !advice) return '-';
+    return [reasons, advice].filter(Boolean).join('。建议：');
+}
+
 function runtimeProcessLabel(item = {}) {
     const detected = Number(item.detected_count) || 0;
     const ready = Number(item.ready_count) || 0;
     const missing = Number(item.missing_count) || 0;
     const limited = Number(item.limited_count) || 0;
-    if (detected === 0) return '未检测到进程';
+    if (detected === 0) {
+        if (item.diagnostics_version >= 2 && item.runtime_detection === 'detected' && Number(item.sample_count) > 0)
+            return `已采样 ${Math.round(Number(item.sample_count))}`;
+        return '未检测到进程';
+    }
     return `已检测 ${detected} · 可采集 ${ready}${missing ? ` · 缺少 ${missing}` : ''}${limited ? ` · 受限 ${limited}` : ''}`;
-}
-
-function runtimeReasonLabel(item = {}) {
-    const detected = Number(item.detected_count) || 0;
-    const ready = Number(item.ready_count) || 0;
-    if (detected === 0) return '当前查询窗口没有检测到该语言进程';
-    if (ready === 0) return '检测到进程，但当前没有可用采集模式';
-    return '';
 }
 
 function lowSampleGuidance(data, sessionMeta, querying) {

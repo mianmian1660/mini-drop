@@ -72,6 +72,7 @@ set(COMMON_SRCS
     common/ContinuousSampler.cpp
     common/ContinuousSegmentProcessor.cpp
     common/CoreEbpfCollector.cpp
+    common/LanguageStatus.cpp
     common/RuntimeSymbolMap.cpp
     common/PythonRuntimeProfiler.cpp
     common/MemrayProfileIngest.cpp
@@ -216,6 +217,7 @@ if(GTest_FOUND)
         tests/test_pid_registry.cpp
         tests/test_runtime_symbol_map.cpp
         tests/test_go_symbolizer.cpp
+        tests/test_language_status.cpp
         tests/test_continuous_sampler.cpp
         tests/test_continuous_segment_processor.cpp
 		tests/test_continuous_session_manager.cpp
@@ -233,6 +235,7 @@ if(GTest_FOUND)
         common/MemrayProfileIngest.cpp
         common/GoSymbolizer.cpp
         common/CoreEbpfCollector.cpp
+        common/LanguageStatus.cpp
         common/ContinuousSegmentProcessor.cpp
         agent/RunnerUtils.cpp
         agent/TaskQueue.cpp

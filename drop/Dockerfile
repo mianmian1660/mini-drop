@@ -133,7 +133,9 @@ RUN (curl --max-time 30 -fsSL "https://github.com/async-profiler/async-profiler/
 ARG PYSPY_VERSION=0.4.2
 ARG PYSPY_WHEEL_SHA256=aeb0323409199c785f730645e9f4bb7a7b9ca2c481f2c331a55642b5d13fa52f
 ARG PYSPY_WHEEL_URL=https://files.pythonhosted.org/packages/f9/34/dd7d3c763a00b7b965e25a5eab0acd1a345dbaf0f45fffe595278873a1c0/py_spy-0.4.2-py2.py3-none-manylinux_2_5_x86_64.manylinux1_x86_64.whl
-RUN curl -fsSL "${PYSPY_WHEEL_URL}" -o /tmp/py-spy.whl \
+ARG PYSPY_WHEEL_MIRROR_URL=http://mirrors.tencentyun.com/pypi/packages/f9/34/dd7d3c763a00b7b965e25a5eab0acd1a345dbaf0f45fffe595278873a1c0/py_spy-0.4.2-py2.py3-none-manylinux_2_5_x86_64.manylinux1_x86_64.whl
+RUN (curl --max-time 30 -fsSL "${PYSPY_WHEEL_URL}" -o /tmp/py-spy.whl \
+      || curl --max-time 60 -fsSL "${PYSPY_WHEEL_MIRROR_URL}" -o /tmp/py-spy.whl) \
     && echo "${PYSPY_WHEEL_SHA256}  /tmp/py-spy.whl" | sha256sum -c - \
     && unzip -q /tmp/py-spy.whl -d /tmp/py-spy-wheel \
     && pyspy_bin="$(find /tmp/py-spy-wheel -type f -name py-spy | head -n 1)" \

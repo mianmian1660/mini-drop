@@ -67,6 +67,32 @@ inline uint64_t add_count(uint64_t total, uint64_t value)
     return total + value;
 }
 
+inline std::string json_escape(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+    {
+        switch (c)
+        {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            break;
+        default:
+            out += c;
+        }
+    }
+    return out;
+}
+
 inline bool env_enabled_default(const char *name, bool fallback)
 {
     const char *value = std::getenv(name);
@@ -163,7 +189,13 @@ struct HistogramPayload
     double p99 = 0;
     bool unavailable = false;
     std::string reason;
+    // 阶段三：完整进程身份（strict CO-RE 按 TGID 归属；degraded bpftrace
+    // 无法安全归属时 pid=0 且 unavailable）。process Session fan-out 必须
+    // pid + process_start_ms + exe 三项精确匹配。
     int pid = 0;
+    int64_t processStartMs = 0;
+    std::string exe;
+    std::string comm;
 };
 
 // 结构化数据库快照（SQL digest 聚合 / 锁等待链），与标量 MetricPayload 并存
@@ -200,8 +232,110 @@ inline bool logical_signal_requested(const std::vector<std::string> &requested, 
 }
 
 // ============================================================
+// 阶段三：统一进程身份与 Session 投影器
+// ============================================================
+
+// 统一 ProcessIdentity：所有样本、profile、metric、histogram、runtime、Go、
+// py-spy、Memray 诊断统一引用该身份类型。process Session 必须
+// pid + process_start_ms + exe 三项精确相等；身份缺失（complete()==false）
+// 时不得猜测归属，对应数据丢弃并记录 identity_unavailable。
+struct ProcessIdentity
+{
+    int pid = 0;
+    int64_t processStartMs = 0;
+    std::string exe;
+    std::string comm;
+
+    bool complete() const { return pid > 0 && processStartMs > 0 && !exe.empty(); }
+    std::string key() const
+    {
+        return std::to_string(pid) + "|" + std::to_string(processStartMs) + "|" + exe;
+    }
+};
+
+// 每 signal 的采集状态（v4 窗口序列化 + 状态窗口登记）。
+enum class SignalCollectionStatus
+{
+    Collected,     // 有真实数据
+    TargetIdle,    // 目标空闲/无事件（零计数但窗口存在）
+    NoEvents,      // 无事件（非目标空闲，如直方图无样本）
+    Unavailable,   // backend 不可用/无法安全归属
+    Failed,        // 采集失败
+    Unknown,       // 旧数据/未登记
+};
+
+inline const char *signal_status_name(SignalCollectionStatus status)
+{
+    switch (status)
+    {
+    case SignalCollectionStatus::Collected: return "collected";
+    case SignalCollectionStatus::TargetIdle: return "target_idle";
+    case SignalCollectionStatus::NoEvents: return "no_events";
+    case SignalCollectionStatus::Unavailable: return "unavailable";
+    case SignalCollectionStatus::Failed: return "failed";
+    default: return "unknown";
+    }
+}
+
+struct SignalStatus
+{
+    SignalCollectionStatus status = SignalCollectionStatus::Unknown;
+    std::string reason;
+    uint64_t lostEvents = 0;
+};
+
+// SessionContract：Session 投影所需的全部合同信息（SID、scope、targets、
+// signals、请求采样率、聚合周期、降级策略）。由 ContinuousSessionManager
+// 从 assignment 构造，SessionFanoutProjector 只依赖它做纯逻辑投影。
+struct SessionContract
+{
+    std::string sid;
+    std::string scope = "host"; // "host" | "process"
+    std::vector<ContinuousTargetProcess> targets;
+    std::vector<std::string> signals; // 请求信号（空 = 默认四类核心）
+    int requestedSampleRateHz = 19;
+    int aggregationWindowSec = 10;
+    bool allowDegraded = false;
+};
+
+// ============================================================
 // 物理层符号化诊断（结构化，供 Session 分流后重新计算，不提前固化为 JSON）
 // ============================================================
+
+// 阶段四：build-id 预热报告条目（每个 DSO 的 ready/missing/failed、解析
+// 路径与失败原因），随 symbol_refs.build_id_report 上报。
+struct BuildIdWarmEntry
+{
+    std::string buildId;
+    std::string dsoPath;
+    std::string status;       // ready | missing | failed
+    std::string resolvedPath;
+    std::string reason;
+    bool cached = false;      // 命中本地缓存，无需重新解析
+};
+
+inline std::string build_id_report_to_json(const std::vector<BuildIdWarmEntry> &entries)
+{
+    if (entries.empty())
+        return "";
+    std::string body = "{\"dsos\":[";
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        const auto &e = entries[i];
+        if (i)
+            body += ",";
+        body += "{\"dso\":\"" + json_escape(e.dsoPath) + "\",\"build_id\":\"" +
+                json_escape(e.buildId) + "\",\"status\":\"" + json_escape(e.status) + "\"";
+        if (!e.resolvedPath.empty())
+            body += ",\"resolved_path\":\"" + json_escape(e.resolvedPath) + "\"";
+        if (!e.reason.empty())
+            body += ",\"reason\":\"" + json_escape(e.reason) + "\"";
+        body += "}";
+    }
+    body += "]}";
+    return body;
+}
+
 struct PhysicalDiagnostics
 {
     // 基于本段实际样本计算的 frame 权重与 symbol_status
@@ -225,8 +359,15 @@ struct PhysicalDiagnostics
     bool runtimeEnrichmentDisabled = false;
     std::string enrichmentDisabledReason;
 
+    // 阶段四：物理采集栈回溯模式（fp|dwarf，DROP_NATIVE_CP_CALL_GRAPH）。
+    // 进入 symbol_refs.language_status 的 native 行模式与诊断建议。
+    std::string unwindMode = "fp";
+
     // 物理层是否执行过 enrich 步骤（关闭时 combined symbol_refs 缺 runtime 数据）。
     bool enrichmentApplied = true;
+
+    // 阶段四：build-id 预热报告（结构化，Session 分流按 DSO 过滤）。
+    std::vector<BuildIdWarmEntry> buildIdWarmReport;
 };
 
 // 不可变 perf.data 段。strict 滚动轮转（perf_rolling）与 degraded 单窗录制
@@ -241,13 +382,21 @@ struct PerfSegment
     int64_t monotonicStartMs = 0; // 录制启动锚点（monotonic）
 };
 
-// 物理层 enrichment 能力集：哪些子步骤本次可用。
+// 物理层 enrichment 能力集：哪些子步骤本次可用。阶段四起按语言独立开关
+//（DROP_CONTINUOUS_GORESYM / _JAVA_PERFMAP / _NODE_PERFMAP / _PYTHON_PERF /
+//  _PYSPY_FALLBACK），不再用统一的 goSymbols=true 代表全部 enrichment。
 struct RuntimeCapabilitySet
 {
     bool pythonFallback = true;
     bool pythonRss = true;
     bool memray = true;
-    bool goSymbols = true;
+    bool goSymbols = true; // 兼容旧开关语义：GoReSym 总门
+    // 阶段四：逐语言能力（默认全部开启，可单独关闭单语言）。
+    bool goReSym = true;
+    bool javaPerfMap = true;
+    bool nodePerfMap = true;
+    bool pythonPerf = true;
+    std::string unwindMode = "fp"; // "fp" | "dwarf"
 };
 
 struct WindowPayload;
@@ -256,6 +405,10 @@ struct SegmentProcessResult
 {
     std::vector<WindowPayload> windows;
     PhysicalDiagnostics diagnostics;
+    // true only when a ready py-spy capture actually replaced matching perf
+    // samples in this segment.  The rolling sampler uses this to avoid dropping
+    // a capture on an older, non-overlapping segment.
+    bool pythonFallbackApplied = false;
     bool success = false;
     std::string failureReason;
 };
@@ -284,6 +437,18 @@ struct WindowPayload
     // 阶段一：逻辑窗口稳定 ID（内容摘要不参与 ID）与窗口内容摘要（冲突检测）。
     std::string windowID;
     std::string contentSHA256;
+    // 阶段三：物理采集器 generation（fan-out 降采样稳定键与 v4 序列化用）。
+    std::string collectorGeneration;
+    // 阶段三：物理采样率与 Session 生效采样率（v4 序列化）。低频 Session 在
+    // fan-out 时确定性降采样，effective 反映降采样后的实际频率。
+    int physicalSampleRateHz = 0;
+    int effectiveSampleRateHz = 0;
+    // 阶段三：每 signal 采集状态（collected/target_idle/no_events/unavailable/
+    // failed + reason + lost events）。零计数窗口也保留状态，使 coverage 能
+    // 区分 idle/no-events、backend unavailable 和真实 gap。
+    std::map<std::string, SignalStatus> signalStatuses;
+    // 阶段三：身份不完整被丢弃的样本数（process Session 无法归属时记录）。
+    uint64_t identityUnavailableCount = 0;
 };
 
 // ============================================================
@@ -321,32 +486,6 @@ inline std::string rfc3339_from_ms(int64_t ms)
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                   tm.tm_hour, tm.tm_min, tm.tm_sec, milliseconds);
     return std::string(buf);
-}
-
-inline std::string json_escape(const std::string &s)
-{
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s)
-    {
-        switch (c)
-        {
-        case '"':
-            out += "\\\"";
-            break;
-        case '\\':
-            out += "\\\\";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            break;
-        default:
-            out += c;
-        }
-    }
-    return out;
 }
 
 inline bool file_exists_local(const std::string &path)
@@ -403,6 +542,10 @@ inline int process_tgid(int pid)
     return pid;
 }
 
+// 阶段三：严格目标匹配。process Session 必须 pid + process_start_ms + exe
+// 三项精确相等；样本身份缺失（start time 或 exe 为空）时不得放宽匹配——
+// 放宽会让 PID 复用后的新进程数据错误进入旧实例 Session。host Session 恒
+// 返回 true（整机数据）。
 inline bool process_targeted(const ContinuousSamplerConfig &cfg,
                              int pid,
                              int64_t processStartMs,
@@ -411,9 +554,8 @@ inline bool process_targeted(const ContinuousSamplerConfig &cfg,
     if (cfg.scope != "process")
         return true;
     for (const auto &target : cfg.targetProcesses)
-        if (target.pid == pid &&
-            (processStartMs <= 0 || target.processStartMs <= 0 || processStartMs == target.processStartMs) &&
-            (cfg.selectorExe.empty() || exe.empty() || exe == cfg.selectorExe))
+        if (target.pid == pid && target.processStartMs > 0 && !target.exe.empty() &&
+            processStartMs == target.processStartMs && exe == target.exe)
             return true;
     return false;
 }
@@ -421,6 +563,19 @@ inline bool process_targeted(const ContinuousSamplerConfig &cfg,
 inline bool process_targeted(const ContinuousSamplerConfig &cfg, int pid, const std::string &exe)
 {
     return process_targeted(cfg, pid, 0, exe);
+}
+
+// 按 ProcessIdentity 严格匹配（供 SessionFanoutProjector 使用）。
+inline bool identity_targeted(const std::vector<ContinuousTargetProcess> &targets,
+                              const ProcessIdentity &identity)
+{
+    if (!identity.complete())
+        return false;
+    for (const auto &target : targets)
+        if (target.pid == identity.pid && target.processStartMs > 0 && !target.exe.empty() &&
+            identity.processStartMs == target.processStartMs && identity.exe == target.exe)
+            return true;
+    return false;
 }
 
 inline int64_t configured_process_start_ms(const ContinuousSamplerConfig &cfg, int pid)
@@ -875,8 +1030,14 @@ inline bool looks_like_elf(const std::string &path)
 
 // 任务1核心：perf script 之前，把能拿到的用户态二进制预热进本地 build-id
 // 缓存，让 perf script 自带的缓存回退机制命中，当场生效不依赖网络往返。
-inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &perf, const std::string &dataPath)
+// 阶段四：report 非空时输出逐 DSO 诊断（ready/missing/failed + 原因）；
+// 容器 DSO 用 resolve_dso_deep（宿主路径 → /proc/<pid>/root → deleted
+// mapping），并在缓存前校验 ELF magic 与 build-id 匹配。
+inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &perf, const std::string &dataPath,
+                                                           std::vector<BuildIdWarmEntry> *report = nullptr)
 {
+    if (report)
+        report->clear();
     std::string listOutput;
     int rc = drop::exec_capture({perf, "buildid-list", "-i", dataPath}, &listOutput, 65536);
     if (rc != 0)
@@ -891,9 +1052,19 @@ inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &pe
     for (auto &e : entries)
     {
         if (drop::build_id_cached_locally(e.buildId))
+        {
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "ready",
+                                   drop::build_id_local_cache_path(e.buildId), "", true});
             continue;
+        }
         if (should_skip_build_id_attempt(e.buildId, nowMs))
+        {
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "missing", "",
+                                   "previous resolution failed; backing off", false});
             continue;
+        }
         pending.push_back(e);
     }
     if (pending.empty())
@@ -907,23 +1078,60 @@ inline std::vector<drop::BuildIdEntry> warm_build_id_cache(const std::string &pe
         if (it == dsoIndex.end())
         {
             record_build_id_transient_fail(e.buildId, nowMs);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "missing", "",
+                                   "no live process maps this DSO", false});
             continue;
         }
-        std::string resolved = drop::resolve_via_pid(e.dsoPath, it->second);
+        // 阶段四：宿主路径 → /proc/<pid>/root → deleted mapping 深度解析。
+        std::string resolved = drop::resolve_dso_deep(it->second, e.dsoPath);
         if (resolved.empty())
         {
             record_build_id_transient_fail(e.buildId, nowMs);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "failed", "",
+                                   "DSO unreadable in host and container views", false});
             continue;
         }
         if (!looks_like_elf(resolved))
         {
             record_build_id_permanent_fail(e.buildId);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "failed", resolved,
+                                   "not a valid ELF file", false});
             continue;
         }
+        // 缓存前校验 build-id：不匹配的文件不能进缓存（防 PID 复用后旧文件
+        // 冒充新 build-id 的符号源）。
+        std::string actualBuildId;
+        bool buildIdMatches = true;
+        if (!e.buildId.empty() && drop::elf_gnu_build_id(resolved, &actualBuildId))
+        {
+            if (!actualBuildId.empty() && actualBuildId != e.buildId)
+            {
+                buildIdMatches = false;
+                record_build_id_permanent_fail(e.buildId);
+                if (report)
+                    report->push_back({e.buildId, e.dsoPath, "failed", resolved,
+                                       "build-id mismatch: ELF has " + actualBuildId, false});
+            }
+        }
+        if (!buildIdMatches)
+            continue;
         if (drop::cache_build_id_locally(e.buildId, resolved))
+        {
             clear_build_id_attempt(e.buildId);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "ready",
+                                   drop::build_id_local_cache_path(e.buildId), "", false});
+        }
         else
+        {
             record_build_id_transient_fail(e.buildId, nowMs);
+            if (report)
+                report->push_back({e.buildId, e.dsoPath, "failed", resolved,
+                                   "cannot write local build-id cache", false});
+        }
     }
     return entries;
 }
@@ -971,9 +1179,23 @@ inline std::string sanitize_python_perf_frame(const std::string &frame)
     return frame.substr(0, pathStart) + frame.substr(slash + 1);
 }
 
+// 阶段四：Go runtime 识别顺序（禁止依赖 exe 名称）：
+//   1. Go build-info 标记；
+//   2. .gopclntab 段（stripped / 重命名 ELF 仍可识别，含 dockerd）；
+//   3. GoReSym 结果（goReport 中已登记的 DSO）；
+//   4. 最后才允许用 runtime.* 等栈帧作结果级辅助判断。
+inline bool stack_frames_hint_go(const std::vector<std::string> &stack)
+{
+    for (const auto &frame : stack)
+        if (frame.rfind("runtime.", 0) == 0)
+            return true;
+    return false;
+}
+
 inline std::string sample_runtime_with_go_hint(const AggregatedSample &sample,
                                                const drop::GoSymbolReport &goReport,
-                                               bool hasGoBuildInfo)
+                                               bool hasGoBuildInfo,
+                                               bool hasGoPclntab = false)
 {
     std::string base = path_basename(sample.exe);
     if (base.rfind("python", 0) == 0)
@@ -987,7 +1209,11 @@ inline std::string sample_runtime_with_go_hint(const AggregatedSample &sample,
             return item.dsoPath == sample.exe;
         });
     };
-    if (hasGoBuildInfo || isGo(goReport.ready) || isGo(goReport.pending) || isGo(goReport.failed))
+    if (hasGoBuildInfo || hasGoPclntab || isGo(goReport.ready) || isGo(goReport.pending) ||
+        isGo(goReport.failed))
+        return "go";
+    // 结果级辅助判断：栈里出现 runtime.* 帧（仅在更强证据缺失时兜底）。
+    if (!sample.exe.empty() && stack_frames_hint_go(sample.stack))
         return "go";
     if (sample.exe.empty())
         return sample.pid <= 2 || sample.comm.rfind("kworker", 0) == 0 ? "kernel" : "unknown";
@@ -999,21 +1225,26 @@ inline std::string sample_runtime(const AggregatedSample &sample,
                                   std::map<int, bool> *goBuildInfoCache)
 {
     bool hasGoBuildInfo = false;
+    bool hasGoPclntab = false;
     if (sample.pid > 0 && !sample.exe.empty())
     {
-        auto cached = goBuildInfoCache->find(sample.pid);
-        if (cached == goBuildInfoCache->end())
+        static thread_local std::map<int, std::pair<bool, bool>> tlsDetectionCache;
+        auto cached = tlsDetectionCache.find(sample.pid);
+        if (cached == tlsDetectionCache.end())
         {
             std::string procExe = "/proc/" + std::to_string(sample.pid) + "/exe";
             hasGoBuildInfo = drop::go_binary_has_build_info(procExe);
-            (*goBuildInfoCache)[sample.pid] = hasGoBuildInfo;
+            // build-info 已确认时无需再扫段表。
+            hasGoPclntab = hasGoBuildInfo ? true : drop::go_binary_has_pclntab(procExe);
+            cached = tlsDetectionCache.emplace(sample.pid, std::make_pair(hasGoBuildInfo, hasGoPclntab)).first;
         }
         else
         {
-            hasGoBuildInfo = cached->second;
+            hasGoBuildInfo = cached->second.first;
+            hasGoPclntab = cached->second.second;
         }
     }
-    return sample_runtime_with_go_hint(sample, goReport, hasGoBuildInfo);
+    return sample_runtime_with_go_hint(sample, goReport, hasGoBuildInfo, hasGoPclntab);
 }
 
 inline std::string python_fallback_json(const std::vector<drop::PythonFallbackResult> &results, size_t limitedCount)
@@ -1027,8 +1258,17 @@ inline std::string python_fallback_json(const std::vector<drop::PythonFallbackRe
         if (!firstReady)
             body += ",";
         firstReady = false;
+        // 阶段三：py-spy 诊断携带完整进程身份（pid+process_start_ms+exe）。
         body += "{\"pid\":" + std::to_string(result.pid) +
-                ",\"mode\":\"py-spy\",\"samples\":" + std::to_string(result.samples.size()) + "}";
+                ",\"process_start_ms\":" + std::to_string(result.startMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"mode\":\"" + std::string(result.nativeStacks ? "py-spy-native" : "py-spy") +
+                "\",\"samples\":" + std::to_string(result.samples.size()) +
+                ",\"capture_start_ms\":" + std::to_string(result.captureStartMs) +
+                ",\"capture_end_ms\":" + std::to_string(result.captureEndMs);
+        if (!result.warning.empty())
+            body += ",\"warning\":\"" + json_escape(result.warning) + "\"";
+        body += "}";
     }
     body += "],\"failed\":[";
     bool firstFailed = true;
@@ -1040,11 +1280,25 @@ inline std::string python_fallback_json(const std::vector<drop::PythonFallbackRe
             body += ",";
         firstFailed = false;
         body += "{\"pid\":" + std::to_string(result.pid) +
-                ",\"reason\":\"" + json_escape(result.reason) + "\"}";
+                ",\"process_start_ms\":" + std::to_string(result.startMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"reason\":\"" + json_escape(result.reason) + "\"}";
     }
     body += "],\"limited_count\":" + std::to_string(limitedCount) + "}";
     return body;
 }
+
+// 阶段四：language_status v2 片段（实现位于 LanguageStatus.cpp，避免头文件
+// 循环依赖）。返回 "{\"diagnostics_version\":2,\"language_status\":{...}}"。
+// targets 非空时按 Session 身份过滤进程实例；unwindMode 进入 native 行。
+std::string language_status_fragment_for_symbol_refs(
+    const std::vector<AggregatedSample> &samples,
+    const drop::RuntimeSymbolReport &runtimeReport,
+    const drop::GoSymbolReport &goReport,
+    const std::vector<drop::PythonFallbackResult> &pythonFallback,
+    size_t pythonLimitedCount,
+    const std::vector<ContinuousTargetProcess> *targets,
+    const std::string &unwindMode);
 
 inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &runtimeReport,
                                              const drop::GoSymbolReport &goReport,
@@ -1053,7 +1307,10 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
                                              const std::vector<drop::MemrayProfileResult> &memrayResults,
                                              const std::vector<AggregatedSample> &samples,
                                              const std::vector<drop::BuildIdEntry> &buildIds,
-                                             const std::string &kallsymsSha256)
+                                             const std::string &kallsymsSha256,
+                                             const std::vector<ContinuousTargetProcess> *sessionTargets = nullptr,
+                                             const std::string &unwindMode = "fp",
+                                             const std::string &buildIdReport = "")
 {
     uint64_t totalFrames = 0;
     uint64_t unresolvedFrames = 0;
@@ -1093,7 +1350,12 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
         if (!result.ready) continue;
         if (!firstMemrayReady) body += ",";
         firstMemrayReady = false;
-        body += "{\"pid\":" + std::to_string(result.pid) + ",\"profile_id\":\"" + json_escape(result.profileID) + "\"}";
+        // 阶段三：Memray 诊断携带完整进程身份（pid+process_start_ms+exe），
+        // 服务端按实例键去重，PID 复用显示为两个实例。
+        body += "{\"pid\":" + std::to_string(result.pid) +
+                ",\"process_start_ms\":" + std::to_string(result.processStartMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"profile_id\":\"" + json_escape(result.profileID) + "\"}";
     }
     body += "],\"failed\":[";
     bool firstMemrayFailed = true;
@@ -1102,9 +1364,20 @@ inline std::string combined_symbol_refs_json(const drop::RuntimeSymbolReport &ru
         if (result.ready) continue;
         if (!firstMemrayFailed) body += ",";
         firstMemrayFailed = false;
-        body += "{\"pid\":" + std::to_string(result.pid) + ",\"reason\":\"" + json_escape(result.reason) + "\"}";
+        body += "{\"pid\":" + std::to_string(result.pid) +
+                ",\"process_start_ms\":" + std::to_string(result.processStartMs) +
+                ",\"exe\":\"" + json_escape(result.exe) +
+                "\",\"reason\":\"" + json_escape(result.reason) + "\"}";
     }
+    // "]}" 关闭 failed 数组 + python_memory 对象（v2 片段之后还有根对象闭合）。
     body += "]}";
+    // 阶段四：v2 语言诊断契约。旧字段（runtime_maps/native_go/python_fallback）
+    // 原样保留一个兼容周期。
+    body += "," + language_status_fragment_for_symbol_refs(
+                       samples, runtimeReport, goReport, pythonFallback, pythonLimitedCount,
+                       sessionTargets, unwindMode);
+    if (!buildIdReport.empty())
+        body += ",\"build_id_report\":" + buildIdReport;
     body += "}";
     return body;
 }
@@ -1176,21 +1449,19 @@ SegmentProcessResult ProcessScript(
     const std::vector<drop::BuildIdEntry> &buildIds,
     const std::vector<drop::PythonFallbackResult> &pythonResults,
     size_t pythonLimitedCount,
-    const std::vector<drop::MemrayProfileResult> &memrayResults);
+    const std::vector<drop::MemrayProfileResult> &memrayResults,
+    const std::vector<BuildIdWarmEntry> &buildIdWarmReport = {});
 
 /// 把物理级 py-spy sidecar 结果合并进 CPU samples（纯函数，供测试与处理器
 /// 共用）：py-spy 就绪 → 删除该 PID 的 perf Python 样本并追加 py-spy 样本
-/// （不双计数）；失败/PID 复用 → 保留原 perf 样本。
+/// （不双计数）；失败/PID 复用 → 保留原 perf 样本。阶段四：结果只能替换
+/// capture 区间与窗口时间重叠且身份一致的 perf 样本；capture 区间缺失时按
+/// 兼容口径处理（视为重叠）。
 void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
                                   const std::vector<drop::PythonFallbackResult> &pythonResults,
-                                  bool *anyReplaced = nullptr);
-
-/// strict 异步 fallback：调用方先暂存 capture 期间处理出的 perf windows；全部
-/// py-spy future 完成后，本函数从所有重叠窗口删除同一 PID/start 的 perf 样本，
-/// 并追加一个使用真实 capture 起止时间的 py-spy sidecar window。
-void apply_python_sidecars_to_windows(std::vector<WindowPayload> *windows,
-                                      const std::vector<drop::PythonFallbackResult> &pythonResults,
-                                      size_t pythonLimitedCount = 0);
+                                  bool *anyReplaced = nullptr,
+                                  int64_t windowStartMs = 0,
+                                  int64_t windowEndMs = 0);
 
 /// 阶段二：Session 分流后重算 symbol_refs。physicalJson 为物理 symbol_refs
 /// （host Session 直接复用）；process Session 用 filteredSamples 重新计算
@@ -1200,5 +1471,52 @@ std::string rebuild_filtered_symbol_refs(const std::string &physicalJson,
                                          const PhysicalDiagnostics &diagnostics,
                                          const std::vector<AggregatedSample> &filteredSamples,
                                          const ContinuousSamplerConfig &session);
+
+/// 用结构化诊断和最终窗口样本生成 Session 专属 symbol_refs。host Session
+/// 也重新序列化，避免多 slice 聚合后沿用最后一个 slice 的 JSON。
+std::string build_session_symbol_refs(const PhysicalDiagnostics &diagnostics,
+                                      const std::vector<AggregatedSample> &samples,
+                                      const ContinuousSamplerConfig &session);
+
+// ============================================================
+// 阶段三：SessionFanoutProjector — 物理窗口 → Session 逻辑窗口的纯逻辑投影
+// ============================================================
+// 共享采集循环不再分别手写过滤规则；所有 Session 分流统一走这里：
+//   1. 按 SessionContract.signals 严格过滤 samples/profiles/metrics/
+//      histograms/dbSnapshots（profiles 按各自 signal_type 过滤，不能因 CPU
+//      未启用而整体清空）。
+//   2. process scope：按 ProcessIdentity（pid+process_start_ms+exe）精确过滤；
+//      身份缺失/进程退出/PID 复用 → 丢弃并记录 identity_unavailable。
+//   3. 确定性按比例降采样：requested_hz < physical_hz 时用最大余数法在聚合
+//      stack 间分配样本数，相同余数用稳定排序键保证重试结果与 content hash
+//      稳定；不放大样本，极低流量窗口允许零样本并上报 target_idle。
+//   4. 重建 process Session 的 symbol_refs（复用 rebuild_filtered_symbol_refs）。
+//   5. 直方图按 signal + 身份过滤；无法安全归属的 degraded 路径标记
+//      unavailable，不得复制整机直方图。
+//   6. 每 signal 登记状态（collected/target_idle/no_events/unavailable/
+//      failed），零计数窗口也保留，使 coverage 能区分 idle 与真实 gap。
+class SessionFanoutProjector
+{
+public:
+    /// 纯函数投影。physical 为物理窗口（含物理诊断与物理采样率）；
+    /// contract 为 Session 合同；physicalSampleRateHz 为物理采集频率；
+    /// histogramAttributionSafe=false 表示当前 backend 无法把直方图安全归属
+    /// 到单个 selector（多进程 + 滚动 bpftrace fallback），此时对请求了该
+    /// 信号的 Session 只登记 unavailable 状态窗口。
+    /// 返回投影后的 Session 窗口；即使零计数也返回（状态窗口），调用方据此
+    /// 决定是否持久化。
+    WindowPayload Project(const WindowPayload &physical,
+                          const SessionContract &contract,
+                          int physicalSampleRateHz,
+                          bool histogramAttributionSafe) const;
+
+    /// 确定性降采样（纯函数，供测试直接驱动）：把 filteredSamples 按
+    /// requested/physical 比例降采样。返回降采样后的样本；不放大样本。
+    static std::vector<AggregatedSample> DownsampleDeterministic(
+        const std::vector<AggregatedSample> &samples,
+        uint64_t requestedHz,
+        uint64_t physicalHz,
+        const std::string &stabilityKey);
+};
 
 } // namespace drop

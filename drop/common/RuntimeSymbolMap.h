@@ -43,6 +43,7 @@ struct RuntimeMapInfo
     bool ready = false;                  // 所有检测到的进程 map 均已就绪（非空、非 stale、已就位）
     std::vector<int> readyPids;          // 已就绪的 PID（调试用）
     std::vector<int> missingPids;        // 缺 map 的 PID
+    std::vector<int> failedAttachPids;   // 阶段四：确定性 attach 失败的 PID（权限/退出/超时）
     std::string reason;                  // 不 ready 时的原因（含 required_flag）
     std::string requiredFlag;            // node: --perf-basic-prof; python: -X perf
 };

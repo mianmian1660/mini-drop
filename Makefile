@@ -7,7 +7,7 @@ TARGET_IP ?= 127.0.0.1
 DURATION ?= 15
 FREQUENCY ?= 99
 
-.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof health test test-drop coverage e2e verify
+.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof health test test-drop web-frontend-test coverage e2e verify
 
 health:
 	@echo "[health] API: $(API)"
@@ -70,7 +70,12 @@ test:
 	$(MAKE) test-drop
 	cd apiserver && go test ./...
 	cd analysis && python3 test_analysis.py
-	cd web_frontend && npm run build
+	$(MAKE) web-frontend-test
+
+# 服务器从 origin 拉取的干净工作树没有 node_modules（gitignore），构建前
+# 按需安装一次；已有依赖时直接复用，保证 make test 在全新 checkout 可用。
+web-frontend-test:
+	cd web_frontend && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npm run build
 
 test-drop:
 	docker build --target test -t mini-drop-drop-tests drop

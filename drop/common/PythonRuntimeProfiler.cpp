@@ -1,15 +1,18 @@
 #include "common/PythonRuntimeProfiler.h"
+#include "common/RuntimeSymbolMap.h"
 #include "common/Utils.h"
 
 #include <algorithm>
 #include <climits>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <dirent.h>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace drop
@@ -106,40 +109,75 @@ PythonFallbackResult capture_one(PythonCandidate candidate, int durationSec, int
 
     if (!python_process_is_same(candidate.pid, candidate.startMs))
     {
-        result.captureStartMs = wall_now_ms();
-        result.captureEndMs = result.captureStartMs;
         result.reason = "process exited or PID was reused";
         return result;
     }
 
+    // 阶段四：记录真实 capture 区间；结果只能替换时间重叠且身份一致的
+    // perf 样本（防跨窗口双计数）。
     result.captureStartMs = wall_now_ms();
     std::string path = "/tmp/mini_drop_pyspy_" + std::to_string(candidate.pid) + "_" +
                        std::to_string(result.captureStartMs) + ".raw";
     std::string output;
-    int rc = exec_capture({"timeout", "-s", "INT", "-k", "2", std::to_string(durationSec + 2),
-                           "/usr/local/bin/py-spy", "record", "--pid", std::to_string(candidate.pid),
-                           "--duration", std::to_string(durationSec), "--rate", std::to_string(rateHz),
-                           "--format", "raw", "--function", "--output", path},
-                          &output, 16384);
+    auto runPySpy = [&](bool native) -> int {
+        std::vector<std::string> args{"timeout", "-s", "INT", "-k", "2", std::to_string(durationSec + 2),
+                                      "/usr/local/bin/py-spy", "record", "--pid", std::to_string(candidate.pid),
+                                      "--duration", std::to_string(durationSec), "--rate", std::to_string(rateHz),
+                                      "--format", "raw", "--function"};
+        if (native)
+            args.push_back("--native");
+        args.insert(args.end(), {"--output", path});
+        return exec_capture(args, &output, 16384);
+    };
+    const bool nativeWanted = pyspy_native_enabled();
+    int rc = runPySpy(nativeWanted);
     result.captureEndMs = wall_now_ms();
-    if (!python_process_is_same(candidate.pid, candidate.startMs))
+    std::ifstream inFirst(path, std::ios::binary);
+    std::string raw((std::istreambuf_iterator<char>(inFirst)), std::istreambuf_iterator<char>());
+    result.samples = parse_pyspy_raw(raw);
+    result.nativeStacks = nativeWanted && !result.samples.empty();
+    // 阶段四：--native 展开失败（如 UNW_EINVAL）时自动退回纯 Python 栈重试，
+    // 不让 C 扩展展开能力缺陷拖垮整个 fallback。
+    if (result.samples.empty() && nativeWanted)
     {
         ::remove(path.c_str());
+        output.clear();
+        result.captureStartMs = wall_now_ms();
+        rc = runPySpy(false);
+        result.captureEndMs = wall_now_ms();
+        std::ifstream inRetry(path, std::ios::binary);
+        raw.assign((std::istreambuf_iterator<char>(inRetry)), std::istreambuf_iterator<char>());
+        result.samples = parse_pyspy_raw(raw);
+        result.nativeStacks = false;
+        if (!result.samples.empty())
+            result.warning = "py-spy --native unavailable; using Python-only stacks";
+    }
+    ::remove(path.c_str());
+    if (!python_process_is_same(candidate.pid, candidate.startMs))
+    {
         result.reason = "process exited or PID was reused during capture";
         return result;
     }
-    std::ifstream in(path, std::ios::binary);
-    std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    ::remove(path.c_str());
-    result.samples = parse_pyspy_raw(raw);
     result.ready = !result.samples.empty();
     // GNU timeout can return 124 after py-spy has already flushed a complete
     // raw profile. Valid samples are authoritative; use rc only to diagnose
     // an empty capture.
-    if (!result.ready && rc != 0)
-        result.reason = "py-spy failed rc=" + std::to_string(rc) + ": " + trim(output);
-    else if (!result.ready)
-        result.reason = "py-spy returned no samples";
+    if (!result.ready)
+    {
+        if (rc != 0)
+        {
+            const std::string trimmed = trim(output);
+            if (trimmed.find("Permission denied") != std::string::npos ||
+                trimmed.find("Operation not permitted") != std::string::npos)
+                result.reason = "py-spy attach permission denied: " + trimmed;
+            else if (rc == 124 || rc == 137)
+                result.reason = "py-spy capture timed out";
+            else
+                result.reason = "py-spy failed rc=" + std::to_string(rc) + ": " + trimmed;
+        }
+        else
+            result.reason = "py-spy returned no samples";
+    }
     return result;
 }
 
@@ -178,6 +216,158 @@ bool python_process_is_same(int pid, int64_t expectedStartMs)
 {
     int64_t currentStartMs = 0;
     return expectedStartMs > 0 && python_process_start_ms(pid, &currentStartMs) && currentStartMs == expectedStartMs;
+}
+
+bool pyspy_native_enabled()
+{
+    const char *value = std::getenv("DROP_NATIVE_CP_PYSPY_NATIVE");
+    if (!value || !*value)
+        return false;
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return !(text == "0" || text == "false" || text == "no" || text == "off");
+}
+
+namespace
+{
+
+// 读取 /proc/<pid>/cmdline（NUL 分隔）。
+std::string read_cmdline(int pid)
+{
+    std::ifstream in("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::replace(content.begin(), content.end(), '\0', ' ');
+    return trim(content);
+}
+
+} // namespace
+
+PythonRuntimeProbe probe_python_runtime(int pid)
+{
+    PythonRuntimeProbe probe;
+    if (pid <= 0)
+        return probe;
+    probe.exe = read_link("/proc/" + std::to_string(pid) + "/exe");
+    if (probe.exe.empty() || basename_of(probe.exe).rfind("python", 0) != 0)
+        return probe;
+    probe.valid = true;
+    probe.cmdline = read_cmdline(pid);
+    // -X perf 兼容 "-Xperf"、"-X perf"、"‑Xperf=..." 写法。
+    probe.hasPerfFlag = probe.cmdline.find("-X perf") != std::string::npos ||
+                        probe.cmdline.find("-Xperf") != std::string::npos;
+    // 从 maps 的 libpython3.<minor> 推断解释器次版本（不执行解释器）。
+    std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+    std::string line;
+    while (std::getline(maps, line))
+    {
+        const size_t pos = line.find("libpython3.");
+        if (pos == std::string::npos)
+            continue;
+        const size_t minorStart = pos + strlen("libpython3.");
+        char *end = nullptr;
+        long minor = std::strtol(line.c_str() + minorStart, &end, 10);
+        if (end && end != line.c_str() + minorStart && minor > 0)
+            probe.pythonMinor = static_cast<int>(minor);
+        break;
+    }
+    int64_t startMs = 0;
+    const bool haveStart = runtime_process_start_ms(pid, &startMs);
+    const int namespacePid = runtime_pid_namespace_pid(pid);
+    probe.hasPerfMap =
+        runtime_map_ready(runtime_perf_map_pid_root_path(pid, namespacePid),
+                          haveStart ? startMs : 0) ||
+        runtime_map_ready(runtime_perf_map_host_path(pid), haveStart ? startMs : 0);
+    return probe;
+}
+
+std::vector<PythonCandidate> hottest_python_candidates_by_cpu_ticks(size_t limit)
+{
+    struct TickSnapshot
+    {
+        int pid = 0;
+        uint64_t ticks = 0;
+        int64_t startMs = 0;
+        std::string comm;
+        std::string exe;
+    };
+    auto snapshot = []() {
+        std::vector<TickSnapshot> out;
+        DIR *dir = ::opendir("/proc");
+        if (!dir)
+            return out;
+        struct dirent *entry;
+        while ((entry = ::readdir(dir)) != nullptr)
+        {
+            char *end = nullptr;
+            const long parsed = std::strtol(entry->d_name, &end, 10);
+            if (!end || *end != '\0' || parsed <= 0)
+                continue;
+            TickSnapshot snap;
+            snap.pid = static_cast<int>(parsed);
+            std::string exe;
+            if (!is_python_pid(snap.pid, &exe))
+                continue;
+            snap.exe = exe;
+            std::ifstream statFile("/proc/" + std::to_string(snap.pid) + "/stat");
+            std::string content;
+            if (!std::getline(statFile, content))
+                continue;
+            const size_t close = content.rfind(')');
+            if (close == std::string::npos)
+                continue;
+            std::istringstream fields(content.substr(close + 1));
+            std::vector<std::string> values;
+            std::string value;
+            while (fields >> value)
+                values.push_back(value);
+            // state(3) 之后：utime=14, stime=15 → 索引 11/12（相对 fields[0]）
+            if (values.size() < 13)
+                continue;
+            snap.ticks = std::strtoull(values[11].c_str(), nullptr, 10) +
+                         std::strtoull(values[12].c_str(), nullptr, 10);
+            python_process_start_ms(snap.pid, &snap.startMs);
+            snap.comm = process_comm(snap.pid);
+            out.push_back(std::move(snap));
+        }
+        ::closedir(dir);
+        return out;
+    };
+
+    const auto first = snapshot();
+    struct timespec pause{0, 200 * 1000 * 1000}; // 200ms 增量窗口
+    ::nanosleep(&pause, nullptr);
+    const auto second = snapshot();
+
+    std::map<int, TickSnapshot> baseline;
+    for (const auto &before : first)
+        baseline[before.pid] = before;
+
+    std::vector<PythonCandidate> out;
+    for (const auto &after : second)
+    {
+        PythonCandidate candidate;
+        candidate.pid = after.pid;
+        candidate.startMs = after.startMs;
+        candidate.comm = after.comm;
+        candidate.exe = after.exe;
+        uint64_t current = after.ticks;
+        auto found = baseline.find(after.pid);
+        if (found != baseline.end() && found->second.startMs == after.startMs &&
+            current >= found->second.ticks)
+            current -= found->second.ticks; // 短周期增量（PID 复用时退化为总量）
+        candidate.samples = static_cast<int>(current);
+        out.push_back(std::move(candidate));
+    }
+    std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) {
+        if (a.samples == b.samples)
+            return a.pid < b.pid;
+        return a.samples > b.samples;
+    });
+    if (out.size() > limit)
+        out.resize(limit);
+    return out;
 }
 
 std::vector<PythonStackSample> parse_pyspy_raw(const std::string &raw)
@@ -233,12 +423,6 @@ void schedule_python_fallback(const std::string &sessionSID,
     g_candidatesBySession[sessionSID] = std::move(next);
 }
 
-void clear_python_fallback_schedule(const std::string &sessionSID)
-{
-    std::lock_guard<std::mutex> lock(g_candidatesMutex);
-    g_candidatesBySession.erase(sessionSID);
-}
-
 PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSID,
                                                     int durationSec,
                                                     int rateHz,
@@ -272,16 +456,7 @@ PythonFallbackCapture start_python_fallback_capture(const std::string &sessionSI
 
 std::vector<PythonFallbackResult> PythonFallbackCapture::Finish()
 {
-    std::vector<PythonFallbackResult> out;
-    // capture_one 自带 timeout；分段等待避免 wall_now_ms()+INT64_MAX 的有符号
-    // 溢出，同时仍保证 Finish 的“等待全部结果”语义。
-    while (!futures_.empty())
-    {
-        auto ready = Poll(1000);
-        out.insert(out.end(), std::make_move_iterator(ready.begin()),
-                   std::make_move_iterator(ready.end()));
-    }
-    return out;
+    return Poll(INT64_MAX);
 }
 
 std::vector<PythonFallbackResult> PythonFallbackCapture::Poll(int64_t maxWaitMs)
@@ -290,15 +465,12 @@ std::vector<PythonFallbackResult> PythonFallbackCapture::Poll(int64_t maxWaitMs)
     out.reserve(futures_.size());
     if (maxWaitMs < 0)
         maxWaitMs = 0;
-    const int64_t start = wall_now_ms();
-    const int64_t deadline = maxWaitMs > INT64_MAX - start ? INT64_MAX : start + maxWaitMs;
+    const int64_t deadline = wall_now_ms() + maxWaitMs;
     std::vector<std::future<PythonFallbackResult>> stillRunning;
     for (auto &future : futures_)
     {
-        int64_t remaining = std::max<int64_t>(0, deadline - wall_now_ms());
-        // 即使预算已用完也必须 wait_for(0)：否则已经 ready 的后续 future
-        // 会被无谓保留到下一轮。
-        if (future.wait_for(std::chrono::milliseconds(remaining)) == std::future_status::ready)
+        int64_t remaining = deadline - wall_now_ms();
+        if (remaining > 0 && future.wait_for(std::chrono::milliseconds(remaining)) == std::future_status::ready)
         {
             try
             {

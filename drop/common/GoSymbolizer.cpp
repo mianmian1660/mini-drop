@@ -31,6 +31,20 @@ namespace
 constexpr const char *kCacheVersion = "goresym-v3.4";
 constexpr int64_t kFailureRetryMs = 5 * 60 * 1000;
 
+// 阶段四：GoReSym 独立开关（默认开启）。关闭时保留 perf 原始样本并标记
+// partial/missing，不阻断 recorder；已有缓存仍可免费物化。
+bool gore_sym_enabled()
+{
+    const char *value = std::getenv("DROP_CONTINUOUS_GORESYM");
+    if (!value || !*value)
+        return true;
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return !(text == "0" || text == "false" || text == "no" || text == "off");
+}
+
 struct ExtractionJob
 {
     std::string buildId;
@@ -559,6 +573,50 @@ bool go_binary_has_build_info(const std::string &path)
     return false;
 }
 
+bool go_binary_has_pclntab(const std::string &path)
+{
+    // 阶段四：读取 ELF 段表，按段名查找 .gopclntab（Go 运行时函数元数据）。
+    // stripped/重命名的 Go ELF 仍保留该段，不依赖 exe 名称或符号表。
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open())
+        return false;
+    unsigned char ident[EI_NIDENT] = {0};
+    if (!in.read(reinterpret_cast<char *>(ident), sizeof(ident)) ||
+        std::memcmp(ident, ELFMAG, SELFMAG) != 0 || ident[EI_DATA] != ELFDATA2LSB ||
+        ident[EI_CLASS] != ELFCLASS64)
+        return false;
+    auto readAt = [&in](uint64_t offset, void *buffer, size_t size) {
+        in.clear();
+        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        return static_cast<bool>(in.read(reinterpret_cast<char *>(buffer), size));
+    };
+    Elf64_Off shoff = 0;
+    uint16_t shentsize = 0, shnum = 0, shstrndx = 0;
+    if (!readAt(0x28, &shoff, sizeof(shoff)) || !readAt(0x3A, &shentsize, sizeof(shentsize)) ||
+        !readAt(0x3C, &shnum, sizeof(shnum)) || !readAt(0x3E, &shstrndx, sizeof(shstrndx)))
+        return false;
+    if (shoff == 0 || shnum == 0 || shentsize < sizeof(Elf64_Shdr))
+        return false;
+    std::vector<Elf64_Shdr> sections(shnum);
+    if (!readAt(shoff, sections.data(), sizeof(Elf64_Shdr) * shnum))
+        return false;
+    if (shstrndx >= shnum)
+        return false;
+    const Elf64_Shdr &strSection = sections[shstrndx];
+    std::vector<char> strTable(strSection.sh_size + 1, '\0');
+    if (strTable.size() <= 1 || !readAt(strSection.sh_offset, strTable.data(), strSection.sh_size))
+        return false;
+    for (const auto &section : sections)
+    {
+        if (section.sh_name >= strTable.size())
+            continue;
+        const char *name = strTable.data() + section.sh_name;
+        if (std::strcmp(name, ".gopclntab") == 0 && section.sh_size > 0)
+            return true;
+    }
+    return false;
+}
+
 bool elf_gnu_build_id(const std::string &path, std::string *buildId)
 {
     buildId->clear();
@@ -912,6 +970,14 @@ GoSymbolReport prepare_go_symbols(const std::vector<BuildIdEntry> &entries)
                 continue;
             }
         }
+        if (!gore_sym_enabled())
+        {
+            // 阶段四：开关关闭 → 不排队新提取；保留 perf 原始样本并给出明确诊断。
+            report.failed.push_back({entry.buildId, entry.dsoPath,
+                                     "DROP_CONTINUOUS_GORESYM disabled"});
+            report.disabled = "DROP_CONTINUOUS_GORESYM disabled";
+            continue;
+        }
         g_states[entry.buildId] = {ExtractionState::Pending, 0, ""};
         ExtractionJob job{entry.buildId, entry.dsoPath, source, cached, regular_file_size(source)};
         auto insertAt = std::upper_bound(g_queue.begin(), g_queue.end(), job.sourceSize,
@@ -983,7 +1049,11 @@ std::string go_symbol_report_json(const GoSymbolReport &report)
     };
     return "{\"ready\":" + items(report.ready) +
            ",\"pending\":" + items(report.pending) +
-           ",\"failed\":" + items(report.failed) + "}";
+           ",\"failed\":" + items(report.failed) +
+           (report.disabled.empty()
+                ? ""
+                : ",\"disabled\":\"" + json_escape(report.disabled) + "\"") +
+           "}";
 }
 
 } // namespace drop

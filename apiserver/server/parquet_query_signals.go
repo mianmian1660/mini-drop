@@ -317,6 +317,11 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 				if row.SignalType != signalType || row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
 					continue
 				}
+				// 阶段三：实例过滤。旧 Parquet 文件无进程身份字段（pid=0），
+				// 实例过滤查询拒绝旧行（不静默混入）；无过滤查询允许。
+				if !pqHistogramRowMatchesFilters(*row, q.Filters) {
+					continue
+				}
 				if row.Backend != "" {
 					backends[row.Backend] = true
 				}
@@ -331,7 +336,7 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 				}
 				item.Count = addContinuousCount(item.Count, row.Count)
 			}
-			totalEvents = addContinuousCount(totalEvents, pqHistogramEventTotal(rows, signalType, hFrom, hTo, authorized))
+			totalEvents = addContinuousCount(totalEvents, pqHistogramEventTotal(rows, signalType, hFrom, hTo, authorized, q.Filters))
 		}
 		if readErr != nil {
 			incParquetQueryError()
@@ -348,7 +353,7 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 			seenBlock[block.BlockID] = true
 			objectKeys = append(objectKeys, block.BlockID)
 		}
-		trend = append(trend, pqHistogramTrendFromRows(rows, signalType, block.Resolution, hFrom, hTo, authorized)...)
+		trend = append(trend, pqHistogramTrendFromRows(rows, signalType, block.Resolution, hFrom, hTo, authorized, q.Filters)...)
 	}
 
 	buckets := make([]ContinuousHistogramBucket, 0, len(merged))
@@ -401,7 +406,7 @@ func (s *APIServer) pqQueryHistogramMixed(ctx context.Context, q ProfileQuery, s
 // pqHistogramEventTotal 兼容新旧 Parquet：旧文件在每个 bucket 重复
 // event_count，新文件只在第一桶写入。按 histogram identity 取 max 后求和。
 func pqHistogramEventTotal(rows []pqHistogramRow, signalType string, hFrom, hTo time.Time,
-	authorized map[string]struct{}) uint64 {
+	authorized map[string]struct{}, filters map[string]interface{}) uint64 {
 	events := map[string]uint64{}
 	for i := range rows {
 		row := &rows[i]
@@ -409,7 +414,10 @@ func pqHistogramEventTotal(rows []pqHistogramRow, signalType string, hFrom, hTo 
 			row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
 			continue
 		}
-		key := row.SessionSID + "|" + strconv.FormatInt(row.Timestamp, 10) + "|" + row.SignalType + "|" + row.Backend + "|" + pqHistogramIdentityLabelKey(row.Labels)
+		if !pqHistogramRowMatchesFilters(*row, filters) {
+			continue
+		}
+		key := pqHistogramRowIdentityKey(*row)
 		if row.EventCount > events[key] {
 			events[key] = row.EventCount
 		}
@@ -421,6 +429,12 @@ func pqHistogramEventTotal(rows []pqHistogramRow, signalType string, hFrom, hTo 
 	return total
 }
 
+func pqHistogramRowIdentityKey(row pqHistogramRow) string {
+	return row.SessionSID + "|" + strconv.FormatInt(row.Timestamp, 10) + "|" + row.SignalType + "|" +
+		row.Backend + "|" + strconv.Itoa(int(row.PID)) + "|" + strconv.FormatInt(row.ProcessStartMs, 10) +
+		"|" + row.Exe + "|" + pqHistogramIdentityLabelKey(row.Labels)
+}
+
 func pqHistogramIdentityLabelKey(labels map[string]string) string {
 	clone := make(map[string]string, len(labels))
 	for key, value := range labels {
@@ -429,6 +443,37 @@ func pqHistogramIdentityLabelKey(labels map[string]string) string {
 		}
 	}
 	return pqSortedLabelKey(clone)
+}
+
+// 阶段三：Parquet histogram 实例过滤。旧 Parquet 文件无进程身份字段
+// （pid=0/start=0/exe=""），实例过滤查询拒绝旧行并返回明确兼容提示（由
+// 调用方在 empty 时给出），不静默混入；无过滤查询允许旧行。
+func pqHistogramRowMatchesFilters(row pqHistogramRow, filters map[string]interface{}) bool {
+	if len(filters) == 0 {
+		return true
+	}
+	if want := labelString(filters, "pid"); want != "" {
+		if row.PID <= 0 || strconv.Itoa(int(row.PID)) != want {
+			return false
+		}
+	}
+	if want := labelString(filters, "process_start_ms"); want != "" {
+		if row.ProcessStartMs <= 0 || strconv.FormatInt(row.ProcessStartMs, 10) != want {
+			return false
+		}
+	}
+	if want := labelString(filters, "process_instance"); want != "" {
+		if row.PID <= 0 || row.ProcessStartMs <= 0 ||
+			strconv.Itoa(int(row.PID))+"|"+strconv.FormatInt(row.ProcessStartMs, 10) != want {
+			return false
+		}
+	}
+	if want := labelString(filters, "exe"); want != "" {
+		if row.Exe == "" || row.Exe != want {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeV1Histogram 把 v1 子范围 histogram 结果并入混合累加器。
@@ -469,7 +514,7 @@ func (s *APIServer) mergeV1Histogram(ctx context.Context, q ProfileQuery, signal
 
 // pqHistogramTrendFromRows 从已经完整读取的 v2 行构建趋势点。
 func pqHistogramTrendFromRows(rows []pqHistogramRow, signalType, resolution string,
-	hFrom, hTo time.Time, authorized map[string]struct{}) []gin.H {
+	hFrom, hTo time.Time, authorized map[string]struct{}, filters map[string]interface{}) []gin.H {
 	type trendAcc struct {
 		events        map[string]uint64
 		p50, p95, p99 float64
@@ -485,6 +530,9 @@ func pqHistogramTrendFromRows(rows []pqHistogramRow, signalType, resolution stri
 			row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
 			continue
 		}
+		if !pqHistogramRowMatchesFilters(*row, filters) {
+			continue
+		}
 		// raw 保持原窗口时间；5m/1h 的 Timestamp 本身已经对齐目标桶。
 		bucket := row.Timestamp
 		item := acc[bucket]
@@ -492,7 +540,7 @@ func pqHistogramTrendFromRows(rows []pqHistogramRow, signalType, resolution stri
 			item = &trendAcc{events: map[string]uint64{}, backend: row.Backend, unavailable: row.Unavailable, reason: row.Reason}
 			acc[bucket] = item
 		}
-		eventKey := row.SessionSID + "|" + strconv.FormatInt(row.Timestamp, 10) + "|" + row.Backend + "|" + pqHistogramIdentityLabelKey(row.Labels)
+		eventKey := pqHistogramRowIdentityKey(*row)
 		if row.EventCount > item.events[eventKey] {
 			item.events[eventKey] = row.EventCount
 		}

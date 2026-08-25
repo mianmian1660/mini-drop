@@ -16,6 +16,7 @@
 // ContinuousSegmentProcessor）。连续采样器的 strict/degraded 引擎都通过它处理
 // 不可变 perf.data 段，共享符号准备、解析、runtime 分类与诊断生成。
 #include "common/ContinuousSegmentProcessor.h"
+#include "common/LanguageStatus.h"
 
 #include <algorithm>
 #include <chrono>
@@ -34,6 +35,7 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -253,7 +255,9 @@ static const std::vector<std::pair<std::string, std::string>> &signal_name_map()
 }
 
 // requestedSignals（逻辑名）→ 物理信号集合字符串（逗号分隔），供共享采集器
-// 取并集。空集合回退四类全开。
+// 取并集。空集合回退四类全开（兼容旧客户端）。阶段三：只映射实际匹配的
+// 物理信号——纯 python_rss/python_memory/db_snapshot 请求不产生 CPU/IO/sched
+// 物理采集（"不选就不采"），返回空字符串。
 static std::string physical_signals_from_requested(const std::vector<std::string> &requested)
 {
     if (requested.empty())
@@ -267,7 +271,7 @@ static std::string physical_signals_from_requested(const std::vector<std::string
                 break;
             }
     if (physical.empty())
-        return "cpu,io,io_syscall,sched";
+        return "";
     std::string out;
     for (size_t i = 0; i < physical.size(); ++i)
     {
@@ -600,7 +604,9 @@ static std::string window_content_digest(const WindowPayload &window)
     for (const auto &hist : window.histograms)
     {
         content << "h:"; text(hist.signalType); text(hist.backend); text(hist.unit); text(hist.reason);
-        content << hist.pid << ':' << hist.eventCount << ':' << hist.unavailable << ':'
+        content << hist.pid << ':' << hist.processStartMs << ':' << hist.eventCount << ':' << hist.unavailable << ':';
+        text(hist.exe); text(hist.comm);
+        content
                 << hist.min << ':' << hist.max << ':' << hist.p50 << ':' << hist.p95 << ':' << hist.p99 << ':';
         for (const auto &bucket : hist.buckets)
         {
@@ -623,10 +629,17 @@ static std::string window_content_digest(const WindowPayload &window)
         text(snap.waitingQuery); text(snap.blockingQuery); text(snap.lockedTable);
         content << ';';
     }
-    content << "meta:" << window.rssTruncated << ':';
+    content << "meta:" << window.rssTruncated << ':' << window.identityUnavailableCount << ':'
+            << window.physicalSampleRateHz << ':' << window.effectiveSampleRateHz << ':';
     text(window.backendStatus); text(window.backendReason); text(window.selectedBackend);
     for (const auto &backend : window.attemptedBackends)
         text(backend);
+    for (const auto &entry : window.signalStatuses)
+    {
+        text(entry.first);
+        content << signal_status_name(entry.second.status) << ':' << entry.second.lostEvents << ':';
+        text(entry.second.reason);
+    }
     if (!window.symbolRefsJson.empty())
     {
         content << "sr:";
@@ -717,10 +730,32 @@ static std::string target_pid_csv(const ContinuousSamplerConfig &cfg)
     return out.str();
 }
 
+// 阶段四：栈回溯模式。默认 Frame Pointer（-g）；DROP_NATIVE_CP_CALL_GRAPH=dwarf
+// 时统一为 --call-graph dwarf,8192。
+static std::string unwind_mode_from_env()
+{
+    const char *env = std::getenv("DROP_NATIVE_CP_CALL_GRAPH");
+    if (!env || !*env)
+        return "fp";
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value == "dwarf" ? "dwarf" : "fp";
+}
+
+static std::vector<std::string> call_graph_args(const std::string &unwindMode)
+{
+    if (unwindMode == "dwarf")
+        return {"--call-graph", "dwarf,8192"};
+    return {"-g"};
+}
+
 static std::vector<std::string> perf_record_args(const ContinuousSamplerConfig &cfg,
                                                  const std::string &perf,
                                                  const std::string &perfEvent,
-                                                 const std::string &dataPath)
+                                                 const std::string &dataPath,
+                                                 const std::string &unwindMode = "fp")
 {
     std::vector<std::string> args{perf, "record", "--no-buildid-cache", "-q"};
     if (cfg.scope == "process")
@@ -734,8 +769,10 @@ static std::vector<std::string> perf_record_args(const ContinuousSamplerConfig &
     {
         args.push_back("-a");
     }
-    args.insert(args.end(), {"-e", perfEvent, "-F", std::to_string(cfg.sampleRateHz),
-                             "-g", "-o", dataPath, "--", "sleep",
+    args.insert(args.end(), {"-e", perfEvent, "-F", std::to_string(cfg.sampleRateHz)});
+    for (auto &arg : call_graph_args(unwindMode))
+        args.push_back(std::move(arg));
+    args.insert(args.end(), {"-o", dataPath, "--", "sleep",
                              std::to_string(cfg.aggregationWindowSec)});
     return args;
 }
@@ -756,14 +793,138 @@ static std::string bpftrace_target_predicate(const ContinuousSamplerConfig &cfg,
     return predicate.empty() ? "/0/" : "/" + predicate + "/";
 }
 
-static std::string python_fallback_scope_key(const ContinuousSamplerConfig &cfg)
+// 前向声明（定义在 collect_window 之后）。
+static bool signal_enabled(const std::string &signals, const std::string &name);
+
+// ============================================================
+// 阶段四：Python 两级策略（perf-map → py-spy）候选构建
+// ============================================================
+
+// 单 PID 的 Python 语义帧覆盖率（%）。只统计 perf backend 的 python 样本
+// （py-spy 样本本身即语义帧），排除内核帧。
+static double python_semantic_percent_for_pid(const std::vector<AggregatedSample> &samples, int pid)
 {
-    // Session SID 单独作为 key 会让 shared engine 的不同 generation 复用上一代
-    // PID 候选；PID 恰好被复用时可能 attach 到错误进程。generation 为空仅为
-    // 旧的独立 sampler 兼容。
-    return cfg.collectorGeneration.empty()
-               ? cfg.sessionSID
-               : cfg.sessionSID + ":" + cfg.collectorGeneration;
+    uint64_t total = 0;
+    uint64_t semantic = 0;
+    for (const auto &sample : samples)
+    {
+        if (sample.pid != pid || sample.runtime != "python" || sample.backend == "py-spy")
+            continue;
+        size_t index = 0;
+        for (const auto &frame : sample.stack)
+        {
+            const drop::ContinuousStackFrame structured =
+                index < sample.frames.size() ? sample.frames[index] : drop::ContinuousStackFrame{};
+            ++index;
+            if (drop::is_kernel_frame(structured) || drop::is_kernel_frame_text(frame))
+                continue;
+            total = add_count(total, sample.count);
+            if (drop::is_python_semantic_frame(structured) || drop::is_python_semantic_frame_text(frame))
+                semantic = add_count(semantic, sample.count);
+        }
+    }
+    if (total == 0)
+        return 100.0; // 无 perf Python 样本时不用覆盖率触发 fallback
+    return static_cast<double>(semantic) * 100.0 / static_cast<double>(total);
+}
+
+// 候选构建规则见 collect_window 内注释。firstWindowDetected=false 时（首窗
+// runtime map 尚未识别出 Python）用进程预检兜底，保证第一窗就能决定 fallback。
+static std::vector<drop::PythonCandidate> build_python_candidates(
+    const ContinuousSamplerConfig &cfg,
+    const drop::RuntimeSymbolReport &runtimeReport,
+    const std::vector<AggregatedSample> &samples,
+    bool firstWindowDetected)
+{
+    std::map<int, drop::PythonCandidate> chosen;
+
+    auto addCandidate = [&](int pid) {
+        int64_t startMs = 0;
+        if (!drop::python_process_start_ms(pid, &startMs))
+            return;
+        auto it = chosen.find(pid);
+        if (it != chosen.end())
+        {
+            it->second.startMs = startMs;
+            return;
+        }
+        drop::PythonCandidate candidate;
+        candidate.pid = pid;
+        candidate.startMs = startMs;
+        candidate.samples = 0;
+        for (const auto &sample : samples)
+            if (sample.pid == pid && !sample.comm.empty())
+            {
+                candidate.comm = sample.comm;
+                break;
+            }
+        if (candidate.comm.empty())
+            candidate.comm = "python";
+        candidate.exe = read_exe(pid);
+        chosen.emplace(pid, std::move(candidate));
+    };
+
+    // 1) perf-map 缺失的采样进程
+    for (int pid : runtimeReport.python.missingPids)
+        addCandidate(pid);
+
+    // 2) 有 map 但语义覆盖 <70%（perf-map 模式质量不足）
+    std::set<int> checkedPids;
+    for (const auto &sample : samples)
+    {
+        if (sample.runtime != "python" || sample.backend == "py-spy")
+            continue;
+        if (!checkedPids.insert(sample.pid).second)
+            continue;
+        if (runtimeReport.python.readyPids.empty() ||
+            std::find(runtimeReport.python.readyPids.begin(), runtimeReport.python.readyPids.end(),
+                      sample.pid) != runtimeReport.python.readyPids.end())
+        {
+            if (python_semantic_percent_for_pid(samples, sample.pid) < 70.0)
+                addCandidate(sample.pid);
+        }
+    }
+
+    // 3) 首窗预检兜底：runtime map 未识别到 Python 时主动探测目标。
+    //    节流：探测含短周期 CPU ticks 采样（约 200ms）与全 /proc 扫描，
+    //    全局最多每 5 秒一次，避免空跑机器上每个段都付这笔开销。
+    if (chosen.empty() && !firstWindowDetected)
+    {
+        static std::atomic<int64_t> lastProbeMonoMs{0};
+        const int64_t nowMono = monotonic_ms();
+        int64_t last = lastProbeMonoMs.load();
+        if (nowMono - last >= 5000 && lastProbeMonoMs.compare_exchange_strong(last, nowMono))
+        {
+            if (cfg.scope == "process")
+            {
+                for (const auto &target : cfg.targetProcesses)
+                {
+                    drop::PythonRuntimeProbe probe = drop::probe_python_runtime(target.pid);
+                    // 无 -X perf 真实 map 的解释器直接进入 py-spy；带 flag 且
+                    // map 就绪的交给 perf-map 路径。
+                    if (probe.valid && !probe.hasPerfMap)
+                        addCandidate(target.pid);
+                }
+            }
+            else
+            {
+                // host Session：短周期 CPU ticks 增量排序，默认只 attach 最热实例。
+                for (auto &candidate :
+                     drop::hottest_python_candidates_by_cpu_ticks(8))
+                {
+                    drop::PythonRuntimeProbe probe = drop::probe_python_runtime(candidate.pid);
+                    if (probe.valid && !probe.hasPerfMap)
+                        chosen.emplace(candidate.pid, std::move(candidate));
+                }
+            }
+        }
+    }
+
+    std::vector<drop::PythonCandidate> out;
+    out.reserve(chosen.size());
+    for (auto &kv : chosen)
+        out.push_back(std::move(kv.second));
+    return out;
 }
 
 
@@ -781,14 +942,23 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     // 阶段二：degraded 的 collect_window 只负责录制原始 perf 段 + 模式特有的
     // sidecar 数据（py-spy / RSS / Memray）；perf.data 交给统一的
     // ContinuousSegmentProcessor 解析（符号准备/解析/runtime 分类/诊断）。
-    const bool pythonFallbackEnabled = env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
-    const int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+    // 阶段三：py-spy 是 CPU fallback，只有请求 cpu_profile 才启用。
+    // 阶段四：独立开关 DROP_CONTINUOUS_PYSPY_FALLBACK（默认开启，可与旧
+    // 开关 DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED 单独关闭）。
+    const bool pythonFallbackEnabled =
+        logical_signal_requested(cfg.requestedSignals, "cpu_profile") &&
+        env_enabled_default("DROP_CONTINUOUS_PYSPY_FALLBACK", true) &&
+        env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
+    // 阶段四：host Session 默认只 attach 最热 2 个 Python 实例（CPU ticks
+    // 增量排序）；process Session 精确目标最多 4 个。
+    int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+    if (cfg.scope != "process")
+        pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_HOST_MAX_PROCESSES", 2);
     const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
     drop::PythonFallbackCapture pythonCapture;
     if (pythonFallbackEnabled)
         pythonCapture = drop::start_python_fallback_capture(
-            python_fallback_scope_key(cfg), cfg.aggregationWindowSec,
-            pythonRateHz, pythonMaxProcesses);
+            cfg.sessionSID, cfg.aggregationWindowSec, pythonRateHz, pythonMaxProcesses);
     // 云 VM 上硬件 cycles 计数器可能冻结（perf stat 读到 2^50 固定值），
     // perf 默认的 cycles 事件会采不到任何样本。默认改用软件事件 cpu-clock，
     // 可用 DROP_NATIVE_CP_PERF_EVENT 覆盖（Step 1 实测结论）。
@@ -796,16 +966,27 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
     if (const char *env = std::getenv("DROP_NATIVE_CP_PERF_EVENT"))
         if (*env)
             perfEvent = env;
+    // 阶段四：栈回溯模式 DROP_NATIVE_CP_CALL_GRAPH=fp|dwarf（默认 fp）。
+    const std::string unwindMode = unwind_mode_from_env();
     std::string recordOutput;
-    std::vector<std::string> recordArgs = perf_record_args(cfg, perf, perfEvent, dataPath);
-    if (recordArgs.empty())
+    // 阶段三：纯 python/db 请求（signals 为空）不启动 CPU perf record。
+    const bool cpuRequested = signal_enabled(cfg.signals, "cpu");
+    std::vector<std::string> recordArgs;
+    if (cpuRequested)
+        recordArgs = perf_record_args(cfg, perf, perfEvent, dataPath, unwindMode);
+    int rc = 0;
+    if (!recordArgs.empty())
+    {
+        rc = drop::exec_capture(recordArgs, &recordOutput, 4096);
+        window.endMs = now_ms();
+    }
+    else
     {
         window.endMs = now_ms();
-        pythonCapture.Finish();
-        return window;
+        // 阶段三：CPU 未请求不是失败——窗口仍承载 RSS/Memray sidecar。
+        window.backendStatus = "ok";
+        window.backendReason = "CPU not requested by Session signals";
     }
-    int rc = drop::exec_capture(recordArgs, &recordOutput, 4096);
-    window.endMs = now_ms();
     if (rc != 0)
     {
         std::cout << "[native-cp] perf record failed rc=" << rc << " output=" << recordOutput << std::endl;
@@ -828,41 +1009,56 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
         }
     }
     std::vector<drop::MemrayProfileResult> memrayResults;
-    const bool memrayEnabled = cfg.scope != "process" &&
+    // 阶段三：RSS/Memray 按 Session 请求信号决定（不选就不采、不存）。
+    const bool rssRequested = logical_signal_requested(cfg.requestedSignals, "python_rss");
+    const bool memrayRequested = logical_signal_requested(cfg.requestedSignals, "python_memory");
+    const bool memrayEnabled = memrayRequested &&
                                env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true);
     if (memrayEnabled)
         memrayResults = drop::collect_memray_profiles();
 
     drop::RuntimeCapabilitySet capabilities;
     capabilities.pythonFallback = pythonFallbackEnabled;
-    capabilities.pythonRss = cfg.scope != "process" &&
+    capabilities.pythonRss = rssRequested &&
                              env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true);
     capabilities.memray = memrayEnabled;
-    capabilities.goSymbols = true;
+    // 阶段四：逐语言能力开关（默认全开，可单独关闭单语言）。
+    capabilities.goReSym = env_enabled_default("DROP_CONTINUOUS_GORESYM", true);
+    capabilities.goSymbols = capabilities.goReSym;
+    capabilities.javaPerfMap = env_enabled_default("DROP_CONTINUOUS_JAVA_PERFMAP", true);
+    capabilities.nodePerfMap = env_enabled_default("DROP_CONTINUOUS_NODE_PERFMAP", true);
+    capabilities.pythonPerf = env_enabled_default("DROP_CONTINUOUS_PYTHON_PERF", true);
+    capabilities.unwindMode = unwindMode;
 
-    PerfSegment segment;
-    segment.path = dataPath;
-    segment.sourceBackend = "perf";
-    segment.collectorGeneration = cfg.collectorGeneration;
-    segment.targetFingerprint = cfg.targetFingerprint;
-    segment.wallStartMs = window.startMs;
-    segment.monotonicStartMs = monoAnchorMs;
-
-    ContinuousSegmentProcessor processor;
-    SegmentProcessResult processed = processor.Process(segment, cfg, capabilities,
-                                                       pythonResults, pythonLimitedCount, memrayResults);
-    // degraded 单窗段处理完即删（成功或最终失败都删除，无重试队列）。
-    ::remove(dataPath.c_str());
-    if (!processed.success)
+    // 阶段三：CPU 未请求时无 perf.data 段，跳过 processor（窗口只承载
+    // RSS/Memray sidecar）。
+    SegmentProcessResult processed;
+    if (cpuRequested)
     {
-        window.backendStatus = "failed";
-        window.backendReason = processed.failureReason;
-        std::cout << "[native-cp] degraded segment processing failed: "
-                  << processed.failureReason << std::endl;
-        return window;
+        PerfSegment segment;
+        segment.path = dataPath;
+        segment.sourceBackend = "perf";
+        segment.collectorGeneration = cfg.collectorGeneration;
+        segment.targetFingerprint = cfg.targetFingerprint;
+        segment.wallStartMs = window.startMs;
+        segment.monotonicStartMs = monoAnchorMs;
+
+        ContinuousSegmentProcessor processor;
+        processed = processor.Process(segment, cfg, capabilities,
+                                      pythonResults, pythonLimitedCount, memrayResults);
+        // degraded 单窗段处理完即删（成功或最终失败都删除，无重试队列）。
+        ::remove(dataPath.c_str());
+        if (!processed.success)
+        {
+            window.backendStatus = "failed";
+            window.backendReason = processed.failureReason;
+            std::cout << "[native-cp] degraded segment processing failed: "
+                      << processed.failureReason << std::endl;
+            return window;
+        }
+        window = std::move(processed.windows.front());
+        window.backendStatus = "ok";
     }
-    window = std::move(processed.windows.front());
-    window.backendStatus = "ok";
 
     // RSS：观测时间生成独立 metric（不伪装成 perf 段时间）。
     if (capabilities.pythonRss)
@@ -902,6 +1098,8 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
             sample.stack = raw.stack;
             sample.comm = result.comm;
             sample.pid = result.pid;
+            // 阶段三：Memray sample 携带完整进程身份。
+            sample.processStartMs = result.processStartMs;
             sample.exe = result.exe;
             sample.backend = "memray";
             sample.runtime = "python";
@@ -927,29 +1125,18 @@ static WindowPayload collect_window(const ContinuousSamplerConfig &cfg)
                               window.profiles.end());
     }
 
-    // 用上一批已发现候选调度下一窗 py-spy（物理级异步 sidecar，不阻塞解析）。
-    std::map<int, AggregatedSample> metadata;
-    for (const auto &sample : window.samples)
-        metadata.emplace(sample.pid, sample);
-    std::vector<drop::PythonCandidate> nextCandidates;
-    if (pythonFallbackEnabled)
+    // 阶段四：两级 Python 策略的候选调度（物理级异步 sidecar，不阻塞解析）。
+    //   1) perf-map 缺失 PID；
+    //   2) 有 perf 样本但 Python 语义覆盖 <70% 的 PID（解释器/native 帧占比过高）；
+    //   3) 首窗预检：process Session 对目标逐个探测（身份/-X perf/真实 map），
+    //      host Session 按 CPU ticks 增量排序只取最热实例。
+    if (pythonFallbackEnabled && cpuRequested)
     {
-        for (int pid : processed.diagnostics.runtimeReport.python.missingPids)
-        {
-            int64_t startMs = 0;
-            if (!drop::python_process_start_ms(pid, &startMs))
-                continue;
-            drop::PythonCandidate candidate;
-            candidate.pid = pid;
-            candidate.startMs = startMs;
-            candidate.samples = processed.diagnostics.runtimeReport.sampledPids[pid];
-            auto it = metadata.find(pid);
-            candidate.comm = it == metadata.end() ? "python" : it->second.comm;
-            candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
-            nextCandidates.push_back(std::move(candidate));
-        }
+        drop::schedule_python_fallback(
+            cfg.sessionSID,
+            build_python_candidates(cfg, processed.diagnostics.runtimeReport, window.samples,
+                                    processed.diagnostics.runtimeReport.python.detected));
     }
-    drop::schedule_python_fallback(python_fallback_scope_key(cfg), nextCandidates);
     return window;
 }
 
@@ -975,8 +1162,10 @@ static bool signal_enabled(const std::string &signals, const std::string &name)
 {
     std::string all = signals;
     std::transform(all.begin(), all.end(), all.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // 阶段三：空字符串 = 无物理信号（纯 python/db 请求），不启用任何信号。
+    // 旧调用方（未设置 signals）由 BuildSamplerConfig 回退四类默认。
     if (all.empty())
-        all = "cpu,io,sched";
+        return false;
     std::stringstream ss(all);
     std::string item;
     while (std::getline(ss, item, ','))
@@ -1359,6 +1548,8 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             signalTypes.insert("db_snapshot");
             backends["db_snapshot"] = "db_system_views";
         }
+        for (const auto &entry : window.signalStatuses)
+            signalTypes.insert(entry.first);
     }
 
     std::string body = "{";
@@ -1368,7 +1559,10 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
     // 阶段一：协议 v3。batch 层 sample_count 废弃写 0；分信号计数
     // signal_counts、collector_generation、batch_sequence、content_sha256
     // 是服务端幂等/冲突校验与统计的新事实来源。
-    body += "\"schema_version\":3,";
+    // 阶段三：协议 v4。窗口新增 signal_statuses（每 signal 采集状态）、
+    // physical/effective_sample_rate_hz、identity_unavailable_count；
+    // histogram 携带完整进程身份（pid/process_start_ms/exe/comm）。
+    body += "\"schema_version\":4,";
     body += "\"collector_generation\":\"" + json_escape(cfg.collectorGeneration) + "\",";
     body += "\"batch_sequence\":" + std::to_string(cfg.batchSequence) + ",";
     body += "\"content_sha256\":\"" + batch_content_digest(cfg, windows) + "\",";
@@ -1569,6 +1763,28 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
         }
         body += "],";
         body += "\"rss_truncated\":" + std::to_string(window.rssTruncated) + ",";
+        // 阶段三：身份不完整被丢弃的样本数（process Session 无法归属时记录）。
+        body += "\"identity_unavailable_count\":" + std::to_string(window.identityUnavailableCount) + ",";
+        // 阶段三：物理/生效采样率（v4）。低频 Session 降采样后 effective < physical。
+        body += "\"physical_sample_rate_hz\":" + std::to_string(window.physicalSampleRateHz) + ",";
+        body += "\"effective_sample_rate_hz\":" + std::to_string(window.effectiveSampleRateHz) + ",";
+        // 阶段三：每 signal 采集状态（collected/target_idle/no_events/
+        // unavailable/failed + reason + lost events）。零计数窗口也登记，
+        // 使 coverage 能区分 idle/no-events、backend unavailable 和真实 gap。
+        body += "\"signal_statuses\":{";
+        {
+            size_t statusIndex = 0;
+            for (const auto &entry : window.signalStatuses)
+            {
+                if (statusIndex++)
+                    body += ",";
+                body += "\"" + json_escape(entry.first) + "\":{\"status\":\"" +
+                        signal_status_name(entry.second.status) + "\",\"reason\":\"" +
+                        json_escape(entry.second.reason) + "\",\"lost_events\":" +
+                        std::to_string(entry.second.lostEvents) + "}";
+            }
+        }
+        body += "},";
         body += "\"metrics\":[";
         for (size_t mi = 0; mi < window.metrics.size(); ++mi)
         {
@@ -1598,6 +1814,11 @@ static std::string build_batch_json(const ContinuousSamplerConfig &cfg,
             body += "\"signal_type\":\"" + json_escape(hist.signalType) + "\",";
             body += "\"backend\":\"" + json_escape(hist.backend) + "\",";
             body += "\"pid\":" + std::to_string(hist.pid) + ",";
+            // 阶段三：histogram 完整进程身份（strict CO-RE 按 TGID 归属；
+            // degraded 无法安全归属时 pid=0 且 unavailable）。
+            body += "\"process_start_ms\":" + std::to_string(hist.processStartMs) + ",";
+            body += "\"exe\":\"" + json_escape(hist.exe) + "\",";
+            body += "\"comm\":\"" + json_escape(hist.comm) + "\",";
             body += "\"unit\":\"" + json_escape(hist.unit) + "\",";
             body += "\"event_count\":" + std::to_string(hist.eventCount) + ",";
             body += "\"unavailable\":" + std::string(hist.unavailable ? "true" : "false") + ",";
@@ -1954,10 +2175,16 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
 {
     WindowPayload window;
     window.startMs = now_ms();
+    window.physicalSampleRateHz = cfg.sampleRateHz;
+    window.effectiveSampleRateHz = cfg.sampleRateHz;
     int64_t captureEndMs = window.startMs + static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1000;
     // 回收上一轮超预算被搁置的 io/sched future（它们已完成后台任务则清理）
     reap_abandoned_hist_futures();
-    std::string signals = cfg.signals.empty() ? env_string_local("DROP_NATIVE_CP_SIGNALS", "cpu,io,io_syscall,sched") : cfg.signals;
+    // 阶段三：signals 为空字符串 = 该 Session 未请求任何 CPU/IO/sched 物理信号
+    //（纯 python_rss/python_memory/db_snapshot），不启动 CPU 采集。旧路径
+    //（signals 未设置时）由 BuildSamplerConfig 回退四类默认，这里不再兜底
+    // env 默认，避免纯 python 请求错误启动 CPU。
+    std::string signals = cfg.signals;
     bool ebpfEnabled = env_enabled_local("DROP_NATIVE_CP_EBPF_ENABLED");
     std::vector<std::string> &attempted = window.attemptedBackends;
 
@@ -2089,8 +2316,18 @@ static WindowPayload collect_dual_track_window(const ContinuousSamplerConfig &cf
     }
     else if (window.backendStatus.empty())
     {
-        window.backendStatus = "failed";
-        window.backendReason = "CPU backend not enabled";
+        // 阶段三：CPU 未请求（纯 python/db 信号）不是失败——窗口仍承载
+        // RSS/Memray/db sidecar 数据，状态由 fan-out 按信号登记。
+        if (signal_enabled(signals, "cpu"))
+        {
+            window.backendStatus = "failed";
+            window.backendReason = "CPU backend not enabled";
+        }
+        else
+        {
+            window.backendStatus = "ok";
+            window.backendReason = "CPU not requested by any Session signal";
+        }
     }
 
     // IO/sched 结果；各自带预算等待，超预算不阻塞 CPU 窗口（标记 unavailable）。
@@ -2168,8 +2405,11 @@ bool RollingPerfRecorder::Start(const ContinuousSamplerConfig &cfg, std::string 
     else
         args.push_back("-a");
     args.insert(args.end(), {"-e", env_string_local("DROP_NATIVE_CP_PERF_EVENT", "cpu-clock"),
-                             "-F", std::to_string(cfg.sampleRateHz), "-g", "-T",
-                             "--timestamp-boundary", "--switch-output=2s", "--timestamp-filename",
+                             "-F", std::to_string(cfg.sampleRateHz), "-T"});
+    // 阶段四：FP（默认）或 DWARF（--call-graph dwarf,8192）统一入口。
+    for (auto &arg : call_graph_args(unwind_mode_from_env()))
+        args.push_back(std::move(arg));
+    args.insert(args.end(), {"--timestamp-boundary", "--switch-output=2s", "--timestamp-filename",
                              "-o", directory + "/perf.data", "--", "sleep", "86400"});
     pid = ::fork();
     if (pid < 0)
@@ -2298,19 +2538,38 @@ static void append_core_histograms(WindowPayload *window,
 {
     std::set<uint32_t> pids;
     for (const auto &sample : samples) pids.insert(sample.tgid);
-    if (cfg.scope != "process" && pids.empty()) pids.insert(0);
+    // host 查询可以在服务端聚合逐 TGID 直方图；同时生成 pid=0 整机副本会让
+    // 无过滤查询把同一事件计算两次。只有确实没有事件时才保留 pid=0 状态项。
+    if (cfg.scope != "process" && pids.empty())
+        pids.insert(0);
     for (uint32_t pid : pids)
         for (uint32_t signal = 1; signal <= 3; ++signal)
         {
             HistogramPayload hist;
             hist.pid = static_cast<int>(pid);
+            // 阶段三：histogram 完整进程身份（strict CO-RE 按 TGID 归属）。
+            // 从物理配置的 targetProcesses 补齐 start/exe/comm；host scope
+            // 的 pid=0 直方图（整机）身份留空。
+            if (pid > 0)
+            {
+                hist.processStartMs = configured_process_start_ms(cfg, static_cast<int>(pid));
+                hist.exe = configured_process_exe(cfg, static_cast<int>(pid));
+                for (const auto &target : cfg.targetProcesses)
+                    if (target.pid == static_cast<int>(pid))
+                    {
+                        hist.comm = target.comm;
+                        break;
+                    }
+            }
             hist.signalType = signal == 1 ? "io_latency" : signal == 2 ? "io_syscall_latency" : "sched_latency";
             hist.backend = "libbpf-co-re";
             hist.unit = "us";
             std::map<uint32_t, HistogramBucket> buckets;
             for (const auto &sample : samples)
             {
-                if (sample.signal != signal || sample.tgid != pid) continue;
+                // pid=0 聚合所有 TGID 的样本；否则只取本 TGID。
+                if (sample.signal != signal) continue;
+                if (pid > 0 && sample.tgid != pid) continue;
                 auto &bucket = buckets[sample.slot];
                 if (bucket.range.empty())
                 {
@@ -2503,6 +2762,17 @@ static void run_continuous_spool_loop(std::atomic<bool> &running,
         }
 
         WindowPayload window = collector(cfg);
+        // 非共享采样器（尤其 DBSnapshotSampler）同样写 v4，必须经过统一投影器
+        // 生成 signal_statuses；否则 API 会收到“有数据但无状态”的非法 v4。
+        SessionContract contract;
+        contract.sid = cfg.sessionSID;
+        contract.scope = cfg.scope;
+        contract.targets = cfg.targetProcesses;
+        contract.signals = cfg.requestedSignals;
+        contract.requestedSampleRateHz = cfg.sampleRateHz;
+        contract.aggregationWindowSec = cfg.aggregationWindowSec;
+        contract.allowDegraded = cfg.allowDegraded;
+        window = SessionFanoutProjector().Project(window, contract, cfg.sampleRateHz, true);
         // 阶段一：补齐稳定 window_id / 内容摘要。
         if (window.windowID.empty())
             window.windowID = make_window_id(cfg, window);
@@ -2562,7 +2832,6 @@ static void run_continuous_spool_loop(std::atomic<bool> &running,
 void PerfEventSampler::Loop()
 {
     run_continuous_spool_loop(running_, config_, collect_window);
-    drop::clear_python_fallback_schedule(python_fallback_scope_key(config_));
 }
 
 DualTrackContinuousSampler::~DualTrackContinuousSampler()
@@ -2623,7 +2892,6 @@ bool DualTrackContinuousSampler::Running() const
 void DualTrackContinuousSampler::Loop()
 {
     run_continuous_spool_loop(running_, config_, collect_dual_track_window);
-    drop::clear_python_fallback_schedule(python_fallback_scope_key(config_));
 }
 
 // ---------- DBSnapshotSampler：阶段一（标量健康指标） ----------
@@ -2679,35 +2947,6 @@ static bool write_mysql_defaults_file(const std::string &path, const std::string
     return ok;
 }
 
-// 生成安全的临时 mysql defaults 文件并写入内容。之前是拼
-// "/tmp/mini_drop_db_" + instanceLabel + "_" + 毫秒时间戳，有两个隐患：
-// (1) instanceLabel 直接拼进文件路径，没做路径穿越校验；(2) 同一毫秒内两
-// 个线程轮询同一 instanceLabel 可能撞名互相覆盖。mkstemp 是 POSIX 标准的
-// "安全创建临时文件"方案，文件名由内核保证唯一、原子创建（O_CREAT|O_EXCL
-// 语义），不依赖任何外部输入拼路径。
-// user/password 若含换行符，理论上能在 [client] 这段 ini 文本里注入额外
-// 配置指令——比设计转义规则更简单可靠的做法是直接拒绝这类输入，正常账号
-// 密码不该含换行。
-static bool stage_mysql_defaults_file(const DBTargetConfig &target, const std::string &password,
-                                      std::string *outPath)
-{
-    if (target.user.find('\n') != std::string::npos || target.user.find('\r') != std::string::npos ||
-        password.find('\n') != std::string::npos || password.find('\r') != std::string::npos)
-        return false;
-    char pathTemplate[] = "/tmp/mini_drop_db_XXXXXX";
-    int fd = ::mkstemp(pathTemplate);
-    if (fd < 0)
-        return false;
-    ::close(fd);
-    if (!write_mysql_defaults_file(pathTemplate, target.user, password))
-    {
-        ::unlink(pathTemplate);
-        return false;
-    }
-    *outPath = pathTemplate;
-    return true;
-}
-
 // 单个 MySQL 目标的一次标量指标轮询：SHOW GLOBAL STATUS 一次性拿全量
 // 计数器，本地过滤出关心的几项，换算成 MetricPayload。查询超时/失败只
 // 标记 unavailable，不能拖垮整个采集循环（沿用 HistogramPayload 已有的
@@ -2722,8 +2961,8 @@ static void collect_mysql_target_metrics(const ContinuousSamplerConfig &cfg, con
                   << " failed to read password_ref=" << target.passwordRef << std::endl;
         return;
     }
-    std::string defaultsPath;
-    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
+    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
+    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
     {
         std::cout << "[native-cp] db target=" << target.instanceLabel << " failed to stage mysql defaults file"
                   << std::endl;
@@ -2798,49 +3037,9 @@ struct DigestCounterState
     uint64_t countStar = 0;
     uint64_t sumTimerWaitPs = 0;
     uint64_t sumRowsExamined = 0;
-    int64_t lastSeenMs = 0; // 上一次刷新这条状态的时间，驱动过期判定和清理
 };
 static std::mutex g_digestStateMutex;
 static std::unordered_map<std::string, DigestCounterState> g_digestState;
-
-// _locked 后缀 = 调用方必须已经持有 g_digestStateMutex，不再自己加锁（避免
-// 和 collect_mysql_target_digests 里已经持有的 lock_guard 重复加锁死锁）。
-
-static void clear_digest_state_for_session_locked(const std::string &sessionSID)
-{
-    if (sessionSID.empty())
-        return;
-    const std::string prefix = sessionSID + "|";
-    for (auto it = g_digestState.begin(); it != g_digestState.end();)
-    {
-        if (it->first.compare(0, prefix.size(), prefix) == 0)
-            it = g_digestState.erase(it);
-        else
-            ++it;
-    }
-}
-
-// Session 停止时按 sessionSID 前缀精确清理（确定性路径），供 DBSnapshotSampler::Stop() 调用。
-static void clear_digest_state_for_session(const std::string &sessionSID)
-{
-    std::lock_guard<std::mutex> lock(g_digestStateMutex);
-    clear_digest_state_for_session_locked(sessionSID);
-}
-
-// 兜底清理：Session 没有走正常 Stop 路径（比如进程被杀）时，上面那个精确
-// 清理捡不到残留状态。每次采集顺手扫一遍，删掉太久没刷新的条目（阈值给得
-// 比"跌出 TOP 50 又重新进来"要宽松得多，只为回收内存，不影响
-// compute_digest_delta 的过期判定——那个判定用的是更短的窗口级阈值）。
-static void sweep_stale_digest_state_locked(int64_t nowMs, int64_t staleAfterMs)
-{
-    for (auto it = g_digestState.begin(); it != g_digestState.end();)
-    {
-        if (nowMs - it->second.lastSeenMs > staleAfterMs)
-            it = g_digestState.erase(it);
-        else
-            ++it;
-    }
-}
 
 // ---- digest 增量状态的纯逻辑（与 mysql 命令行解耦，便于单测） ----
 
@@ -2909,20 +3108,10 @@ struct DigestDeltaResult
 // 纯函数：由上一轮状态与当前计数计算窗口增量。prev 为空指针表示首轮
 // （FirstSeen，只建立基线）。任一累计计数器回退都视为新基线（Reset），
 // 避免无符号整数下溢把 (cur - prev) 变成一个天文数字。
-//
-// maxGapMs 处理另一类问题：digest 查询只取 ORDER BY SUM_TIMER_WAIT DESC
-// LIMIT 50，某个 digest 可能这一轮排进前 50、下一轮被挤出去、再下一轮又
-// 冲回来——如果只按"数值有没有回退"判断，回来的时候会把它缺席期间累积的
-// 全部调用当成这一个窗口的增量，产生虚假尖峰。这里借鉴 Prometheus 处理累
-// 计计数器（rate()/increase()）的思路：不是无脑做减法，而是先看采样点之
-// 间的间隔是否正常连续，间隔太大就当成需要重新计基线，不当增量上报。
-static DigestDeltaResult compute_digest_delta(const DigestCounterState *prev, const DigestCounterState &cur,
-                                              int64_t nowMs, int64_t maxGapMs)
+static DigestDeltaResult compute_digest_delta(const DigestCounterState *prev, const DigestCounterState &cur)
 {
     if (prev == nullptr)
         return DigestDeltaResult{};
-    if (prev->lastSeenMs > 0 && nowMs - prev->lastSeenMs > maxGapMs)
-        return DigestDeltaResult{DigestDeltaKind::Reset, 0, 0, 0};
     if (cur.countStar < prev->countStar || cur.sumTimerWaitPs < prev->sumTimerWaitPs ||
         cur.sumRowsExamined < prev->sumRowsExamined)
         return DigestDeltaResult{DigestDeltaKind::Reset, 0, 0, 0};
@@ -2953,8 +3142,8 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
     std::string password;
     if (!read_db_target_password(target, &password))
         return;
-    std::string defaultsPath;
-    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
+    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
+    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
         return;
     const std::string query =
         "SELECT SCHEMA_NAME, DIGEST, "
@@ -2996,18 +3185,15 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
         {
             // 第一次见到这个 digest：只记基线，不上报（否则会把"自服务器启动
             // 以来的全部历史调用"当成本窗口发生的调用，数字会失真）。
-            g_digestState[stateKey] = {row.countStar, row.sumTimerWaitPs, row.sumRowsExamined, nowMillis};
+            g_digestState[stateKey] = {row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
             continue;
         }
         DigestCounterState prev = it->second;
-        const DigestCounterState cur{row.countStar, row.sumTimerWaitPs, row.sumRowsExamined, nowMillis};
+        const DigestCounterState cur{row.countStar, row.sumTimerWaitPs, row.sumRowsExamined};
         it->second = cur;
-        // 1.5x 窗口时长：正常相邻两轮之间的间隔应该约等于 aggregationWindowSec，
-        // 给 50% 冗余容忍单次调度抖动，超过这个还判定为"缺席过久，重新计基线"。
-        const int64_t maxGapMs = static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 1500;
-        DigestDeltaResult delta = compute_digest_delta(&prev, cur, nowMillis, maxGapMs);
+        DigestDeltaResult delta = compute_digest_delta(&prev, cur);
         if (delta.kind != DigestDeltaKind::Increment)
-            continue; // 首轮基线、计数器回退（TRUNCATE/重启）或缺席过久：本轮不上报
+            continue; // 首轮基线或任一计数器回退（TRUNCATE/重启）：本轮不上报
         if (delta.deltaCalls == 0)
             continue; // 零增量：不上报，但状态已更新为当前累计值
 
@@ -3022,12 +3208,6 @@ static void collect_mysql_target_digests(const ContinuousSamplerConfig &cfg, con
         sample.rowsExaminedTotal = delta.deltaRows;
         window->dbSnapshots.push_back(std::move(sample));
     }
-
-    // 兜底清理：非正常停止路径下（进程被杀等）不会经过 Stop() 里的确定性
-    // 清理，这里顺手扫一遍过期条目回收内存。阈值给得很宽松（20 倍窗口时
-    // 长），不会跟上面 1.5 倍窗口时长的过期判定冲突——那个是"这一条要不要
-    // 当增量上报"，这个纯粹是"要不要把这条状态从内存里删掉"。
-    sweep_stale_digest_state_locked(nowMillis, static_cast<int64_t>(std::max(1, cfg.aggregationWindowSec)) * 20000);
 }
 
 // 锁等待链：直接查 MySQL 内置的 sys.innodb_lock_waits 视图（5.7.7+ 默认启
@@ -3041,8 +3221,8 @@ static void collect_mysql_target_lock_waits(const ContinuousSamplerConfig &cfg, 
     std::string password;
     if (!read_db_target_password(target, &password))
         return;
-    std::string defaultsPath;
-    if (!stage_mysql_defaults_file(target, password, &defaultsPath))
+    std::string defaultsPath = "/tmp/mini_drop_db_" + target.instanceLabel + "_" + std::to_string(now_ms()) + ".cnf";
+    if (!write_mysql_defaults_file(defaultsPath, target.user, password))
         return;
     const std::string query =
         "SELECT waiting_pid, "
@@ -3192,8 +3372,6 @@ void DBSnapshotSampler::Stop()
     running_ = false;
     if (worker_.joinable())
         worker_.join();
-    // 确定性清理这个 Session 名下的 digest 增量状态，不用等兜底的过期扫描。
-    clear_digest_state_for_session(config_.sessionSID);
 }
 
 bool DBSnapshotSampler::Running() const
@@ -3218,6 +3396,62 @@ struct SharedSessionAccumulator
     // 阶段一：该 Session 在本次 collector generation 内单调递增的批次序号。
     uint64_t batchSequence = 0;
 };
+
+// A Memray .ready file is a physical capture shared by every Session that
+// requested python_memory.  Keep it claimed until every projected copy has
+// reached that Session's durable spool; acknowledging it for the first
+// Session would make a crash lose the remaining deliveries.
+std::mutex g_sharedProfileMutex;
+std::map<std::string, std::set<std::string>> g_sharedProfileDeliveries;
+
+static void register_shared_profile_deliveries(const WindowPayload &window,
+                                               const std::string &sessionSID)
+{
+    std::lock_guard<std::mutex> lock(g_sharedProfileMutex);
+    for (const auto &profile : window.profiles)
+        if (!profile.readyPath.empty())
+            g_sharedProfileDeliveries[profile.readyPath].insert(sessionSID);
+}
+
+static void acknowledge_shared_profile_deliveries(const std::vector<WindowPayload> &windows,
+                                                   const std::string &sessionSID)
+{
+    std::set<std::string> ready;
+    {
+        std::lock_guard<std::mutex> lock(g_sharedProfileMutex);
+        for (const auto &window : windows)
+            for (const auto &profile : window.profiles)
+            {
+                if (profile.readyPath.empty())
+                    continue;
+                auto delivery = g_sharedProfileDeliveries.find(profile.readyPath);
+                if (delivery == g_sharedProfileDeliveries.end())
+                    continue;
+                delivery->second.erase(sessionSID);
+                if (delivery->second.empty())
+                {
+                    ready.insert(delivery->first);
+                    g_sharedProfileDeliveries.erase(delivery);
+                }
+            }
+    }
+    for (const auto &path : ready)
+        if (!drop::acknowledge_memray_profile(path))
+            std::cout << "[native-cp] failed to mark shared Memray profile done: " << path << std::endl;
+}
+
+static void release_shared_profile_deliveries()
+{
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_sharedProfileMutex);
+        for (const auto &delivery : g_sharedProfileDeliveries)
+            pending.push_back(delivery.first);
+        g_sharedProfileDeliveries.clear();
+    }
+    for (const auto &path : pending)
+        drop::release_memray_profile(path);
+}
 
 static ContinuousSamplerConfig shared_physical_config(const std::vector<ContinuousSamplerConfig> &sessions)
 {
@@ -3252,6 +3486,7 @@ static ContinuousSamplerConfig shared_physical_config(const std::vector<Continuo
         for (const auto &signal : session.requestedSignals)
             if (std::find(unionRequested.begin(), unionRequested.end(), signal) == unionRequested.end())
                 unionRequested.push_back(signal);
+    physical.requestedSignals = unionRequested;
     physical.signals = physical_signals_from_requested(unionRequested);
     // 阶段一：共享采集器实例拥有独立 collector generation（新实例 = 新 generation）。
     physical.collectorGeneration = collector_generation_id();
@@ -3268,98 +3503,31 @@ static HistogramPayload unavailable_shared_histogram(const std::string &signalTy
     return histogram;
 }
 
+// 阶段三：把 ContinuousSamplerConfig 转成 SessionContract（纯逻辑投影合同）。
+static drop::SessionContract session_contract_from_config(const ContinuousSamplerConfig &session)
+{
+    drop::SessionContract contract;
+    contract.sid = session.sessionSID;
+    contract.scope = session.scope;
+    contract.targets = session.targetProcesses;
+    contract.signals = session.requestedSignals;
+    contract.requestedSampleRateHz = session.sampleRateHz;
+    contract.aggregationWindowSec = session.aggregationWindowSec;
+    contract.allowDegraded = session.allowDegraded;
+    return contract;
+}
+
+// 阶段三：统一 Session 分流入口。所有共享采集循环（strict/degraded）都通过
+// SessionFanoutProjector 投影物理窗口，不再分别手写过滤规则。
 static WindowPayload filter_shared_window(const WindowPayload &source,
                                           const ContinuousSamplerConfig &session,
                                           bool histogramAttributionSafe)
 {
-    // 阶段一：逻辑层严格按该 Session 请求的信号分流（对 host/process 两种
-    // scope 都生效）：未请求的信号从窗口 payload 中剔除，后续 build_batch_json
-    // 按剔除后的内容重算分信号计数。
-    const bool cpuRequested = logical_signal_requested(session.requestedSignals, "cpu_profile");
-    const bool ioRequested = logical_signal_requested(session.requestedSignals, "io_latency");
-    const bool ioSyscallRequested = logical_signal_requested(session.requestedSignals, "io_syscall_latency");
-    const bool schedRequested = logical_signal_requested(session.requestedSignals, "sched_latency");
-    const bool rssRequested = logical_signal_requested(session.requestedSignals, "python_rss");
-    const bool dbRequested = logical_signal_requested(session.requestedSignals, "db_snapshot");
-
-    WindowPayload out = source;
-    if (!cpuRequested)
-    {
-        out.samples.clear();
-        out.profiles.clear();
-    }
-    else if (session.scope == "process")
-    {
-        out.samples.erase(std::remove_if(out.samples.begin(), out.samples.end(), [&](const auto &sample) {
-                              return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
-                          }),
-                          out.samples.end());
-        for (auto &profile : out.profiles)
-        {
-            profile.readyPath.clear();
-            profile.samples.erase(std::remove_if(profile.samples.begin(), profile.samples.end(), [&](const auto &sample) {
-                                      return !process_targeted(session, sample.pid, sample.processStartMs, sample.exe);
-                                  }),
-                                  profile.samples.end());
-        }
-        out.profiles.erase(std::remove_if(out.profiles.begin(), out.profiles.end(), [](const auto &profile) {
-                               return profile.samples.empty();
-                           }),
-                           out.profiles.end());
-    }
-    if (!rssRequested)
-        out.metrics.clear();
-    else if (session.scope == "process")
-    {
-        out.metrics.erase(std::remove_if(out.metrics.begin(), out.metrics.end(), [&](const auto &metric) {
-                              return !process_targeted(session, metric.pid, metric.processStartMs, metric.exe);
-                          }),
-                          out.metrics.end());
-    }
-    if (!dbRequested)
-        out.dbSnapshots.clear();
-    if (session.scope == "process")
-    {
-        out.histograms.erase(std::remove_if(out.histograms.begin(), out.histograms.end(), [&](const auto &histogram) {
-                                  return histogram.pid > 0 && !process_targeted(session, histogram.pid, 0, "");
-                              }),
-                             out.histograms.end());
-        // 阶段二：process Session 不再简单执行 symbolRefsJson.clear()。按
-        // PID + process_start_ms + exe 过滤后，用结构化物理诊断重建只含本
-        // Session 目标的 symbol_refs（重算 symbol_status / frame 权重 /
-        // build-id / runtime PID），杜绝看到其他 selector 的 PID、路径或诊断。
-        // kallsyms SHA、collector generation 等整机级信息允许复用。
-        if (source.physicalDiagnostics)
-            out.symbolRefsJson = drop::rebuild_filtered_symbol_refs(
-                source.symbolRefsJson, *source.physicalDiagnostics, out.samples, session);
-        else if (!out.symbolRefsJson.empty())
-            out.symbolRefsJson.clear();
-    }
-    // 信号级过滤：直方图按请求的信号类型剔除（host/process 均生效）。
-    out.histograms.erase(std::remove_if(out.histograms.begin(), out.histograms.end(), [&](const auto &histogram) {
-                             const std::string &signal = histogram.signalType;
-                             if (signal == "io_latency")
-                                 return !ioRequested;
-                             if (signal == "io_syscall_latency")
-                                 return !ioSyscallRequested;
-                             if (signal == "sched_latency")
-                                 return !schedRequested;
-                             return true; // 未知直方图信号类型一律剔除
-                         }),
-                         out.histograms.end());
-    if (!histogramAttributionSafe)
-    {
-        // 多进程选择器 + 滚动 bpftrace fallback：直方图无法安全归属到单个
-        // selector，仅对请求了该信号的 Session 打 unavailable 标记。
-        out.histograms.clear();
-        if (ioRequested)
-            out.histograms.push_back(unavailable_shared_histogram("io_latency"));
-        if (ioSyscallRequested)
-            out.histograms.push_back(unavailable_shared_histogram("io_syscall_latency"));
-        if (schedRequested)
-            out.histograms.push_back(unavailable_shared_histogram("sched_latency"));
-    }
-    return out;
+    static const drop::SessionFanoutProjector projector;
+    return projector.Project(source, session_contract_from_config(session),
+                             source.physicalSampleRateHz > 0 ? source.physicalSampleRateHz
+                                                             : session.sampleRateHz,
+                             histogramAttributionSafe);
 }
 
 static HistogramPayload merge_histograms(const std::vector<HistogramPayload> &parts,
@@ -3377,6 +3545,15 @@ static HistogramPayload merge_histograms(const std::vector<HistogramPayload> &pa
             sawAvailable = true;
         else if (merged.reason.empty())
             merged.reason = part.reason;
+        // 阶段三：合并时保留完整进程身份（pid/start/exe/comm）。同一
+        // (signal, pid) 的 slice 合并；pid=0 的整机直方图身份留空。
+        if (part.pid > 0 && merged.pid == 0)
+        {
+            merged.pid = part.pid;
+            merged.processStartMs = part.processStartMs;
+            merged.exe = part.exe;
+            merged.comm = part.comm;
+        }
         for (const auto &bucket : part.buckets)
         {
             std::string key = bucket.range + "|" + std::to_string(bucket.low) + "|" + std::to_string(bucket.high);
@@ -3397,6 +3574,100 @@ static HistogramPayload merge_histograms(const std::vector<HistogramPayload> &pa
     return merged;
 }
 
+static std::shared_ptr<const PhysicalDiagnostics> merge_physical_diagnostics(
+    const std::vector<WindowPayload> &slices)
+{
+    auto merged = std::make_shared<PhysicalDiagnostics>();
+    bool found = false;
+    bool sliceUnwindAssigned = false;
+    std::set<std::string> buildIDs;
+    std::set<std::string> buildEntries;
+    std::map<std::string, drop::PythonFallbackResult> python;
+    std::map<std::string, drop::MemrayProfileResult> memray;
+
+    auto mergePids = [](std::vector<int> *target, const std::vector<int> &source) {
+        for (int pid : source)
+            if (std::find(target->begin(), target->end(), pid) == target->end())
+                target->push_back(pid);
+    };
+    auto mergeRuntimeInfo = [&](drop::RuntimeMapInfo *target, const drop::RuntimeMapInfo &source) {
+        target->detected = target->detected || source.detected;
+        mergePids(&target->readyPids, source.readyPids);
+        mergePids(&target->missingPids, source.missingPids);
+        target->ready = target->detected && !target->readyPids.empty() && target->missingPids.empty();
+        if (!source.reason.empty()) target->reason = source.reason;
+        if (!source.requiredFlag.empty()) target->requiredFlag = source.requiredFlag;
+    };
+    auto mergeGoItems = [](std::vector<drop::GoSymbolItem> *target,
+                           const std::vector<drop::GoSymbolItem> &source) {
+        for (const auto &item : source)
+        {
+            const auto same = [&](const auto &existing) {
+                return existing.buildId == item.buildId && existing.dsoPath == item.dsoPath;
+            };
+            if (std::none_of(target->begin(), target->end(), same))
+                target->push_back(item);
+        }
+    };
+
+    for (const auto &slice : slices)
+    {
+        if (!slice.physicalDiagnostics)
+            continue;
+        found = true;
+        const auto &source = *slice.physicalDiagnostics;
+        for (const auto &id : source.buildIds)
+            if (buildIDs.insert(id).second) merged->buildIds.push_back(id);
+        for (const auto &entry : source.buildIdEntries)
+        {
+            const std::string key = entry.buildId + "|" + entry.dsoPath;
+            if (buildEntries.insert(key).second) merged->buildIdEntries.push_back(entry);
+        }
+        if (!source.kallsymsSha256.empty()) merged->kallsymsSha256 = source.kallsymsSha256;
+        // 阶段四：栈回溯模式与 build-id 预热报告必须随合并保留，否则
+        // persist_shared_aggregate 重建 symbol_refs 时会退化成默认值。
+        // 注意 unwindMode 字段默认值为 "fp"（非空），不能用 empty() 判断。
+        if (!sliceUnwindAssigned && !source.unwindMode.empty())
+        {
+            merged->unwindMode = source.unwindMode;
+            sliceUnwindAssigned = true;
+        }
+        std::map<std::string, bool> warmSeen;
+        for (const auto &warm : merged->buildIdWarmReport)
+            warmSeen[warm.buildId + "|" + warm.dsoPath] = true;
+        for (const auto &warm : source.buildIdWarmReport)
+            if (!warmSeen[warm.buildId + "|" + warm.dsoPath])
+                merged->buildIdWarmReport.push_back(warm);
+        mergeRuntimeInfo(&merged->runtimeReport.java, source.runtimeReport.java);
+        mergeRuntimeInfo(&merged->runtimeReport.node, source.runtimeReport.node);
+        mergeRuntimeInfo(&merged->runtimeReport.python, source.runtimeReport.python);
+        merged->runtimeReport.skippedRefresh += source.runtimeReport.skippedRefresh;
+        for (const auto &entry : source.runtimeReport.sampledPids)
+            merged->runtimeReport.sampledPids[entry.first] += entry.second;
+        mergeGoItems(&merged->goReport.ready, source.goReport.ready);
+        mergeGoItems(&merged->goReport.pending, source.goReport.pending);
+        mergeGoItems(&merged->goReport.failed, source.goReport.failed);
+        if (!source.goReport.disabled.empty())
+            merged->goReport.disabled = source.goReport.disabled;
+        for (const auto &item : source.pythonFallback)
+            python[std::to_string(item.pid) + "|" + std::to_string(item.startMs) + "|" + item.exe] = item;
+        for (const auto &item : source.memrayResults)
+            memray[item.profileID + "|" + std::to_string(item.pid) + "|" +
+                   std::to_string(item.processStartMs) + "|" + item.exe] = item;
+        merged->pythonFallbackLimitedCount += source.pythonFallbackLimitedCount;
+        merged->runtimeEnrichmentDisabled = merged->runtimeEnrichmentDisabled || source.runtimeEnrichmentDisabled;
+        if (!source.enrichmentDisabledReason.empty())
+            merged->enrichmentDisabledReason = source.enrichmentDisabledReason;
+        merged->enrichmentApplied = merged->enrichmentApplied && source.enrichmentApplied;
+    }
+    if (!found)
+        return {};
+    merged->runtimeReport.status = drop::runtime_aggregate_status(merged->runtimeReport);
+    for (auto &entry : python) merged->pythonFallback.push_back(std::move(entry.second));
+    for (auto &entry : memray) merged->memrayResults.push_back(std::move(entry.second));
+    return merged;
+}
+
 static WindowPayload merge_shared_slices(const std::vector<WindowPayload> &slices)
 {
     WindowPayload merged;
@@ -3404,7 +3675,8 @@ static WindowPayload merge_shared_slices(const std::vector<WindowPayload> &slice
         return merged;
     merged.startMs = slices.front().startMs;
     merged.endMs = slices.front().endMs;
-    std::map<std::string, std::vector<HistogramPayload>> histograms;
+    using HistogramIdentity = std::tuple<std::string, int, int64_t, std::string>;
+    std::map<HistogramIdentity, std::vector<HistogramPayload>> histograms;
     std::set<std::string> attempted;
     bool anyFailed = false;
     bool anyDegraded = false;
@@ -3415,9 +3687,47 @@ static WindowPayload merge_shared_slices(const std::vector<WindowPayload> &slice
         merged.samples.insert(merged.samples.end(), slice.samples.begin(), slice.samples.end());
         merged.profiles.insert(merged.profiles.end(), slice.profiles.begin(), slice.profiles.end());
         merged.metrics.insert(merged.metrics.end(), slice.metrics.begin(), slice.metrics.end());
+        merged.dbSnapshots.insert(merged.dbSnapshots.end(), slice.dbSnapshots.begin(), slice.dbSnapshots.end());
         merged.rssTruncated += slice.rssTruncated;
+        merged.identityUnavailableCount = add_count(merged.identityUnavailableCount, slice.identityUnavailableCount);
+        if (!slice.collectorGeneration.empty())
+            merged.collectorGeneration = slice.collectorGeneration;
+        if (slice.physicalSampleRateHz > 0)
+            merged.physicalSampleRateHz = slice.physicalSampleRateHz;
+        if (slice.effectiveSampleRateHz > 0)
+            merged.effectiveSampleRateHz = slice.effectiveSampleRateHz;
+        // 阶段三：每 signal 状态合并——任一 slice 有数据则 collected；否则
+        // 取最严重状态（failed > unavailable > no_events > target_idle）。
+        for (const auto &entry : slice.signalStatuses)
+        {
+            auto &target = merged.signalStatuses[entry.first];
+            const uint64_t mergedLost = add_count(target.lostEvents, entry.second.lostEvents);
+            const auto severity = [](SignalCollectionStatus status) {
+                switch (status)
+                {
+                case SignalCollectionStatus::Failed: return 4;
+                case SignalCollectionStatus::Unavailable: return 3;
+                case SignalCollectionStatus::NoEvents: return 2;
+                case SignalCollectionStatus::TargetIdle: return 1;
+                default: return 0;
+                }
+            };
+            if (target.status == SignalCollectionStatus::Collected)
+            {
+                target.lostEvents = mergedLost;
+                continue;
+            }
+            if (entry.second.status == SignalCollectionStatus::Collected ||
+                severity(entry.second.status) > severity(target.status))
+            {
+                target = entry.second;
+            }
+            target.lostEvents = mergedLost;
+        }
+        // 完整身份参与分组，防止 PID 复用跨 slice 合并。
         for (const auto &histogram : slice.histograms)
-            histograms[histogram.signalType].push_back(histogram);
+            histograms[{histogram.signalType, histogram.pid, histogram.processStartMs,
+                        histogram.exe}].push_back(histogram);
         attempted.insert(slice.attemptedBackends.begin(), slice.attemptedBackends.end());
         if (!slice.selectedBackend.empty())
             merged.selectedBackend = slice.selectedBackend;
@@ -3431,7 +3741,8 @@ static WindowPayload merge_shared_slices(const std::vector<WindowPayload> &slice
             merged.backendReason = slice.backendReason;
     }
     for (const auto &entry : histograms)
-        merged.histograms.push_back(merge_histograms(entry.second, entry.first));
+        merged.histograms.push_back(merge_histograms(entry.second, std::get<0>(entry.first)));
+    merged.physicalDiagnostics = merge_physical_diagnostics(slices);
     merged.attemptedBackends.assign(attempted.begin(), attempted.end());
     merged.backendStatus = anyFailed ? (slices.size() == 1 ? "failed" : "degraded") : (anyDegraded ? "degraded" : "ok");
     return merged;
@@ -3465,34 +3776,46 @@ static bool persist_shared_aggregate(SharedSessionAccumulator *session)
 {
     if (!session)
         return false;
+    // 阶段三：不再删除"无 payload"的窗口——零计数窗口携带每 signal 状态
+    // （target_idle/no_events/unavailable），是 coverage 区分目标空闲与真实
+    // 采集缺口的事实来源。只丢弃时间无效的窗口。
     session->slices.erase(std::remove_if(session->slices.begin(), session->slices.end(), [](const auto &slice) {
-        const bool hasPayload = !slice.samples.empty() || !slice.profiles.empty() ||
-                                !slice.metrics.empty() || !slice.histograms.empty();
-        return slice.endMs <= slice.startMs || !hasPayload;
+        return slice.endMs <= slice.startMs;
     }), session->slices.end());
     if (!session || session->slices.empty())
         return true;
     std::vector<WindowPayload> aggregates = merge_shared_slices_preserving_gaps(session->slices);
-    session->slices.clear();
     // 阶段一：为合并后的窗口补齐稳定 window_id / 内容摘要（保证同逻辑窗口
     // 重传一致；内容摘要不参与 ID，冲突时仍是同一 ID）。
     for (auto &window : aggregates)
     {
+        if (window.physicalDiagnostics)
+            window.symbolRefsJson = build_session_symbol_refs(*window.physicalDiagnostics,
+                                                              window.samples, session->config);
         if (window.windowID.empty())
             window.windowID = make_window_id(session->config, window);
         if (window.contentSHA256.empty())
             window.contentSHA256 = window_content_digest(window);
     }
+    const size_t previousBatchSize = session->batch.size();
     session->batch.insert(session->batch.end(), aggregates.begin(), aggregates.end());
+    bool createdBatch = false;
     if (session->batchID.empty())
     {
         session->config.batchSequence = ++session->batchSequence;
         session->batchID = make_batch_id(session->config);
+        createdBatch = true;
     }
     std::string body = build_batch_json(session->config, session->batchID, session->batch);
     if (!persist_batch(session->config, session->batchID, body))
+    {
+        session->batch.resize(previousBatchSize);
+        if (createdBatch)
+            session->batchID.clear();
         return false;
-    acknowledge_batch_profiles(aggregates);
+    }
+    session->slices.clear();
+    acknowledge_shared_profile_deliveries(aggregates, session->config.sessionSID);
 
     const int windowsPerBatch = std::max(1, (session->config.uploadBatchSec + session->config.aggregationWindowSec - 1) /
                                                session->config.aggregationWindowSec);
@@ -3597,7 +3920,15 @@ struct SharedDualTrackContinuousSampler::Impl
         CoreEbpfCollector core;
         RollingPerfRecorder recorder;
         std::string error;
-        if (!core.Start(physical.targetProcesses, &error) || !recorder.Start(physical, &error))
+        // 阶段三：host/process 混合共享——存在 host Session 时启用整机
+        // wildcard，同时保留 process targets 的 TID 映射，使 process Session
+        // 的 sched histogram 仍能归属到 TGID。
+        core.SetHostWildcard(physical.scope == "host" && !physical.targetProcesses.empty());
+        // 阶段三：纯 python/db 请求（signals 为空）不启动 perf/CO-RE 物理
+        // 采集——strict 引擎直接不可用，走 degraded 路径只做 sidecar。
+        const bool anyPhysicalRequested = !physical.signals.empty();
+        if (anyPhysicalRequested &&
+            (!core.Start(physical.targetProcesses, &error) || !recorder.Start(physical, &error)))
         {
             std::cout << "[native-cp] strict engine unavailable: " << error << std::endl;
             {
@@ -3608,11 +3939,18 @@ struct SharedDualTrackContinuousSampler::Impl
             recorder.Stop();
             return StrictRunResult::Unavailable;
         }
+        if (!anyPhysicalRequested)
+        {
+            std::lock_guard<std::mutex> lock(statusMutex);
+            degradationReason = "no CPU/IO/sched signal requested by any Session; strict engine idle";
+            return StrictRunResult::Unavailable;
+        }
         {
             std::lock_guard<std::mutex> lock(statusMutex);
             degradationReason = core.DegradationReason();
         }
-        std::cout << "[native-cp] strict engine started backend=perf_rolling,libbpf-co-re" << std::endl;
+        std::cout << "[native-cp] strict engine started backend=perf_rolling,libbpf-co-re"
+                  << " unwind=" << unwind_mode_from_env() << std::endl;
 
         std::vector<CoreHistogramSample> pendingCoreSamples;
         uint64_t pendingCoreLost = 0;
@@ -3623,31 +3961,59 @@ struct SharedDualTrackContinuousSampler::Impl
         const uint64_t segmentQueueBytesLimit = static_cast<uint64_t>(
             std::max<int64_t>(1, env_positive_int("DROP_STRICT_SEGMENT_QUEUE_BYTES",
                                                   512 * 1024 * 1024)));
-        // 物理级 Python sidecar：异步覆盖真实 capture 区间，不阻塞滚动 perf 解析。
-        // py-spy 是 CPU fallback，process Session 同样需要；只有 RSS/Memray
-        // 继续维持 host-only，避免扫描并摄取无关进程的内存数据。
-        const bool pythonFallbackEnabled =
-            env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
+        // 阶段三：物理级 sidecar 按"所有活动 Session 请求信号的并集"决定
+        // 是否启动（不选就不采、不存）：
+        //   - py-spy 是 CPU fallback：任一 Session 请求 cpu_profile 才启用。
+        //   - RSS/Memray：任一 Session 请求 python_rss/python_memory 才启用。
+        //   - fan-out 再按各自 Session signals 严格过滤。
+        const bool anyCpuRequested = std::any_of(sessions.begin(), sessions.end(), [](const auto &session) {
+            return logical_signal_requested(session.requestedSignals, "cpu_profile");
+        });
+        const bool anyRssRequested = std::any_of(sessions.begin(), sessions.end(), [](const auto &session) {
+            return logical_signal_requested(session.requestedSignals, "python_rss");
+        });
+        const bool anyMemrayRequested = std::any_of(sessions.begin(), sessions.end(), [](const auto &session) {
+            return logical_signal_requested(session.requestedSignals, "python_memory");
+        });
+        const bool pythonFallbackEnabled = anyCpuRequested &&
+                                           env_enabled_default("DROP_CONTINUOUS_PYSPY_FALLBACK", true) &&
+                                           env_enabled_default("DROP_NATIVE_CP_PYTHON_FALLBACK_ENABLED", true);
         const int pythonRateHz = env_positive_int("DROP_NATIVE_CP_PYTHON_RATE_HZ", 19);
-        const int pythonMaxProcesses = env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4);
+        // Rolling perf cuts immutable segments every two seconds.  Match the
+        // py-spy capture interval to that physical segment instead of the
+        // logical aggregation window (commonly five seconds); otherwise one
+        // five-second sidecar replaced only one two-second segment and left
+        // roughly 40% generic perf samples in every Python query.
+        const int pythonCaptureSec = env_positive_int("DROP_NATIVE_CP_PYTHON_CAPTURE_SEC", 2);
+        // 阶段四：host Session 默认只 attach 最热 2 个 Python 实例；process
+        // Session 精确目标最多 4 个。
+        const int pythonMaxProcesses =
+            physical.scope == "process"
+                ? env_positive_int("DROP_NATIVE_CP_PYTHON_MAX_PROCESSES", 4)
+                : env_positive_int("DROP_NATIVE_CP_PYTHON_HOST_MAX_PROCESSES", 2);
         const int pythonSidecarPollMs = std::max(0, env_positive_int("DROP_STRICT_PYTHON_SIDECAR_POLL_MS", 350));
+        // 阶段四：栈回溯模式与逐语言能力开关。
+        const std::string unwindMode = unwind_mode_from_env();
         RuntimeCapabilitySet caps;
         caps.pythonFallback = pythonFallbackEnabled;
-        caps.pythonRss = physical.scope != "process" &&
+        caps.pythonRss = anyRssRequested &&
                          env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true);
-        caps.memray = physical.scope != "process" &&
+        caps.memray = anyMemrayRequested &&
                       env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true);
-        caps.goSymbols = true;
+        caps.goReSym = env_enabled_default("DROP_CONTINUOUS_GORESYM", true);
+        caps.goSymbols = caps.goReSym;
+        caps.javaPerfMap = env_enabled_default("DROP_CONTINUOUS_JAVA_PERFMAP", true);
+        caps.nodePerfMap = env_enabled_default("DROP_CONTINUOUS_NODE_PERFMAP", true);
+        caps.pythonPerf = env_enabled_default("DROP_CONTINUOUS_PYTHON_PERF", true);
+        caps.unwindMode = unwindMode;
         bool sidecarInFlight = false;
         drop::PythonFallbackCapture sidecarCapture;
         std::vector<drop::PythonFallbackResult> pendingSidecarResults;
         size_t sidecarLimitedCount = 0;
-        std::vector<WindowPayload> heldStrictWindows;
 
         size_t processedSegments = 0;
         int consecutiveProcessorFailures = 0;
         bool strictBacklogged = false;
-        bool strictUnavailable = false;
         int64_t lastSidecarCollectMs = 0;
         const int64_t sidecarIntervalMs = static_cast<int64_t>(std::max(1, physical.aggregationWindowSec)) * 1000;
 
@@ -3681,6 +4047,15 @@ struct SharedDualTrackContinuousSampler::Impl
             if (caps.memray && nowM - lastSidecarCollectMs >= sidecarIntervalMs)
             {
                 auto memrayResults = drop::collect_memray_profiles();
+                if (!memrayResults.empty())
+                {
+                    auto diagnostics = window->physicalDiagnostics
+                        ? std::make_shared<PhysicalDiagnostics>(*window->physicalDiagnostics)
+                        : std::make_shared<PhysicalDiagnostics>();
+                    diagnostics->memrayResults.insert(diagnostics->memrayResults.end(),
+                                                      memrayResults.begin(), memrayResults.end());
+                    window->physicalDiagnostics = diagnostics;
+                }
                 for (const auto &result : memrayResults)
                 {
                     ProfilePayload profile;
@@ -3696,6 +4071,9 @@ struct SharedDualTrackContinuousSampler::Impl
                         sample.stack = raw.stack;
                         sample.comm = result.comm;
                         sample.pid = result.pid;
+                        // 阶段三：Memray sample 携带完整进程身份，process
+                        // Session fan-out 才能按实例精确归属。
+                        sample.processStartMs = result.processStartMs;
                         sample.exe = result.exe;
                         sample.backend = "memray";
                         sample.runtime = "python";
@@ -3709,34 +4087,6 @@ struct SharedDualTrackContinuousSampler::Impl
                 lastSidecarCollectMs = nowM;
         };
 
-        auto fanOutPhysicalWindows = [&](std::vector<WindowPayload> *windows) {
-            if (!windows)
-                return true;
-            for (auto &physicalWindow : *windows)
-            {
-                collectMemorySidecars(&physicalWindow, now_ms());
-                if (!WindowAllowed(physicalWindow))
-                    continue;
-                for (auto &accumulator : accumulators)
-                {
-                    accumulator.slices.push_back(
-                        filter_shared_window(physicalWindow, accumulator.config, true));
-                    const int64_t coveredMs = accumulator.slices.back().endMs -
-                                              accumulator.slices.front().startMs;
-                    if (coveredMs >= static_cast<int64_t>(accumulator.config.aggregationWindowSec) * 1000 &&
-                        !persist_shared_aggregate(&accumulator))
-                    {
-                        std::cout << "[native-cp] strict engine failed to persist sid="
-                                  << accumulator.config.sessionSID << std::endl;
-                        running = false;
-                        return false;
-                    }
-                }
-            }
-            windows->clear();
-            return true;
-        };
-
         while (running.load())
         {
             DrainAllSessionSpools(false);
@@ -3745,12 +4095,7 @@ struct SharedDualTrackContinuousSampler::Impl
             if (!core.UpdateTargets(physical.targetProcesses, &error))
             {
                 std::cout << "[native-cp] strict target refresh failed: " << error << std::endl;
-                strict.store(false);
-                strictUnavailable = true;
-                {
-                    std::lock_guard<std::mutex> lock(statusMutex);
-                    degradationReason = "strict target refresh failed: " + error;
-                }
+                running = false;
                 break;
             }
 
@@ -3758,7 +4103,7 @@ struct SharedDualTrackContinuousSampler::Impl
             // 30 段 / 512 MiB），任一达到即停止认定 strict 并停止产生新段。
             const size_t pendingCount = recorder.PendingSegmentCount();
             const uint64_t pendingBytes = recorder.PendingSegmentBytes();
-            if (pendingCount >= segmentQueueLimit || pendingBytes >= segmentQueueBytesLimit)
+            if (pendingCount > segmentQueueLimit || pendingBytes > segmentQueueBytesLimit)
             {
                 std::cout << "[native-cp] strict segment backlog count=" << pendingCount
                           << " bytes=" << pendingBytes << std::endl;
@@ -3782,13 +4127,15 @@ struct SharedDualTrackContinuousSampler::Impl
             // 物理级 Python sidecar：上一批已发现候选异步覆盖 capture 区间。
             if (pythonFallbackEnabled)
             {
-                if (!sidecarInFlight && pendingSidecarResults.empty())
+                // Capture continuously.  Completed results may still be
+                // suppressing perf samples across their full time interval;
+                // that must not block the next capture from starting.
+                if (!sidecarInFlight)
                 {
                     sidecarCapture = drop::start_python_fallback_capture(
-                        python_fallback_scope_key(physical),
-                        std::max(1, physical.aggregationWindowSec),
+                        physical.sessionSID, pythonCaptureSec,
                         pythonRateHz, pythonMaxProcesses);
-                    sidecarInFlight = sidecarCapture.AnyPending();
+                    sidecarInFlight = true;
                 }
                 if (sidecarInFlight)
                 {
@@ -3802,17 +4149,7 @@ struct SharedDualTrackContinuousSampler::Impl
                         sidecarLimitedCount = sidecarCapture.LimitedCount();
                     }
                     if (!sidecarCapture.AnyPending())
-                    {
                         sidecarInFlight = false;
-                        // capture 期间的 perf windows 一直暂存；现在按真实时间区间
-                        // 删除重叠 Python perf 样本并追加独立 py-spy window。
-                        apply_python_sidecars_to_windows(
-                            &heldStrictWindows, pendingSidecarResults, sidecarLimitedCount);
-                        if (!fanOutPhysicalWindows(&heldStrictWindows))
-                            break;
-                        pendingSidecarResults.clear();
-                        sidecarLimitedCount = 0;
-                    }
                 }
             }
 
@@ -3833,7 +4170,8 @@ struct SharedDualTrackContinuousSampler::Impl
                 while (attempts < segmentMaxRetries)
                 {
                     ++attempts;
-                    processed = processor.Process(segment, physical, caps);
+                    processed = processor.Process(segment, physical, caps,
+                                                  pendingSidecarResults, sidecarLimitedCount, {});
                     if (processed.success)
                     {
                         segmentOk = true;
@@ -3851,13 +4189,41 @@ struct SharedDualTrackContinuousSampler::Impl
                     recorder.Abandon(segment.path);
                     std::cout << "[native-cp] strict segment abandoned (gap) path="
                               << segment.path << std::endl;
-                    if (consecutiveProcessorFailures >= segmentMaxRetries)
-                        break;
                     continue;
                 }
                 consecutiveProcessorFailures = 0;
                 processedSegments++;
                 recorder.Confirm(segment.path); // 仅处理成功后删除
+                // 一份 py-spy 聚合结果覆盖整个真实 capture 区间：首个重叠段
+                // 追加一次聚合样本，随后清空 samples、但保留身份与区间，让其
+                // 余下重叠段只删除对应 perf 样本。这样既不重复计数，也不会在
+                // capture 区间中间退回 generic perf。
+                if (!pendingSidecarResults.empty())
+                {
+                    int64_t segmentStart = 0;
+                    int64_t segmentEnd = 0;
+                    if (!processed.windows.empty())
+                    {
+                        segmentStart = processed.windows.front().startMs;
+                        segmentEnd = processed.windows.front().endMs;
+                    }
+                    if (processed.pythonFallbackApplied)
+                        for (auto &sidecar : pendingSidecarResults)
+                            if (sidecar.ready && sidecar.captureStartMs < segmentEnd &&
+                                sidecar.captureEndMs > segmentStart)
+                                sidecar.samples.clear();
+                    pendingSidecarResults.erase(
+                        std::remove_if(pendingSidecarResults.begin(), pendingSidecarResults.end(),
+                                       [&](const auto &sidecar) {
+                                           return !sidecar.ready ||
+                                                  (sidecar.captureEndMs > 0 &&
+                                                   segmentStart >= sidecar.captureEndMs);
+                                       }),
+                        pendingSidecarResults.end());
+                    if (pendingSidecarResults.empty())
+                        sidecarLimitedCount = 0;
+                }
+
                 // 阶段二：strict readiness = 至少一个真实 segment 已被统一
                 // processor 成功处理（保证 cutover 后不进入缺失多语言能力的
                 // 伪 strict 状态）。
@@ -3870,32 +4236,28 @@ struct SharedDualTrackContinuousSampler::Impl
                               << processedSegments << " processed segment(s)" << std::endl;
                 }
 
-                // 调度下一窗 py-spy 候选（物理级身份去重由单 coordinator 保证）。
-                // 必须在 move processed.windows 之前提取 metadata。
+                // 阶段四修复：必须在把 windows move 进 iterationWindows 之前
+                // 收集 py-spy 候选元数据——move 之后 processed.windows 的样本
+                // 已被搬空，旧实现读到空 metadata 导致 py-spy 候选为空。
                 if (pythonFallbackEnabled)
                 {
-                    std::map<int, AggregatedSample> metadata;
+                    std::vector<AggregatedSample> allSamples;
                     for (const auto &w : processed.windows)
-                        for (const auto &sample : w.samples)
-                            metadata.emplace(sample.pid, sample);
-                    std::vector<drop::PythonCandidate> nextCandidates;
-                    for (int pid : processed.diagnostics.runtimeReport.python.missingPids)
-                    {
-                        int64_t startMs = 0;
-                        if (!drop::python_process_start_ms(pid, &startMs))
-                            continue;
-                        drop::PythonCandidate candidate;
-                        candidate.pid = pid;
-                        candidate.startMs = startMs;
-                        candidate.samples = processed.diagnostics.runtimeReport.sampledPids[pid];
-                        auto it = metadata.find(pid);
-                        candidate.comm = it == metadata.end() ? "python" : it->second.comm;
-                        candidate.exe = it == metadata.end() ? read_exe(pid) : it->second.exe;
-                        nextCandidates.push_back(std::move(candidate));
-                    }
+                        allSamples.insert(allSamples.end(), w.samples.begin(), w.samples.end());
+                    bool pythonDetected = false;
+                    for (const auto &w : processed.windows)
+                        if (w.physicalDiagnostics &&
+                            w.physicalDiagnostics->runtimeReport.python.detected)
+                        {
+                            pythonDetected = true;
+                            break;
+                        }
                     drop::schedule_python_fallback(
-                        python_fallback_scope_key(physical), nextCandidates);
+                        physical.sessionSID,
+                        build_python_candidates(physical, processed.diagnostics.runtimeReport,
+                                                allSamples, pythonDetected));
                 }
+
                 for (auto &physicalWindow : processed.windows)
                 {
                     physicalWindow.attemptedBackends.push_back("libbpf-co-re");
@@ -3904,20 +4266,36 @@ struct SharedDualTrackContinuousSampler::Impl
                     iterationWindows.push_back(std::move(physicalWindow));
                 }
             }
-            const bool processorFatal = consecutiveProcessorFailures >= segmentMaxRetries;
             // 本迭代 CO-RE 直方图附加到首个物理窗口（与旧行为一致）。
             queue_core_histograms(&iterationWindows, physical, &pendingCoreSamples, &pendingCoreLost,
                                   std::move(coreSamples), lost);
-            if (sidecarInFlight)
+            for (auto &physicalWindow : iterationWindows)
             {
-                heldStrictWindows.insert(heldStrictWindows.end(),
-                                         std::make_move_iterator(iterationWindows.begin()),
-                                         std::make_move_iterator(iterationWindows.end()));
+                collectMemorySidecars(&physicalWindow, now_ms());
+                // 阶段一：cutover watermark 过滤（新 generation 切点前不输出）。
+                if (!WindowAllowed(physicalWindow))
+                    continue;
+                // Register every recipient before any Session can persist and ACK
+                // the shared Memray file.
+                for (auto &accumulator : accumulators)
+                {
+                    accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
+                    register_shared_profile_deliveries(accumulator.slices.back(),
+                                                       accumulator.config.sessionSID);
+                }
+                for (auto &accumulator : accumulators)
+                {
+                    const int64_t coveredMs = accumulator.slices.back().endMs - accumulator.slices.front().startMs;
+                    if (coveredMs >= static_cast<int64_t>(accumulator.config.aggregationWindowSec) * 1000 &&
+                        !persist_shared_aggregate(&accumulator))
+                    {
+                        std::cout << "[native-cp] strict engine failed to persist sid="
+                                  << accumulator.config.sessionSID << std::endl;
+                        running = false;
+                        break;
+                    }
+                }
             }
-            else if (!fanOutPhysicalWindows(&iterationWindows))
-                break;
-            if (processorFatal)
-                break;
             interruptible_wait(running, 50);
         }
         recorder.Stop();
@@ -3925,19 +4303,42 @@ struct SharedDualTrackContinuousSampler::Impl
         auto finalSegments = recorder.Drain(physical, true);
         uint64_t lost = 0;
         auto finalCore = core.StopAndDrain(&lost);
-        std::vector<WindowPayload> finalWindows;
+        // 先把最终 CO-RE 直方图并入 pending（首窗附加）。
+        {
+            std::vector<WindowPayload> emptyWindows;
+            queue_core_histograms(&emptyWindows, physical, &pendingCoreSamples, &pendingCoreLost,
+                                  std::move(finalCore), lost);
+        }
         for (auto &segment : finalSegments)
         {
-            SegmentProcessResult processed = processor.Process(segment, physical, caps);
+            SegmentProcessResult processed = processor.Process(segment, physical, caps,
+                                                               pendingSidecarResults, sidecarLimitedCount, {});
             if (processed.success)
             {
                 recorder.Confirm(segment.path);
+                // sidecar 结果只应用于首个成功处理的最终段（防跨段双计数）。
+                if (!pendingSidecarResults.empty())
+                {
+                    pendingSidecarResults.clear();
+                    sidecarLimitedCount = 0;
+                }
                 for (auto &physicalWindow : processed.windows)
                 {
                     physicalWindow.attemptedBackends.push_back("libbpf-co-re");
                     physicalWindow.selectedBackend = "perf_rolling+libbpf-co-re";
                     physicalWindow.backendStatus = "ok";
-                    finalWindows.push_back(std::move(physicalWindow));
+                    std::vector<WindowPayload> tmp{physicalWindow};
+                    queue_core_histograms(&tmp, physical, &pendingCoreSamples, &pendingCoreLost,
+                                          std::vector<CoreHistogramSample>(), 0);
+                    physicalWindow = std::move(tmp.front());
+                    if (!WindowAllowed(physicalWindow))
+                        continue;
+                    for (auto &accumulator : accumulators)
+                    {
+                        accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, true));
+                        register_shared_profile_deliveries(accumulator.slices.back(),
+                                                           accumulator.config.sessionSID);
+                    }
                 }
             }
             else
@@ -3948,37 +4349,18 @@ struct SharedDualTrackContinuousSampler::Impl
             }
         }
         if (sidecarInFlight)
-        {
-            auto ready = sidecarCapture.Finish();
-            pendingSidecarResults.insert(pendingSidecarResults.end(),
-                                         std::make_move_iterator(ready.begin()),
-                                         std::make_move_iterator(ready.end()));
-            sidecarLimitedCount = sidecarCapture.LimitedCount();
-        }
-        heldStrictWindows.insert(heldStrictWindows.end(),
-                                 std::make_move_iterator(finalWindows.begin()),
-                                 std::make_move_iterator(finalWindows.end()));
-        queue_core_histograms(&heldStrictWindows, physical, &pendingCoreSamples, &pendingCoreLost,
-                              std::move(finalCore), lost);
-        apply_python_sidecars_to_windows(
-            &heldStrictWindows, pendingSidecarResults, sidecarLimitedCount);
-        fanOutPhysicalWindows(&heldStrictWindows);
+            sidecarCapture.Finish();
         for (auto &accumulator : accumulators)
             if (!finalize_shared_session(&accumulator))
                 std::cout << "[native-cp] strict engine final flush failed sid="
                           << accumulator.config.sessionSID << std::endl;
+        release_shared_profile_deliveries();
         DrainAllSessionSpools(true);
 
         if (strictBacklogged)
-        {
-            strict.store(false);
             return StrictRunResult::Backlogged;
-        }
-        if (strictUnavailable)
-            return StrictRunResult::Unavailable;
         if (consecutiveProcessorFailures >= segmentMaxRetries)
         {
-            strict.store(false);
             std::lock_guard<std::mutex> lock(statusMutex);
             if (degradationReason.find("processor") == std::string::npos)
                 degradationReason += degradationReason.empty()
@@ -4083,13 +4465,79 @@ struct SharedDualTrackContinuousSampler::Impl
                 continue;
             }
             WindowPayload physicalWindow = collect_dual_track_window(physical);
+            // 阶段三：degraded 共享路径也按 Session 信号并集采集 RSS/Memray
+            // sidecar（与 strict 路径的 collectMemorySidecars 一致）。
+            {
+                const bool anyRssRequested = std::any_of(sessions.begin(), sessions.end(), [](const auto &session) {
+                    return logical_signal_requested(session.requestedSignals, "python_rss");
+                });
+                const bool anyMemrayRequested = std::any_of(sessions.begin(), sessions.end(), [](const auto &session) {
+                    return logical_signal_requested(session.requestedSignals, "python_memory");
+                });
+                if (anyRssRequested && env_enabled_default("DROP_NATIVE_CP_PYTHON_RSS_ENABLED", true))
+                {
+                    size_t truncated = 0;
+                    auto rss = drop::collect_python_rss(
+                        static_cast<size_t>(env_positive_int("DROP_NATIVE_CP_PYTHON_RSS_MAX_PROCESSES", 128)), &truncated);
+                    physicalWindow.rssTruncated = truncated;
+                    for (const auto &point : rss)
+                    {
+                        MetricPayload metric;
+                        metric.metric = "rss_bytes";
+                        metric.unit = "bytes";
+                        metric.runtime = "python";
+                        metric.comm = point.comm;
+                        metric.pid = point.pid;
+                        metric.processStartMs = point.startMs;
+                        metric.exe = point.exe;
+                        metric.timestampMs = point.timestampMs;
+                        metric.value = point.valueBytes;
+                        physicalWindow.metrics.push_back(std::move(metric));
+                    }
+                }
+                if (anyMemrayRequested && env_enabled_default("DROP_NATIVE_CP_MEMRAY_INGEST_ENABLED", true))
+                {
+                    auto memrayResults = drop::collect_memray_profiles();
+                    for (const auto &result : memrayResults)
+                    {
+                        ProfilePayload profile;
+                        profile.signalType = "python_memory";
+                        profile.backend = "memray";
+                        profile.profileID = result.profileID;
+                        profile.unit = "bytes";
+                        if (result.ready)
+                            profile.readyPath = result.readyPath;
+                        for (const auto &raw : result.samples)
+                        {
+                            AggregatedSample sample;
+                            sample.stack = raw.stack;
+                            sample.comm = result.comm;
+                            sample.pid = result.pid;
+                            sample.processStartMs = result.processStartMs;
+                            sample.exe = result.exe;
+                            sample.backend = "memray";
+                            sample.runtime = "python";
+                            sample.count = clamp_count(raw.count);
+                            profile.samples.push_back(std::move(sample));
+                        }
+                        physicalWindow.profiles.push_back(std::move(profile));
+                    }
+                }
+            }
             // 阶段一：cutover watermark 过滤（新 generation 切点前不输出；
             // 旧 generation 切点后不输出）。
             if (!WindowAllowed(physicalWindow))
                 continue;
+            // Complete fan-out registration before the first Session is allowed
+            // to persist and ACK shared sidecar files.
             for (auto &accumulator : accumulators)
             {
                 accumulator.slices.push_back(filter_shared_window(physicalWindow, accumulator.config, histogramAttributionSafe));
+                register_shared_profile_deliveries(accumulator.slices.back(),
+                                                   accumulator.config.sessionSID);
+            }
+            for (auto &accumulator : accumulators)
+            {
                 const int64_t coveredMs = accumulator.slices.back().endMs - accumulator.slices.front().startMs;
                 if (coveredMs >= static_cast<int64_t>(accumulator.config.aggregationWindowSec) * 1000 &&
                     !persist_shared_aggregate(&accumulator))
@@ -4106,8 +4554,10 @@ struct SharedDualTrackContinuousSampler::Impl
             if (!finalize_shared_session(&accumulator))
                 std::cout << "[native-cp] shared engine failed final Session flush sid="
                           << accumulator.config.sessionSID << " errno=" << errno << std::endl;
+        // Any delivery still pending belongs to a failed Session spool.  Release
+        // the claim so a later collector generation can ingest the .ready file.
+        release_shared_profile_deliveries();
         DrainAllSessionSpools(true);
-        drop::clear_python_fallback_schedule(python_fallback_scope_key(physical));
     }
 };
 
@@ -4223,9 +4673,6 @@ void SharedDualTrackContinuousSampler::Stop()
     impl_->failed = false;
     if (impl_->worker.joinable())
         impl_->worker.join();
-    if (!impl_->physical.sessionSID.empty())
-        drop::clear_python_fallback_schedule(
-            python_fallback_scope_key(impl_->physical));
 }
 
 bool SharedDualTrackContinuousSampler::Running() const

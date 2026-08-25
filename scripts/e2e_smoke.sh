@@ -17,7 +17,8 @@ echo "[e2e] base=$BASE target=$TARGET_IP"
 
 if ! curl -fsS "$BASE/healthz" >/tmp/mini-drop-e2e-health.json 2>/dev/null; then
   if [[ "${BASE:-}" == "http://127.0.0.1:8191" ]] && command -v docker >/dev/null 2>&1; then
-    container_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mini-drop-project-apiserver-1 2>/dev/null || true)"
+    apiserver_container="$(docker ps --format '{{.Names}}' | grep -E 'apiserver-1$' | head -1 || true)"
+    container_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${apiserver_container}" 2>/dev/null || true)"
     if [[ -n "$container_ip" ]]; then
       fallback_base="http://${container_ip}:8191"
       if curl -fsS "$fallback_base/healthz" >/tmp/mini-drop-e2e-health.json 2>/dev/null; then

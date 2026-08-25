@@ -104,22 +104,23 @@ type ProfileNode struct {
 }
 
 type ProfileSymbolDiagnostics struct {
-	TotalFrameWeight             float64  `json:"total_frame_weight"`
-	UnresolvedFrameWeight        float64  `json:"unresolved_frame_weight"`
-	ModuleUnresolvedFrameWeight  float64  `json:"module_unresolved_frame_weight"`
-	NoModuleFrameWeight          float64  `json:"no_module_frame_weight"`
-	UnresolvedPercent            float64  `json:"unresolved_percent"`
-	GoSymbolState                string   `json:"go_symbol_state"`
-	Reasons                      []string `json:"reasons"`
+	TotalFrameWeight            float64  `json:"total_frame_weight"`
+	UnresolvedFrameWeight       float64  `json:"unresolved_frame_weight"`
+	ModuleUnresolvedFrameWeight float64  `json:"module_unresolved_frame_weight"`
+	NoModuleFrameWeight         float64  `json:"no_module_frame_weight"`
+	UnresolvedPercent           float64  `json:"unresolved_percent"`
+	GoSymbolState               string   `json:"go_symbol_state"`
+	Reasons                     []string `json:"reasons"`
 }
 
 type ProfileRuntimeProcessDiagnostic struct {
-	PID    int    `json:"pid"`
-	Comm   string `json:"comm,omitempty"`
-	Exe    string `json:"exe,omitempty"`
-	Mode   string `json:"mode,omitempty"`
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	PID            int    `json:"pid"`
+	ProcessStartMs int64  `json:"process_start_ms,omitempty"`
+	Comm           string `json:"comm,omitempty"`
+	Exe            string `json:"exe,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	Status         string `json:"status"`
+	Reason         string `json:"reason,omitempty"`
 }
 
 type ProfileRuntimeDiagnostic struct {
@@ -131,6 +132,18 @@ type ProfileRuntimeDiagnostic struct {
 	LimitedCount  int                               `json:"limited_count"`
 	Reasons       []string                          `json:"reasons"`
 	Processes     []ProfileRuntimeProcessDiagnostic `json:"processes"`
+	// 阶段四：v2 语言诊断契约字段（Agent language_status）。历史窗口没有
+	// v2 数据时保持零值，前端按 diagnostics_version 判断展示口径。
+	DiagnosticsVersion            int     `json:"diagnostics_version,omitempty"`
+	RuntimeDetection              string  `json:"runtime_detection,omitempty"`
+	CollectorStatus               string  `json:"collector_status,omitempty"`
+	SymbolStatusV2                string  `json:"symbol_status_v2,omitempty"`
+	SemanticFramePercent          float64 `json:"semantic_frame_percent"`
+	SemanticSamplePercent         float64 `json:"semantic_sample_percent"`
+	UnresolvedFramePercent        float64 `json:"unresolved_frame_percent"`
+	TargetModuleUnresolvedPercent float64 `json:"target_module_unresolved_percent"`
+	TargetModuleFrameWeight       float64 `json:"target_module_frame_weight"`
+	SampleCount                   float64 `json:"sample_count"`
 }
 
 type ProfileFlamegraph struct {
@@ -155,10 +168,10 @@ type ProfileFlamegraph struct {
 	// 承载 Message 提示前端引导去看 TopN）。
 	Degraded bool `json:"degraded,omitempty"`
 	// 阶段五：v2 兼容字段（mode=prefer/enforce 时填充）。
-	ResolutionSeconds  int        `json:"resolution_seconds,omitempty"`
-	MixedResolution    bool       `json:"mixed_resolution,omitempty"`
-	StorageSource      string     `json:"storage_source,omitempty"`
-	EarliestAvailable  *time.Time `json:"earliest_available_at,omitempty"`
+	ResolutionSeconds int        `json:"resolution_seconds,omitempty"`
+	MixedResolution   bool       `json:"mixed_resolution,omitempty"`
+	StorageSource     string     `json:"storage_source,omitempty"`
+	EarliestAvailable *time.Time `json:"earliest_available_at,omitempty"`
 }
 
 type ProfileTopItem struct {

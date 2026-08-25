@@ -605,8 +605,9 @@ TEST(ContinuousSampler, BuildBatchJsonV3EmitsCorrectnessFields)
     window.contentSHA256 = window_content_digest(window);
 
     std::string json = build_batch_json(cfg, "cpb-v3", {window});
-    // schema_version=3；batch 层 sample_count 废弃写 0。
-    EXPECT_NE(json.find("\"schema_version\":3"), std::string::npos);
+    // 阶段三：schema_version=4（v4 在 v3 基础上增加信号状态/采样率/身份字段）；
+    // batch 层 sample_count 废弃写 0。
+    EXPECT_NE(json.find("\"schema_version\":4"), std::string::npos);
     EXPECT_NE(json.find("\"sample_count\":0"), std::string::npos);
     // 新协议字段。
     EXPECT_NE(json.find("\"collector_generation\":\"gen-test-1\""), std::string::npos);
@@ -800,9 +801,10 @@ TEST(ContinuousProcessScope, UsesExplicitPIDTargetWithoutWholeHostFlag)
     const auto args = perf_record_args(cfg, "perf", "cpu-clock", "/tmp/test.data");
     EXPECT_NE(std::find(args.begin(), args.end(), "-p"), args.end());
     EXPECT_EQ(std::find(args.begin(), args.end(), "-a"), args.end());
-    EXPECT_TRUE(process_targeted(cfg, 42, "/opt/api"));
     EXPECT_TRUE(process_targeted(cfg, 42, 1000, "/opt/api"));
     EXPECT_FALSE(process_targeted(cfg, 42, 9999, "/opt/api"));
+    // 阶段三：无 start time 的调用（身份缺失）不得放宽匹配——PID 复用防护。
+    EXPECT_FALSE(process_targeted(cfg, 42, "/opt/api"));
     EXPECT_FALSE(process_targeted(cfg, 99, "/opt/other"));
 }
 
@@ -851,6 +853,166 @@ TEST(SharedContinuousEngine, BuildsOneUnionTargetSetAtHighestFrequency)
     ASSERT_NE(pidFlag, args.end());
     ASSERT_NE(++pidFlag, args.end());
     EXPECT_EQ(*pidFlag, "42,77");
+
+    // 物理 requestedSignals 也必须保存并集；degraded 路径直接读取该字段，
+    // 不能受第一个 Session 顺序影响。
+    ContinuousSamplerConfig rssOnly = first;
+    rssOnly.requestedSignals = {"python_rss"};
+    ContinuousSamplerConfig cpuSecond = second;
+    cpuSecond.requestedSignals = {"cpu_profile"};
+    const auto mixedSignals = shared_physical_config({rssOnly, cpuSecond});
+    EXPECT_TRUE(logical_signal_requested(mixedSignals.requestedSignals, "python_rss"));
+    EXPECT_TRUE(logical_signal_requested(mixedSignals.requestedSignals, "cpu_profile"));
+    EXPECT_EQ(mixedSignals.signals, "cpu");
+}
+
+TEST(SharedContinuousEngine, MergeKeepsCollectedStatusAndSeparatesPidReuse)
+{
+    WindowPayload first;
+    first.startMs = 1000;
+    first.endMs = 6000;
+    first.signalStatuses["cpu_profile"].status = SignalCollectionStatus::Collected;
+    HistogramPayload oldProcess;
+    oldProcess.signalType = "io_latency";
+    oldProcess.pid = 42;
+    oldProcess.processStartMs = 1000;
+    oldProcess.exe = "/opt/old";
+    oldProcess.eventCount = 3;
+    oldProcess.buckets.push_back({"[1, 2)", 1, 2, 3});
+    first.histograms.push_back(oldProcess);
+
+    WindowPayload second = first;
+    second.startMs = 6000;
+    second.endMs = 11000;
+    second.signalStatuses["cpu_profile"].status = SignalCollectionStatus::NoEvents;
+    second.histograms.front().processStartMs = 2000;
+    second.histograms.front().exe = "/opt/new";
+    second.histograms.front().eventCount = 5;
+    second.histograms.front().buckets.front().count = 5;
+
+    const auto merged = merge_shared_slices({first, second});
+    EXPECT_EQ(merged.signalStatuses.at("cpu_profile").status, SignalCollectionStatus::Collected);
+    ASSERT_EQ(merged.histograms.size(), 2u);
+    EXPECT_NE(merged.histograms[0].processStartMs, merged.histograms[1].processStartMs);
+}
+
+TEST(SharedContinuousEngine, MergeCarriesDiagnosticsFromEverySlice)
+{
+    WindowPayload first;
+    first.startMs = 1000;
+    first.endMs = 6000;
+    auto firstDiagnostics = std::make_shared<PhysicalDiagnostics>();
+    PythonFallbackResult firstPython;
+    firstPython.pid = 10;
+    firstPython.startMs = 1000;
+    firstPython.exe = "/usr/bin/python3";
+    firstDiagnostics->pythonFallback.push_back(firstPython);
+    first.physicalDiagnostics = firstDiagnostics;
+
+    WindowPayload second;
+    second.startMs = 6000;
+    second.endMs = 11000;
+    auto secondDiagnostics = std::make_shared<PhysicalDiagnostics>();
+    PythonFallbackResult secondPython = firstPython;
+    secondPython.pid = 20;
+    secondPython.startMs = 2000;
+    secondDiagnostics->pythonFallback.push_back(secondPython);
+    second.physicalDiagnostics = secondDiagnostics;
+
+    const auto merged = merge_shared_slices({first, second});
+    ASSERT_NE(merged.physicalDiagnostics, nullptr);
+    EXPECT_EQ(merged.physicalDiagnostics->pythonFallback.size(), 2u);
+}
+
+TEST(SharedContinuousEngine, WaitsForEverySessionBeforeAcknowledgingSharedProfile)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_sharedProfileMutex);
+        g_sharedProfileDeliveries.clear();
+    }
+    WindowPayload projected;
+    ProfilePayload profile;
+    profile.signalType = "python_memory";
+    profile.readyPath = "/tmp/mini-drop-nonexistent-shared-profile.ready";
+    projected.profiles.push_back(profile);
+
+    register_shared_profile_deliveries(projected, "sid-a");
+    register_shared_profile_deliveries(projected, "sid-b");
+    acknowledge_shared_profile_deliveries({projected}, "sid-a");
+    {
+        std::lock_guard<std::mutex> lock(g_sharedProfileMutex);
+        ASSERT_EQ(g_sharedProfileDeliveries.size(), 1U);
+        EXPECT_EQ(g_sharedProfileDeliveries.begin()->second,
+                  (std::set<std::string>{"sid-b"}));
+    }
+    acknowledge_shared_profile_deliveries({projected}, "sid-b");
+    {
+        std::lock_guard<std::mutex> lock(g_sharedProfileMutex);
+        EXPECT_TRUE(g_sharedProfileDeliveries.empty());
+    }
+}
+
+TEST(SharedContinuousEngine, KeepsAggregateInMemoryWhenDurableSpoolFails)
+{
+    SharedSessionAccumulator session;
+    session.config.sessionSID = "sid-spool-failure";
+    session.config.spoolDirectory = "/proc/mini-drop-unwritable-spool";
+    session.config.collectorGeneration = "gen-spool-failure";
+    session.config.targetFingerprint = "fp-spool-failure";
+    WindowPayload window;
+    window.startMs = 1000;
+    window.endMs = 2000;
+    window.signalStatuses["cpu_profile"].status = SignalCollectionStatus::NoEvents;
+    session.slices.push_back(window);
+
+    EXPECT_FALSE(persist_shared_aggregate(&session));
+    ASSERT_EQ(session.slices.size(), 1U);
+    EXPECT_TRUE(session.batch.empty());
+    EXPECT_TRUE(session.batchID.empty());
+}
+
+TEST(SharedContinuousEngine, HostCoreHistogramDoesNotDuplicatePidZeroAggregate)
+{
+    ContinuousSamplerConfig cfg = make_cfg();
+    cfg.scope = "host";
+    WindowPayload window;
+    append_core_histograms(&window, cfg, {{1, 42, 1, 3}, {1, 77, 1, 5}}, 0);
+    uint64_t ioEvents = 0;
+    for (const auto &hist : window.histograms)
+    {
+        EXPECT_NE(hist.pid, 0);
+        if (hist.signalType == "io_latency")
+            ioEvents += hist.eventCount;
+    }
+    EXPECT_EQ(ioEvents, 8u);
+}
+
+TEST(ContinuousSampler, V4DigestIncludesIdentityStatusAndRates)
+{
+    WindowPayload base;
+    base.startMs = 1000;
+    base.endMs = 6000;
+    HistogramPayload hist;
+    hist.signalType = "io_latency";
+    hist.pid = 42;
+    hist.processStartMs = 1000;
+    hist.exe = "/opt/app";
+    hist.eventCount = 1;
+    hist.buckets.push_back({"[1, 2)", 1, 2, 1});
+    base.histograms.push_back(hist);
+    base.physicalSampleRateHz = 49;
+    base.effectiveSampleRateHz = 19;
+    base.signalStatuses["io_latency"].status = SignalCollectionStatus::Collected;
+
+    WindowPayload changed = base;
+    changed.histograms.front().processStartMs = 2000;
+    EXPECT_NE(window_content_digest(base), window_content_digest(changed));
+    changed = base;
+    changed.signalStatuses["io_latency"].status = SignalCollectionStatus::Unavailable;
+    EXPECT_NE(window_content_digest(base), window_content_digest(changed));
+    changed = base;
+    changed.effectiveSampleRateHz = 29;
+    EXPECT_NE(window_content_digest(base), window_content_digest(changed));
 }
 
 TEST(SharedContinuousEngine, FansOutByPIDStartIdentityWithoutHistogramLeakage)
@@ -1040,8 +1202,8 @@ TEST(SharedContinuousEngine, RefusesUnapprovedDegradedFallback)
 // ---- 首轮只建立基线 ----
 TEST(ContinuousSampler, DigestDeltaFirstSeenBaselineOnly)
 {
-    DigestCounterState first{100, 5000000000ULL, 50, 2000};
-    DigestDeltaResult delta = compute_digest_delta(nullptr, first, 2000, 1500);
+    DigestCounterState first{100, 5000000000ULL, 50};
+    DigestDeltaResult delta = compute_digest_delta(nullptr, first);
     EXPECT_EQ(delta.kind, DigestDeltaKind::FirstSeen);
     EXPECT_EQ(delta.deltaCalls, 0u);
     EXPECT_EQ(delta.deltaLatencyUs, 0u);
@@ -1051,9 +1213,9 @@ TEST(ContinuousSampler, DigestDeltaFirstSeenBaselineOnly)
 // ---- 后续仅上报窗口增量，latency 从 ps 换算成 us ----
 TEST(ContinuousSampler, DigestDeltaReportsWindowIncrement)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
-    DigestCounterState cur{120, 5200000000ULL, 60, 2000};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{120, 5200000000ULL, 60};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
     EXPECT_EQ(delta.deltaCalls, 20u);
     // (5.2e12 - 5.0e12) ps = 200000000 ps = 200 us（ps -> us 除以 1e6）
@@ -1064,9 +1226,9 @@ TEST(ContinuousSampler, DigestDeltaReportsWindowIncrement)
 // ---- 零增量不输出（deltaCalls == 0）----
 TEST(ContinuousSampler, DigestDeltaZeroCallsNotEmitted)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
-    DigestCounterState cur{100, 5100000000ULL, 55, 2000};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{100, 5100000000ULL, 55};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Increment);
     EXPECT_EQ(delta.deltaCalls, 0u);
     // 调用方应据此跳过上报
@@ -1075,18 +1237,18 @@ TEST(ContinuousSampler, DigestDeltaZeroCallsNotEmitted)
 // ---- countStar 回退：重建基线，本轮不上报 ----
 TEST(ContinuousSampler, DigestDeltaCounterResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
-    DigestCounterState cur{3, 5000000000ULL, 50, 2000};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{3, 5000000000ULL, 50};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
 }
 
 // ---- sumTimerWaitPs 回退：重建基线，避免无符号下溢 ----
 TEST(ContinuousSampler, DigestDeltaLatencyResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
-    DigestCounterState cur{120, 4000000000ULL, 60, 2000};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{120, 4000000000ULL, 60};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
     // 旧实现只检查 countStar，这里 sumTimerWaitPs 回退会触发无符号下溢
 }
@@ -1094,22 +1256,10 @@ TEST(ContinuousSampler, DigestDeltaLatencyResetRebuildsBaseline)
 // ---- sumRowsExamined 回退：重建基线，避免无符号下溢 ----
 TEST(ContinuousSampler, DigestDeltaRowsResetRebuildsBaseline)
 {
-    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
-    DigestCounterState cur{120, 5200000000ULL, 10, 2000};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 2000, 1500);
+    DigestCounterState prev{100, 5000000000ULL, 50};
+    DigestCounterState cur{120, 5200000000ULL, 10};
+    DigestDeltaResult delta = compute_digest_delta(&prev, cur);
     EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
-}
-
-// ---- digest 跌出 TOP 50 太久后重新出现：重建基线，不把缺席期累计量算入本窗 ----
-TEST(ContinuousSampler, DigestDeltaLongGapRebuildsBaseline)
-{
-    DigestCounterState prev{100, 5000000000ULL, 50, 1000};
-    DigestCounterState cur{180, 9000000000ULL, 90, 4000};
-    DigestDeltaResult delta = compute_digest_delta(&prev, cur, 4000, 1500);
-    EXPECT_EQ(delta.kind, DigestDeltaKind::Reset);
-    EXPECT_EQ(delta.deltaCalls, 0u);
-    EXPECT_EQ(delta.deltaLatencyUs, 0u);
-    EXPECT_EQ(delta.deltaRows, 0u);
 }
 
 // ---- 跨 Session / 跨实例状态隔离 ----
