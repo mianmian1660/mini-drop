@@ -979,7 +979,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             {signalTab === 'cpu' && <section style={S.card}>
                 <div style={S.sectionHead}>
                     <h3 style={S.title}>热点 TopN</h3>
-                    <span style={S.subtle}>{topn?.items?.length || 0} functions · {profileUnitLabel(topn?.unit || unit)}</span>
+                    <span style={S.subtle}>{topn?.items?.length || 0} 个函数 · {profileUnitLabel(topn?.unit || unit)}</span>
                 </div>
                 <TopNTable data={topn} loading={querying} profileURL={profileURL} filterText={activeFilterText} />
                 {topn?.truncated && (
@@ -1999,16 +1999,21 @@ export function TopNTable({ data, loading, profileURL, filterText = '' }) {
     if (data?.empty || items.length === 0) {
         return <ProfileEmpty message={data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} url={data?.profile_url || profileURL} />;
     }
+    // samples 口径下把列头明确写成"累计/自身样本数"并给出悬浮说明，避免两列
+    // 都叫 Samples 让人看不出差异（累计=含子调用，自身=栈顶）。
+    const isSamples = profileUnitLabel(data?.unit) === 'samples';
+    const cumLabel = isSamples ? '累计样本数' : metricColumnLabel(data.unit, '累计');
+    const selfLabel = isSamples ? '自身样本数' : metricColumnLabel(data.unit, '自身');
     return (
         <div className="table-scroll" style={S.tableWrap}>
             <table style={S.table}>
                 <thead>
                     <tr>
-                        <th style={{ ...S.th, width: '48%' }}>函数</th>
-                        <th style={S.th}>{metricColumnLabel(data.unit, '累计')}</th>
-                        <th style={S.th}>累计占比</th>
-                        <th style={S.th}>{metricColumnLabel(data.unit, '自身')}</th>
-                        <th style={S.th}>自身占比</th>
+                        <th style={{ ...S.th, width: '44%' }}>函数</th>
+                        <th style={S.th} title="该函数出现在调用链任意位置（自身执行 + 调用其子函数期间）被采样到的次数。调用了很多耗时子函数的函数此值会偏高。">{cumLabel}</th>
+                        <th style={S.th} title="累计样本数 ÷ 当前窗口总样本数。可近似理解为该函数（含其子调用）占 CPU 的比例。">累计占比</th>
+                        <th style={S.th} title="该函数自己（栈顶，正在执行自身指令）被采样到的次数，不含其调用的子函数。这是判断“这行代码本身在烧 CPU”的指标，表格按此列降序排序。">{selfLabel}</th>
+                        <th style={S.th} title="自身样本数 ÷ 当前窗口总样本数。可近似理解为该函数自身烧掉的 CPU 比例。">自身占比</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -2017,14 +2022,19 @@ export function TopNTable({ data, loading, profileURL, filterText = '' }) {
                             <td style={{ ...S.td, ...(item.unresolved ? S.tdMuted : {}) }} title={item.name}>
                                 {truncate(item.display_name || item.name, 72)}
                             </td>
-                            <td style={S.td}>{formatMetricValue(item.value, item.unit || data.unit)}</td>
+                            <td style={S.td} title="累计：含自身执行及所有子函数调用">{formatMetricValue(item.value, item.unit || data.unit)}</td>
                             <td style={S.td}>{formatPercent(item.percent)}</td>
-                            <td style={S.td}>{formatMetricValue(item.self, item.unit || data.unit)}</td>
+                            <td style={S.td} title="自身：仅该函数自己（栈顶）被采样">{formatMetricValue(item.self, item.unit || data.unit)}</td>
                             <td style={S.td}>{formatPercent(item.self_percent)}</td>
                         </tr>
                     ))}
                 </tbody>
             </table>
+            {data?.total > 0 && (
+                <div style={{ ...S.subtle, marginTop: 8, lineHeight: 1.5 }}>
+                    占比分母为当前窗口总样本数（{formatMetricValue(data.total, data.unit)}）。自身 = 该函数自己（栈顶）被采样次数；累计 = 含其调用的子函数；表格按自身样本数降序排序。
+                </div>
+            )}
         </div>
     );
 }
