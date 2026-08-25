@@ -104,11 +104,24 @@ def run_perf_script(perf_data_path: str, kallsyms_path: str = None) -> str:
         timeout=120  # 大文件可能较慢
     )
     if result.returncode != 0:
-        error_msg = result.stderr.strip() or "perf script 返回非零退出码"
-        raise subprocess.CalledProcessError(
-            result.returncode, cmd,
-            output=result.stdout, stderr=result.stderr
-        )
+        # perf.data 的尾部若有少量损坏，perf script 可能在已经输出大量可用
+        # 样本后仍以非零码退出。周期采样窗口不应因此整窗报废：有 stdout
+        # 就交给 stackcollapse 做逐条解析，后续 folded 为空检查仍会挡住真正
+        # 无法分析的输入；完全没有样本时才按硬失败处理。
+        if result.stdout and result.stdout.strip():
+            detail = (result.stderr or "").strip().replace("\n", " ")
+            if len(detail) > 500:
+                detail = detail[:500] + "..."
+            print(
+                f"[flamegraph] 警告: perf script 返回 {result.returncode}，"
+                f"但已输出可用样本，继续降级分析: {detail or '无 stderr'}",
+                file=sys.stderr,
+            )
+        else:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd,
+                output=result.stdout, stderr=result.stderr
+            )
 
     lines = result.stdout.strip()
     if not lines:

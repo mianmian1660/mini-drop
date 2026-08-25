@@ -48,7 +48,7 @@ from attribution import run_attribution
 from observability import elapsed_seconds, log_event, now_seconds
 import artifact_descriptor as ad
 import pprof_builder as pprof_builder
-from analyzer_contract import AnalyzerTemporaryError
+from analyzer_contract import AnalyzerInputError, AnalyzerTemporaryError
 from job_context import get as job_context_get
 
 
@@ -854,23 +854,47 @@ def _analyze_cpu_flamegraph(conn, storage_cfg: dict, task: dict,
         else:
             script_output = run_perf_script(local_perf, kallsyms_path=local_kallsyms)
             folded_text = run_stackcollapse(script_output)
+    except subprocess.TimeoutExpired as e:
+        raise AnalyzerTemporaryError(
+            f"perf script / 折叠栈生成超时: {e}"
+        ) from e
+    except FileNotFoundError as e:
+        raise AnalyzerTemporaryError(
+            f"perf script / 折叠栈工具不可用: {e}"
+        ) from e
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.output or "").strip()
+        if len(detail) > 900:
+            detail = detail[:900] + "..."
+        raise AnalyzerInputError(
+            "perf script / 折叠栈生成失败"
+            + (f": {detail}" if detail else f"（exit={e.returncode}）")
+        ) from e
     except Exception as e:
-        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
-                   f"perf script / 折叠栈生成失败: {e}",
-                   traceback.format_exc())
+        raise AnalyzerInputError(
+            f"perf script / 折叠栈生成失败: {e}"
+        ) from e
 
     if not folded_text or not folded_text.strip():
-        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
-                   "perf script 输出为空，无法生成火焰图",
-                   traceback.format_exc())
+        raise AnalyzerInputError("perf script 输出为空，无法生成火焰图")
 
     # --- 4. 同一模型生成 SVG 与 TopN ---
     try:
         svg_content = run_flamegraph(folded_text, title=title)
+    except subprocess.TimeoutExpired as e:
+        raise AnalyzerTemporaryError(f"火焰图生成超时: {e}") from e
+    except FileNotFoundError as e:
+        raise AnalyzerTemporaryError(f"火焰图工具不可用: {e}") from e
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.output or "").strip()
+        if len(detail) > 900:
+            detail = detail[:900] + "..."
+        raise AnalyzerInputError(
+            "火焰图生成失败"
+            + (f": {detail}" if detail else f"（exit={e.returncode}）")
+        ) from e
     except Exception as e:
-        exit_error(ErrorCode.ERR_ANALYSIS_FAILED,
-                   f"火焰图生成失败: {e}",
-                   traceback.format_exc())
+        raise AnalyzerInputError(f"火焰图生成失败: {e}") from e
 
     top_json = {}
     try:

@@ -3,6 +3,9 @@ package server
 import (
 	"math"
 	"testing"
+	"time"
+
+	"github.com/mini-drop/apiserver/model"
 )
 
 // topItem 构造一条 top.json 记录。字段名和 analysis 端
@@ -206,5 +209,80 @@ func TestDiffTopFunctions_DuplicateFunctionKeepsHighest(t *testing.T) {
 	}
 	if math.Abs(entries[0].DeltaPercentage-(-30)) > 1e-9 {
 		t.Errorf("差值应为 -30，实际 %v", entries[0].DeltaPercentage)
+	}
+}
+
+func TestTaskDiffReadsActiveGenerationArtifacts(t *testing.T) {
+	s := newTestAPIServer(t)
+	store := newContinuousMemoryStorage()
+	s.Storage = store
+	now := time.Now()
+	baseTask := model.HotmethodTask{TID: "generation-base", Name: "base", Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: now}
+	compareTask := model.HotmethodTask{TID: "generation-compare", Name: "compare", Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: now}
+	if err := s.DB.Create(&baseTask).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&compareTask).Error; err != nil {
+		t.Fatal(err)
+	}
+	baseJob := model.AnalysisJob{TaskTID: baseTask.TID, Pipeline: "perf_flamegraph", Status: model.AnalysisJobStatusSuccess, Generation: 1, CreatedAt: now, UpdatedAt: now}
+	compareJob := model.AnalysisJob{TaskTID: compareTask.TID, Pipeline: "perf_flamegraph", Status: model.AnalysisJobStatusSuccess, Generation: 2, CreatedAt: now, UpdatedAt: now}
+	if err := s.DB.Create(&baseJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&compareJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	baseTask.ActiveAnalysisJobID = &baseJob.ID
+	compareTask.ActiveAnalysisJobID = &compareJob.ID
+	if err := s.DB.Model(&baseTask).Update("active_analysis_job_id", baseJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Model(&compareTask).Update("active_analysis_job_id", compareJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	type artifactInput struct {
+		task *model.HotmethodTask
+		job  *model.AnalysisJob
+		name string
+		body string
+	}
+	inputs := []artifactInput{
+		{&baseTask, &baseJob, "top.json", `{"self_time_top":[{"function":"hot","percentage":20,"samples":20}]}`},
+		{&compareTask, &compareJob, "top.json", `{"self_time_top":[{"function":"hot","percentage":70,"samples":70}]}`},
+		{&baseTask, &baseJob, "folded.txt", "main;hot 2\n"},
+		{&compareTask, &compareJob, "folded.txt", "main;hot 7\n"},
+	}
+	for _, in := range inputs {
+		key := "tasks/" + in.task.TID + "/analysis/perf_flamegraph/test/generation/" + in.name
+		jobID := in.job.ID
+		artifact := model.Artifact{
+			TaskTID: in.task.TID, AnalysisJobID: &jobID, Kind: model.ArtifactKindResult,
+			ObjectKey: key, LogicalName: in.name, Status: model.ArtifactStatusReady, CreatedAt: now,
+		}
+		if in.name == "folded.txt" {
+			artifact.Kind = model.ArtifactKindIntermediate
+		}
+		if err := s.DB.Create(&artifact).Error; err != nil {
+			t.Fatal(err)
+		}
+		store.objects[key] = in.body
+		store.modified[key] = now
+	}
+
+	baseTop := s.fetchTopFunctionsForTask(&baseTask)
+	compareTop := s.fetchTopFunctionsForTask(&compareTask)
+	entries := diffTopFunctions(baseTop, compareTop, 1)
+	if len(entries) != 1 || entries[0].Function != "hot" || entries[0].DeltaPercentage != 50 {
+		t.Fatalf("generation-scoped top diff mismatch: %#v", entries)
+	}
+
+	flame, reason := s.buildTaskDiffFlamegraph(&baseTask, &compareTask, 100)
+	if reason != "" {
+		t.Fatalf("generation-scoped folded artifacts should be readable: %s", reason)
+	}
+	if flame.Empty || flame.BaseTotal != 2 || flame.CompareTotal != 7 || len(flame.Root.Children) == 0 {
+		t.Fatalf("generation-scoped flame diff mismatch: %#v", flame)
 	}
 }

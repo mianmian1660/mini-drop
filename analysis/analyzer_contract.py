@@ -218,6 +218,10 @@ class LegacyFunctionAnalyzer(BaseAnalyzer):
             exc = error_box["exc"]
             if isinstance(exc, AnalyzerError):
                 raise exc
+            if isinstance(exc, SystemExit):
+                raise AnalyzerInputError(
+                    f"旧分析器异常退出（exit={exc.code}）；未返回结构化错误"
+                ) from exc
             raise AnalyzerTemporaryError(str(exc)) from exc
         elapsed = time.time() - started
         if elapsed > self.timeout_seconds:

@@ -1326,6 +1326,24 @@ func (s *APIServer) fetchTopFunctions(tid string) []map[string]interface{} {
 	return normalizeTopFunctions(topData)
 }
 
+// fetchTopFunctionsForTask 和任务详情页使用同一套 generation 选择规则：优先
+// active analysis job，仅对没有分代产物的历史任务回退 {tid}/top.json。
+func (s *APIServer) fetchTopFunctionsForTask(task *model.HotmethodTask) []map[string]interface{} {
+	if task == nil {
+		return nil
+	}
+	job, _ := s.resolveSelectedAnalysisJob(task, "")
+	if job != nil {
+		if top := s.fetchTopFunctionsForJob(task.TID, job); len(top) > 0 {
+			return top
+		}
+		if s.jobHasAnyArtifacts(task.TID, job.ID) {
+			return nil
+		}
+	}
+	return s.fetchTopFunctions(task.TID)
+}
+
 func normalizeTopFunctions(topData map[string]interface{}) []map[string]interface{} {
 	sampleUnit, _ := topData["sample_unit"].(string)
 	sampleKind, _ := topData["sample_kind"].(string)
@@ -2348,7 +2366,8 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 // GetTaskDiff — 两个任务的热点函数对比（基线 vs 对比）
 // GET /api/v1/tasks/diff?baseline_tid=X&compare_tid=Y&threshold=1
 //
-// 数据来自两侧的 {tid}/top.json。perf、pprof、async-profiler、eBPF-CPU
+// 数据来自两侧当前 active analysis generation 的 top.json，旧任务回退
+// {tid}/top.json。perf、pprof、async-profiler、eBPF-CPU
 // 四种采集器都会产出该文件，所以对比不挑采集器；eBPF 直方图任务只有
 // bpf_data.json，没有可比的函数列表，会被明确拒绝而不是返回一张空表。
 //
@@ -2522,7 +2541,7 @@ func (s *APIServer) GetTaskDiff(c *gin.Context) {
 
 	// 缺产物时说明是哪一侧、为什么缺，而不是回空表让用户自己猜
 	fetchSide := func(t *model.HotmethodTask, field string) ([]map[string]interface{}, bool) {
-		top := s.fetchTopFunctions(t.TID)
+		top := s.fetchTopFunctionsForTask(t)
 		if len(top) > 0 {
 			return top, true
 		}

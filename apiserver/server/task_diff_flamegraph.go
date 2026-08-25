@@ -21,10 +21,9 @@ import (
 	"github.com/mini-drop/apiserver/model"
 )
 
-// fetchFoldedStacks 从对象存储读取 {tid}/folded.txt。和 fetchTopFunctions 读
-// {tid}/top.json 走同一条简化路径——GetTaskDiff 的表格对比也是用这个口径
-// （不做 analysis job 分代解析），这里保持一致，不引入新的复杂度。
-func (s *APIServer) fetchFoldedStacks(tid string) (string, bool) {
+// fetchLegacyFoldedStacks 从对象存储读取旧任务的 {tid}/folded.txt。
+// 新分代任务由 fetchFoldedStacksForTask 按 active analysis job 读取。
+func (s *APIServer) fetchLegacyFoldedStacks(tid string) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -42,6 +41,42 @@ func (s *APIServer) fetchFoldedStacks(tid string) (string, bool) {
 		return "", false
 	}
 	return sb.String(), true
+}
+
+// fetchFoldedStacksForTask 优先读取任务当前 active analysis generation 的
+// folded.txt。阶段 4 起分析产物使用 tasks/{tid}/analysis/.../gN/ 路径，不能
+// 再把 {tid}/folded.txt 当作唯一来源。只有没有分代产物的历史任务才回退旧 key。
+func (s *APIServer) fetchFoldedStacksForTask(task *model.HotmethodTask) (string, bool) {
+	if task == nil {
+		return "", false
+	}
+	job, _ := s.resolveSelectedAnalysisJob(task, "")
+	if job != nil {
+		artifacts := s.jobArtifactsByLogicalName(task.TID, job.ID, "folded.txt")
+		if len(artifacts) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			for i := range artifacts {
+				resolved := s.resolveBlobForKey(ctx, artifacts[i].ObjectKey)
+				reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, resolved.PhysicalKey)
+				if err != nil {
+					continue
+				}
+				body, readErr := io.ReadAll(reader)
+				reader.Close()
+				if readErr == nil && len(body) > 0 {
+					return string(body), true
+				}
+			}
+			return "", false
+		}
+		// active generation 已有其它分代产物时，folded 的缺失是真缺失，不能
+		// 偷读旧代同名 key，否则两侧会悄悄比较错误的 generation。
+		if s.jobHasAnyArtifacts(task.TID, job.ID) {
+			return "", false
+		}
+	}
+	return s.fetchLegacyFoldedStacks(task.TID)
 }
 
 // foldedTextToTreeNode 把折叠栈文本（"funcA;funcB;funcC 123" 一行一条）解析成
@@ -121,11 +156,11 @@ func (s *APIServer) buildTaskDiffFlamegraph(baselineTask, compareTask *model.Hot
 		return "没有可对比的调用栈产物（folded.txt）"
 	}
 
-	baseText, baseOK := s.fetchFoldedStacks(baselineTask.TID)
+	baseText, baseOK := s.fetchFoldedStacksForTask(baselineTask)
 	if !baseOK {
 		return ProfileDiffFlamegraph{}, "基线任务（" + baselineTask.TID + "）" + reasonFor(baselineTask)
 	}
-	compareText, compareOK := s.fetchFoldedStacks(compareTask.TID)
+	compareText, compareOK := s.fetchFoldedStacksForTask(compareTask)
 	if !compareOK {
 		return ProfileDiffFlamegraph{}, "对比任务（" + compareTask.TID + "）" + reasonFor(compareTask)
 	}
