@@ -121,7 +121,10 @@ export function parseStringList(value) {
     if (typeof value === 'string' && value.trim()) {
         const text = value.trim();
         if (/^[A-Za-z0-9+/]+={0,2}$/.test(text) && text.length >= 16) return ['能力解析失败'];
-        return [text];
+        // 兼容旧 Agent/接口返回的逗号或换行分隔能力字符串。
+        // JSON 数组已在上方处理；这里仅拆分纯文本，避免能力字典收到
+        // "perf_cpu,ebpf_io" 这种无法匹配的整体值。
+        return text.split(/[\s,;，；]+/).map(item => item.trim()).filter(Boolean);
     }
     return [];
 }
