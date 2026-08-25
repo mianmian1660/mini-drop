@@ -1345,6 +1345,8 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "timeline 时间范围不合法或超出保留边界")
 		return
 	}
+	// 阶段九：按信号计算覆盖率。signal 为空时按 session.signals 展开全部信号。
+	requestedSignal := strings.TrimSpace(c.Query("signal"))
 	query := s.DB.Where("session_sid = ?", session.SID).Order("window_start ASC")
 	query = query.Where("window_end >= ? AND window_start <= ?", boundaryFrom, boundaryTo)
 
@@ -1357,14 +1359,31 @@ func (s *APIServer) GetContinuousTimeline(c *gin.Context) {
 	// 阶段六：Timeline 从 coverage segments + 最近热 window 计算，保持
 	// windows/gaps/coverage/clock 兼容字段；历史压缩条目 compacted=true +
 	// coverage_source=parquet_catalog（避免长范围全量返回明细窗口）。
-	windows, gaps, coverage, err := s.continuousTimelineV2(c.Request.Context(), session, boundaryFrom, boundaryTo, fin.FinalizedTo, query)
+	windows, gaps, coverage, merged, err := s.continuousTimelineV2(c.Request.Context(), session, boundaryFrom, boundaryTo, fin.FinalizedTo, query)
 	if err != nil {
 		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 Continuous timeline 失败")
 		return
 	}
+	// 阶段九：按信号独立覆盖率 + 状态可信度 + 长时间范围聚合。
+	grace := continuousTimelineGrace(session)
+	boundaries := continuousSessionBoundariesFor(merged, session, boundaryFrom, boundaryTo, grace)
+	signalCoverage := gin.H{}
+	for _, sig := range continuousTimelineSignalsFor(session, requestedSignal) {
+		sc := continuousSignalCoverageV2(filterMergedBySignal(merged, continuousSignalTypesForTimeline(sig)),
+			boundaryFrom, boundaryTo, fin.FinalizedTo, session, boundaries)
+		signalCoverage[sig] = sc
+	}
+	// Session 总体状态概览（所有信号合并口径，与旧 coverage/gaps 同源）。
+	overallIntervals := continuousStatusIntervalsFor(merged, boundaryFrom, boundaryTo, fin.FinalizedTo, session, boundaries)
+	overallStats := continuousCoverageStatsOf(mergeStatusIntervals(overallIntervals, pqCoverageMergeTolerance))
+	overallStatus := continuousOverallStatus(overallStats)
+	boundary := continuousCoverageBoundaryFor(merged, session, boundaryFrom, boundaryTo, grace)
 	s.RespondOK(c, gin.H{
 		"session": session, "windows": windows, "total": len(windows),
 		"gaps": gaps, "coverage": coverage,
+		"signal_coverage": signalCoverage,
+		"status_summary":  continuousStatusSummaryFor(overallStatus),
+		"boundary":        boundary,
 		"finalized_to":         fin.FinalizedTo,
 		"pending":              fin.Pending,
 		"pending_tail_seconds": fin.PendingTailSeconds,
@@ -1413,9 +1432,7 @@ func (s *APIServer) continuousFinalizationState(session model.ContinuousSession,
 	// finalized_to 取“安全时间地平线”和最新已入库 batch 结束时间的较晚者：
 	// 最近已收到的数据可以立即计入覆盖；采集停滞时 [lastEnd,horizon] 会成为
 	// 真实 trailing gap，而不是永远被隐藏在 pending tail 中。
-	grace := time.Duration(firstNonZeroUint32(session.UploadBatchSec, 60))*time.Second +
-		2*time.Duration(firstNonZeroUint32(session.AggregationWindowSec, 10))*time.Second +
-		15*time.Second
+	grace := continuousTimelineGrace(session)
 	horizon := now.Add(-grace)
 	if lastEnd.IsZero() {
 		startedAt := session.StartedAt
@@ -1464,8 +1481,10 @@ func (s *APIServer) continuousFinalizationState(session model.ContinuousSession,
 // continuousTimelineV2 阶段六 timeline：热 window（< 2h，v1 staging）+
 // coverage segments（历史已压缩，compacted=true）合成 windows/gaps/coverage。
 // 长范围不再全量返回明细 window，避免响应体积随范围线性膨胀。
+// 阶段九：额外返回 merged（全部信号的合并窗口列表），供按信号覆盖率
+// （continuousSignalCoverageV2）与 Session 总体状态复用，避免重复查询。
 func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.ContinuousSession, from, to, finalizedTo time.Time,
-	baseQuery *gorm.DB) ([]gin.H, []continuousTimelineGap, gin.H, error) {
+	baseQuery *gorm.DB) ([]gin.H, []continuousTimelineGap, gin.H, []model.ProfileWindow, error) {
 	hotRetention := time.Duration(s.Config.ContinuousParquet.HotMetadataRetentionMinutes) * time.Minute
 	if hotRetention <= 0 {
 		hotRetention = 120 * time.Minute
@@ -1481,7 +1500,7 @@ func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.Cont
 			return hotCutoff
 		}()).
 		Find(&hotWindows).Error; err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	var segments []model.ContinuousCoverageSegment
 	catalogTo := to
@@ -1491,7 +1510,7 @@ func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.Cont
 	if err := s.DB.WithContext(ctx).
 		Where("session_sid = ? AND segment_start < ? AND segment_end > ?", session.SID, catalogTo, from).
 		Order("segment_start ASC").Find(&segments).Error; err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	items := make([]gin.H, 0, len(hotWindows)+len(segments))
@@ -1535,7 +1554,7 @@ func (s *APIServer) continuousTimelineV2(ctx context.Context, session model.Cont
 		return windowStartOf(items[i]).Before(windowStartOf(items[j]))
 	})
 	gaps, coverage := continuousTimelineCoverage(merged, from, to, finalizedTo, 5*time.Second)
-	return items, gaps, coverage, nil
+	return items, gaps, coverage, merged, nil
 }
 
 func windowStartOf(item gin.H) time.Time {

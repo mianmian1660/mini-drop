@@ -3,7 +3,7 @@ import { continuous, profiles, sentinelRules } from '../api';
 import InteractiveFlamegraph, { countProfileNodes } from './InteractiveFlamegraph';
 import HistogramTrendChart from './HistogramTrendChart';
 import { localDateTimeToISO } from '../utils/time';
-import { SENTINEL_SIGNALS, decodeJSONField } from '../utils/continuous';
+import { SENTINEL_SIGNALS, decodeJSONField, signalLabel } from '../utils/continuous';
 import {
     formatMetricValue,
     formatRawMetric,
@@ -59,12 +59,18 @@ const S = {
     coverageBar: { display: 'flex', width: '100%', height: 14, overflow: 'hidden', borderRadius: 4, background: '#f2f4f7', border: '1px solid #d0d5dd' },
     coverageOK: { height: '100%', background: '#12b76a', cursor: 'default' },
     coverageGap: { height: '100%', background: '#d92d20', minWidth: 2, cursor: 'default' },
+    coverageLegend: { display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 8, color: '#667085', fontSize: 12 },
+    coverageLegendItem: { display: 'inline-flex', alignItems: 'center', gap: 5 },
+    coverageDot: { width: 8, height: 8, borderRadius: 999, display: 'inline-block' },
+    coverageSummary: { marginTop: 8, color: '#475467', fontSize: 12, lineHeight: 1.5 },
+    coverageSummaryLabel: { color: '#111827', marginRight: 6 },
     coverageTooltip: { position: 'absolute', top: 22, zIndex: 5, minWidth: 220, maxWidth: 320, padding: 10, color: '#344054', background: '#fff', border: '1px solid #d0d5dd', borderRadius: 6, boxShadow: '0 8px 20px rgba(16,24,40,.12)', fontSize: 12, lineHeight: 1.45, pointerEvents: 'none' },
     coverageTooltipTitle: { color: '#111827', fontWeight: 700, marginBottom: 5 },
     coverageAlert: { marginTop: 12, borderRadius: 6, border: '1px solid #fedf89', background: '#fffaeb', padding: '10px 12px', color: '#92400e', fontSize: 13, lineHeight: 1.5 },
     coverageAlertWarn: { borderColor: '#fecd6f', background: '#fff7e6' },
     coverageAlertTitle: { fontWeight: 700, marginBottom: 4 },
     gapList: { display: 'grid', gap: 5, marginTop: 8, color: '#b42318', fontSize: 12 },
+    gapToggle: { background: 'none', border: 'none', color: '#315efb', cursor: 'pointer', fontSize: 12, padding: 0, textAlign: 'left' },
     timeSlider: { minWidth: 0, display: 'grid', gap: 10 },
     sliderFrame: { border: '1px solid #eaecf0', borderRadius: 8, background: '#fbfcfe', padding: 12 },
     sliderTrack: { position: 'relative', height: 34, margin: '10px 8px 4px', touchAction: 'none' },
@@ -226,7 +232,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
 		? `进程持续采集 / ${fixedSession?.selector_exe || '-'} / ${selectedInstance ? '单实例' : '全部实例'} / ${stackScopeLabel}`
 		: activeFilters.comm ? `整机任务查询过滤 / ${activeFilterText} / ${stackScopeLabel}` : `整机持续采集 / ${stackScopeLabel}`;
     const activeFiltersKey = useMemo(() => JSON.stringify(activeFilters), [activeFilters]);
-    const coverageAlert = useMemo(() => coverageAlertForReliability(reliability), [reliability]);
+    // 阶段九：当前选中信号（v1 signal_type），timeline 按信号独立计算覆盖率。
+    const currentSignal = SIGNAL_TAB_OPTIONS.find(option => option.tab === signalTab)?.signal;
+    const coverageAlert = useMemo(() => coverageAlertForReliability(reliability, currentSignal), [reliability, currentSignal]);
 
     useEffect(() => {
         const timer = setTimeout(() => setFlameSearchText(flameSearchInput.trim()), 250);
@@ -287,7 +295,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             }
         try {
             const timelinePromise = sessionSID
-                ? continuous.timeline(sessionSID, { from: queryWindow.from, to: queryWindow.to }).catch(() => null)
+                ? continuous.timeline(sessionSID, { from: queryWindow.from, to: queryWindow.to, signal: currentSignal }).catch(() => null)
                 : Promise.resolve(null);
             timelinePromise.then(timelineRes => {
                 if (requestID === querySequence.current) {
@@ -862,7 +870,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     </div>
                     <LabelChips target={target} />
                 </details>
-                <CoverageBand reliability={reliability} />
+                <CoverageBand reliability={reliability} signal={currentSignal} />
             </section>
 
             {error && <div style={S.error}>{error}</div>}
@@ -1374,55 +1382,202 @@ function useRangeDrag({ maxMinute, fromMinute, toMinute, minSpan = 1, snapEven =
     return { startDrag };
 }
 
-export function CoverageBand({ reliability }) {
+export function CoverageBand({ reliability, signal }) {
     const [hover, setHover] = useState(null);
+    const [showAllGaps, setShowAllGaps] = useState(false);
     if (!reliability?.coverage) return null;
-    const segments = coverageSegments(reliability.coverage, reliability.gaps || []);
-    const ratio = Math.max(0, Math.min(1, Number(reliability.coverage.ratio) || 0));
+    const view = coverageBandsFromReliability(reliability, signal);
+    const ratio = Math.max(0, Math.min(1, Number(view.ratio) || 0));
     const clock = reliability.clock || {};
     const clockStatus = clock.status || 'unknown';
     const clockBad = clockStatus === 'warning' || clockStatus === 'critical';
+    const summary = view.statusSummary || coverageStatusText(view.status);
+    // Session 总体状态概览（所有信号合并口径，与当前信号状态独立）。
+    const overall = reliability.status_summary || null;
+    const displayGaps = showAllGaps ? view.gaps : view.gaps.slice(0, 6);
     return (
         <div style={S.coverage}>
             <div style={S.sectionHead}>
                 <strong style={{ fontSize: 13 }}>采集覆盖</strong>
                 <span style={S.subtle}>
-                    {(ratio * 100).toFixed(1)}% · {reliability.gaps?.length || 0} 个缺口
+                    {signal ? `${signalLabel(signal)} · ` : ''}{(ratio * 100).toFixed(1)}% · {view.gapCountTotal} 个缺口
                 </span>
             </div>
             <div style={S.coverageWrap} onMouseLeave={() => setHover(null)}>
                 <div style={S.coverageBar} role="img" aria-label={`采集覆盖率 ${(ratio * 100).toFixed(1)}%`}>
-                    {segments.map((segment, index) => (
+                    {view.bands.map((band, index) => (
                         <span
-                            key={`${segment.type}-${index}`}
-                            data-testid={`coverage-${segment.type}`}
-                            style={{ ...(segment.type === 'gap' ? S.coverageGap : S.coverageOK), width: `${segment.percent}%` }}
-                            onMouseEnter={event => setCoverageHover(event, segment, setHover)}
-                            onMouseMove={event => setCoverageHover(event, segment, setHover)}
+                            key={`${band.status}-${index}`}
+                            data-testid={`coverage-${band.status}`}
+                            style={{ background: coverageStatusColor(band.status), width: `${band.percent}%` }}
+                            onMouseEnter={event => setCoverageHover(event, band, setHover)}
+                            onMouseMove={event => setCoverageHover(event, band, setHover)}
                         />
                     ))}
                 </div>
                 {hover && <CoverageTooltip hover={hover} />}
             </div>
+            <div style={S.coverageLegend}>
+                <LegendItem color="#12b76a" label="有数据" />
+                <LegendItem color="#d92d20" label="确认缺数" />
+                <LegendItem color="#f79009" label="整理中" />
+                <LegendItem color="#98a2b3" label="空闲/启动/收尾" />
+            </div>
+            {summary?.label && (
+                <div style={S.coverageSummary}>
+                    <strong style={S.coverageSummaryLabel}>{summary.label}</strong>
+                    {summary.explanation && <span>{summary.explanation}</span>}
+                    {summary.suggestion && <span style={{ color: '#667085' }}>（{summary.suggestion}）</span>}
+                </div>
+            )}
+            {overall?.label && overall.label !== summary?.label && (
+                <div style={{ ...S.coverageSummary, color: '#667085' }}>
+                    <strong style={S.coverageSummaryLabel}>Session 总体</strong>
+                    {overall.label}（{overall.explanation}）
+                </div>
+            )}
             <div style={S.metaLine}>
                 <span style={clockBad ? { ...S.metaItem, ...S.metaItemWarn } : S.metaItem}>
                     <span style={S.metaKey}>Agent 时钟</span>
                     {clockStatus === 'unknown' ? '未观测' : `${clockStatus} · ${formatClockOffset(clock.offset_ms)}`}
                 </span>
             </div>
-            {Array.isArray(reliability.gaps) && reliability.gaps.length > 0 && (
+            {view.gaps.length > 0 && (
                 <div style={S.gapList}>
-                    {reliability.gaps.slice(0, 6).map((gap, index) => (
+                    {displayGaps.map((gap, index) => (
                         <span key={`${gap.start}-${index}`}>
                             {formatTime(gap.start)} - {formatTime(gap.end)} · {formatGapDuration(gap.duration_seconds)}
                         </span>
                     ))}
-                    {reliability.gaps.length > 6 && <span>另有 {reliability.gaps.length - 6} 个缺口</span>}
+                    {view.gapCountTotal > 6 && (
+                        <button type="button" style={S.gapToggle} onClick={() => setShowAllGaps(v => !v)}>
+                            {showAllGaps ? '收起缺口列表' : `另有 ${view.gapCountTotal - 6} 个缺口`}
+                        </button>
+                    )}
                 </div>
             )}
         </div>
     );
 }
+
+function LegendItem({ color, label }) {
+    return (
+        <span style={S.coverageLegendItem}>
+            <span style={{ ...S.coverageDot, background: color }} />
+            {label}
+        </span>
+    );
+}
+
+// 阶段九：从 timeline 响应提取当前信号的覆盖视图。优先 signal_coverage[signal]
+// 的 coverage_bands；其次顶层 coverage_bands（旧客户端/无 signal 参数）；
+// 最后降级为旧 coverage/gaps 两色段（covered/gap）。
+export function coverageBandsFromReliability(reliability, signal) {
+    const data = reliability || {};
+    const legacyCoverage = data.coverage || {};
+    const legacyGaps = Array.isArray(data.gaps) ? data.gaps : [];
+
+    const buildView = (source, useLegacyFields) => {
+        const sourceCoverage = source?.coverage || (useLegacyFields ? legacyCoverage : {});
+        const gaps = Array.isArray(source?.gaps) ? source.gaps : (useLegacyFields ? legacyGaps : []);
+        const rawBands = Array.isArray(source?.coverage_bands) ? source.coverage_bands : [];
+        const sourceRatio = validCoverageRatio(source?.coverage?.ratio);
+        const legacyRatio = validCoverageRatio(legacyCoverage.ratio);
+        const ratio = sourceRatio ?? (useLegacyFields ? legacyRatio : validCoverageRatio(data.coverage?.ratio)) ?? 0;
+        const statusSummary = source?.status_summary || (useLegacyFields ? data.status_summary : null);
+
+        let bands;
+        if (rawBands.length > 0) {
+            bands = rawBands.map(band => ({ ...band, percent: bandPercent(band, sourceCoverage) }));
+        } else if (gaps.length > 0 || ratio === 1 || useLegacyFields) {
+            bands = coverageSegments(sourceCoverage, gaps).map(segment => ({
+                start: new Date(segment.start).toISOString(),
+                end: new Date(segment.end).toISOString(),
+                status: segment.type === 'gap' ? 'real_gap' : 'healthy',
+                duration_seconds: (segment.end - segment.start) / 1000,
+                percent: segment.percent,
+                sample_count: 0,
+            }));
+        } else {
+            // A signal response may legitimately have no detail bands yet.
+            // Keep its own zero/unknown state instead of borrowing another signal.
+            bands = [];
+        }
+
+        const rawGapCount = source?.gap_count_total ?? (useLegacyFields ? data.gap_count_total : undefined);
+        const gapCountTotal = validGapCount(rawGapCount) ?? gaps.length;
+        const explicitGapSeconds = validNonNegativeNumber(sourceCoverage?.gap_seconds);
+        const gapSeconds = explicitGapSeconds ?? gaps.reduce((sum, gap) => sum + gapDurationSeconds(gap), 0);
+        const status = source?.status || statusSummary?.status || (gaps.length > 0 ? 'real_gap' : (ratio > 0 ? 'healthy' : 'unknown'));
+        return { bands, ratio, gaps, gapCountTotal, gapSeconds, statusSummary: statusSummary || null, status };
+    };
+
+    const sc = signal ? data.signal_coverage?.[signal] : null;
+    if (sc) {
+        // signal_coverage is authoritative even when coverage_bands is empty.
+        // In particular, ratio=0 is valid and must never inherit CPU/legacy data.
+        return buildView(sc, false);
+    }
+    return buildView(data, true);
+}
+
+function bandPercent(band, coverage) {
+    const total = (new Date(coverage?.to).getTime() - new Date(coverage?.from).getTime()) / 1000;
+    if (!Number.isFinite(total) || total <= 0) return 0;
+    const duration = validNonNegativeNumber(band?.duration_seconds) || 0;
+    return Math.max(0, Math.min(100, (duration / total) * 100));
+}
+
+function validNonNegativeNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function validCoverageRatio(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 && number <= 1 ? number : null;
+}
+
+function validGapCount(value) {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
+function gapDurationSeconds(gap) {
+    const explicit = validNonNegativeNumber(gap?.duration_seconds);
+    if (explicit !== null) return explicit;
+    const start = new Date(gap?.start).getTime();
+    const end = new Date(gap?.end).getTime();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+    return (end - start) / 1000;
+}
+
+// 状态 → 色带颜色：绿=有数据，红=确认缺数/采集异常，黄=整理中，灰=空闲/启动/收尾/未知。
+export const coverageStatusColor = (status) => {
+    switch (status) {
+        case 'healthy': return '#12b76a';
+        case 'real_gap': return '#d92d20';
+        case 'collector_failed': return '#b42318';
+        case 'pending_upload': return '#f79009';
+        case 'target_idle':
+        case 'startup_grace':
+        case 'shutdown_grace':
+        case 'unknown':
+        default: return '#98a2b3';
+    }
+};
+
+// 状态 → 通俗中文文案（与后端 status_summary 同源；旧 API 降级时前端兜底）。
+export const coverageStatusText = (status) => ({
+    healthy: { label: '数据正常', explanation: '这段时间已经收到有效采集数据', suggestion: '' },
+    real_gap: { label: '确认缺少数据', explanation: '这段时间已经超过等待时间，仍没有收到数据', suggestion: '请检查 Agent 状态与网络上传' },
+    pending_upload: { label: '数据整理中', explanation: '采集器已经工作，数据还在上传或整理', suggestion: '稍后刷新；如果持续超过上传周期，请检查 Agent 状态' },
+    target_idle: { label: '目标暂时空闲', explanation: '目标存在，但这段时间没有可采集活动', suggestion: '无需处理' },
+    startup_grace: { label: '正在启动采集', explanation: '采集器刚启动，正在准备首批数据', suggestion: '稍等片刻后刷新' },
+    shutdown_grace: { label: '停止收尾中', explanation: '采集已经停止，正在完成最后数据整理', suggestion: '无需处理' },
+    collector_failed: { label: '采集异常', explanation: '采集过程出现错误，需要检查 Agent', suggestion: '请检查 Agent 日志与采集能力' },
+    unknown: { label: '状态未知', explanation: '这段历史数据缺少足够状态信息', suggestion: '可尝试重新采集' },
+})[status] || { label: status || '状态未知', explanation: '', suggestion: '' };
 
 function setCoverageHover(event, segment, setHover) {
     const target = event.currentTarget;
@@ -1437,14 +1592,14 @@ function setCoverageHover(event, segment, setHover) {
 
 function CoverageTooltip({ hover }) {
     const { segment, x } = hover;
-    const isGap = segment.type === 'gap';
+    const text = coverageStatusText(segment.status);
     const left = `min(max(${Math.round(x)}px, 110px), calc(100% - 110px))`;
     return (
         <div role="tooltip" style={{ ...S.coverageTooltip, left, transform: 'translateX(-50%)' }}>
-            <div style={S.coverageTooltipTitle}>{isGap ? '采集缺口' : '已覆盖'}</div>
+            <div style={S.coverageTooltipTitle}>{text.label}</div>
             <div>{formatTime(segment.start)} - {formatTime(segment.end)}</div>
-            <div>持续 {formatGapDuration((segment.end - segment.start) / 1000)} · 占比 {segment.percent.toFixed(1)}%</div>
-            {isGap && <div style={{ color: '#b42318', marginTop: 4 }}>该时段无样本或存在上传空档</div>}
+            <div>持续 {formatGapDuration(segment.duration_seconds)} · 占比 {segment.percent.toFixed(1)}%</div>
+            {text.explanation && <div style={{ marginTop: 4 }}>{text.explanation}</div>}
         </div>
     );
 }
@@ -1459,17 +1614,19 @@ function CoverageAlert({ alert }) {
     );
 }
 
-export function coverageAlertForReliability(reliability) {
+export function coverageAlertForReliability(reliability, signal) {
     if (!reliability?.coverage) return null;
-    const gaps = Array.isArray(reliability.gaps) ? reliability.gaps : [];
+    const view = coverageBandsFromReliability(reliability, signal);
+    const gaps = view.gaps;
     if (gaps.length === 0) return null;
-    const ratio = Math.max(0, Math.min(1, Number(reliability.coverage.ratio) || 0));
+    const ratio = Math.max(0, Math.min(1, Number(view.ratio) || 0));
     const longest = gaps.reduce((max, gap) => Math.max(max, Number(gap?.duration_seconds) || 0), 0);
-    const total = gaps.reduce((sum, gap) => sum + (Number(gap?.duration_seconds) || 0), 0);
+    // 累计缺口优先用后端精确统计（gap_seconds），避免详细缺口截断后低估。
+    const total = Number(view.gapSeconds) || gaps.reduce((sum, gap) => sum + (Number(gap?.duration_seconds) || 0), 0);
     const severity = ratio < 0.97 || longest >= 15 ? 'warn' : 'info';
     return {
         severity,
-        summary: `覆盖 ${(ratio * 100).toFixed(1)}% · ${gaps.length} 个缺口 · 最长 ${formatGapDuration(longest)}`,
+        summary: `覆盖 ${(ratio * 100).toFixed(1)}% · ${view.gapCountTotal} 个缺口 · 最长 ${formatGapDuration(longest)}`,
         detail: `累计缺口 ${formatGapDuration(total)}，常见于 agent 短暂卡顿、上传滞后或当前窗口内进程空闲。`,
     };
 }
