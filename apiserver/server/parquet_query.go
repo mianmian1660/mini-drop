@@ -108,6 +108,23 @@ func pqSampleFromCPURow(row pqCPURow) ContinuousStackSample {
 	return sample
 }
 
+func continuousProfileSampleSeen(seen map[string]bool, sample ContinuousStackSample) bool {
+	if sample.ProfileID == "" {
+		return false
+	}
+	key := sample.ProfileID + "|" + strconv.Itoa(sample.PID) + "|" + strconv.FormatInt(sample.ProcessStartMs, 10) + "|" + sample.Exe + "|"
+	if len(sample.Frames) > 0 {
+		key += pqStackKey(framesToParquet(sample.Frames))
+	} else {
+		key += strings.Join(sample.Stack, "\x00") + "|" + sample.StackString
+	}
+	if seen[key] {
+		return true
+	}
+	seen[key] = true
+	return false
+}
+
 // pqLabelsInterface map[string]string → map[string]interface{}。
 func pqLabelsInterface(labels map[string]string) map[string]interface{} {
 	if len(labels) == 0 {
@@ -211,6 +228,9 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 					continue
 				}
 				sample := pqSampleFromCPURow(*row)
+				if row.ProfileStatus == "failed" {
+					continue
+				}
 				if !continuousSampleMatches(sample, pqLabelsInterface(row.Labels), q.Filters) {
 					continue
 				}
@@ -219,7 +239,7 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 				// (profile_id + pid + start + exe) 只消费一次，防止跨层
 				// 双计。旧 Parquet 无 profile_id（空串）不参与去重。
 				if row.ProfileID != "" {
-					if continuousProfileSeen(agg.SeenProfileIDs, row.ProfileID, []ContinuousStackSample{sample}) {
+					if continuousProfileSampleSeen(agg.SeenProfileIDs, sample) {
 						continue
 					}
 				}

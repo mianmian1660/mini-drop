@@ -51,11 +51,15 @@ func goldenSeedBatch(t *testing.T, s *APIServer, hour time.Time) {
 			SignalType: "python_memory", ProfileID: "memray-1-100", Backend: "memray", Unit: "bytes",
 			Samples: []ContinuousStackSample{
 				{PID: 200, ProcessStartMs: 2000, Comm: "python3", Exe: "/usr/bin/python3", Runtime: "python", Count: 4096, Stack: []string{"allocA"}},
+				{PID: 200, ProcessStartMs: 2000, Comm: "python3", Exe: "/usr/bin/python3", Runtime: "python", Count: 2048, Stack: []string{"allocB"}},
 			},
+		}, {
+			SignalType: "python_memory", ProfileID: "memray-1-failed", Backend: "memray", Unit: "bytes",
 		}},
 		Metrics: []ContinuousMetricIngest{
 			{Metric: "rss_bytes", Timestamp: hour.Add(2*time.Minute + 30*time.Second), PID: 200, ProcessStartMs: 2000, Comm: "python3", Exe: "/usr/bin/python3", Runtime: "python", Value: 1048576, Unit: "bytes"},
 		},
+		RSSTruncated: 3,
 	}
 	windowB := ContinuousWindowIngest{
 		WindowStart: hour.Add(4 * time.Minute),
@@ -203,9 +207,9 @@ func TestGoldenQueryMemoryCrossStorage(t *testing.T) {
 	if err != nil || !v1Found {
 		t.Fatalf("v1 query: found=%v err=%v", v1Found, err)
 	}
-	// 跨窗口重复投递的 memray-1-100 只计一次 → Total=4096。
-	if v1Agg.Total != 4096 {
-		t.Fatalf("v1 memory Total=%v want 4096（跨窗口去重）", v1Agg.Total)
+	// 跨窗口重复 profile 的每条 stack 只计一次，但同一 profile 内不同 stack 都保留。
+	if v1Agg.Total != 6144 {
+		t.Fatalf("v1 memory Total=%v want 6144（跨窗口去重且保留多栈）", v1Agg.Total)
 	}
 
 	s.Config.ContinuousParquet.Mode = "prefer"
@@ -229,12 +233,15 @@ func TestGoldenQueryRSSCrossStorage(t *testing.T) {
 	q := goldenQuery(hour, "memory")
 
 	// v1 时序。
-	v1Series, _, v1Found, err := s.queryNativeContinuousTimeseries(ctx, q, "rss_bytes", 20)
+	v1Series, v1Truncated, v1Found, err := s.queryNativeContinuousTimeseries(ctx, q, "rss_bytes", 20)
 	if err != nil || !v1Found {
 		t.Fatalf("v1 timeseries: found=%v err=%v", v1Found, err)
 	}
 	if len(v1Series) != 1 || v1Series[0].Peak != 1048576 {
 		t.Fatalf("v1 series=%+v", v1Series)
+	}
+	if v1Truncated != 3 {
+		t.Fatalf("v1 rss_truncated=%d want 3", v1Truncated)
 	}
 
 	// v2 时序（构建 metrics 块）。
@@ -243,17 +250,44 @@ func TestGoldenQueryRSSCrossStorage(t *testing.T) {
 	if err != nil || !built {
 		t.Fatalf("pqBuildRawHour: built=%v err=%v", built, err)
 	}
-	v2Series, _, v2Found, err := s.pqQueryTimeseriesMixed(ctx, q, "rss_bytes", 20)
+	v2Series, v2Truncated, v2Found, err := s.pqQueryTimeseriesMixed(ctx, q, "rss_bytes", 20)
 	if err != nil || !v2Found {
 		t.Fatalf("v2 timeseries: found=%v err=%v", v2Found, err)
 	}
 	if len(v2Series) != 1 || v2Series[0].Peak != 1048576 {
 		t.Fatalf("v2 series=%+v", v2Series)
 	}
+	if v2Truncated != 3 {
+		t.Fatalf("v2 rss_truncated=%d want 3", v2Truncated)
+	}
 	if v1Series[0].PID != v2Series[0].PID || v1Series[0].ProcessStartMs != v2Series[0].ProcessStartMs ||
 		v1Series[0].Exe != v2Series[0].Exe {
 		t.Fatalf("series 身份不一致 v1=%+v v2=%+v", v1Series[0], v2Series[0])
 	}
+}
+
+func TestGoldenQueryFailedMemoryProfilePreservedInParquet(t *testing.T) {
+	s := pqTestServer(t)
+	hour := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	goldenSeedBatch(t, s, hour)
+	ctx := context.Background()
+	s.Config.ContinuousParquet.Mode = "prefer"
+	if _, err := s.pqBuildRawHour(ctx, "default", hour); err != nil {
+		t.Fatal(err)
+	}
+	profiles, found, err := s.queryMemoryProfilesMixed(ctx, goldenQuery(hour, "memory"))
+	if err != nil || !found {
+		t.Fatalf("profiles found=%v err=%v", found, err)
+	}
+	for _, profile := range profiles {
+		if profile.ProfileID == "memray-1-failed" {
+			if profile.Status != "failed" || profile.Reason == "" {
+				t.Fatalf("failed profile=%+v", profile)
+			}
+			return
+		}
+	}
+	t.Fatalf("failed Memray profile missing after Parquet compaction: %+v", profiles)
 }
 
 // TestGoldenQueryParquetProfileIDPreserved v2 写入保留 profile_id，

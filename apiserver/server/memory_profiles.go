@@ -73,7 +73,7 @@ func (s *APIServer) GetContinuousMemoryProfiles(c *gin.Context) {
 	})
 	s.RespondOK(c, gin.H{
 		"profiles": profiles, "total": len(profiles), "empty": len(profiles) == 0,
-		"generated_at": time.Now(),
+		"generated_at":   time.Now(),
 		"storage_source": stats.StorageSource, "resolution_seconds": stats.ResolutionSeconds,
 		"mixed_resolution": stats.MixedResolution, "earliest_available_at": stats.EarliestAvailable,
 	})
@@ -146,6 +146,11 @@ func (s *APIServer) queryMemoryProfilesMixed(ctx context.Context, q ProfileQuery
 				if row.ProfileID == "" {
 					continue // 旧 Parquet 无 profile_id，无法关联
 				}
+				sample := pqSampleFromCPURow(*row)
+				if (row.ProfileStatus == "failed" && len(q.Filters) > 0) ||
+					(row.ProfileStatus != "failed" && !continuousSampleMatches(sample, pqLabelsInterface(row.Labels), q.Filters)) {
+					continue
+				}
 				key := row.ProfileID + "|" + strconv.Itoa(int(row.PID)) + "|" + strconv.FormatInt(row.ProcessStartMs, 10) + "|" + row.Exe
 				item := byProfile[key]
 				if item == nil {
@@ -158,6 +163,10 @@ func (s *APIServer) queryMemoryProfilesMixed(ctx context.Context, q ProfileQuery
 					}
 					byProfile[key] = item
 					order = append(order, key)
+				}
+				if row.ProfileStatus == "failed" {
+					item.Status = "failed"
+					item.Reason = row.ProfileReason
 				}
 				item.SampleCount = addContinuousCount(item.SampleCount, row.Value)
 			}
@@ -252,7 +261,12 @@ func (s *APIServer) queryNativeMemoryProfiles(ctx context.Context, q ProfileQuer
 						Unit:    firstNonEmpty(profile.Unit, "bytes"),
 						Status:  "ready",
 					}
+					matched := len(q.Filters) == 0
 					for _, sample := range profile.Samples {
+						if !continuousSampleMatches(sample, window.Labels, q.Filters) {
+							continue
+						}
+						matched = true
 						if info.PID == 0 {
 							info.PID = sample.PID
 							info.ProcessStartMs = sample.ProcessStartMs
@@ -260,6 +274,9 @@ func (s *APIServer) queryNativeMemoryProfiles(ctx context.Context, q ProfileQuer
 							info.Exe = sample.Exe
 						}
 						info.SampleCount = addContinuousCount(info.SampleCount, firstNonZeroUint64(sample.Count, 1))
+					}
+					if !matched {
+						continue
 					}
 					if info.ProfileID == "" {
 						info.ProfileID = "anonymous-" + strconv.FormatInt(window.WindowStart.UnixMilli(), 10)

@@ -409,7 +409,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         if (!targetHost) return;
         setHeapTasksLoading(true);
         try {
-            const res = await profiles.heapTasks({ host: targetHost, limit: 5 });
+            const res = await profiles.heapTasks({ host: targetHost, from: timeWindow.from, to: timeWindow.to, limit: 5 });
             if (res.code === 0) {
                 setHeapTasks(res.data?.tasks || res.data || []);
             }
@@ -418,7 +418,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setHeapTasksLoading(false);
         }
-    }, [targetHost]);
+    }, [targetHost, timeWindow.from, timeWindow.to]);
 
     // 阶段七：Memray allocation profile 元数据（SDK 接入状态/时间范围/错误）。
     const loadMemoryProfiles = useCallback(async (queryWindow) => {
@@ -431,6 +431,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 service: targetService,
                 session_sid: sessionSID,
                 profile_type: 'memory',
+				filters: activeFiltersKey,
                 from: queryWindow.from,
                 to: queryWindow.to,
             });
@@ -445,7 +446,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         } finally {
             setMemoryProfilesLoading(false);
         }
-    }, [targetKey, targetHost, targetService, sessionSID]);
+    }, [targetKey, targetHost, targetService, sessionSID, activeFiltersKey]);
 
     useEffect(() => {
         if (profileType === 'memory') loadHeapTasks();

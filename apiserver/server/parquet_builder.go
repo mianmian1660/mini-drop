@@ -108,6 +108,17 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 			}
 			rows.CPU = append(rows.CPU, row)
 		}
+		if window.SignalType == "python_memory" || window.SignalType == "memory" {
+			for _, profile := range in.Profiles {
+				if continuousNormalizeProfileSignal(profile.SignalType) != "python_memory" || len(profile.Samples) > 0 || profile.ProfileID == "" {
+					continue
+				}
+				rows.CPU = append(rows.CPU, pqCPURow{Timestamp: ts, SessionSID: sessionSID,
+					Service: firstNonEmpty(inServiceName(s, sessionSID), "hotmethod"), Agent: firstNonEmpty(inLabelsString(in, "agent_id"), ""),
+					Labels: labels, Unit: firstNonEmpty(profile.Unit, "bytes"), ProfileType: window.SignalType,
+					ProfileID: profile.ProfileID, ProfileStatus: "failed", ProfileReason: "profile 无可用样本（转换失败或无峰值分配）"})
+			}
+		}
 	case "metrics", "python_rss":
 		for _, metric := range in.Metrics {
 			kind, registered := pqMetricKindFor(metric.Metric)
@@ -133,6 +144,7 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 				Last:           metric.Value,
 				Unit:           metric.Unit,
 				Labels:         sanitizeContinuousLabels(metric.Labels),
+				RSSTruncated:   int32(window.RSSTruncated),
 			}
 			rows.Metrics = append(rows.Metrics, row)
 		}
@@ -1255,8 +1267,8 @@ func pqStackKey(frames []pqCPUFrame) string {
 func downsampleCPURows(rows []pqCPURow, targetResolution string) []pqCPURow {
 	type key struct {
 		bucket, session, backend, runtime, labels, stack, unit, profileType, profileID string
-		pid                                                                           int32
-		processStartMs                                                                int64
+		pid                                                                            int32
+		processStartMs                                                                 int64
 	}
 	acc := map[key]*pqCPURow{}
 	order := []key{}
@@ -1264,14 +1276,14 @@ func downsampleCPURows(rows []pqCPURow, targetResolution string) []pqCPURow {
 		row := &rows[i]
 		bucket := pqBucketStart(time.UnixMilli(row.Timestamp), targetResolution).UnixMilli()
 		k := key{
-			bucket:         strconv.FormatInt(bucket, 10),
-			session:        row.SessionSID,
-			backend:        row.Backend,
-			runtime:        row.Runtime,
-			labels:         pqSortedLabelKey(row.Labels),
-			stack:          pqStackKey(row.Frames),
-			unit:           row.Unit,
-			profileType:    row.ProfileType,
+			bucket:      strconv.FormatInt(bucket, 10),
+			session:     row.SessionSID,
+			backend:     row.Backend,
+			runtime:     row.Runtime,
+			labels:      pqSortedLabelKey(row.Labels),
+			stack:       pqStackKey(row.Frames),
+			unit:        row.Unit,
+			profileType: row.ProfileType,
 			// 阶段七：profile_id 参与降采样分组——同一 profile 的样本在
 			// 同一桶内合并，不同 profile 不合并（查询侧按 profile 去重，
 			// 合并会破坏去重键的区分度）。
@@ -1336,6 +1348,9 @@ func downsampleMetricRows(rows []pqMetricRow, targetResolution string) []pqMetri
 		}
 		if row.Value > a.Max {
 			a.Max = row.Value
+		}
+		if row.RSSTruncated > a.RSSTruncated {
+			a.RSSTruncated = row.RSSTruncated
 		}
 		if row.MetricKind == "counter" {
 			// reset-aware：只累加正向增量；回绕/重启后从 0 起。

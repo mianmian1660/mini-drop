@@ -186,6 +186,9 @@ func (s *APIServer) pqQueryTimeseriesMixed(ctx context.Context, q ProfileQuery, 
 				if row.Metric != metricName || row.Timestamp < hFrom.UnixMilli() || row.Timestamp >= hTo.UnixMilli() {
 					continue
 				}
+				if int(row.RSSTruncated) > rssTruncated {
+					rssTruncated = int(row.RSSTruncated)
+				}
 				sample := ContinuousStackSample{
 					PID: int(row.PID), Comm: row.Comm, Exe: row.Exe, Runtime: row.Runtime,
 					Labels: pqLabelsInterface(row.Labels),
