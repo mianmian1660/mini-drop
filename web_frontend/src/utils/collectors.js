@@ -29,6 +29,45 @@ const CAPABILITY_LABELS = {
     bpftrace: 'bpftrace',
 };
 
+// 采集能力的中文名称与用途说明（capability 展示用）。
+// 未覆盖的能力回退到 capabilityLabel 的短名，不展示原始内部字段名。
+const CAPABILITY_DESCRIPTIONS = {
+    perf_cpu: { name: 'CPU 采样', usage: 'perf 火焰图，定位 CPU 热点' },
+    perf: { name: 'CPU 采样', usage: 'perf 火焰图，定位 CPU 热点' },
+    'async-profiler': { name: 'Java 采样', usage: 'Java async-profiler 火焰图' },
+    async_profiler_java: { name: 'Java 采样', usage: 'Java async-profiler 火焰图' },
+    java: { name: 'Java 采样', usage: 'Java async-profiler 火焰图' },
+    go_pprof: { name: 'Go 采样', usage: 'Go pprof CPU 火焰图' },
+    go_pprof_heap: { name: 'Go 堆分析', usage: 'Go pprof Heap 堆快照' },
+    pprof: { name: 'Go 采样', usage: 'Go pprof CPU 火焰图' },
+    ebpf_cpu: { name: 'eBPF CPU 采样', usage: 'eBPF CPU 火焰图' },
+    ebpf_io: { name: 'eBPF IO', usage: 'eBPF IO 延迟分析' },
+    ebpf_sched: { name: 'eBPF 调度', usage: 'eBPF 调度延迟分析' },
+    ebpf: { name: 'eBPF 采样', usage: 'eBPF 火焰图' },
+    bpftrace: { name: 'bpftrace 脚本', usage: '受限脚本诊断' },
+    native_cp_perf_event: { name: '内核符号', usage: 'perf_event 可读，支持内核符号解析' },
+    native_cp_perf: { name: '内核符号', usage: 'perf 命令可用，支持内核符号解析' },
+    native_cp_btf: { name: '内核符号', usage: 'BTF 可用，支持内核符号解析' },
+    native_cp_ebpf_fs: { name: 'eBPF 采样', usage: 'eBPF 文件系统可用' },
+    native_cp_tracefs: { name: 'eBPF 采样', usage: 'tracefs 可用' },
+    native_cp_tracepoint_block: { name: 'eBPF IO', usage: '块设备 tracepoint 可用' },
+    native_cp_tracepoint_sched: { name: 'eBPF 调度', usage: '调度 tracepoint 可用' },
+    native_cp_sampler_perf_event: { name: '持续采集', usage: 'perf_event 采样器就绪' },
+    native_cp_sampler_core_ready: { name: '持续采集', usage: '核心采样器就绪' },
+    lang_go_goresym: { name: 'Go 符号', usage: 'Go 符号解析可用' },
+    lang_java_asprof: { name: 'Java 符号', usage: 'Java 符号解析可用' },
+    lang_python_pyspy: { name: 'Python 采样', usage: 'py-spy 可用' },
+    lang_runtime_perf_map: { name: '运行时符号', usage: 'perf map 运行时符号可用' },
+    perf_dwarf_call_graph: { name: 'DWARF 调用栈', usage: 'perf DWARF 调用栈可用' },
+};
+
+export function capabilityDescription(capability) {
+    const key = String(capability || '');
+    const desc = CAPABILITY_DESCRIPTIONS[key];
+    if (!desc) return null;
+    return desc;
+}
+
 function parseJSON(text) {
     try {
         return JSON.parse(text);

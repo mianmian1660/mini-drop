@@ -260,6 +260,116 @@ func (x *HostStats) GetCollectedAtUnixMs() int64 {
 }
 
 // ----------------------------------------------------------
+// HostMetadata：宿主机身份与系统信息（由 drop_agent 采集并随心跳上报）
+// 与 HostStats（资源占用）不同，本消息描述"这台机器是什么"：
+// 操作系统、内核、架构、CPU 型号与核数、开机时长。
+// 采集失败时对应字段留空或为 0，不伪造默认值；单个字段失败不影响其他字段。
+// 字段均为追加编号，兼容旧 Agent/Server。
+// ----------------------------------------------------------
+type HostMetadata struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	OsName            string `protobuf:"bytes,1,opt,name=os_name,json=osName,proto3" json:"os_name,omitempty"`                          // 操作系统名称，如 "Ubuntu"（/etc/os-release NAME）
+	OsVersion         string `protobuf:"bytes,2,opt,name=os_version,json=osVersion,proto3" json:"os_version,omitempty"`                 // 操作系统版本，如 "24.04"（/etc/os-release VERSION_ID）
+	KernelVersion     string `protobuf:"bytes,3,opt,name=kernel_version,json=kernelVersion,proto3" json:"kernel_version,omitempty"`     // 内核版本，如 "6.8.0-31-generic"（uname -r）
+	Architecture      string `protobuf:"bytes,4,opt,name=architecture,proto3" json:"architecture,omitempty"`                            // 硬件架构，如 "x86_64"（uname -m）
+	CpuModel          string `protobuf:"bytes,5,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`                    // CPU 型号，如 "AMD EPYC 7B12"（/proc/cpuinfo model name）
+	CpuCores          int32  `protobuf:"varint,6,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`                   // 在线 CPU 核数（sysconf(_SC_NPROCESSORS_ONLN)）
+	UptimeSeconds     int64  `protobuf:"varint,7,opt,name=uptime_seconds,json=uptimeSeconds,proto3" json:"uptime_seconds,omitempty"`     // 开机时长（秒，/proc/uptime）
+	CollectedAtUnixMs int64  `protobuf:"varint,8,opt,name=collected_at_unix_ms,json=collectedAtUnixMs,proto3" json:"collected_at_unix_ms,omitempty"` // 采集时间（Unix 毫秒）
+}
+
+func (x *HostMetadata) Reset() {
+	*x = HostMetadata{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_common_proto_common_proto_msgTypes[2]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *HostMetadata) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HostMetadata) ProtoMessage() {}
+
+func (x *HostMetadata) ProtoReflect() protoreflect.Message {
+	mi := &file_common_proto_common_proto_msgTypes[2]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HostMetadata.ProtoReflect.Descriptor instead.
+func (*HostMetadata) Descriptor() ([]byte, []int) {
+	return file_common_proto_common_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *HostMetadata) GetOsName() string {
+	if x != nil {
+		return x.OsName
+	}
+	return ""
+}
+
+func (x *HostMetadata) GetOsVersion() string {
+	if x != nil {
+		return x.OsVersion
+	}
+	return ""
+}
+
+func (x *HostMetadata) GetKernelVersion() string {
+	if x != nil {
+		return x.KernelVersion
+	}
+	return ""
+}
+
+func (x *HostMetadata) GetArchitecture() string {
+	if x != nil {
+		return x.Architecture
+	}
+	return ""
+}
+
+func (x *HostMetadata) GetCpuModel() string {
+	if x != nil {
+		return x.CpuModel
+	}
+	return ""
+}
+
+func (x *HostMetadata) GetCpuCores() int32 {
+	if x != nil {
+		return x.CpuCores
+	}
+	return 0
+}
+
+func (x *HostMetadata) GetUptimeSeconds() int64 {
+	if x != nil {
+		return x.UptimeSeconds
+	}
+	return 0
+}
+
+func (x *HostMetadata) GetCollectedAtUnixMs() int64 {
+	if x != nil {
+		return x.CollectedAtUnixMs
+	}
+	return 0
+}
+
+// ----------------------------------------------------------
 // AttemptStatus：Agent 心跳里汇报的执行尝试
 // ----------------------------------------------------------
 type AttemptStatus struct {
@@ -274,7 +384,7 @@ type AttemptStatus struct {
 func (x *AttemptStatus) Reset() {
 	*x = AttemptStatus{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_common_proto_common_proto_msgTypes[2]
+		mi := &file_common_proto_common_proto_msgTypes[3]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -287,7 +397,7 @@ func (x *AttemptStatus) String() string {
 func (*AttemptStatus) ProtoMessage() {}
 
 func (x *AttemptStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_common_proto_msgTypes[2]
+	mi := &file_common_proto_common_proto_msgTypes[3]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -300,7 +410,7 @@ func (x *AttemptStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttemptStatus.ProtoReflect.Descriptor instead.
 func (*AttemptStatus) Descriptor() ([]byte, []int) {
-	return file_common_proto_common_proto_rawDescGZIP(), []int{2}
+	return file_common_proto_common_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *AttemptStatus) GetTaskID() string {
@@ -333,7 +443,7 @@ type File struct {
 func (x *File) Reset() {
 	*x = File{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_common_proto_common_proto_msgTypes[3]
+		mi := &file_common_proto_common_proto_msgTypes[4]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -346,7 +456,7 @@ func (x *File) String() string {
 func (*File) ProtoMessage() {}
 
 func (x *File) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_common_proto_msgTypes[3]
+	mi := &file_common_proto_common_proto_msgTypes[4]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -359,7 +469,7 @@ func (x *File) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use File.ProtoReflect.Descriptor instead.
 func (*File) Descriptor() ([]byte, []int) {
-	return file_common_proto_common_proto_rawDescGZIP(), []int{3}
+	return file_common_proto_common_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *File) GetName() string {
@@ -405,7 +515,7 @@ type CosConfig struct {
 func (x *CosConfig) Reset() {
 	*x = CosConfig{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_common_proto_common_proto_msgTypes[4]
+		mi := &file_common_proto_common_proto_msgTypes[5]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -418,7 +528,7 @@ func (x *CosConfig) String() string {
 func (*CosConfig) ProtoMessage() {}
 
 func (x *CosConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_common_proto_msgTypes[4]
+	mi := &file_common_proto_common_proto_msgTypes[5]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -431,7 +541,7 @@ func (x *CosConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CosConfig.ProtoReflect.Descriptor instead.
 func (*CosConfig) Descriptor() ([]byte, []int) {
-	return file_common_proto_common_proto_rawDescGZIP(), []int{4}
+	return file_common_proto_common_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CosConfig) GetEndpoint() string {
@@ -536,9 +646,28 @@ var file_common_proto_common_proto_rawDesc = []byte{
 	0x64, 0x69, 0x73, 0x6b, 0x4d, 0x6f, 0x75, 0x6e, 0x74, 0x12, 0x2f, 0x0a, 0x14, 0x63, 0x6f, 0x6c,
 	0x6c, 0x65, 0x63, 0x74, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x5f, 0x75, 0x6e, 0x69, 0x78, 0x5f, 0x6d,
 	0x73, 0x18, 0x0c, 0x20, 0x01, 0x28, 0x03, 0x52, 0x11, 0x63, 0x6f, 0x6c, 0x6c, 0x65, 0x63, 0x74,
-	0x65, 0x64, 0x41, 0x74, 0x55, 0x6e, 0x69, 0x78, 0x4d, 0x73, 0x22, 0x46, 0x0a, 0x0d, 0x41, 0x74,
-	0x74, 0x65, 0x6d, 0x70, 0x74, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x12, 0x16, 0x0a, 0x06, 0x74,
-	0x61, 0x73, 0x6b, 0x49, 0x44, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x74, 0x61, 0x73,
+	0x65, 0x64, 0x41, 0x74, 0x55, 0x6e, 0x69, 0x78, 0x4d, 0x73, 0x22, 0xa4, 0x02, 0x0a, 0x0c, 0x48,
+	0x6f, 0x73, 0x74, 0x4d, 0x65, 0x74, 0x61, 0x64, 0x61, 0x74, 0x61, 0x12, 0x17, 0x0a, 0x07, 0x6f,
+	0x73, 0x5f, 0x6e, 0x61, 0x6d, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x6f, 0x73,
+	0x4e, 0x61, 0x6d, 0x65, 0x12, 0x1d, 0x0a, 0x0a, 0x6f, 0x73, 0x5f, 0x76, 0x65, 0x72, 0x73, 0x69,
+	0x6f, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x6f, 0x73, 0x56, 0x65, 0x72, 0x73,
+	0x69, 0x6f, 0x6e, 0x12, 0x25, 0x0a, 0x0e, 0x6b, 0x65, 0x72, 0x6e, 0x65, 0x6c, 0x5f, 0x76, 0x65,
+	0x72, 0x73, 0x69, 0x6f, 0x6e, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0d, 0x6b, 0x65, 0x72,
+	0x6e, 0x65, 0x6c, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x12, 0x22, 0x0a, 0x0c, 0x61, 0x72,
+	0x63, 0x68, 0x69, 0x74, 0x65, 0x63, 0x74, 0x75, 0x72, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09,
+	0x52, 0x0c, 0x61, 0x72, 0x63, 0x68, 0x69, 0x74, 0x65, 0x63, 0x74, 0x75, 0x72, 0x65, 0x12, 0x1b,
+	0x0a, 0x09, 0x63, 0x70, 0x75, 0x5f, 0x6d, 0x6f, 0x64, 0x65, 0x6c, 0x18, 0x05, 0x20, 0x01, 0x28,
+	0x09, 0x52, 0x08, 0x63, 0x70, 0x75, 0x4d, 0x6f, 0x64, 0x65, 0x6c, 0x12, 0x1b, 0x0a, 0x09, 0x63,
+	0x70, 0x75, 0x5f, 0x63, 0x6f, 0x72, 0x65, 0x73, 0x18, 0x06, 0x20, 0x01, 0x28, 0x05, 0x52, 0x08,
+	0x63, 0x70, 0x75, 0x43, 0x6f, 0x72, 0x65, 0x73, 0x12, 0x25, 0x0a, 0x0e, 0x75, 0x70, 0x74, 0x69,
+	0x6d, 0x65, 0x5f, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x73, 0x18, 0x07, 0x20, 0x01, 0x28, 0x03,
+	0x52, 0x0d, 0x75, 0x70, 0x74, 0x69, 0x6d, 0x65, 0x53, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x73, 0x12,
+	0x30, 0x0a, 0x15, 0x63, 0x6f, 0x6c, 0x6c, 0x65, 0x63, 0x74, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x5f,
+	0x75, 0x6e, 0x69, 0x78, 0x5f, 0x6d, 0x73, 0x18, 0x08, 0x20, 0x01, 0x28, 0x03, 0x52, 0x11, 0x63,
+	0x6f, 0x6c, 0x6c, 0x65, 0x63, 0x74, 0x65, 0x64, 0x41, 0x74, 0x55, 0x6e, 0x69, 0x78, 0x4d, 0x73,
+	0x22, 0x46, 0x0a, 0x0d, 0x41, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x53, 0x74, 0x61, 0x74, 0x75,
+	0x73, 0x12, 0x16, 0x0a, 0x06, 0x74, 0x61, 0x73, 0x6b, 0x49, 0x44, 0x18, 0x01, 0x20, 0x01, 0x28,
+	0x09, 0x52, 0x06, 0x74, 0x61, 0x73,
 	0x6b, 0x49, 0x44, 0x12, 0x1d, 0x0a, 0x0a, 0x61, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x5f, 0x69,
 	0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x04, 0x52, 0x09, 0x61, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74,
 	0x49, 0x64, 0x22, 0x48, 0x0a, 0x04, 0x46, 0x69, 0x6c, 0x65, 0x12, 0x12, 0x0a, 0x04, 0x6e, 0x61,
@@ -580,13 +709,14 @@ func file_common_proto_common_proto_rawDescGZIP() []byte {
 	return file_common_proto_common_proto_rawDescData
 }
 
-var file_common_proto_common_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_common_proto_common_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_common_proto_common_proto_goTypes = []interface{}{
 	(*PidStats)(nil),      // 0: common.PidStats
 	(*HostStats)(nil),     // 1: common.HostStats
-	(*AttemptStatus)(nil), // 2: common.AttemptStatus
-	(*File)(nil),          // 3: common.File
-	(*CosConfig)(nil),     // 4: common.CosConfig
+	(*HostMetadata)(nil),  // 2: common.HostMetadata
+	(*AttemptStatus)(nil), // 3: common.AttemptStatus
+	(*File)(nil),          // 4: common.File
+	(*CosConfig)(nil),     // 5: common.CosConfig
 }
 var file_common_proto_common_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
@@ -627,7 +757,7 @@ func file_common_proto_common_proto_init() {
 			}
 		}
 		file_common_proto_common_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AttemptStatus); i {
+			switch v := v.(*HostMetadata); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -639,7 +769,7 @@ func file_common_proto_common_proto_init() {
 			}
 		}
 		file_common_proto_common_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*File); i {
+			switch v := v.(*AttemptStatus); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -651,6 +781,18 @@ func file_common_proto_common_proto_init() {
 			}
 		}
 		file_common_proto_common_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*File); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_common_proto_common_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
 			switch v := v.(*CosConfig); i {
 			case 0:
 				return &v.state
@@ -669,7 +811,7 @@ func file_common_proto_common_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_common_proto_common_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

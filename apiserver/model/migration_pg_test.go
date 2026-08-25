@@ -128,4 +128,44 @@ func TestMigrations016ObjectKeyUnique(t *testing.T) {
 	_ = db.Exec("DELETE FROM continuous_parquet_blocks WHERE block_id IN ('pg-file-a','pg-file-b')").Error
 }
 
+// 026 主机元数据迁移：agent_infos.host_metadata JSONB 列存在且可读写
+func TestMigration026HostMetadata(t *testing.T) {
+	db := pgTestDB(t)
+	if err := AutoMigrate(db); err != nil {
+		t.Fatalf("构造 schema 失败: %v", err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("应用迁移失败: %v", err)
+	}
+	// 重复应用必须幂等
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("重复 RunMigrations 失败: %v", err)
+	}
+
+	// 列存在
+	var colCount int64
+	if err := db.Raw(`SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='agent_infos' AND column_name='host_metadata'`).Scan(&colCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if colCount == 0 {
+		t.Fatal("agent_infos.host_metadata 列未创建")
+	}
+
+	// JSONB 读写
+	metaJSON := `{"os_name":"Ubuntu","os_version":"24.04","kernel_version":"6.8.0-31-generic","architecture":"x86_64","cpu_model":"AMD EPYC 7B12","cpu_cores":8,"uptime_seconds":86400}`
+	if err := db.Exec(`INSERT INTO agent_infos (hostname, ip_addr, online, host_metadata)
+		VALUES ('pg-meta-host', '10.9.9.9', true, ?::jsonb)`, metaJSON).Error; err != nil {
+		t.Fatalf("写入 host_metadata 失败: %v", err)
+	}
+	var stored string
+	if err := db.Raw(`SELECT host_metadata::text FROM agent_infos WHERE ip_addr='10.9.9.9'`).Scan(&stored).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored == "" {
+		t.Fatal("host_metadata 读取为空")
+	}
+	_ = db.Exec("DELETE FROM agent_infos WHERE ip_addr='10.9.9.9'").Error
+}
+
 var _ = fmt.Sprintf

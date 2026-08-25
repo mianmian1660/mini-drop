@@ -107,6 +107,42 @@ func hostStatsFromPB(h *commonpb.HostStats) map[string]interface{} {
 	}
 }
 
+// hostMetadataFromPB 把 gRPC HostMetadata 转成前端可用的 host_metadata 对象。
+// 旧 Agent 未上报时返回 nil（前端显示"暂未上报"）。采集失败字段为空或 0，
+// 不伪造默认值。
+func hostMetadataFromPB(h *commonpb.HostMetadata) map[string]interface{} {
+	if h == nil {
+		return nil
+	}
+	var collectedAt string
+	if h.GetCollectedAtUnixMs() > 0 {
+		collectedAt = time.UnixMilli(h.GetCollectedAtUnixMs()).UTC().Format(time.RFC3339)
+	}
+	return gin.H{
+		"os_name":          h.GetOsName(),
+		"os_version":       h.GetOsVersion(),
+		"kernel_version":   h.GetKernelVersion(),
+		"architecture":     h.GetArchitecture(),
+		"cpu_model":        h.GetCpuModel(),
+		"cpu_cores":        h.GetCpuCores(),
+		"uptime_seconds":   h.GetUptimeSeconds(),
+		"collected_at":     collectedAt,
+	}
+}
+
+// hostMetadataFromDB 读取数据库里最后已知的主机元数据（JSONB）。
+// 从未上报或解析失败时返回 nil。
+func hostMetadataFromDB(agent model.AgentInfo) map[string]interface{} {
+	if len(agent.HostMetadata) == 0 {
+		return nil
+	}
+	var meta map[string]interface{}
+	if err := util.UnmarshalJSONB(agent.HostMetadata, &meta); err != nil {
+		return nil
+	}
+	return meta
+}
+
 func agentMetadataFromStat(resp *pb.StatAgentResponse) map[string]interface{} {
 	now := time.Now()
 	capabilities, _ := util.MarshalJSONB(resp.GetCapabilities())
@@ -139,6 +175,13 @@ func agentMetadataFromStat(resp *pb.StatAgentResponse) map[string]interface{} {
 	}
 	if resp.GetAgentId() != "" {
 		updates["agent_id"] = resp.GetAgentId()
+	}
+	// 主机元数据：新 Agent 上报时写入；旧 Agent 未上报时不设置该字段，
+	// 保留数据库里最后已知的值（Agent 离线或旧版本不覆盖已有元数据）。
+	if resp.GetHostMetadata() != nil {
+		if hostMetaJSON, err := util.MarshalJSONB(hostMetadataFromPB(resp.GetHostMetadata())); err == nil {
+			updates["host_metadata"] = hostMetaJSON
+		}
 	}
 	return updates
 }
@@ -189,6 +232,11 @@ func (s *APIServer) upsertAgentFromStat(targetIP string, resp *pb.StatAgentRespo
 		SupportedOS:    resp.GetPlatform(),
 		Status:         "online",
 		LastSeen:       now,
+	}
+	if resp.GetHostMetadata() != nil {
+		if hostMetaJSON, err := util.MarshalJSONB(hostMetadataFromPB(resp.GetHostMetadata())); err == nil {
+			agent.HostMetadata = hostMetaJSON
+		}
 	}
 	if resp.GetLastSeenUnixMs() > 0 {
 		agent.LastSeen = time.UnixMilli(resp.GetLastSeenUnixMs())
@@ -496,25 +544,38 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 				s.recordAgentAudit(agent.IPAddr, agent.Hostname, "recovered", "实时资源查询成功，Agent 恢复在线")
 			}
 
+			// 主机元数据：gRPC 实时成功时优先返回实时值；旧 Agent 未上报时
+			// 回退到数据库最后已知值，并明确标注来源。
+			hostMeta := hostMetadataFromPB(resp.GetHostMetadata())
+			hostMetaSource := "none"
+			if hostMeta != nil {
+				hostMetaSource = "grpc"
+			} else if dbMeta := hostMetadataFromDB(agent); dbMeta != nil {
+				hostMeta = dbMeta
+				hostMetaSource = "db"
+			}
+
 			c.JSON(http.StatusOK, gin.H{
 				"code": 0,
 				"data": gin.H{
-					"hostname":        agent.Hostname,
-					"ip_addr":         ip,
-					"online":          true,
-					"version":         agent.Version,
-					"environment":     agent.Environment,
-					"supported_os":    agent.SupportedOS,
-					"capabilities":    agent.Capabilities,
-					"labels":          agent.Labels,
-					"resource_budget": agent.ResourceBudget,
-					"status":          agent.Status,
-					"last_seen":       agent.LastSeen,
-					"cpu_percent":     resp.GetCpuPercent(),
-					"memory_kb":       resp.GetMemoryKb(),
-					"read_kb_per_s":   resp.GetReadKbPerS(),
-					"write_kb_per_s":  resp.GetWriteKbPerS(),
-					"host":            hostStatsFromPB(resp.GetHostStats()),
+					"hostname":            agent.Hostname,
+					"ip_addr":             ip,
+					"online":              true,
+					"version":             agent.Version,
+					"environment":         agent.Environment,
+					"supported_os":        agent.SupportedOS,
+					"capabilities":        agent.Capabilities,
+					"labels":              agent.Labels,
+					"resource_budget":     agent.ResourceBudget,
+					"status":              agent.Status,
+					"last_seen":           agent.LastSeen,
+					"cpu_percent":         resp.GetCpuPercent(),
+					"memory_kb":           resp.GetMemoryKb(),
+					"read_kb_per_s":       resp.GetReadKbPerS(),
+					"write_kb_per_s":      resp.GetWriteKbPerS(),
+					"host":                hostStatsFromPB(resp.GetHostStats()),
+					"host_metadata":       hostMeta,
+					"host_metadata_source": hostMetaSource,
 				},
 			})
 			return
@@ -536,25 +597,33 @@ func (s *APIServer) StatAgent(c *gin.Context) {
 		return
 	}
 
+	dbMeta := hostMetadataFromDB(agent)
+	dbMetaSource := "none"
+	if dbMeta != nil {
+		dbMetaSource = "db"
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": gin.H{
-			"hostname":        agent.Hostname,
-			"ip_addr":         agent.IPAddr,
-			"online":          agent.Online,
-			"version":         agent.Version,
-			"environment":     agent.Environment,
-			"supported_os":    agent.SupportedOS,
-			"capabilities":    agent.Capabilities,
-			"labels":          agent.Labels,
-			"resource_budget": agent.ResourceBudget,
-			"status":          agent.Status,
-			"last_seen":       agent.LastSeen,
-			"cpu_percent":     0.0,
-			"memory_kb":       0,
-			"read_kb_per_s":   0.0,
-			"write_kb_per_s":  0.0,
-			"host":            nil, // gRPC 不可达，无整机实时数据
+			"hostname":            agent.Hostname,
+			"ip_addr":             agent.IPAddr,
+			"online":              agent.Online,
+			"version":             agent.Version,
+			"environment":         agent.Environment,
+			"supported_os":        agent.SupportedOS,
+			"capabilities":        agent.Capabilities,
+			"labels":              agent.Labels,
+			"resource_budget":     agent.ResourceBudget,
+			"status":              agent.Status,
+			"last_seen":           agent.LastSeen,
+			"cpu_percent":         0.0,
+			"memory_kb":           0,
+			"read_kb_per_s":       0.0,
+			"write_kb_per_s":      0.0,
+			"host":                nil, // gRPC 不可达，无整机实时数据
+			"host_metadata":       dbMeta,
+			"host_metadata_source": dbMetaSource,
 		},
 	})
 }
@@ -596,6 +665,15 @@ func (s *APIServer) GetAgentDetail(c *gin.Context) {
 		"source":         "db",
 		"host":           nil, // gRPC 不可达或旧 Agent 未上报时保持 null
 	}
+	// 主机元数据：gRPC 不可达时展示数据库最后已知值（来源 db），
+	// 从未上报时为 null（来源 none）。
+	dbMeta := hostMetadataFromDB(agent)
+	dbMetaSource := "none"
+	if dbMeta != nil {
+		dbMetaSource = "db"
+	}
+	stat["host_metadata"] = dbMeta
+	stat["host_metadata_source"] = dbMetaSource
 
 	if s.ControlCli != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -611,13 +689,25 @@ func (s *APIServer) GetAgentDetail(c *gin.Context) {
 				s.Logger.Warn("更新 Agent 详情心跳失败", zap.String("ip", ip), zap.Error(err))
 			}
 			_ = s.DB.Where("ip_addr = ?", ip).First(&agent).Error
+			// 主机元数据：gRPC 实时成功时优先返回实时值；旧 Agent 未上报时
+			// 回退到数据库最后已知值（来源 db）。
+			hostMeta := hostMetadataFromPB(resp.GetHostMetadata())
+			hostMetaSource := "none"
+			if hostMeta != nil {
+				hostMetaSource = "grpc"
+			} else if dbMeta := hostMetadataFromDB(agent); dbMeta != nil {
+				hostMeta = dbMeta
+				hostMetaSource = "db"
+			}
 			stat = gin.H{
-				"cpu_percent":    resp.GetCpuPercent(),
-				"memory_kb":      resp.GetMemoryKb(),
-				"read_kb_per_s":  resp.GetReadKbPerS(),
-				"write_kb_per_s": resp.GetWriteKbPerS(),
-				"source":         "grpc",
-				"host":           hostStatsFromPB(resp.GetHostStats()),
+				"cpu_percent":         resp.GetCpuPercent(),
+				"memory_kb":           resp.GetMemoryKb(),
+				"read_kb_per_s":       resp.GetReadKbPerS(),
+				"write_kb_per_s":      resp.GetWriteKbPerS(),
+				"source":              "grpc",
+				"host":                hostStatsFromPB(resp.GetHostStats()),
+				"host_metadata":       hostMeta,
+				"host_metadata_source": hostMetaSource,
 			}
 		} else if err != nil {
 			s.Logger.Warn("Agent 详情实时探测失败", zap.String("ip", ip), zap.Error(err))

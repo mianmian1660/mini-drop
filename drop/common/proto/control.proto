@@ -76,6 +76,7 @@ message StatAgentResponse {
   bool online = 14;
   int64 last_seen_unix_ms = 15;
   common.HostStats host_stats = 16; // 整机资源（可选；旧 Agent/Server 不返回时前端显示缺失原因）
+  common.HostMetadata host_metadata = 17; // 主机身份与系统信息（可选；旧 Agent 不返回时前端显示"暂未上报"）
 }
 
 // ---------- CancelTask ----------

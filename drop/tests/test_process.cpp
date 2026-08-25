@@ -170,4 +170,84 @@ namespace
         EXPECT_EQ(disk.used_bytes, 0u);
     }
 
+    // ------------------------------------------------------------
+    // 主机身份与系统信息（HostMetadata）采集
+    // ------------------------------------------------------------
+
+    TEST(HostMetadata, ParsesAllFields)
+    {
+        std::string osRelease = WriteTempFile(
+            "NAME=\"Ubuntu\"\n"
+            "VERSION=\"24.04.1 LTS (Noble Numbat)\"\n"
+            "VERSION_ID=\"24.04\"\n"
+            "ID=ubuntu\n",
+            "os_release");
+        std::string cpuInfo = WriteTempFile(
+            "processor\t: 0\n"
+            "model name\t: AMD EPYC 7B12\n"
+            "processor\t: 1\n"
+            "model name\t: AMD EPYC 7B12\n",
+            "cpuinfo");
+        std::string uptime = WriteTempFile("86400.12 50000.00\n", "uptime");
+
+        common::HostMetadata meta;
+        drop::collect_host_metadata(&meta, osRelease, cpuInfo, uptime);
+        std::remove(osRelease.c_str());
+        std::remove(cpuInfo.c_str());
+        std::remove(uptime.c_str());
+
+        EXPECT_EQ(meta.os_name(), "Ubuntu");
+        EXPECT_EQ(meta.os_version(), "24.04");
+        EXPECT_EQ(meta.cpu_model(), "AMD EPYC 7B12");
+        EXPECT_EQ(meta.cpu_cores(), 2);
+        EXPECT_EQ(meta.uptime_seconds(), 86400);
+        // uname 字段来自真实系统（测试机为 Linux），非空即可
+        EXPECT_FALSE(meta.kernel_version().empty());
+        EXPECT_FALSE(meta.architecture().empty());
+        EXPECT_GT(meta.collected_at_unix_ms(), 0);
+    }
+
+    TEST(HostMetadata, SingleFieldFailureDoesNotAffectOthers)
+    {
+        // os-release 缺失（路径不存在）→ os_name/os_version 为空，
+        // 但 cpuinfo/uptime 仍正常解析
+        std::string cpuInfo = WriteTempFile(
+            "processor\t: 0\n"
+            "model name\t: Intel(R) Xeon(R) Gold 6230\n",
+            "cpuinfo_only");
+        std::string uptime = WriteTempFile("123.5 10.0\n", "uptime_only");
+
+        common::HostMetadata meta;
+        drop::collect_host_metadata(&meta, "/tmp/definitely_missing_os_release_xyz", cpuInfo, uptime);
+        std::remove(cpuInfo.c_str());
+        std::remove(uptime.c_str());
+
+        EXPECT_TRUE(meta.os_name().empty());
+        EXPECT_TRUE(meta.os_version().empty());
+        EXPECT_EQ(meta.cpu_model(), "Intel(R) Xeon(R) Gold 6230");
+        EXPECT_EQ(meta.cpu_cores(), 1);
+        EXPECT_EQ(meta.uptime_seconds(), 123);
+        // uname 兜底：os_name 为空时用 sysname（Linux）
+        EXPECT_FALSE(meta.kernel_version().empty());
+    }
+
+    TEST(HostMetadata, MissingFilesLeaveFieldsEmpty)
+    {
+        common::HostMetadata meta;
+        drop::collect_host_metadata(&meta,
+                                    "/tmp/definitely_missing_os_release_xyz",
+                                    "/tmp/definitely_missing_cpuinfo_xyz",
+                                    "/tmp/definitely_missing_uptime_xyz");
+        // 所有文件缺失：不伪造默认值，字段为空或 0
+        EXPECT_TRUE(meta.os_name().empty());
+        EXPECT_TRUE(meta.os_version().empty());
+        EXPECT_TRUE(meta.cpu_model().empty());
+        EXPECT_EQ(meta.cpu_cores(), 0);
+        EXPECT_EQ(meta.uptime_seconds(), 0);
+        // uname 仍可提供内核/架构（真实系统）
+        EXPECT_FALSE(meta.kernel_version().empty());
+        EXPECT_FALSE(meta.architecture().empty());
+        EXPECT_GT(meta.collected_at_unix_ms(), 0);
+    }
+
 } // namespace

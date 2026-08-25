@@ -13,6 +13,7 @@
 #include <unistd.h>    // getpid, sysconf
 #include <sys/stat.h>      // stat, S_ISDIR
 #include <sys/statvfs.h>   // statvfs
+#include <sys/utsname.h>   // uname
 #include <dirent.h>        // opendir, readdir
 #include <cstdlib>         // atoi, atol, strtoull
 
@@ -278,6 +279,104 @@ namespace drop
         }
 
         out.set_collected_at_unix_ms(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    }
+
+    // ------------------------------------------------------------
+    // 宿主机身份与系统信息采集（HostMetadata）
+    // ------------------------------------------------------------
+
+    // 去掉 os-release 值两侧的引号（NAME="Ubuntu" → Ubuntu）
+    static std::string trim_os_release_value(const std::string &raw)
+    {
+        std::string value = raw;
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+            value = value.substr(1, value.size() - 2);
+        return value;
+    }
+
+    void collect_host_metadata(common::HostMetadata *out,
+                               const std::string &osReleasePath,
+                               const std::string &cpuInfoPath,
+                               const std::string &uptimePath)
+    {
+        if (!out)
+            return;
+
+        // /etc/os-release：NAME= 与 VERSION_ID=（单个字段失败不影响其他字段）
+        {
+            std::ifstream f(osReleasePath);
+            std::string line;
+            while (std::getline(f, line))
+            {
+                if (line.rfind("NAME=", 0) == 0 && out->os_name().empty())
+                {
+                    out->set_os_name(trim_os_release_value(line.substr(5)));
+                }
+                else if (line.rfind("VERSION_ID=", 0) == 0 && out->os_version().empty())
+                {
+                    out->set_os_version(trim_os_release_value(line.substr(11)));
+                }
+            }
+        }
+
+        // uname：内核版本与架构；os-release 读取失败时用 sysname 兜底 os_name
+        {
+            struct utsname uts;
+            if (uname(&uts) == 0)
+            {
+                if (out->os_name().empty() && uts.sysname[0])
+                    out->set_os_name(uts.sysname);
+                if (uts.release[0])
+                    out->set_kernel_version(uts.release);
+                if (uts.machine[0])
+                    out->set_architecture(uts.machine);
+            }
+        }
+
+        // /proc/cpuinfo：model name 与 processor 条目数（在线 CPU 核数）
+        {
+            std::ifstream f(cpuInfoPath);
+            std::string line;
+            int cores = 0;
+            while (std::getline(f, line))
+            {
+                if (line.rfind("model name", 0) == 0 && out->cpu_model().empty())
+                {
+                    size_t colon = line.find(':');
+                    if (colon != std::string::npos)
+                    {
+                        std::string value = line.substr(colon + 1);
+                        size_t start = value.find_first_not_of(" \t");
+                        if (start != std::string::npos)
+                            out->set_cpu_model(value.substr(start));
+                    }
+                }
+                else if (line.rfind("processor", 0) == 0)
+                {
+                    cores++;
+                }
+            }
+            if (cores > 0)
+                out->set_cpu_cores(cores);
+        }
+
+        // /proc/uptime：第一行第一个数字（开机秒数）
+        {
+            std::ifstream f(uptimePath);
+            std::string line;
+            if (std::getline(f, line))
+            {
+                std::istringstream iss(line);
+                double uptime = 0.0;
+                if (iss >> uptime && uptime >= 0)
+                    out->set_uptime_seconds((int64_t)uptime);
+            }
+        }
+
+        out->set_collected_at_unix_ms(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
                 .count());

@@ -57,6 +57,12 @@ namespace drop_server
                 info.lastHostStats.CopyFrom(request->host_stats());
                 info.hasHostStats = true;
             }
+            // 主机身份与系统信息（可选字段）：旧 Agent 不携带时保持 hasHostMetadata=false
+            if (request->has_host_metadata())
+            {
+                info.lastHostMetadata.CopyFrom(request->host_metadata());
+                info.hasHostMetadata = true;
+            }
             info.lastChildrenPstats.clear();
             if (request->has_childrenpstats())
             {

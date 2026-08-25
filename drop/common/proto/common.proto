@@ -48,6 +48,24 @@ message HostStats {
 }
 
 // ----------------------------------------------------------
+// HostMetadata：宿主机身份与系统信息（由 drop_agent 采集并随心跳上报）
+// 与 HostStats（资源占用）不同，本消息描述"这台机器是什么"：
+// 操作系统、内核、架构、CPU 型号与核数、开机时长。
+// 采集失败时对应字段留空或为 0，不伪造默认值；单个字段失败不影响其他字段。
+// 字段均为追加编号，兼容旧 Agent/Server。
+// ----------------------------------------------------------
+message HostMetadata {
+  string os_name            = 1;  // 操作系统名称，如 "Ubuntu"（/etc/os-release NAME）
+  string os_version         = 2;  // 操作系统版本，如 "24.04"（/etc/os-release VERSION_ID）
+  string kernel_version     = 3;  // 内核版本，如 "6.8.0-31-generic"（uname -r）
+  string architecture       = 4;  // 硬件架构，如 "x86_64"（uname -m）
+  string cpu_model          = 5;  // CPU 型号，如 "AMD EPYC 7B12"（/proc/cpuinfo model name）
+  int32  cpu_cores          = 6;  // 在线 CPU 核数（sysconf(_SC_NPROCESSORS_ONLN)）
+  int64  uptime_seconds     = 7;  // 开机时长（秒，/proc/uptime）
+  int64  collected_at_unix_ms = 8; // 采集时间（Unix 毫秒）
+}
+
+// ----------------------------------------------------------
 // AttemptStatus：Agent 心跳里汇报的执行尝试
 // ----------------------------------------------------------
 message AttemptStatus {
