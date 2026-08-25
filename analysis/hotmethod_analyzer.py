@@ -48,7 +48,7 @@ from attribution import run_attribution
 from observability import elapsed_seconds, log_event, now_seconds
 import artifact_descriptor as ad
 import pprof_builder as pprof_builder
-from analyzer_contract import AnalyzerInputError, AnalyzerTemporaryError
+from analyzer_contract import AnalyzerError, AnalyzerInputError, AnalyzerTemporaryError
 from job_context import get as job_context_get
 
 
@@ -738,6 +738,27 @@ def _build_cpu_pprof(script_output, folded_text, local_perf, task, tid) -> dict:
                     pass
         if folded_samples <= 0:
             raise RuntimeError("folded 样本总数为零")
+        if check.get("total_samples") != folded_samples and script_output:
+            # stackcollapse-perf.pl 对少数不完整/特殊 perf 样本的取舍可能与
+            # Python perf-script 解析器不同。火焰图和 TopN 都以 folded 为
+            # 准，因此此时也从 folded 重建 pprof，保证三个结果描述的是
+            # 完全相同的样本集合，而不是让整个分析因一条样本差异失败。
+            log_event(
+                "pprof_model_fallback",
+                task_tid=tid,
+                perf_samples=check.get("total_samples"),
+                folded_samples=folded_samples,
+                reason="sample_count_mismatch",
+            )
+            model = pprof_builder.folded_to_model(folded_text)
+            raw_gz = pprof_builder.pprof_gz(
+                model, period_ns=period_ns,
+                time_nanos=start_ns, duration_nanos=duration_ns,
+                build_ids=build_ids,
+            )
+            check = pprof_builder.validate_pprof_proto(raw_gz)
+            if not check["ok"]:
+                raise RuntimeError("folded pprof 校验失败: " + check["error"])
         if check.get("total_samples") != folded_samples:
             raise RuntimeError(
                 "pprof/folded 样本数不一致: pprof=%s folded=%s" %
@@ -1671,7 +1692,7 @@ def run_analysis_for_type(conn, storage_cfg: dict, task: dict,
         else:
             print(f"[analysis] 未知任务类型 {task_type}，跳过分析", file=sys.stderr)
 
-    except SystemExit:
+    except (SystemExit, AnalyzerError):
         raise
     except Exception as e:
         exit_error(ErrorCode.ERR_ANALYSIS_FAILED,

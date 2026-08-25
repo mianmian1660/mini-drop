@@ -1063,6 +1063,47 @@ def t_pprof_enforce_rejects_upload_failure():
         else:
             os.environ["PORTABLE_PROFILE_MODE"] = old
 
+def t_pprof_falls_back_to_folded_when_sample_counts_differ():
+    import hotmethod_analyzer as hm
+    import pprof_builder as pb
+
+    script = (
+        "worker 10 10 [000] 1.0: cpu-clock: 1 leaf (/bin/worker)\n"
+        "worker 10 10 [000] 1.1: cpu-clock: 1 leaf (/bin/worker)\n"
+    )
+    folded = "worker;leaf 1\n"
+    old = os.environ.get("PORTABLE_PROFILE_MODE")
+    os.environ["PORTABLE_PROFILE_MODE"] = "enforce"
+    try:
+        descriptor = hm._build_cpu_pprof(
+            script, folded, "/path/that/does/not/exist", {}, "tid-mismatch"
+        )
+        check = pb.validate_pprof_proto(descriptor["_payload"])
+        assert check["ok"], check["error"]
+        assert check["total_samples"] == 1
+    finally:
+        if old is None:
+            os.environ.pop("PORTABLE_PROFILE_MODE", None)
+        else:
+            os.environ["PORTABLE_PROFILE_MODE"] = old
+
+def t_run_analysis_preserves_structured_analyzer_errors():
+    import hotmethod_analyzer as hm
+    from analyzer_contract import AnalyzerInputError
+
+    original = hm._analyze_cpu_flamegraph
+    def fails(*_args, **_kwargs):
+        raise AnalyzerInputError("确定性输入错误")
+    hm._analyze_cpu_flamegraph = fails
+    try:
+        try:
+            hm.run_analysis_for_type(None, {}, {}, "bucket", "tid", hm.TASK_TYPE_GENERIC)
+            assert False, "AnalyzerInputError should propagate"
+        except AnalyzerInputError as exc:
+            assert str(exc) == "确定性输入错误"
+    finally:
+        hm._analyze_cpu_flamegraph = original
+
 def t_task_time_nanos_uses_database_timestamps():
     from datetime import datetime, timezone
     from hotmethod_analyzer import _task_time_nanos
