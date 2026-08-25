@@ -48,6 +48,13 @@ const S = {
     storageAlertDanger: { marginTop: 12, background: '#fff6f5', border: '1px solid #fda29b', color: '#b42318', borderRadius: 6, padding: '8px 12px', fontSize: 12, lineHeight: 1.5 },
     contextFooter: { display: 'flex', justifyContent: 'flex-end', marginTop: 12, borderTop: '1px solid #f2f4f7', paddingTop: 10 },
     contextToggle: { background: '#f8fafc', color: '#315efb', border: '1px solid #d0d7de', padding: '5px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700 },
+    // 采集能力：胶囊标签 + 能力说明紧凑网格
+    capabilityPills: { display: 'flex', flexWrap: 'wrap', gap: '6px' },
+    capabilityPill: { display: 'inline-flex', alignItems: 'center', padding: '2px 10px', borderRadius: 999, background: '#eef2ff', color: '#3730a3', fontSize: 12, lineHeight: '20px', whiteSpace: 'nowrap' },
+    capabilityList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '4px 24px' },
+    capabilityListItem: { fontSize: 12, lineHeight: '20px', minWidth: 0 },
+    capabilityListName: { color: '#111827', fontWeight: 650 },
+    capabilityListUsage: { color: '#667085' },
     tabBar: { display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 16, borderBottom: '1px solid #e5e7eb' },
     tab: (active) => ({ padding: '10px 0 11px', borderRadius: 0, border: 'none', borderBottom: active ? '2px solid #315efb' : '2px solid transparent', background: 'transparent', color: active ? '#315efb' : '#667085', cursor: 'pointer', fontSize: 14, fontWeight: 700 }),
     sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 },
@@ -334,10 +341,6 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
             ? '当前 Agent 版本暂未上报主机信息（操作系统 / 内核 / CPU 型号）。'
             : '按需采集器离线，主机信息为最后已知值或暂未上报。');
 
-    const capabilitySummary = capabilities?.length
-        ? capabilities.map(cap => capabilityLabel(cap)).join('、')
-        : '未声明采集能力';
-
     const osLabel = hostMetadata
         ? [hostMetadata.os_name, hostMetadata.os_version].filter(Boolean).join(' ') || '--'
         : '--';
@@ -350,7 +353,6 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                     <div style={S.contextHeaderMeta}>
                         <span style={S.contextMetaItem} title="主机名">{target.hostname || target.ip || '-'}</span>
                         <span style={S.contextMetaItem} title="IP">{target.ip || '-'}</span>
-                        <span style={S.contextMetaItem} title="环境">{target.environment || 'environment'}</span>
                         <span style={S.contextMetaItem} title="按需采集器（drop_agent）状态">按需采集器 <StatusPill value={target.drop_agent_status} kind="drop" /></span>
                         <span style={S.contextMetaItem} title="持续采集状态">持续采集 <StatusPill value={target.profile_status} kind="profile" /></span>
                     </div>
@@ -364,7 +366,7 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
             {/* 阶段 0：服务端存储压力紧凑提示（normal 时 computeStorageAlert 返回 null，不渲染） */}
             {storageAlert && <StoragePressureBanner alert={storageAlert} />}
 
-            {/* 主机身份：操作系统 / 内核 / 架构 / CPU 型号 / 核数 / 环境 / 标签 */}
+            {/* 主机身份：操作系统 / 内核 / 架构 / CPU 型号 / 核数 */}
             <div style={S.identityTitle}>主机身份</div>
             <div style={S.hostIdentityGrid}>
                 <ContextItem label="操作系统" value={osLabel} />
@@ -372,8 +374,6 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                 <ContextItem label="架构" value={hostMetadata?.architecture || '--'} />
                 <ContextItem label="CPU 型号" value={hostMetadata?.cpu_model || '--'} />
                 <ContextItem label="CPU 核数" value={hostMetadata?.cpu_cores ? `${hostMetadata.cpu_cores} 核` : '--'} />
-                <ContextItem label="环境" value={target.environment || '-'} />
-                <ContextItem label="标签" value={labelSummary(target.labels)} wide />
             </div>
             {metaMissingReason && <div style={S.hostMissingNote}>{metaMissingReason}</div>}
 
@@ -415,13 +415,57 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                     <ContextItem label="最近心跳" value={agent.last_seen ? formatRelativeTime(agent.last_seen) : '--'} />
                     <ContextItem label="按需采集器" value={<StatusPill value={target.drop_agent_status} kind="drop" />} />
                     <ContextItem label="持续采集" value={<StatusPill value={target.profile_status} kind="profile" />} />
-                    <ContextItem label="采集能力" value={capabilitySummary} wide />
-                    <ContextItem label="能力说明" value={capabilityDescriptions(capabilities)} wide />
+                    <ContextItem label="采集能力" value={<CapabilityPills capabilities={capabilities} />} wide />
+                    <ContextItem label="能力说明" value={<CapabilityList capabilities={capabilities} />} wide />
                     <ContextItem label="时间范围" value={activeTab === 'profiling' ? 'Tab 内选择' : '当前主机上下文'} />
                     <ContextItem label="数据来源" value={sourceLabel} />
                 </div>
             )}
         </section>
+    );
+}
+
+// 采集能力：胶囊标签流式布局，每个能力一个标签，hover 显示用途说明。
+function CapabilityPills({ capabilities }) {
+    const list = Array.isArray(capabilities) ? capabilities : [];
+    if (list.length === 0) return '未声明采集能力';
+    return (
+        <div style={S.capabilityPills}>
+            {list.map((cap, idx) => {
+                const desc = capabilityDescription(cap);
+                const label = desc ? desc.name : capabilityLabel(cap);
+                return (
+                    <span key={`${cap}-${idx}`} style={S.capabilityPill} title={desc ? `${desc.name} — ${desc.usage}` : label}>
+                        {label}
+                    </span>
+                );
+            })}
+        </div>
+    );
+}
+
+// 能力说明：按中文名去重后的紧凑网格列表（"名称 — 用途"）。
+function CapabilityList({ capabilities }) {
+    const list = Array.isArray(capabilities) ? capabilities : [];
+    if (list.length === 0) return '未声明采集能力';
+    const seen = new Set();
+    const items = [];
+    for (const cap of list) {
+        const desc = capabilityDescription(cap);
+        const name = desc ? desc.name : capabilityLabel(cap);
+        if (seen.has(name)) continue;
+        seen.add(name);
+        items.push(desc ? { name, usage: desc.usage } : { name, usage: '' });
+    }
+    return (
+        <div style={S.capabilityList}>
+            {items.map(item => (
+                <div key={item.name} style={S.capabilityListItem}>
+                    <span style={S.capabilityListName}>{item.name}</span>
+                    {item.usage ? <span style={S.capabilityListUsage}> — {item.usage}</span> : null}
+                </div>
+            ))}
+        </div>
     );
 }
 
@@ -848,29 +892,6 @@ function statusLabel(status, kind = '') {
     if (status === 'stopped') return '已停止';
     if (status === 'query_unsupported') return '查询不兼容';
     return status || '未知';
-}
-
-function labelSummary(labels) {
-    const entries = Object.entries(labels || {});
-    if (entries.length === 0) return 'node/job/env/instance 待接入';
-    return entries.slice(0, 4).map(([k, v]) => `${k}=${v}`).join(', ');
-}
-
-// 采集能力的中文名称与用途说明（如 "CPU 采样 — perf 火焰图，定位 CPU 热点"）。
-// 未覆盖的能力回退到短名，不展示原始内部字段名。
-function capabilityDescriptions(capabilities) {
-    const list = Array.isArray(capabilities) ? capabilities : [];
-    if (list.length === 0) return '未声明采集能力';
-    const seen = new Set();
-    const parts = [];
-    for (const cap of list) {
-        const desc = capabilityDescription(cap);
-        const name = desc ? desc.name : capabilityLabel(cap);
-        if (seen.has(name)) continue;
-        seen.add(name);
-        parts.push(desc ? `${desc.name} — ${desc.usage}` : name);
-    }
-    return parts.join('；');
 }
 
 function formatTime(value) {
