@@ -88,6 +88,7 @@ web_frontend/node_modules/
 
 # ----- 本地演示材料（不上传 GitHub）-----
 演示视频思路.md
+.local-presentations/
 
 # ----- AI agent skills（本地安装的 caveman 等 skill，个人工具不入库）-----
 .agents/

@@ -12,6 +12,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -663,6 +664,43 @@ func (s *APIServer) jobArtifactsByLogicalName(tid string, jobID uint, logicalNam
 	return artifacts
 }
 
+// readArtifactLogicalContent 读取 Artifact 的逻辑内容。Artifact/Blob 的对象
+// 可能为 gzip 物理存储；HTTP 展示依赖 Content-Encoding 由浏览器解压，而
+// 服务端内部消费者（JSON 解析、Diff 建树）必须在这里显式解压。
+func (s *APIServer) readArtifactLogicalContent(ctx context.Context, artifact model.Artifact, maxBytes int64) ([]byte, error) {
+	resolved := s.resolveBlobForKey(ctx, artifact.ObjectKey)
+	raw, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, resolved.PhysicalKey)
+	if err != nil {
+		return nil, err
+	}
+	defer raw.Close()
+
+	compression := artifact.Compression
+	if resolved.Blob != nil && resolved.Blob.Compression != "" {
+		compression = resolved.Blob.Compression
+	}
+	var reader io.Reader = raw
+	if compression == model.CompressionGzip {
+		zr, err := gzip.NewReader(raw)
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		reader = zr
+	}
+	if maxBytes <= 0 {
+		maxBytes = 64 << 20
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("artifact logical content exceeds %d bytes", maxBytes)
+	}
+	return body, nil
+}
+
 // jobLogicalNameFallbackSQL 生成 object_key 后缀回退条件（旧数据 logical_name 为空时）。
 func jobLogicalNameFallbackSQL(logicalNames []string) string {
 	parts := make([]string, 0, len(logicalNames))
@@ -684,15 +722,12 @@ func (s *APIServer) fetchJSONArtifactForJob(tid string, job *model.AnalysisJob, 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for i := range artifacts {
-		resolved := s.resolveBlobForKey(ctx, artifacts[i].ObjectKey)
-		reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, resolved.PhysicalKey)
+		body, err := s.readArtifactLogicalContent(ctx, artifacts[i], 16<<20)
 		if err != nil {
 			continue
 		}
 		var data map[string]interface{}
-		decodeErr := json.NewDecoder(reader).Decode(&data)
-		reader.Close()
-		if decodeErr == nil {
+		if json.Unmarshal(body, &data) == nil {
 			return data
 		}
 	}

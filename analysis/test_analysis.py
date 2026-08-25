@@ -114,6 +114,39 @@ def t_perf_script_omits_period_field():
     assert "period" not in fields.split(",")
     assert fields == flamegraph.PERF_SCRIPT_FIELDS
 
+def t_perf_script_keeps_partial_output_on_nonzero_exit():
+    import subprocess
+    import flamegraph
+
+    original_run = flamegraph.subprocess.run
+    try:
+        flamegraph.subprocess.run = lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 1,
+            stdout="python 1/1 [000] 1.0: cpu-clock:\n        abc hot (/tmp/app)\n",
+            stderr="corrupted tail detected",
+        )
+        output = flamegraph.run_perf_script("/tmp/partial.perf")
+    finally:
+        flamegraph.subprocess.run = original_run
+    assert "hot" in output
+
+def t_perf_script_rejects_nonzero_exit_without_samples():
+    import subprocess
+    import flamegraph
+
+    original_run = flamegraph.subprocess.run
+    try:
+        flamegraph.subprocess.run = lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 1, stdout="", stderr="invalid perf.data"
+        )
+        try:
+            flamegraph.run_perf_script("/tmp/broken.perf")
+            assert False, "没有任何样本的非零退出必须失败"
+        except subprocess.CalledProcessError as exc:
+            assert "invalid perf.data" in (exc.stderr or "")
+    finally:
+        flamegraph.subprocess.run = original_run
+
 def t_parse_bpf_histogram():
     from bpf_analyzer import parse_bpf_histogram
     text = "@io_lat_us:\n[1, 2)        42 |@@@@@\n[2, 4)        88 |@@@@@@@@@@\n[4, 8)       156 |@@@@@@@@@@@@\n# Total IO: 286\n"
@@ -1030,6 +1063,47 @@ def t_pprof_enforce_rejects_upload_failure():
         else:
             os.environ["PORTABLE_PROFILE_MODE"] = old
 
+def t_pprof_falls_back_to_folded_when_sample_counts_differ():
+    import hotmethod_analyzer as hm
+    import pprof_builder as pb
+
+    script = (
+        "worker 10 10 [000] 1.0: cpu-clock: 1 leaf (/bin/worker)\n"
+        "worker 10 10 [000] 1.1: cpu-clock: 1 leaf (/bin/worker)\n"
+    )
+    folded = "worker;leaf 1\n"
+    old = os.environ.get("PORTABLE_PROFILE_MODE")
+    os.environ["PORTABLE_PROFILE_MODE"] = "enforce"
+    try:
+        descriptor = hm._build_cpu_pprof(
+            script, folded, "/path/that/does/not/exist", {}, "tid-mismatch"
+        )
+        check = pb.validate_pprof_proto(descriptor["_payload"])
+        assert check["ok"], check["error"]
+        assert check["total_samples"] == 1
+    finally:
+        if old is None:
+            os.environ.pop("PORTABLE_PROFILE_MODE", None)
+        else:
+            os.environ["PORTABLE_PROFILE_MODE"] = old
+
+def t_run_analysis_preserves_structured_analyzer_errors():
+    import hotmethod_analyzer as hm
+    from analyzer_contract import AnalyzerInputError
+
+    original = hm._analyze_cpu_flamegraph
+    def fails(*_args, **_kwargs):
+        raise AnalyzerInputError("确定性输入错误")
+    hm._analyze_cpu_flamegraph = fails
+    try:
+        try:
+            hm.run_analysis_for_type(None, {}, {}, "bucket", "tid", hm.TASK_TYPE_GENERIC)
+            assert False, "AnalyzerInputError should propagate"
+        except AnalyzerInputError as exc:
+            assert str(exc) == "确定性输入错误"
+    finally:
+        hm._analyze_cpu_flamegraph = original
+
 def t_task_time_nanos_uses_database_timestamps():
     from datetime import datetime, timezone
     from hotmethod_analyzer import _task_time_nanos
@@ -1197,6 +1271,28 @@ def t_timed_out_legacy_thread_keeps_immutable_job_context():
                 break
             time.sleep(0.005)
     assert observed == ["tasks/tid-a/analysis/perf/v/g1"]
+
+
+def t_legacy_system_exit_is_not_reported_as_retryable_number():
+    from analyzer_contract import AnalyzerInputError, InputSpec, LegacyFunctionAnalyzer
+
+    def exits(*_args):
+        raise SystemExit(1)
+
+    analyzer = LegacyFunctionAnalyzer(
+        name="exit-test", pipeline="perf", input_spec=InputSpec("perf.data", ["perf"]),
+        output_specs=[], analyze_func=exits,
+    )
+    prepared = {
+        "conn": object(), "storage_cfg": {}, "task": {}, "bucket": "b", "tid": "tid-exit",
+        "job_context": {"output_prefix": "tid-exit"},
+    }
+    try:
+        analyzer.analyze(prepared)
+        assert False, "SystemExit 应转换为确定性输入错误"
+    except AnalyzerInputError as exc:
+        assert "exit=1" in str(exc)
+        assert str(exc) != "1"
 
 
 if __name__ == "__main__":
