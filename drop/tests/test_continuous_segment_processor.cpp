@@ -264,7 +264,7 @@ TEST(ContinuousSegmentProcessor, PythonSidecarMergesWithoutDoubleCounting)
     interval.captureEndMs = 3000;
     std::vector<AggregatedSample> before = {perfPython};
     bool beforeReplaced = false;
-    merge_python_sidecar_samples(&before, {interval}, &beforeReplaced, 0, 1000);
+    merge_python_sidecar_samples(&before, {interval}, &beforeReplaced, 1, 1000);
     EXPECT_FALSE(beforeReplaced);
     ASSERT_EQ(before.size(), 1u);
 
