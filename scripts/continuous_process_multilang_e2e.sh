@@ -27,6 +27,35 @@ fail() { printf 'FAIL %s\n' "$1" >&2; exit 1; }
 
 api_headers=(-H "Drop-User-Uid: $AUTH_UID" -H "Drop-User-Name: $AUTH_NAME")
 
+# 阶段七内存验收会留下一个专用 host Session。host 与 process Session
+# 互斥，因此完整部署的多语言验收必须先通过其所属测试账号停止该 fixture。
+# 仅按精确名称、目标与 host scope 匹配，绝不触碰普通用户会话。
+stop_phase7_memory_fixture() {
+    local response sid
+    response="$(curl -fsS -G "$BASE/api/v1/continuous/sessions" \
+        -H 'Drop-User-Uid: user-e2e' -H 'Drop-User-Name: user-e2e' \
+        --data-urlencode 'owner_filter=mine' \
+        --data-urlencode "target_ip=$TARGET_IP" \
+        --data-urlencode 'desired_state=running' \
+        --data-urlencode 'keyword=phase7-memory-acceptance')" || fail "list phase7 memory fixture"
+    sid="$(printf '%s' "$response" | python3 -c '
+import json, sys
+for session in json.load(sys.stdin).get("data", {}).get("sessions", []):
+    if (session.get("name") == "phase7-memory-acceptance" and
+            session.get("target_ip") == sys.argv[1] and
+            session.get("scope") == "host" and
+            session.get("desired_state") == "running"):
+        print(session["sid"])
+        break
+' "$TARGET_IP")"
+    if [[ -n "$sid" ]]; then
+        curl -fsS -X POST "$BASE/api/v1/continuous/sessions/$sid/stop" \
+            -H 'Drop-User-Uid: user-e2e' -H 'Drop-User-Name: user-e2e' >/dev/null \
+            || fail "stop phase7 memory fixture $sid"
+        printf '[e2e] stopped phase7 memory fixture sid=%s\n' "$sid"
+    fi
+}
+
 process_start_ms() {
     python3 - "$1" <<'PY'
 import os, sys
@@ -75,6 +104,7 @@ trap cleanup_on_signal HUP INT TERM
 
 printf '[e2e] base=%s target=%s run=%s\n' "$BASE" "$TARGET_IP" "$RUN_TAG"
 curl -fsS "$BASE/healthz" >/dev/null || fail "apiserver healthz"
+stop_phase7_memory_fixture
 [[ -x /home/ubuntu/profiling_test/test_c_profiling ]] || fail "C workload missing"
 [[ -x /home/ubuntu/profiling_test/test_go_profiling ]] || fail "Go workload missing"
 command -v node >/dev/null || fail "node unavailable"
