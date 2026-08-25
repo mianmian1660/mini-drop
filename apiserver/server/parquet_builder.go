@@ -144,7 +144,7 @@ func pqCollectWindowRows(s *APIServer, window model.ProfileWindow, batch *contin
 				Last:           metric.Value,
 				Unit:           metric.Unit,
 				Labels:         sanitizeContinuousLabels(metric.Labels),
-				RSSTruncated:   int32(window.RSSTruncated),
+				RSSTruncated:   int32(in.RSSTruncated),
 			}
 			rows.Metrics = append(rows.Metrics, row)
 		}
