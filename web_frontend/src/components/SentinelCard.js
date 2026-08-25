@@ -78,7 +78,7 @@ export default function SentinelCard({ targetIP, signals = [] }) {
     };
 
     return <div>
-        <div style={S.head}><h3 style={S.title}>当前哨兵</h3>{hasAnyEligible && !adding && <button style={S.link} onClick={() => setAdding(true)}>+ 添加哨兵</button>}</div>
+        <div style={S.head} title="哨兵 = 监控规则。当被监控的指标超过设定阈值时，系统会自动记录异常并触发一次更深入的诊断。"><h3 style={S.title}>当前哨兵</h3>{hasAnyEligible && !adding && <button style={S.link} onClick={() => setAdding(true)}>+ 添加哨兵</button>}</div>
         {error && <div style={S.error}>{error}</div>}
         {loading ? <div style={S.subtle}>正在加载...</div>
             : !hasAnyEligible ? <div style={S.subtle}>当前会话没有可用于哨兵判异的信号（仅调度延迟 / IO 延迟 / 系统调用 IO 支持）。</div>
@@ -86,9 +86,9 @@ export default function SentinelCard({ targetIP, signals = [] }) {
                     : <div style={{ display: 'grid', gap: 8 }}>{rules.map(rule => (
                         <div key={rule.sid} style={S.row}>
                             <div>
-                                <div style={S.rowTitle}>{ruleSummary(rule)}</div>
-                                <span style={S.subtle}>冷却期 {Math.round(rule.cooldown_seconds / 60)} 分钟</span>
-                                <div><span style={S.badge}>已启用</span></div>
+                                <div style={S.rowTitle} title="规则含义示例：'调度 · p99 > 5 ms' 表示调度延迟的 P99（99% 的情况耗时都低于该值）超过 5 毫秒时触发告警。">{ruleSummary(rule)}</div>
+                                <span style={S.subtle} title="触发一次后，此分钟内不会对同一规则重复告警，避免频繁打扰。">冷却期 {Math.round(rule.cooldown_seconds / 60)} 分钟</span>
+                                <div><span style={S.badge} title="该监控规则当前正在生效。">已启用</span></div>
                             </div>
                             {rule.can_manage && <button style={S.danger} disabled={deletingSid === rule.sid} onClick={() => remove(rule)}>{deletingSid === rule.sid ? '删除中...' : '删除'}</button>}
                         </div>
@@ -127,13 +127,13 @@ function AddSentinelForm({ targetIP, signals, onCancel, onCreated }) {
     };
 
     return <div style={S.form}>
-        <label><span style={S.label}>监控信号</span>
+        <label><span style={S.label} title="选择监控哪种数据（信号）：调度延迟 / IO 延迟 / 系统调用 IO。">监控信号</span>
             <select style={S.input} value={signal} onChange={event => setSignal(event.target.value)}>
                 {signals.map(item => <option key={item} value={item}>{signalLabel(item)} · p99</option>)}
             </select>
         </label>
-        <label><span style={S.label}>告警阈值 ms</span><input style={S.input} type="number" min={0.1} step={0.5} value={floor} onChange={event => setFloor(event.target.value)} /></label>
-        <label><span style={S.label}>冷却期（分钟）</span><input style={S.input} type="number" min={1} value={cooldownMin} onChange={event => setCooldownMin(event.target.value)} /></label>
+        <label><span style={S.label} title="阈值（毫秒）。当该信号超过此值，判定为异常并触发诊断。P99 表示 99% 的情况耗时都低于这个值。">告警阈值 ms</span><input style={S.input} type="number" min={0.1} step={0.5} value={floor} onChange={event => setFloor(event.target.value)} /></label>
+        <label><span style={S.label} title="触发告警后，多少分钟内不再重复告警，避免频繁打扰。">冷却期（分钟）</span><input style={S.input} type="number" min={1} value={cooldownMin} onChange={event => setCooldownMin(event.target.value)} /></label>
         {error && <div style={{ ...S.error, gridColumn: '1/-1', marginTop: 0 }}>{error}</div>}
         <div style={S.formActions}>
             <button style={S.cancelBtn} onClick={onCancel} disabled={submitting}>取消</button>

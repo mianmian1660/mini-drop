@@ -384,18 +384,21 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                     percent={host?.cpu_percent}
                     available={cpuAvailable}
                     detail={cpuAvailable ? `使用率（0–100%）· 采集于 ${collectedAt}` : null}
+                    hint="整台机器所有 CPU 核心的平均使用率（0–100%）。长期接近 100% 说明计算资源紧张。"
                 />
                 <HostResourceBlock
                     title="整机内存"
                     percent={host?.memory_percent}
                     available={memAvailable}
                     detail={memAvailable ? `已用 ${formatCapacity(host.memory_used_bytes)} / 总量 ${formatCapacity(host.memory_total_bytes)} · 采集于 ${collectedAt}` : null}
+                    hint="整台机器的内存使用情况。接近总量说明内存紧张，可能影响程序运行速度。"
                 />
                 <HostResourceBlock
                     title={`系统盘 ${host?.disk_mount || '/'}`}
                     percent={host?.disk_percent}
                     available={diskAvailable}
                     detail={diskAvailable ? `已用 ${formatCapacity(host.disk_used_bytes)} / 总量 ${formatCapacity(host.disk_total_bytes)} · 采集于 ${collectedAt}` : null}
+                    hint="这台服务器磁盘的占用情况。磁盘快满会影响服务运行和日志写入。"
                 />
             </div>
 
@@ -484,13 +487,13 @@ function StoragePressureBanner({ alert }) {
 
 // 单个整机资源块（CPU / 内存 / 系统盘）。细进度条颜色按使用率：
 // <70% 品牌蓝，70-89% 警告橙，>=90% 危险红。
-function HostResourceBlock({ title, percent, available, detail }) {
+function HostResourceBlock({ title, percent, available, detail, hint }) {
     const pct = clampPercent(percent);
     const color = usageColor(pct);
     return (
         <div style={S.hostResource}>
             <div style={S.hostResourceHead}>
-                <span style={S.hostResourceTitle}>{title}</span>
+                <span style={S.hostResourceTitle} title={hint}>{title}</span>
                 <span style={S.hostResourcePct}>{available ? `${formatMetric(pct, 1)}%` : '--'}</span>
             </div>
             <div style={S.hostBarTrack}>
@@ -676,9 +679,9 @@ function RunningSessionsCard({ target, onTab, sessions, loading, stopping, onSto
                             <tr>
                                 <th style={S.th}>名称</th>
                                 <th style={S.th}>范围与目标</th>
-                                <th style={S.th}>状态</th>
-                                <th style={S.th}>信号</th>
-                                <th style={S.th}>最近上传</th>
+                                <th style={S.th} title="会话当前所处阶段：运行中 / 等待进程 / 已停止 / 离线等">状态</th>
+                                <th style={S.th} title="这个持续采集会话采集了哪些数据（CPU / 块 IO / 调度延迟等）">信号</th>
+                                <th style={S.th} title="距上一次成功把数据上传到服务器的时间">最近上传</th>
                                 <th style={S.th}>操作</th>
                             </tr>
                         </thead>
@@ -877,7 +880,21 @@ function Metric({ label, value }) {
 function StatusPill({ value, kind = '' }) {
     const status = String(value || 'unknown');
     const color = isProfileReady(status) ? '#16a34a' : status === 'offline' ? '#dc2626' : (status === 'unconfigured' || status === 'no_session') ? '#64748b' : '#7c3aed';
-    return <span style={{ ...S.badge, background: color, color: '#fff' }}>{statusLabel(status, kind)}</span>;
+    return <span style={{ ...S.badge, background: color, color: '#fff' }} title={statusHint(status, kind)}>{statusLabel(status, kind)}</span>;
+}
+
+// 面向非技术人员：把状态值翻译成一句通俗解释（hover 显示）。
+function statusHint(status, kind = '') {
+    if (status === 'online_with_samples') return '采集器在线，且已采集到样本数据，可以查看火焰图 / TopN';
+    if (status === 'online_no_samples') return '采集器在线，但当前没有样本数据（目标进程可能空闲，稍等或制造负载后刷新）';
+    if (status === 'online') return '采集器在线';
+    if (status === 'offline') return kind === 'drop' ? '按需采集器离线：不能新建一次性采样任务；已运行的持续采集会话不受影响' : '采集器离线，无法上报数据';
+    if (status === 'unconfigured') return '尚未配置持续采集';
+    if (status === 'no_session') return '该主机还没有创建持续采集会话';
+    if (status === 'running') return '持续采集中';
+    if (status === 'stopped') return '持续采集已停止，仍可查看历史数据';
+    if (status === 'query_unsupported') return '当前版本不支持查询该数据';
+    return status || '未知';
 }
 
 function isProfileReady(status) {

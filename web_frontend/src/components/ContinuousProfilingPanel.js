@@ -842,10 +842,10 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     </div>
                 )}
                 <div style={{ ...S.summaryGrid, marginTop: 14 }}>
-                    <Metric label="采集方式" value={sessionMeta.sampler} />
-                    <Metric label="采样频率" value={formatRateHz(sessionMeta.sampleRateHz)} />
-                    <Metric label="聚合窗口" value={formatDurationSec(sessionMeta.aggregationWindowSec)} />
-                    <Metric label="上传周期" value={formatDurationSec(sessionMeta.uploadBatchSec)} />
+                    <Metric label="采集方式" value={sessionMeta.sampler} hint="用什么工具采集数据。perf_event 是 Linux 内核自带的性能采样工具，不需要修改你的程序。" />
+                    <Metric label="采样频率" value={formatRateHz(sessionMeta.sampleRateHz)} hint="每秒钟采样几次。采样越频繁数据越精细，但会占用更多系统资源；目标空闲时样本会变少，属正常现象。" />
+                    <Metric label="聚合窗口" value={formatDurationSec(sessionMeta.aggregationWindowSec)} hint="一段时间内的数据被打包成一个窗口（一次快照）。火焰图、TopN 就是这个窗口内所有采样的统计结果。" />
+                    <Metric label="上传周期" value={formatDurationSec(sessionMeta.uploadBatchSec)} hint="每隔这个时长把积攒的窗口批量上传一次到服务器。所以页面上看到的数据最多可能延迟这个时长。" />
                 </div>
                 <div style={{ ...S.info, marginTop: 14 }}>
 					{signalTab === 'cpu' ? scopeLabel : `${taskScope === 'process' ? '进程范围' : '整机范围'} ${signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'} / eBPF histogram`}；{sessionMeta.sampler} 以 {formatRateHz(sessionMeta.sampleRateHz)} 低频采样，当前查询窗口：{formatTime(timeWindow.from)} - {formatTime(timeWindow.to)}。
@@ -856,20 +856,20 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 <details style={S.compactDetails}>
                     <summary style={S.detailsSummary}>采集元信息</summary>
                     <div style={S.metaLine}>
-                        <span style={S.metaItem}><span style={S.metaKey}>数据保留</span>{formatHours(sessionMeta.retentionHours)}</span>
+                        <span style={S.metaItem} title="原始数据在服务器上保留的时长。超过后会自动转为精简摘要，不再保留完整调用栈，只能看到函数级汇总。"><span style={S.metaKey}>数据保留</span>{formatHours(sessionMeta.retentionHours)}</span>
                         <span style={uploadState.warn ? { ...S.metaItem, ...S.metaItemWarn } : S.metaItem} title={uploadState.title}>
                             <span style={S.metaKey}>最近上传</span>{uploadState.label}
                         </span>
-                        <span style={S.metaItem}><span style={S.metaKey}>Session</span>{shortSessionID(sessionMeta.sid)}</span>
-                        <span style={S.metaItem}><span style={S.metaKey}>样本状态</span>{sampleState}</span>
-                        <span style={S.metaItem} title="本次查询实际使用的存储层与最粗分辨率（v1=分钟 JSON 热窗口，v2=Parquet 历史块）">
+                        <span style={S.metaItem} title="持续采集会话的内部唯一标识，用于区分每一次持续采集任务。"><span style={S.metaKey}>Session</span>{shortSessionID(sessionMeta.sid)}</span>
+                        <span style={S.metaItem} title="当前查询窗口是否采集到了样本数据（perf 采样到 CPU 正在执行的代码）。目标空闲时没有样本属正常现象。"><span style={S.metaKey}>样本状态</span>{sampleState}</span>
+                        <span style={S.metaItem} title="本次查询实际使用的数据存储层：v1=分钟级热窗口（近期数据），v2=Parquet 历史块（更长时间范围）。">
                             <span style={S.metaKey}>存储来源</span>{storageSourceLabel(flamegraph?.storage_source || topn?.storage_source || rssMeta?.storage_source || 'parquet_v1')}
                         </span>
-                        <span style={S.metaItem} title="查询使用的最粗时间分辨率（秒）">
+                        <span style={S.metaItem} title="本次查询的数据按多粗的时间粒度聚合（数值越小越精细、越接近实时）。">
                             <span style={S.metaKey}>分辨率</span>{resolutionLabel(flamegraph?.resolution_seconds || topn?.resolution_seconds || rssMeta?.resolution_seconds || 60)}
                         </span>
                         {(flamegraph?.mixed_resolution || topn?.mixed_resolution || rssMeta?.mixed_resolution) && (
-                            <span style={S.metaItem}><span style={S.metaKey}>混合分辨率</span>是</span>
+                            <span style={S.metaItem} title="查询时间范围内，不同时段使用了不同粗细的存储粒度，数值精度会略有差异。"><span style={S.metaKey}>混合分辨率</span>是</span>
                         )}
                     </div>
                     <LabelChips target={target} />
@@ -1854,8 +1854,8 @@ function Field({ label, children, wide = false }) {
     return <label style={wide ? S.fieldWide : S.field}><span style={S.label}>{label}</span>{children}</label>;
 }
 
-function Metric({ label, value }) {
-    return <div style={S.metric}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value || '-'}</div></div>;
+function Metric({ label, value, hint }) {
+    return <div style={S.metric} title={hint || undefined}><div style={S.metricLabel}>{label}</div><div style={S.metricValue}>{value || '-'}</div></div>;
 }
 
 function continuousSessionMeta(target, fixedSession = null) {
