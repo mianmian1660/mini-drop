@@ -294,10 +294,10 @@ func TestHostMetadataFromPB(t *testing.T) {
 	if full["kernel_version"] != "6.8.0-31-generic" || full["architecture"] != "x86_64" {
 		t.Fatalf("kernel/arch fields wrong: %#v", full)
 	}
-	if full["cpu_model"] != "AMD EPYC 7B12" || full["cpu_cores"] != float64(8) {
+	if full["cpu_model"] != "AMD EPYC 7B12" || full["cpu_cores"] != int32(8) {
 		t.Fatalf("cpu fields wrong: %#v", full)
 	}
-	if full["uptime_seconds"] != float64(86400) {
+	if full["uptime_seconds"] != int64(86400) {
 		t.Fatalf("uptime wrong: %#v", full)
 	}
 	if full["collected_at"] != "2026-08-25T10:30:00Z" {
@@ -324,7 +324,7 @@ func TestHostMetadataFromPB(t *testing.T) {
 	if partial["os_version"] != "" || partial["architecture"] != "" || partial["cpu_model"] != "" {
 		t.Fatalf("missing fields should be empty string: %#v", partial)
 	}
-	if partial["cpu_cores"] != float64(0) || partial["uptime_seconds"] != float64(0) {
+	if partial["cpu_cores"] != int32(0) || partial["uptime_seconds"] != int64(0) {
 		t.Fatalf("missing numeric fields should be 0: %#v", partial)
 	}
 	if partial["collected_at"] != "" {
@@ -367,7 +367,7 @@ func TestAgentDetailIncludesHostMetadata(t *testing.T) {
 	if !ok {
 		t.Fatalf("host_metadata object missing: %#v", stat["host_metadata"])
 	}
-	if meta["os_name"] != "Ubuntu" || meta["os_version"] != "24.04" || meta["cpu_cores"] != float64(8) {
+	if meta["os_name"] != "Ubuntu" || meta["os_version"] != "24.04" || meta["cpu_cores"] != int32(8) {
 		t.Fatalf("host_metadata wrong: %#v", meta)
 	}
 	if meta["collected_at"] != "2026-08-25T10:30:00Z" {
@@ -452,7 +452,7 @@ func TestAgentDetailHostMetadataDBFallback(t *testing.T) {
 	if !ok {
 		t.Fatalf("db host_metadata missing: %#v", stat["host_metadata"])
 	}
-	if meta["os_name"] != "Ubuntu" || meta["cpu_cores"] != float64(8) {
+	if meta["os_name"] != "Ubuntu" || meta["cpu_cores"] != int32(8) {
 		t.Fatalf("db host_metadata wrong: %#v", meta)
 	}
 }
