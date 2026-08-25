@@ -20,6 +20,7 @@ declare -a START_MS=()
 declare -a EXES=()
 declare -a NAMES=()
 declare -a SIDS=()
+CLEANUP_DONE=0
 
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1" >&2; exit 1; }
@@ -46,6 +47,10 @@ stop_session() {
 }
 
 cleanup() {
+	if [[ "$CLEANUP_DONE" -eq 1 ]]; then
+		return
+	fi
+	CLEANUP_DONE=1
     set +e
     for sid in "${SIDS[@]-}"; do
         [[ -n "$sid" ]] && stop_session "$sid"
@@ -61,6 +66,12 @@ cleanup() {
     rm -rf "$TEST_ROOT"
 }
 trap cleanup EXIT
+
+cleanup_on_signal() {
+	cleanup
+	exit 130
+}
+trap cleanup_on_signal HUP INT TERM
 
 printf '[e2e] base=%s target=%s run=%s\n' "$BASE" "$TARGET_IP" "$RUN_TAG"
 curl -fsS "$BASE/healthz" >/dev/null || fail "apiserver healthz"

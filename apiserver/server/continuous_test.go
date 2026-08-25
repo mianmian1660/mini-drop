@@ -474,12 +474,17 @@ func TestContinuousLanguageStatusV2LatestProcessStateReplacesStaleFailure(t *tes
 
 func TestContinuousLanguageStatusV2MissingCollectorCannotBePromotedByFrames(t *testing.T) {
 	agg := &continuousAggregate{SymbolStatus: "not_applicable", SymbolReasons: map[string]bool{},
-		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{}}
+		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
+		Top:                map[string]*ProfileTopItem{},
+		Root:               &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
+		LabelValue:         map[string]map[string]bool{},
+		Backends:           map[string]bool{}}
 	refs := map[string]interface{}{
 		"diagnostics_version": 2,
 		"language_status": map[string]interface{}{
 			"node": map[string]interface{}{
 				"runtime_detection":       "detected",
+				"collector_modes":         []interface{}{"perf-map"},
 				"collector_status":        "missing",
 				"sample_count":            10,
 				"frame_weight":            10,
@@ -494,9 +499,19 @@ func TestContinuousLanguageStatusV2MissingCollectorCannotBePromotedByFrames(t *t
 		},
 	}
 	continuousAggregateRuntimeMetadata(agg, refs)
+	continuousAddSample(agg, ContinuousStackSample{
+		PID: 7, Exe: "/usr/bin/node", Runtime: "node", Backend: "perf_rolling",
+		Count: 10, Stack: []string{"node", "0x1234"},
+	}, nil)
 	node := continuousRuntimeDiagnostics(*agg)["node"]
 	if node.CollectorStatus != "missing" || node.SemanticSamplePercent != 100 {
 		t.Fatalf("semantic frames must not promote a missing collector: %#v", node)
+	}
+	if node.ReadyCount != 0 || node.MissingCount != 1 || len(node.Processes) != 1 {
+		t.Fatalf("generic perf samples must not invent a v2-ready collector: %#v", node)
+	}
+	if len(node.Modes) != 1 || node.Modes[0] != "perf-map" {
+		t.Fatalf("generic perf backend must not leak into v2 collector modes: %#v", node.Modes)
 	}
 }
 

@@ -3551,12 +3551,20 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 	agg.Total += count
 	runtimeName := firstNonEmpty(continuousSampleLabel(sample, windowLabels, "runtime"), "unknown")
 	diag := continuousRuntimeAccumulator(agg, runtimeName)
-	processKey := strconv.Itoa(sample.PID) + "|" + sample.Exe
-	process := ProfileRuntimeProcessDiagnostic{PID: sample.PID, Comm: sample.Comm, Exe: sample.Exe, Mode: sample.Backend, Status: "ready"}
-	diag.Detected[processKey] = process
-	diag.Ready[processKey] = process
-	if sample.Backend != "" {
-		diag.Modes[sample.Backend] = true
+	// v2 language_status is the authoritative collector-capability contract.
+	// A generic perf sample only proves that the process was sampled; it does not
+	// prove that the runtime-specific collector (for example Node's JIT map) is
+	// ready.  Adding a synthetic perf_rolling/ready row here used to turn an
+	// explicit "missing --perf-basic-prof" state into the misleading "partial".
+	// Keep the sample-derived fallback only for historical v1 windows.
+	if !diag.HasV2 {
+		processKey := strconv.Itoa(sample.PID) + "|" + sample.Exe
+		process := ProfileRuntimeProcessDiagnostic{PID: sample.PID, Comm: sample.Comm, Exe: sample.Exe, Mode: sample.Backend, Status: "ready"}
+		diag.Detected[processKey] = process
+		diag.Ready[processKey] = process
+		if sample.Backend != "" {
+			diag.Modes[sample.Backend] = true
+		}
 	}
 	for _, key := range []string{"comm", "pid", "process_start_ms", "process_instance", "exe", "runtime"} {
 		if value := continuousSampleLabel(sample, windowLabels, key); value != "" {
