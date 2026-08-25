@@ -15,6 +15,7 @@ import ScheduleTimeline from '../components/ScheduleTimeline';
 import { collectorLabelFromTask, parseRequestParams } from '../utils/collectors';
 import { schedulePeriodLabel, schedulePeriodTitle, scheduleStatusText, scheduleUsesInterval, intervalHumanLabel } from '../utils/schedule';
 import { formatDateTime } from '../utils/time';
+import InfoTooltip from '../components/InfoTooltip';
 
 const S = {
     container: { width: '100%', maxWidth: 1320, minWidth: 0, margin: '0 auto', padding: '22px 28px 36px', fontFamily: 'Arial, sans-serif', color: '#101828' },
@@ -162,7 +163,7 @@ export default function ScheduleDetailPage() {
 function ContextItem({ label, value, hint }) {
     return (
         <div style={S.item} title={hint}>
-            <div style={S.label}>{label}</div>
+            <div style={S.label}>{label}{hint && <InfoTooltip>{hint}</InfoTooltip>}</div>
             <div style={S.value}>{value}</div>
         </div>
     );

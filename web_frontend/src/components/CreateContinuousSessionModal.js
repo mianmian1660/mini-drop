@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { continuous, sentinelRules } from '../api';
 import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, SENTINEL_SIGNALS, formatBytes, selectorModeLabel, signalLabel } from '../utils/continuous';
+import InfoTooltip from './InfoTooltip';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(16,24,40,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
@@ -333,7 +334,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
 
             <details style={S.section}>
                 <summary style={{ cursor: 'pointer', color: '#344054', fontSize: 13, fontWeight: 700 }}>高级设置</summary>
-                <p style={S.fieldHint}>下方数值保持技术单位（Hz / 秒 / 小时），鼠标悬停或键盘聚焦可查看每项的含义。</p>
+                <p style={S.fieldHint}>下方数值保持技术单位（Hz / 秒 / 小时），点击或悬停旁边的 i 可查看含义。</p>
                 <div style={S.grid}>
                     <NumberField
                         label="采样频率（每秒采集多少次）" hint="采样频率 Hz：数值越高火焰图越精细，但 CPU 开销越大（1–999）"
@@ -374,7 +375,7 @@ function NumberField({ label, hint, value, onChange, min, max, disabled, fieldId
     const id = fieldId || `field-${label}`;
     return (
         <label>
-            <span style={S.label}>{label}</span>
+            <span style={S.label}>{label}{hint && <InfoTooltip>{hint}</InfoTooltip>}</span>
             <input
                 type="number"
                 style={S.input}

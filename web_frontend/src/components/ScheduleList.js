@@ -15,6 +15,7 @@ import Pagination from './Pagination';
 import { collectorLabelFromTask } from '../utils/collectors';
 import { schedulePeriodLabel, schedulePeriodTitle, scheduleStatusText } from '../utils/schedule';
 import { formatDateTime } from '../utils/time';
+import InfoTooltip from './InfoTooltip';
 
 const S = {
     card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 20, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,.04)' },
@@ -174,10 +175,11 @@ export default function ScheduleList({ targetIp, detailPrefix, compact = false, 
                                         <td style={S.td}>
                                             <span style={{ ...S.badge, background: running ? '#16a34a' : '#64748b', color: '#fff' }} title={scheduleStatusText(sch)}>
                                                 {running ? '启用' : '停用'}
+                                                <InfoTooltip>{scheduleStatusText(sch)}</InfoTooltip>
                                             </span>
                                         </td>
                                         <td style={S.td}>
-                                            <span style={S.cron} title={schedulePeriodTitle(sch)}>{schedulePeriodLabel(sch)}</span>
+                                            <span style={S.cron} title={schedulePeriodTitle(sch)}>{schedulePeriodLabel(sch)}<InfoTooltip>{schedulePeriodTitle(sch)}</InfoTooltip></span>
                                         </td>
                                         <td style={S.td}>{formatDateTime(sch.last_run_at) || '-'}</td>
                                         <td style={S.td}>{running ? (formatDateTime(sch.next_run_at) || '-') : '已停用'}</td>

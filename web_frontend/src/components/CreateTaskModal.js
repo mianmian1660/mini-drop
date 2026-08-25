@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { tasks, agents, schedules, taskKinds } from '../api';
 import { capabilityLabel, parseStringList } from '../utils/collectors';
 import { intervalHumanLabel } from '../utils/schedule';
+import InfoTooltip from './InfoTooltip';
 
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(15, 23, 42, 0.45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '48px 16px 24px', overflowY: 'auto' },
@@ -475,7 +476,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                     </label>
                     {f.continuous && (
                         <div>
-                            <label style={S.label} title="每隔多久自动触发一次深度采样">采样间隔（每隔多久采集一次）</label>
+                            <label style={S.label}>采样间隔（每隔多久采集一次）<InfoTooltip>系统会按这个间隔自动创建一次深度采样窗口，采样时长必须短于间隔。</InfoTooltip></label>
                             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8, alignItems: 'center' }}>
                                 {INTERVAL_PRESETS.map(p => (
                                     <button key={p.intervalSeconds} style={S.presetBtn(f.interval_seconds === p.intervalSeconds && !f.custom_interval_min)}
@@ -495,7 +496,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                                 </span>
                             </div>
 
-                            <label style={S.label} title="计划首次运行的时间；选择过去的时间会立即开始">开始时间</label>
+                            <label style={S.label}>开始时间<InfoTooltip>选择立即开始，或指定第一次采集的时间；选择过去的时间会尽快开始。</InfoTooltip></label>
                             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
                                 <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: 13 }}>
                                     <input type="radio" name="start-mode" checked={f.start_mode === 'now'} onChange={() => up('start_mode', 'now')} />立即开始
@@ -514,7 +515,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                                 )}
                             </div>
 
-                            <p style={S.hint}>每个采集窗口持续 {f.duration}s / 采样频率 {f.frequency}Hz。采样时长必须小于采样间隔，否则相邻窗口会重叠。</p>
+                            <p style={S.hint}>每个采集窗口持续 {f.duration}s / 采样频率 {f.frequency}Hz。采样时长必须小于采样间隔，否则相邻窗口会重叠。<InfoTooltip>窗口是一次实际采样的持续时间；间隔是两次采样开始之间的时间。</InfoTooltip></p>
                             {nextRunEstimate && (
                                 <p style={S.ok}>下一次采集：{nextRunEstimate.toLocaleString()}（{intervalHumanLabel(f.interval_seconds)}一次）</p>
                             )}
