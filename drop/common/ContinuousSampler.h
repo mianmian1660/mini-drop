@@ -27,6 +27,10 @@ struct ContinuousTargetProcess
     int64_t processStartMs = 0;
     std::string comm;
     std::string exe;
+    // 阶段六：cgroup 路径与解析出的 container ID（来自 /proc/<pid>/cgroup）。
+    // cgroup/container_id selector 按这些字段匹配；无法读取或识别时为空。
+    std::string cgroup;
+    std::string containerId;
 };
 
 // 阶段一（标量健康指标，借鉴 mysqld_exporter/postgres_exporter 的采集口径）
@@ -68,6 +72,16 @@ struct ContinuousSamplerConfig
     std::string authUID;
     std::string scope = "host";
     std::string selectorExe;
+    // 阶段六：selector 模式与结构化参数（fan-out 身份过滤与诊断）。
+    //   - pid_instance:      selectorPid + selectorProcessStartMs + selectorExe
+    //   - exe_all_instances: selectorExe
+    //   - cgroup:            selectorCgroup
+    //   - container_id:      selectorContainerId
+    std::string selectorMode = "exe_all_instances";
+    int selectorPid = 0;
+    int64_t selectorProcessStartMs = 0;
+    std::string selectorCgroup;
+    std::string selectorContainerId;
     std::string signals = "cpu,io,io_syscall,sched";
     // 阶段一：信号控制面。requestedSignals 是该 Session 请求的逻辑信号
     // （cpu_profile/io_latency/io_syscall_latency/sched_latency），由 assignment

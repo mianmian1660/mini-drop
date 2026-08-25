@@ -223,6 +223,92 @@ bool atomic_write(const std::string &path, const std::string &body)
 
 } // namespace
 
+// 阶段六：读取 /proc/<pid>/cgroup 的 cgroup 路径。
+//   - cgroup v2:  "0::/system.slice/docker-abc123.scope"
+//   - cgroup v1:  "0:name=systemd:/system.slice/foo" 或 "2:cpu:/docker/abc123"
+// 返回去掉控制器前缀后的路径（以 / 开头）；无法读取时返回空字符串。
+std::string process_cgroup_path(int pid)
+{
+    std::ifstream in("/proc/" + std::to_string(pid) + "/cgroup");
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.empty())
+            continue;
+        // 取最后一个 ':' 之后的部分（v2 是 "0::/path"，v1 是 "N:controller:/path"）。
+        size_t colon = line.rfind(':');
+        if (colon == std::string::npos)
+            continue;
+        std::string path = line.substr(colon + 1);
+        if (!path.empty() && path[0] == '/')
+            return path;
+    }
+    return "";
+}
+
+// 阶段六：从 cgroup 路径提取 container ID。支持常见运行时路径模式：
+//   - /docker/<64hex>、/kubepods/.../docker/<64hex>
+//   - /kubepods/.../cri-o-<64hex>、/kubepods/.../containerd/<64hex>
+//   - /system.slice/docker-<64hex>.scope、containerd-<64hex>.scope、
+//     crio-<64hex>.scope
+// 无法识别时返回空字符串（调用方上报 unsupported/waiting 原因）。
+std::string extract_container_id(const std::string &cgroupPath)
+{
+    if (cgroupPath.empty())
+        return "";
+    const std::string path = cgroupPath;
+    // 1. 形如 /docker/<id> 或 /kubepods/.../docker/<id> 的段。
+    size_t pos = 0;
+    while ((pos = path.find('/', pos)) != std::string::npos)
+    {
+        size_t segmentStart = pos + 1;
+        size_t segmentEnd = path.find('/', segmentStart);
+        std::string segment = path.substr(segmentStart, segmentEnd == std::string::npos ? std::string::npos : segmentEnd - segmentStart);
+        if (segment == "docker" || segment == "containerd" || segment == "cri-containerd")
+        {
+            if (segmentEnd != std::string::npos)
+            {
+                size_t idStart = segmentEnd + 1;
+                size_t idEnd = path.find('/', idStart);
+                std::string id = path.substr(idStart, idEnd == std::string::npos ? std::string::npos : idEnd - idStart);
+                if (id.size() >= 12 && id.size() <= 64 &&
+                    id.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+                    return id;
+            }
+        }
+        pos = segmentEnd == std::string::npos ? path.size() : segmentEnd;
+    }
+    // 2. 形如 /system.slice/docker-<id>.scope（systemd 驱动）。
+    for (const char *prefix : {"docker-", "containerd-", "crio-", "libpod-"})
+    {
+        std::string marker = std::string("/") + prefix;
+        size_t found = path.find(marker);
+        if (found == std::string::npos)
+            continue;
+        size_t idStart = found + marker.size();
+        size_t idEnd = path.find('.', idStart);
+        std::string id = path.substr(idStart, idEnd == std::string::npos ? std::string::npos : idEnd - idStart);
+        if (id.size() >= 12 && id.size() <= 64 &&
+            id.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+            return id;
+    }
+    // 3. 形如 /kubepods/.../cri-o-<id>（CRI-O 无斜杠分隔）。
+    {
+        std::string marker = "/cri-o-";
+        size_t found = path.find(marker);
+        if (found != std::string::npos)
+        {
+            size_t idStart = found + marker.size();
+            size_t idEnd = path.find('/', idStart);
+            std::string id = path.substr(idStart, idEnd == std::string::npos ? std::string::npos : idEnd - idStart);
+            if (id.size() >= 12 && id.size() <= 64 &&
+                id.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+                return id;
+        }
+    }
+    return "";
+}
+
 std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesByExe(
     const std::vector<drop::ContinuousTargetProcess> &processes,
     const std::string &selectorExe)
@@ -231,6 +317,48 @@ std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesByExe(
     for (const auto &process : processes)
         if (!selectorExe.empty() && process.exe == selectorExe)
             matches.push_back(process);
+    return matches;
+}
+
+// 阶段六：按 selector 模式匹配进程（见头文件注释）。
+std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesBySelector(
+    const std::vector<drop::ContinuousTargetProcess> &processes,
+    const ContinuousAssignment &assignment)
+{
+    std::vector<drop::ContinuousTargetProcess> matches;
+    if (assignment.scope != "process")
+        return matches;
+    for (const auto &process : processes)
+    {
+        if (assignment.selectorMode == "pid_instance")
+        {
+            // 精确三元组匹配：PID 复用后新进程的 start time 不同，不会误匹配。
+            if (process.pid == assignment.selectorPid &&
+                process.processStartMs == assignment.selectorProcessStartMs &&
+                !assignment.selectorExe.empty() && process.exe == assignment.selectorExe)
+                matches.push_back(process);
+        }
+        else if (assignment.selectorMode == "cgroup")
+        {
+            const std::string &selected = assignment.selectorCgroup;
+            const bool descendant = !selected.empty() && process.cgroup.size() > selected.size() &&
+                                    process.cgroup.compare(0, selected.size(), selected) == 0 &&
+                                    process.cgroup[selected.size()] == '/';
+            if (!selected.empty() && (process.cgroup == selected || descendant))
+                matches.push_back(process);
+        }
+        else if (assignment.selectorMode == "container_id")
+        {
+            if (!assignment.selectorContainerId.empty() &&
+                process.containerId == assignment.selectorContainerId)
+                matches.push_back(process);
+        }
+        else // exe_all_instances（含历史 all_instances 归一化）
+        {
+            if (!assignment.selectorExe.empty() && process.exe == assignment.selectorExe)
+                matches.push_back(process);
+        }
+    }
     return matches;
 }
 
@@ -325,7 +453,15 @@ std::vector<drop::ContinuousTargetProcess> ContinuousSessionManager::ScanProcess
         int64_t started = process_start_ms(pid);
         if (pid <= 0 || exe.empty() || started <= 0)
             continue;
-        out.push_back({pid, started, read_line(base + "/comm"), exe});
+        drop::ContinuousTargetProcess process;
+        process.pid = pid;
+        process.processStartMs = started;
+        process.comm = read_line(base + "/comm");
+        process.exe = exe;
+        // 阶段六：cgroup 路径与 container ID（供 cgroup/container_id selector）。
+        process.cgroup = process_cgroup_path(pid);
+        process.containerId = extract_container_id(process.cgroup);
+        out.push_back(std::move(process));
     }
     ::closedir(directory);
     std::sort(out.begin(), out.end(), [](const auto &left, const auto &right) { return left.pid < right.pid; });
@@ -342,7 +478,8 @@ std::string ContinuousSessionManager::BuildReconcileBody(const std::vector<drop:
     for (const auto &process : processes)
         body["processes"].push_back({{"pid", process.pid}, {"process_start_ms", process.processStartMs},
                                       {"comm", process.comm}, {"exe", process.exe},
-                                      {"rss_bytes", process_rss_bytes(process.pid)}});
+                                      {"rss_bytes", process_rss_bytes(process.pid)},
+                                      {"cgroup_path", process.cgroup}, {"container_id", process.containerId}});
     body["sessions"] = json::array();
     for (const auto &entry : runtimes_)
     {
@@ -350,7 +487,8 @@ std::string ContinuousSessionManager::BuildReconcileBody(const std::vector<drop:
         json active = json::array();
         for (const auto &target : runtime.targets)
             active.push_back({{"pid", target.pid}, {"process_start_ms", target.processStartMs},
-                              {"comm", target.comm}, {"exe", target.exe}, {"rss_bytes", process_rss_bytes(target.pid)}});
+                              {"comm", target.comm}, {"exe", target.exe}, {"rss_bytes", process_rss_bytes(target.pid)},
+                              {"cgroup_path", target.cgroup}, {"container_id", target.containerId}});
         std::string observedState = runtime.observedState;
         std::string degradationReason = runtime.degradationReason;
         // 阶段五：服务器存储压力时上报 waiting/server_storage_pressure
@@ -434,6 +572,34 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
             assignment.sid = item.value("sid", "");
             assignment.scope = item.value("scope", "host");
             assignment.selectorExe = item.value("selector_exe", "");
+            // 阶段六：selector 模式与结构化参数。selector_params 是服务端
+            // jsonb 的原始字节（Go []byte 无自定义 MarshalJSON 时 base64 编码），
+            // 与 labels 相同处理：先 base64 解码再解析 JSON。
+            assignment.selectorMode = item.value("selector_mode", "exe_all_instances");
+            if (assignment.selectorMode == "all_instances")
+                assignment.selectorMode = "exe_all_instances";
+            if (item.contains("selector_params") && !item.at("selector_params").is_null())
+            {
+                const std::string paramsB64 = item.value("selector_params", std::string());
+                if (!paramsB64.empty())
+                {
+                    try
+                    {
+                        json params = json::parse(base64_decode(paramsB64));
+                        assignment.selectorPid = params.value("pid", 0);
+                        assignment.selectorProcessStartMs = params.value("process_start_ms", static_cast<int64_t>(0));
+                        if (params.contains("exe") && params.at("exe").is_string())
+                            assignment.selectorExe = params.value("exe", assignment.selectorExe);
+                        assignment.selectorCgroup = params.value("cgroup", "");
+                        assignment.selectorContainerId = params.value("container_id", "");
+                    }
+                    catch (const std::exception &error)
+                    {
+                        std::cerr << "[native-cp] reconcile selector_params parse failed sid=" << assignment.sid
+                                  << ": " << error.what() << std::endl;
+                    }
+                }
+            }
             assignment.desiredState = item.value("desired_state", "running");
             assignment.continuityMode = item.value("continuity_mode", "degraded");
             assignment.allowDegraded = item.value("allow_degraded", assignment.continuityMode == "degraded");
@@ -495,6 +661,21 @@ bool ContinuousSessionManager::ParseAssignments(const std::string &response,
         std::cerr << "[native-cp] reconcile JSON parse failed: " << error.what() << std::endl;
         return false;
     }
+}
+
+// 阶段六：按 selector 模式生成 waiting 原因（进程退出/无法读取元数据时）。
+std::string selector_waiting_reason(const ContinuousAssignment &assignment)
+{
+    if (assignment.selectorMode == "pid_instance")
+        return "target pid " + std::to_string(assignment.selectorPid) +
+               " is not currently present; collection stays waiting and will NOT follow a reused PID or a new process at the same path";
+    if (assignment.selectorMode == "cgroup")
+        return "no process currently matches cgroup " + assignment.selectorCgroup +
+               "; collection will resume when a process joins the cgroup";
+    if (assignment.selectorMode == "container_id")
+        return "no process currently matches container_id " + assignment.selectorContainerId +
+               "; collection will resume when a process in the container is visible";
+    return "target exe is not currently present; collection will resume when any instance returns";
 }
 
 void ContinuousSessionManager::ApplyAssignments(const std::vector<ContinuousAssignment> &assignments,
@@ -563,14 +744,15 @@ void ContinuousSessionManager::RefreshTargets(const std::vector<drop::Continuous
         Runtime &runtime = entry.second;
         std::vector<drop::ContinuousTargetProcess> targets;
         if (runtime.assignment.scope == "process")
-            targets = MatchContinuousProcessesByExe(processes, runtime.assignment.selectorExe);
+            targets = MatchContinuousProcessesBySelector(processes, runtime.assignment);
         bool changed = !same_targets(runtime.targets, targets);
         if (runtime.assignment.scope == "process" && targets.empty())
         {
             runtime.targets.clear();
             runtime.observedState = "waiting";
             runtime.effectiveContinuityMode = runtime.assignment.continuityMode;
-            runtime.degradationReason = "target exe is not currently present; collection will resume when any instance returns";
+            // 阶段六：按 selector 模式给出可诊断的 waiting 原因。
+            runtime.degradationReason = selector_waiting_reason(runtime.assignment);
             runtime.lastError.clear();
             continue;
         }
@@ -598,6 +780,12 @@ drop::ContinuousSamplerConfig ContinuousSessionManager::BuildSamplerConfig(const
     samplerConfig.authUID = authUID_;
     samplerConfig.scope = runtime.assignment.scope;
     samplerConfig.selectorExe = runtime.assignment.selectorExe;
+    // 阶段六：selector 模式与结构化参数透传（fan-out 身份过滤与诊断）。
+    samplerConfig.selectorMode = runtime.assignment.selectorMode;
+    samplerConfig.selectorPid = runtime.assignment.selectorPid;
+    samplerConfig.selectorProcessStartMs = runtime.assignment.selectorProcessStartMs;
+    samplerConfig.selectorCgroup = runtime.assignment.selectorCgroup;
+    samplerConfig.selectorContainerId = runtime.assignment.selectorContainerId;
     // 阶段一：信号控制面。requestedSignals 来自 assignment；为空时回退四类
     // 默认。signals（物理采集集）由 requestedSignals 换算；共享采集器还会在
     // shared_physical_config 里对所有活动 Session 取并集。
@@ -694,6 +882,10 @@ void ContinuousSessionManager::RebuildSharedEngine()
                     << runtime.assignment.scope << '|' << runtime.assignment.continuityMode << '|'
                     << runtime.assignment.allowDegraded << '|' << runtime.assignment.sampleRateHz << '|'
                     << runtime.assignment.aggregationWindowSec << '|' << runtime.assignment.uploadBatchSec << '|';
+        // 阶段六：selector 模式与参数计入 fingerprint（变化时触发受控切换）。
+        fingerprint << runtime.assignment.selectorMode << '|' << runtime.assignment.selectorPid << '|'
+                    << runtime.assignment.selectorProcessStartMs << '|' << runtime.assignment.selectorCgroup << '|'
+                    << runtime.assignment.selectorContainerId << '|';
         // 阶段一：请求信号集与目标集（target fingerprint 的来源）也计入共享
         // 引擎 fingerprint，变化时触发受控切换。
         for (const auto &signal : runtime.assignment.requestedSignals)

@@ -71,9 +71,29 @@ type CreateContinuousSessionReq struct {
 	Scope                string                 `json:"scope"`
 	SelectorExe          string                 `json:"selector_exe"`
 	SelectorMode         string                 `json:"selector_mode"`
-	Signals              []string               `json:"signals"`
-	ContinuityMode       string                 `json:"continuity_mode"`
-	AllowDegraded        bool                   `json:"allow_degraded"`
+	// SelectorParams 阶段六：selector 的结构化参数。按 selector_mode 使用：
+	//   - pid_instance:      {pid, process_start_ms, exe}
+	//   - exe_all_instances: {exe}
+	//   - cgroup:            {cgroup}
+	//   - container_id:      {container_id}
+	// 兼容旧客户端：只传 selector_exe + selector_mode=all_instances 时归一化为
+	// exe_all_instances。
+	SelectorParams *ContinuousSelectorParams `json:"selector_params"`
+	Signals        []string                  `json:"signals"`
+	ContinuityMode string                    `json:"continuity_mode"`
+	AllowDegraded  bool                      `json:"allow_degraded"`
+}
+
+// ContinuousSelectorParams 阶段六：selector 的结构化参数（与 Agent 侧
+// ContinuousTargetProcess 的匹配身份对应）。进程实例身份统一使用
+// pid + process_start_ms + exe 三元组，避免 PID 复用导致旧 Session 采集到
+// 新进程。
+type ContinuousSelectorParams struct {
+	PID            int    `json:"pid"`
+	ProcessStartMs int64  `json:"process_start_ms"`
+	Exe            string `json:"exe"`
+	Cgroup         string `json:"cgroup"`
+	ContainerID    string `json:"container_id"`
 }
 
 type ContinuousBatchIngestReq struct {
@@ -410,6 +430,7 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 	caps, _ := util.MarshalJSONB(req.Capabilities)
 	signals, _ := util.MarshalJSONB(req.Signals)
 	requestedSignals, _ := util.MarshalJSONB(req.Signals)
+	selectorParams, _ := util.MarshalJSONB(req.SelectorParams)
 	now := time.Now()
 	session := model.ContinuousSession{
 		SID:                  "cps-" + util.GenTID()[4:],
@@ -427,6 +448,7 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 		Scope:                req.Scope,
 		SelectorExe:          req.SelectorExe,
 		SelectorMode:         req.SelectorMode,
+		SelectorParams:       selectorParams,
 		Signals:              signals,
 		RequestedSignals:     requestedSignals,
 		DesiredState:         model.ContinuousDesiredStateRunning,
@@ -464,8 +486,8 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 			Find(&active).Error; err != nil {
 			return err
 		}
-		if err := validateContinuousActiveSet(active, req.Scope, req.SelectorExe); err != nil {
-			conflictSession = findContinuousConflict(active, req.Scope, req.SelectorExe)
+		if err := validateContinuousActiveSet(active, req); err != nil {
+			conflictSession = findContinuousConflict(active, req)
 			return err
 		}
 		nextRevision := lockedState.Revision + 1
@@ -503,10 +525,16 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 	s.RespondOK(c, gin.H{"session": session})
 }
 
-func findContinuousConflict(active []model.ContinuousSession, scope, selectorExe string) *model.ContinuousSession {
+func findContinuousConflict(active []model.ContinuousSession, req CreateContinuousSessionReq) *model.ContinuousSession {
+	requestIdentity := continuousSelectorIdentity(model.ContinuousSession{
+		SelectorMode:   req.SelectorMode,
+		SelectorExe:    req.SelectorExe,
+		SelectorParams: mustMarshalSelectorParams(req.SelectorParams),
+	})
 	for index := range active {
 		session := &active[index]
-		if scope == "host" || session.Scope == "host" || session.Scope == "" || session.SelectorExe == selectorExe {
+		if req.Scope == "host" || session.Scope == "host" || session.Scope == "" ||
+			continuousSelectorIdentity(*session) == requestIdentity {
 			return session
 		}
 	}
@@ -4136,6 +4164,28 @@ func applyContinuousDefaults(req *CreateContinuousSessionReq) error {
 	req.SelectorMode = strings.ToLower(strings.TrimSpace(req.SelectorMode))
 	if req.SelectorMode == "" {
 		req.SelectorMode = "all_instances"
+	}
+	// 阶段六：all_instances 是 exe_all_instances 的历史别名，统一归一化。
+	if req.SelectorMode == "all_instances" {
+		req.SelectorMode = "exe_all_instances"
+	}
+	// 阶段六：selector_params 与 selector_exe 兼容同步。新客户端传结构化
+	// selector_params；旧客户端只传 selector_exe 时从 exe 推导 params。
+	if req.SelectorParams != nil {
+		req.SelectorParams.Exe = strings.TrimSpace(req.SelectorParams.Exe)
+		req.SelectorParams.Cgroup = strings.TrimSpace(req.SelectorParams.Cgroup)
+		req.SelectorParams.ContainerID = strings.TrimSpace(req.SelectorParams.ContainerID)
+		if req.SelectorParams.Exe != "" {
+			req.SelectorExe = req.SelectorParams.Exe
+		}
+		if req.SelectorMode == "container_id" {
+			req.SelectorParams.ContainerID = strings.ToLower(req.SelectorParams.ContainerID)
+		}
+		if req.SelectorMode == "container_id" {
+			req.SelectorParams.ContainerID = strings.ToLower(req.SelectorParams.ContainerID)
+		}
+	} else if req.SelectorExe != "" {
+		req.SelectorParams = &ContinuousSelectorParams{Exe: req.SelectorExe}
 	}
 	req.ContinuityMode = strings.ToLower(strings.TrimSpace(req.ContinuityMode))
 	if req.ContinuityMode == "" {

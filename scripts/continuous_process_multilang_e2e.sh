@@ -131,7 +131,7 @@ path, name, target_ip, exe = sys.argv[1:]
 body = {
     "name": name, "target_ip": target_ip,
     "hostname": "cloud-server-111-230-29-115",
-    "scope": "process", "selector_exe": exe, "selector_mode": "all_instances",
+    "scope": "process", "selector_exe": exe, "selector_mode": "exe_all_instances",
     "signals": ["cpu_profile", "io_latency", "io_syscall_latency", "sched_latency"],
     "sample_rate_hz": 9, "aggregation_window_sec": 5, "upload_batch_sec": 15,
     "retention_hours": 1, "continuity_mode": "strict", "allow_degraded": True,
