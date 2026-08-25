@@ -4127,7 +4127,10 @@ struct SharedDualTrackContinuousSampler::Impl
             // 物理级 Python sidecar：上一批已发现候选异步覆盖 capture 区间。
             if (pythonFallbackEnabled)
             {
-                if (!sidecarInFlight && pendingSidecarResults.empty())
+                // Capture continuously.  Completed results may still be
+                // suppressing perf samples across their full time interval;
+                // that must not block the next capture from starting.
+                if (!sidecarInFlight)
                 {
                     sidecarCapture = drop::start_python_fallback_capture(
                         physical.sessionSID, pythonCaptureSec,
@@ -4139,7 +4142,10 @@ struct SharedDualTrackContinuousSampler::Impl
                     auto ready = sidecarCapture.Poll(pythonSidecarPollMs);
                     if (!ready.empty())
                     {
-                        pendingSidecarResults = std::move(ready);
+                        pendingSidecarResults.insert(
+                            pendingSidecarResults.end(),
+                            std::make_move_iterator(ready.begin()),
+                            std::make_move_iterator(ready.end()));
                         sidecarLimitedCount = sidecarCapture.LimitedCount();
                     }
                     if (!sidecarCapture.AnyPending())
@@ -4188,30 +4194,34 @@ struct SharedDualTrackContinuousSampler::Impl
                 consecutiveProcessorFailures = 0;
                 processedSegments++;
                 recorder.Confirm(segment.path); // 仅处理成功后删除
-                // 只有真正替换了时间重叠且身份一致的 perf 样本后才能消费
-                // sidecar。Drain 可能先返回 capture 之前的旧 segment；旧实现
-                // 在这种情况下也清空结果，导致 fallback 间歇性失效。
+                // 一份 py-spy 聚合结果覆盖整个真实 capture 区间：首个重叠段
+                // 追加一次聚合样本，随后清空 samples、但保留身份与区间，让其
+                // 余下重叠段只删除对应 perf 样本。这样既不重复计数，也不会在
+                // capture 区间中间退回 generic perf。
                 if (!pendingSidecarResults.empty())
                 {
-                    bool hasReady = false;
-                    bool hasFailure = false;
-                    int64_t newestCaptureEnd = 0;
-                    for (const auto &sidecar : pendingSidecarResults)
-                    {
-                        hasReady = hasReady || sidecar.ready;
-                        hasFailure = hasFailure || !sidecar.ready;
-                        newestCaptureEnd = std::max(newestCaptureEnd, sidecar.captureEndMs);
-                    }
                     int64_t segmentStart = 0;
+                    int64_t segmentEnd = 0;
                     if (!processed.windows.empty())
-                        segmentStart = processed.windows.front().startMs;
-                    const bool expired = hasReady && newestCaptureEnd > 0 &&
-                                         segmentStart > newestCaptureEnd;
-                    if (processed.pythonFallbackApplied || (!hasReady && hasFailure) || expired)
                     {
-                        pendingSidecarResults.clear();
-                        sidecarLimitedCount = 0;
+                        segmentStart = processed.windows.front().startMs;
+                        segmentEnd = processed.windows.front().endMs;
                     }
+                    if (processed.pythonFallbackApplied)
+                        for (auto &sidecar : pendingSidecarResults)
+                            if (sidecar.ready && sidecar.captureStartMs < segmentEnd &&
+                                sidecar.captureEndMs > segmentStart)
+                                sidecar.samples.clear();
+                    pendingSidecarResults.erase(
+                        std::remove_if(pendingSidecarResults.begin(), pendingSidecarResults.end(),
+                                       [&](const auto &sidecar) {
+                                           return !sidecar.ready ||
+                                                  (sidecar.captureEndMs > 0 &&
+                                                   segmentStart >= sidecar.captureEndMs);
+                                       }),
+                        pendingSidecarResults.end());
+                    if (pendingSidecarResults.empty())
+                        sidecarLimitedCount = 0;
                 }
 
                 // 阶段二：strict readiness = 至少一个真实 segment 已被统一

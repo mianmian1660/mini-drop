@@ -36,7 +36,7 @@ void merge_python_sidecar_samples(std::vector<AggregatedSample> *samples,
             return true; // 历史数据无区间：保持旧行为
         if (windowStartMs <= 0 || windowEndMs <= 0)
             return true;
-        return result.captureStartMs <= windowEndMs && result.captureEndMs >= windowStartMs;
+        return result.captureStartMs < windowEndMs && result.captureEndMs > windowStartMs;
     };
     // 只有"时间重叠且身份能在本窗 perf 样本中找到"的结果才会替换；
     // 其余（过期 / 身份不一致 / 窗口无该进程样本）一律忽略，不删除也不追加。

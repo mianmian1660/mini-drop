@@ -256,6 +256,37 @@ TEST(ContinuousSegmentProcessor, PythonSidecarMergesWithoutDoubleCounting)
     merge_python_sidecar_samples(&incompleteSamples, {incomplete});
     ASSERT_EQ(incompleteSamples.size(), 1u);
     EXPECT_EQ(incompleteSamples.front().backend, "perf_rolling");
+
+    // 一个聚合 sidecar 只追加一次，但必须在整个 capture 区间内持续抑制
+    // 对应 perf 样本；相邻区间边界不视为重叠。
+    PythonFallbackResult interval = ready;
+    interval.captureStartMs = 1000;
+    interval.captureEndMs = 3000;
+    std::vector<AggregatedSample> before = {perfPython};
+    bool beforeReplaced = false;
+    merge_python_sidecar_samples(&before, {interval}, &beforeReplaced, 0, 1000);
+    EXPECT_FALSE(beforeReplaced);
+    ASSERT_EQ(before.size(), 1u);
+
+    std::vector<AggregatedSample> firstOverlap = {perfPython};
+    bool firstOverlapReplaced = false;
+    merge_python_sidecar_samples(&firstOverlap, {interval}, &firstOverlapReplaced, 1000, 2000);
+    EXPECT_TRUE(firstOverlapReplaced);
+    ASSERT_EQ(firstOverlap.size(), 1u);
+    EXPECT_EQ(firstOverlap.front().backend, "py-spy");
+
+    interval.samples.clear();
+    std::vector<AggregatedSample> remainingOverlap = {perfPython};
+    bool remainingReplaced = false;
+    merge_python_sidecar_samples(&remainingOverlap, {interval}, &remainingReplaced, 2000, 3000);
+    EXPECT_TRUE(remainingReplaced);
+    EXPECT_TRUE(remainingOverlap.empty());
+
+    std::vector<AggregatedSample> after = {perfPython};
+    bool afterReplaced = false;
+    merge_python_sidecar_samples(&after, {interval}, &afterReplaced, 3000, 4000);
+    EXPECT_FALSE(afterReplaced);
+    ASSERT_EQ(after.size(), 1u);
 }
 
 TEST(ContinuousSegmentProcessor, RebuildFilteredSymbolRefsIsolatesProcessSession)
