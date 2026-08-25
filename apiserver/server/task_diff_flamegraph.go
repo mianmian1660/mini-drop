@@ -57,14 +57,8 @@ func (s *APIServer) fetchFoldedStacksForTask(task *model.HotmethodTask) (string,
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			for i := range artifacts {
-				resolved := s.resolveBlobForKey(ctx, artifacts[i].ObjectKey)
-				reader, err := s.Storage.GetObject(ctx, s.Config.Storage.Bucket, resolved.PhysicalKey)
-				if err != nil {
-					continue
-				}
-				body, readErr := io.ReadAll(reader)
-				reader.Close()
-				if readErr == nil && len(body) > 0 {
+				body, err := s.readArtifactLogicalContent(ctx, artifacts[i], 64<<20)
+				if err == nil && len(body) > 0 {
 					return string(body), true
 				}
 			}

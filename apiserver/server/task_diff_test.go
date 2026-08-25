@@ -259,7 +259,8 @@ func TestTaskDiffReadsActiveGenerationArtifacts(t *testing.T) {
 		jobID := in.job.ID
 		artifact := model.Artifact{
 			TaskTID: in.task.TID, AnalysisJobID: &jobID, Kind: model.ArtifactKindResult,
-			ObjectKey: key, LogicalName: in.name, Status: model.ArtifactStatusReady, CreatedAt: now,
+			ObjectKey: key, LogicalName: in.name, Status: model.ArtifactStatusReady,
+			Compression: model.CompressionGzip, CreatedAt: now,
 		}
 		if in.name == "folded.txt" {
 			artifact.Kind = model.ArtifactKindIntermediate
@@ -267,7 +268,7 @@ func TestTaskDiffReadsActiveGenerationArtifacts(t *testing.T) {
 		if err := s.DB.Create(&artifact).Error; err != nil {
 			t.Fatal(err)
 		}
-		store.objects[key] = in.body
+		store.objects[key] = string(mustGzip(t, []byte(in.body)))
 		store.modified[key] = now
 	}
 
