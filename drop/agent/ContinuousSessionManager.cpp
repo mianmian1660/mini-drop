@@ -340,7 +340,11 @@ std::vector<drop::ContinuousTargetProcess> MatchContinuousProcessesBySelector(
         }
         else if (assignment.selectorMode == "cgroup")
         {
-            if (!assignment.selectorCgroup.empty() && process.cgroup == assignment.selectorCgroup)
+            const std::string &selected = assignment.selectorCgroup;
+            const bool descendant = !selected.empty() && process.cgroup.size() > selected.size() &&
+                                    process.cgroup.compare(0, selected.size(), selected) == 0 &&
+                                    process.cgroup[selected.size()] == '/';
+            if (!selected.empty() && (process.cgroup == selected || descendant))
                 matches.push_back(process);
         }
         else if (assignment.selectorMode == "container_id")
@@ -483,7 +487,8 @@ std::string ContinuousSessionManager::BuildReconcileBody(const std::vector<drop:
         json active = json::array();
         for (const auto &target : runtime.targets)
             active.push_back({{"pid", target.pid}, {"process_start_ms", target.processStartMs},
-                              {"comm", target.comm}, {"exe", target.exe}, {"rss_bytes", process_rss_bytes(target.pid)}});
+                              {"comm", target.comm}, {"exe", target.exe}, {"rss_bytes", process_rss_bytes(target.pid)},
+                              {"cgroup_path", target.cgroup}, {"container_id", target.containerId}});
         std::string observedState = runtime.observedState;
         std::string degradationReason = runtime.degradationReason;
         // 阶段五：服务器存储压力时上报 waiting/server_storage_pressure

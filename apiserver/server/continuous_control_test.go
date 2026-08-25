@@ -121,6 +121,7 @@ func TestValidateContinuousSelector(t *testing.T) {
 		{"cgroup relative", CreateContinuousSessionReq{SelectorMode: "cgroup", SelectorParams: &ContinuousSelectorParams{Cgroup: "docker-abc.scope"}}, true},
 		{"container_id ok", CreateContinuousSessionReq{SelectorMode: "container_id", SelectorParams: &ContinuousSelectorParams{ContainerID: "abc123def456"}}, false},
 		{"container_id too short", CreateContinuousSessionReq{SelectorMode: "container_id", SelectorParams: &ContinuousSelectorParams{ContainerID: "abc"}}, true},
+		{"container_id non-hex", CreateContinuousSessionReq{SelectorMode: "container_id", SelectorParams: &ContinuousSelectorParams{ContainerID: "abc123def456zz"}}, true},
 		{"unknown mode", CreateContinuousSessionReq{SelectorMode: "systemd_unit"}, true},
 	}
 	for _, tc := range cases {

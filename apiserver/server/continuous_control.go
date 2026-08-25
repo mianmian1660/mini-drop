@@ -146,41 +146,41 @@ type reconcileContinuousReq struct {
 // batch_sequence 是 Agent 侧采集器实例概念，DTO 仅透传服务端已知值（通常为空
 // 字符串/0），由 Agent 在生成 batch/window 时填充。
 type continuousAssignmentDTO struct {
-	SID                  string     `json:"sid"`
-	Name                 string     `json:"name"`
-	TargetIP             string     `json:"target_ip"`
-	Hostname             string     `json:"hostname"`
-	ServiceName          string     `json:"service_name"`
-	SampleRateHz         uint32     `json:"sample_rate_hz"`
-	AggregationWindowSec uint32     `json:"aggregation_window_sec"`
-	UploadBatchSec       uint32     `json:"upload_batch_sec"`
-	RetentionHours       uint32     `json:"retention_hours"`
-	Labels               []byte     `json:"labels"`
-	Capabilities         []byte     `json:"capabilities"`
-	Status               string     `json:"status"`
-	Scope                string     `json:"scope"`
-	SelectorExe          string     `json:"selector_exe"`
-	SelectorMode         string     `json:"selector_mode"`
+	SID                  string `json:"sid"`
+	Name                 string `json:"name"`
+	TargetIP             string `json:"target_ip"`
+	Hostname             string `json:"hostname"`
+	ServiceName          string `json:"service_name"`
+	SampleRateHz         uint32 `json:"sample_rate_hz"`
+	AggregationWindowSec uint32 `json:"aggregation_window_sec"`
+	UploadBatchSec       uint32 `json:"upload_batch_sec"`
+	RetentionHours       uint32 `json:"retention_hours"`
+	Labels               []byte `json:"labels"`
+	Capabilities         []byte `json:"capabilities"`
+	Status               string `json:"status"`
+	Scope                string `json:"scope"`
+	SelectorExe          string `json:"selector_exe"`
+	SelectorMode         string `json:"selector_mode"`
 	// 阶段六：selector 结构化参数（pid/process_start_ms/exe/cgroup/
 	// container_id），Agent 侧按 selector_mode 解析匹配。
-	SelectorParams       []byte     `json:"selector_params"`
-	Signals              []string   `json:"signals"`
-	RequestedSignals     []string   `json:"requested_signals"`
-	DesiredState         string     `json:"desired_state"`
-	ObservedState        string     `json:"observed_state"`
-	ContinuityMode       string     `json:"continuity_mode"`
-	AllowDegraded        bool       `json:"allow_degraded"`
-	DegradationReason    string     `json:"degradation_reason"`
-	LastError            string     `json:"last_error"`
-	Revision             uint64     `json:"revision"`
-	AgentID              string     `json:"agent_id"`
-	UID                  string     `json:"uid"`
-	UserName             string     `json:"user_name"`
-	StartedAt            time.Time  `json:"started_at"`
-	StoppedAt            *time.Time `json:"stopped_at"`
-	CollectorGeneration  string     `json:"collector_generation,omitempty"`
-	TargetFingerprint    string     `json:"target_fingerprint,omitempty"`
-	BatchSequence        uint64     `json:"batch_sequence,omitempty"`
+	SelectorParams      []byte     `json:"selector_params"`
+	Signals             []string   `json:"signals"`
+	RequestedSignals    []string   `json:"requested_signals"`
+	DesiredState        string     `json:"desired_state"`
+	ObservedState       string     `json:"observed_state"`
+	ContinuityMode      string     `json:"continuity_mode"`
+	AllowDegraded       bool       `json:"allow_degraded"`
+	DegradationReason   string     `json:"degradation_reason"`
+	LastError           string     `json:"last_error"`
+	Revision            uint64     `json:"revision"`
+	AgentID             string     `json:"agent_id"`
+	UID                 string     `json:"uid"`
+	UserName            string     `json:"user_name"`
+	StartedAt           time.Time  `json:"started_at"`
+	StoppedAt           *time.Time `json:"stopped_at"`
+	CollectorGeneration string     `json:"collector_generation,omitempty"`
+	TargetFingerprint   string     `json:"target_fingerprint,omitempty"`
+	BatchSequence       uint64     `json:"batch_sequence,omitempty"`
 }
 
 // continuousAssignmentDTOs 把 GORM Session 行转换为显式 assignment DTO。
@@ -292,6 +292,9 @@ func validateContinuousSelector(req CreateContinuousSessionReq) string {
 		if len(req.SelectorParams.ContainerID) < 12 || len(req.SelectorParams.ContainerID) > 64 {
 			return "container_id 长度必须在 12 到 64 之间"
 		}
+		if strings.Trim(req.SelectorParams.ContainerID, "0123456789abcdefABCDEF") != "" {
+			return "container_id 必须是十六进制字符串"
+		}
 	default:
 		return "selector_mode 仅支持 pid_instance/exe_all_instances/cgroup/container_id"
 	}
@@ -305,7 +308,7 @@ func continuousSelectorIdentity(session model.ContinuousSession) string {
 	params := parseContinuousSelectorParams(session.SelectorParams)
 	switch session.SelectorMode {
 	case "pid_instance":
-		return "pid_instance:" + strconv.Itoa(params.PID) + ":" + strconv.FormatInt(params.ProcessStartMs, 10)
+		return "pid_instance:" + strconv.Itoa(params.PID) + ":" + strconv.FormatInt(params.ProcessStartMs, 10) + ":" + params.Exe
 	case "cgroup":
 		return "cgroup:" + params.Cgroup
 	case "container_id":
@@ -346,8 +349,8 @@ func validateContinuousActiveSet(active []model.ContinuousSession, req CreateCon
 	}
 	processCount := 0
 	requestIdentity := continuousSelectorIdentity(model.ContinuousSession{
-		SelectorMode: req.SelectorMode,
-		SelectorExe:  req.SelectorExe,
+		SelectorMode:   req.SelectorMode,
+		SelectorExe:    req.SelectorExe,
 		SelectorParams: mustMarshalSelectorParams(req.SelectorParams),
 	})
 	for _, session := range active {

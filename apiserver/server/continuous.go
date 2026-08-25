@@ -78,10 +78,10 @@ type CreateContinuousSessionReq struct {
 	//   - container_id:      {container_id}
 	// 兼容旧客户端：只传 selector_exe + selector_mode=all_instances 时归一化为
 	// exe_all_instances。
-	SelectorParams       *ContinuousSelectorParams `json:"selector_params"`
-	Signals              []string                 `json:"signals"`
-	ContinuityMode       string                   `json:"continuity_mode"`
-	AllowDegraded        bool                     `json:"allow_degraded"`
+	SelectorParams *ContinuousSelectorParams `json:"selector_params"`
+	Signals        []string                  `json:"signals"`
+	ContinuityMode string                    `json:"continuity_mode"`
+	AllowDegraded  bool                      `json:"allow_degraded"`
 }
 
 // ContinuousSelectorParams 阶段六：selector 的结构化参数（与 Agent 侧
@@ -527,8 +527,8 @@ func (s *APIServer) createContinuousSession(c *gin.Context, ownerUID string, use
 
 func findContinuousConflict(active []model.ContinuousSession, req CreateContinuousSessionReq) *model.ContinuousSession {
 	requestIdentity := continuousSelectorIdentity(model.ContinuousSession{
-		SelectorMode: req.SelectorMode,
-		SelectorExe:  req.SelectorExe,
+		SelectorMode:   req.SelectorMode,
+		SelectorExe:    req.SelectorExe,
 		SelectorParams: mustMarshalSelectorParams(req.SelectorParams),
 	})
 	for index := range active {
@@ -4108,6 +4108,12 @@ func applyContinuousDefaults(req *CreateContinuousSessionReq) error {
 		req.SelectorParams.ContainerID = strings.TrimSpace(req.SelectorParams.ContainerID)
 		if req.SelectorParams.Exe != "" {
 			req.SelectorExe = req.SelectorParams.Exe
+		}
+		if req.SelectorMode == "container_id" {
+			req.SelectorParams.ContainerID = strings.ToLower(req.SelectorParams.ContainerID)
+		}
+		if req.SelectorMode == "container_id" {
+			req.SelectorParams.ContainerID = strings.ToLower(req.SelectorParams.ContainerID)
 		}
 	} else if req.SelectorExe != "" {
 		req.SelectorParams = &ContinuousSelectorParams{Exe: req.SelectorExe}
