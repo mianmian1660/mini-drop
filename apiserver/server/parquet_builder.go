@@ -478,6 +478,18 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 	// 不同：空 samples 回退 agent 计数/metrics 只数 rss/histogram 数 EventCount）。
 	// 已登记 migration failure 的窗口（missing_object/source_mismatch）视为审计
 	// 缺口，不参与完整性判据。
+	profileSeen := map[string]int64{}
+	for i := range cpuRows {
+		if cpuRows[i].ProfileID == "" || cpuRows[i].ProfileStatus == "failed" {
+			continue
+		}
+		sample := pqSampleFromCPURow(cpuRows[i])
+		if continuousProfileSampleSeenAt(profileSeen, sample, cpuRows[i].Timestamp) {
+			cpuRows[i].ProfileStatus = "duplicate"
+			cpuRows[i].Value = 0
+		}
+	}
+
 	failedWindows := s.pqFailedWindowSet(ctx)
 	for _, signal := range []string{
 		model.ContinuousParquetSignalCPU,
@@ -1266,9 +1278,9 @@ func pqStackKey(frames []pqCPUFrame) string {
 // downsampleCPURows 按 (bucket, series labels, stack, unit) 聚合 value=sum。
 func downsampleCPURows(rows []pqCPURow, targetResolution string) []pqCPURow {
 	type key struct {
-		bucket, session, backend, runtime, labels, stack, unit, profileType, profileID string
-		pid                                                                            int32
-		processStartMs                                                                 int64
+		bucket, session, backend, runtime, labels, stack, unit, profileType, profileID, profileStatus string
+		pid                                                                                           int32
+		processStartMs                                                                                int64
 	}
 	acc := map[key]*pqCPURow{}
 	order := []key{}
@@ -1288,6 +1300,7 @@ func downsampleCPURows(rows []pqCPURow, targetResolution string) []pqCPURow {
 			// 同一桶内合并，不同 profile 不合并（查询侧按 profile 去重，
 			// 合并会破坏去重键的区分度）。
 			profileID:      row.ProfileID,
+			profileStatus:  row.ProfileStatus,
 			pid:            row.PID,
 			processStartMs: row.ProcessStartMs,
 		}

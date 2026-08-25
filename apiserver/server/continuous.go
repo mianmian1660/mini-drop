@@ -332,6 +332,7 @@ type continuousAggregate struct {
 	Unit                        string
 	RuntimeDiagnostics          map[string]*runtimeDiagnosticAccumulator
 	SeenProfileIDs              map[string]bool
+	SeenProfileSamples          map[string]int64
 }
 
 type runtimeDiagnosticAccumulator struct {
@@ -2184,6 +2185,7 @@ func (s *APIServer) downsampleContinuousWindows(ctx context.Context, session mod
 						SymbolReasons:      map[string]bool{},
 						RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
 						SeenProfileIDs:     map[string]bool{},
+						SeenProfileSamples: map[string]int64{},
 						Unit:               "samples",
 					}
 					buckets[keyBucket] = agg
@@ -2549,6 +2551,7 @@ func (s *APIServer) queryNativeContinuousAggregate(ctx context.Context, q Profil
 		Unit:               map[bool]string{true: "bytes", false: "samples"}[q.ProfileType == "memory"],
 		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
 		SeenProfileIDs:     map[string]bool{},
+		SeenProfileSamples: map[string]int64{},
 	}
 	found, err := s.aggregateV1WindowsInto(ctx, q, q.From, q.To, &agg)
 	if err != nil {

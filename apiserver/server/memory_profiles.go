@@ -151,7 +151,9 @@ func (s *APIServer) queryMemoryProfilesMixed(ctx context.Context, q ProfileQuery
 					(row.ProfileStatus != "failed" && !continuousSampleMatches(sample, pqLabelsInterface(row.Labels), q.Filters)) {
 					continue
 				}
-				key := row.ProfileID + "|" + strconv.Itoa(int(row.PID)) + "|" + strconv.FormatInt(row.ProcessStartMs, 10) + "|" + row.Exe
+				baseKey := row.ProfileID + "|" + strconv.Itoa(int(row.PID)) + "|" + strconv.FormatInt(row.ProcessStartMs, 10) + "|" + row.Exe
+				status := firstNonEmpty(row.ProfileStatus, "ready")
+				key := baseKey + "|" + status
 				item := byProfile[key]
 				if item == nil {
 					item = &ContinuousMemoryProfileInfo{
@@ -159,7 +161,7 @@ func (s *APIServer) queryMemoryProfilesMixed(ctx context.Context, q ProfileQuery
 						WindowStart: time.UnixMilli(row.Timestamp), WindowEnd: time.UnixMilli(row.Timestamp).Add(time.Minute),
 						PID: int(row.PID), ProcessStartMs: row.ProcessStartMs,
 						Comm: row.Comm, Exe: row.Exe, Backend: row.Backend,
-						Unit: firstNonEmpty(row.Unit, "bytes"), Status: "ready",
+						Unit: firstNonEmpty(row.Unit, "bytes"), Status: status,
 					}
 					byProfile[key] = item
 					order = append(order, key)
