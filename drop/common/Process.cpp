@@ -322,13 +322,12 @@ namespace drop
             }
         }
 
-        // uname：内核版本与架构；os-release 读取失败时用 sysname 兜底 os_name
+        // uname：内核版本与架构。os_name 只来自 /etc/os-release，
+        // 不在这里兜底（os-release 缺失时保持为空，前端显示"暂未上报"）。
         {
             struct utsname uts;
             if (uname(&uts) == 0)
             {
-                if (out->os_name().empty() && uts.sysname[0])
-                    out->set_os_name(uts.sysname);
                 if (uts.release[0])
                     out->set_kernel_version(uts.release);
                 if (uts.machine[0])
