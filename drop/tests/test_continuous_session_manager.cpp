@@ -432,7 +432,7 @@ TEST(ContinuousSessionManager, CgroupSelectorMatchesGroupMembers)
     EXPECT_EQ(matches[1].pid, 43);
 
     // A nested cgroup remains part of the selected cgroup subtree.
-    processes.push_back({45, 4000, "worker", "/system.slice/docker-abc123.scope/child", "abc123def456"});
+    processes.push_back({45, 4000, "worker", "/usr/bin/worker", "/system.slice/docker-abc123.scope/child", "abc123def456"});
     matches = MatchContinuousProcessesBySelector(processes, assignment);
     ASSERT_EQ(matches.size(), 3u);
 }
