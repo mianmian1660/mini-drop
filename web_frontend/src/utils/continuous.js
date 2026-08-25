@@ -58,3 +58,43 @@ export function formatBytes(value) {
     if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
     return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
+
+// ============================================================
+// 阶段六：selector 模型辅助（pid_instance / exe_all_instances /
+// cgroup / container_id）
+// ============================================================
+
+export const SELECTOR_MODES = ['pid_instance', 'exe_all_instances', 'cgroup', 'container_id'];
+
+export function selectorModeLabel(mode) {
+    return ({
+        pid_instance: '单进程实例', exe_all_instances: '同路径全部实例',
+        cgroup: 'cgroup', container_id: '容器',
+    })[mode] || mode || '未知';
+}
+
+// selector 精确身份描述（用于列表/详情展示）。
+export function selectorIdentity(session) {
+    const mode = session?.selector_mode || 'exe_all_instances';
+    const params = decodeJSONField(session?.selector_params, {});
+    if (mode === 'pid_instance') {
+        const pid = Number(params?.pid) || 0;
+        const start = Number(params?.process_start_ms) || 0;
+        const exe = params?.exe || session?.selector_exe || '';
+        return { mode, exe, detail: `PID ${pid} · ${formatStartMs(start)}`, follow: '不跟随重启：进程退出后进入等待，PID 复用不会误采新进程' };
+    }
+    if (mode === 'cgroup') {
+        return { mode, exe: '', detail: params?.cgroup || '', follow: '跟随 cgroup 内进程变化' };
+    }
+    if (mode === 'container_id') {
+        return { mode, exe: '', detail: params?.container_id || '', follow: '跟随容器内进程变化' };
+    }
+    return { mode, exe: session?.selector_exe || '', detail: '全部实例', follow: '自动跟随同路径新实例' };
+}
+
+export function formatStartMs(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms <= 0) return 'start 未知';
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? `start ${value}` : date.toLocaleString();
+}

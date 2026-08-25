@@ -113,6 +113,10 @@ type continuousProcessReport struct {
 	Comm           string `json:"comm"`
 	Exe            string `json:"exe"`
 	RSSBytes       uint64 `json:"rss_bytes"`
+	// 阶段六：cgroup 路径与解析出的 container ID（Agent 从 /proc/<pid>/cgroup
+	// 读取并识别；无法读取或识别时为空字符串）。
+	CgroupPath  string `json:"cgroup_path"`
+	ContainerID string `json:"container_id"`
 }
 
 type continuousObservedReport struct {
@@ -142,38 +146,41 @@ type reconcileContinuousReq struct {
 // batch_sequence 是 Agent 侧采集器实例概念，DTO 仅透传服务端已知值（通常为空
 // 字符串/0），由 Agent 在生成 batch/window 时填充。
 type continuousAssignmentDTO struct {
-	SID                  string     `json:"sid"`
-	Name                 string     `json:"name"`
-	TargetIP             string     `json:"target_ip"`
-	Hostname             string     `json:"hostname"`
-	ServiceName          string     `json:"service_name"`
-	SampleRateHz         uint32     `json:"sample_rate_hz"`
-	AggregationWindowSec uint32     `json:"aggregation_window_sec"`
-	UploadBatchSec       uint32     `json:"upload_batch_sec"`
-	RetentionHours       uint32     `json:"retention_hours"`
-	Labels               []byte     `json:"labels"`
-	Capabilities         []byte     `json:"capabilities"`
-	Status               string     `json:"status"`
-	Scope                string     `json:"scope"`
-	SelectorExe          string     `json:"selector_exe"`
-	SelectorMode         string     `json:"selector_mode"`
-	Signals              []string   `json:"signals"`
-	RequestedSignals     []string   `json:"requested_signals"`
-	DesiredState         string     `json:"desired_state"`
-	ObservedState        string     `json:"observed_state"`
-	ContinuityMode       string     `json:"continuity_mode"`
-	AllowDegraded        bool       `json:"allow_degraded"`
-	DegradationReason    string     `json:"degradation_reason"`
-	LastError            string     `json:"last_error"`
-	Revision             uint64     `json:"revision"`
-	AgentID              string     `json:"agent_id"`
-	UID                  string     `json:"uid"`
-	UserName             string     `json:"user_name"`
-	StartedAt            time.Time  `json:"started_at"`
-	StoppedAt            *time.Time `json:"stopped_at"`
-	CollectorGeneration  string     `json:"collector_generation,omitempty"`
-	TargetFingerprint    string     `json:"target_fingerprint,omitempty"`
-	BatchSequence        uint64     `json:"batch_sequence,omitempty"`
+	SID                  string `json:"sid"`
+	Name                 string `json:"name"`
+	TargetIP             string `json:"target_ip"`
+	Hostname             string `json:"hostname"`
+	ServiceName          string `json:"service_name"`
+	SampleRateHz         uint32 `json:"sample_rate_hz"`
+	AggregationWindowSec uint32 `json:"aggregation_window_sec"`
+	UploadBatchSec       uint32 `json:"upload_batch_sec"`
+	RetentionHours       uint32 `json:"retention_hours"`
+	Labels               []byte `json:"labels"`
+	Capabilities         []byte `json:"capabilities"`
+	Status               string `json:"status"`
+	Scope                string `json:"scope"`
+	SelectorExe          string `json:"selector_exe"`
+	SelectorMode         string `json:"selector_mode"`
+	// 阶段六：selector 结构化参数（pid/process_start_ms/exe/cgroup/
+	// container_id），Agent 侧按 selector_mode 解析匹配。
+	SelectorParams      []byte     `json:"selector_params"`
+	Signals             []string   `json:"signals"`
+	RequestedSignals    []string   `json:"requested_signals"`
+	DesiredState        string     `json:"desired_state"`
+	ObservedState       string     `json:"observed_state"`
+	ContinuityMode      string     `json:"continuity_mode"`
+	AllowDegraded       bool       `json:"allow_degraded"`
+	DegradationReason   string     `json:"degradation_reason"`
+	LastError           string     `json:"last_error"`
+	Revision            uint64     `json:"revision"`
+	AgentID             string     `json:"agent_id"`
+	UID                 string     `json:"uid"`
+	UserName            string     `json:"user_name"`
+	StartedAt           time.Time  `json:"started_at"`
+	StoppedAt           *time.Time `json:"stopped_at"`
+	CollectorGeneration string     `json:"collector_generation,omitempty"`
+	TargetFingerprint   string     `json:"target_fingerprint,omitempty"`
+	BatchSequence       uint64     `json:"batch_sequence,omitempty"`
 }
 
 // continuousAssignmentDTOs 把 GORM Session 行转换为显式 assignment DTO。
@@ -194,6 +201,7 @@ func continuousAssignmentDTOs(sessions []model.ContinuousSession) []continuousAs
 			Labels:               session.Labels,
 			Capabilities:         session.Capabilities,
 			Status:               session.Status,
+			SelectorParams:       session.SelectorParams,
 			Scope:                session.Scope,
 			SelectorExe:          session.SelectorExe,
 			SelectorMode:         session.SelectorMode,
@@ -227,11 +235,8 @@ func validateContinuousCreateRequest(req CreateContinuousSessionReq) string {
 		return "scope 仅支持 host/process"
 	}
 	if req.Scope == "process" {
-		if req.SelectorExe == "" || !filepath.IsAbs(req.SelectorExe) {
-			return "进程持续任务必须提供绝对路径 selector_exe"
-		}
-		if req.SelectorMode != "all_instances" {
-			return "selector_mode 仅支持 all_instances"
+		if message := validateContinuousSelector(req); message != "" {
+			return message
 		}
 	}
 	if req.SampleRateHz < 1 || req.SampleRateHz > 999 {
@@ -252,8 +257,86 @@ func validateContinuousCreateRequest(req CreateContinuousSessionReq) string {
 	return ""
 }
 
-func validateContinuousActiveSet(active []model.ContinuousSession, scope, selectorExe string) error {
-	if scope == "host" {
+// validateContinuousSelector 阶段六：按 selector_mode 校验参数组合。
+//   - pid_instance:     必须提供 pid + process_start_ms + 绝对路径 exe；
+//   - exe_all_instances:必须提供绝对路径 exe；
+//   - cgroup:           必须提供 cgroup 路径（/ 开头）；
+//   - container_id:     必须提供 container ID（64 位 hex 或 docker 短 ID）。
+func validateContinuousSelector(req CreateContinuousSessionReq) string {
+	switch req.SelectorMode {
+	case "pid_instance":
+		if req.SelectorParams == nil || req.SelectorParams.PID <= 0 {
+			return "pid_instance 必须提供 selector_params.pid"
+		}
+		if req.SelectorParams.ProcessStartMs <= 0 {
+			return "pid_instance 必须提供 selector_params.process_start_ms"
+		}
+		if req.SelectorParams.Exe == "" || !filepath.IsAbs(req.SelectorParams.Exe) {
+			return "pid_instance 必须提供绝对路径 selector_params.exe"
+		}
+	case "exe_all_instances":
+		if req.SelectorExe == "" || !filepath.IsAbs(req.SelectorExe) {
+			return "进程持续任务必须提供绝对路径 selector_exe"
+		}
+	case "cgroup":
+		if req.SelectorParams == nil || req.SelectorParams.Cgroup == "" {
+			return "cgroup 必须提供 selector_params.cgroup"
+		}
+		if !strings.HasPrefix(req.SelectorParams.Cgroup, "/") {
+			return "cgroup 路径必须以 / 开头"
+		}
+	case "container_id":
+		if req.SelectorParams == nil || req.SelectorParams.ContainerID == "" {
+			return "container_id 必须提供 selector_params.container_id"
+		}
+		if len(req.SelectorParams.ContainerID) < 12 || len(req.SelectorParams.ContainerID) > 64 {
+			return "container_id 长度必须在 12 到 64 之间"
+		}
+		if strings.Trim(req.SelectorParams.ContainerID, "0123456789abcdefABCDEF") != "" {
+			return "container_id 必须是十六进制字符串"
+		}
+	default:
+		return "selector_mode 仅支持 pid_instance/exe_all_instances/cgroup/container_id"
+	}
+	return ""
+}
+
+// continuousSelectorIdentity 阶段六：selector 的实际身份键（用于冲突判断）。
+// 同一 exe 下允许创建不同 PID instance Session；cgroup/container 按各自
+// 身份判断冲突。
+func continuousSelectorIdentity(session model.ContinuousSession) string {
+	params := parseContinuousSelectorParams(session.SelectorParams)
+	switch session.SelectorMode {
+	case "pid_instance":
+		return "pid_instance:" + strconv.Itoa(params.PID) + ":" + strconv.FormatInt(params.ProcessStartMs, 10) + ":" + params.Exe
+	case "cgroup":
+		return "cgroup:" + params.Cgroup
+	case "container_id":
+		return "container_id:" + params.ContainerID
+	default:
+		return "exe:" + session.SelectorExe
+	}
+}
+
+// parseContinuousSelectorParams 解析 session.selector_params jsonb；解析失败
+// 或为空时返回零值结构（调用方按 selector_mode 回退到 selector_exe）。
+func parseContinuousSelectorParams(raw []byte) ContinuousSelectorParams {
+	var params ContinuousSelectorParams
+	if len(raw) == 0 {
+		return params
+	}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return ContinuousSelectorParams{}
+	}
+	return params
+}
+
+// validateContinuousActiveSet 阶段六：按 selector 实际身份判断冲突。
+//   - host 与 process 互斥（整机任务独占）；
+//   - 同一 exe 下允许创建不同 PID instance Session（pid_instance 身份不同）；
+//   - 相同 exe_all_instances / cgroup / container_id 身份视为重复 selector。
+func validateContinuousActiveSet(active []model.ContinuousSession, req CreateContinuousSessionReq) error {
+	if req.Scope == "host" {
 		for _, session := range active {
 			if session.Scope == "host" || session.Scope == "" {
 				return errContinuousHostLimitReached
@@ -265,12 +348,17 @@ func validateContinuousActiveSet(active []model.ContinuousSession, scope, select
 		return nil
 	}
 	processCount := 0
+	requestIdentity := continuousSelectorIdentity(model.ContinuousSession{
+		SelectorMode:   req.SelectorMode,
+		SelectorExe:    req.SelectorExe,
+		SelectorParams: mustMarshalSelectorParams(req.SelectorParams),
+	})
 	for _, session := range active {
 		if session.Scope == "host" || session.Scope == "" {
 			return errContinuousModeConflict
 		}
 		processCount++
-		if session.SelectorExe == selectorExe {
+		if continuousSelectorIdentity(session) == requestIdentity {
 			return errContinuousDuplicateSelector
 		}
 	}
@@ -278,6 +366,19 @@ func validateContinuousActiveSet(active []model.ContinuousSession, scope, select
 		return errContinuousLimitReached
 	}
 	return nil
+}
+
+// mustMarshalSelectorParams 把结构化 selector 参数序列化为 jsonb（用于身份
+// 键计算；序列化失败时返回 nil，身份键回退到 exe）。
+func mustMarshalSelectorParams(params *ContinuousSelectorParams) []byte {
+	if params == nil {
+		return nil
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func continuousPagination(c *gin.Context) (int, int) {
@@ -380,7 +481,9 @@ func (s *APIServer) ListContinuousProcesses(c *gin.Context) {
 	query := s.DB.Where("target_ip = ?", targetIP)
 	if keyword := strings.TrimSpace(c.Query("keyword")); keyword != "" {
 		like := "%" + keyword + "%"
-		query = query.Where("comm LIKE ? OR exe LIKE ?", like, like)
+		// 阶段六：cgroup/container 也纳入搜索（创建弹窗按 cgroup/容器选择）。
+		query = query.Where("comm LIKE ? OR exe LIKE ? OR cgroup_path LIKE ? OR container_id LIKE ?",
+			like, like, like, like)
 	}
 	var processes []model.ContinuousProcessSnapshot
 	if err := query.Order("rss_bytes DESC, pid ASC").Limit(2000).Find(&processes).Error; err != nil {
@@ -440,7 +543,10 @@ func (s *APIServer) ReconcileContinuousSessions(c *gin.Context) {
 			row := model.ContinuousProcessSnapshot{
 				TargetIP: req.TargetIP, AgentID: req.AgentID, PID: process.PID,
 				ProcessStartMs: process.ProcessStartMs, Comm: process.Comm,
-				Exe: process.Exe, RSSBytes: process.RSSBytes, ObservedAt: now,
+				Exe: process.Exe, RSSBytes: process.RSSBytes,
+				CgroupPath:  strings.TrimSpace(process.CgroupPath),
+				ContainerID: strings.TrimSpace(process.ContainerID),
+				ObservedAt:  now,
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err

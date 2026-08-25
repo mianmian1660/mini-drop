@@ -8,7 +8,7 @@ import ScheduleList from '../components/ScheduleList';
 import Pagination from '../components/Pagination';
 import TaskCancelButton from '../components/TaskCancelButton';
 import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
-import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
+import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel, signalLabel } from '../utils/continuous';
 import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
 import { computeStorageAlert, resolveStorageAlert } from '../utils/storageStatus';
 
@@ -590,7 +590,7 @@ function RunningSessionsCard({ target, onTab }) {
                                             <div style={S.subtle}>{shortSID(session.sid)}</div>
                                         </td>
                                         <td style={S.td}>
-                                            {isProcess ? <strong>进程 · {active.length} 个活动实例</strong> : <strong>整机</strong>}
+                                            {isProcess ? <strong>进程 · {selectorModeLabel(selectorIdentity(session).mode)} · {active.length} 个活动实例</strong> : <strong>整机</strong>}
                                             {session.selector_exe ? <div style={S.mono} title={session.selector_exe}>{session.selector_exe}</div> : null}
                                             <div style={S.subtle}>样本 {formatCount(session.sample_count)}</div>
                                         </td>

@@ -54,9 +54,10 @@ struct ContinuousSessionManagerTestAccess
         manager.AdvanceStoppingSessions();
     }
 
-    static std::string BuildReconcileBody(const ContinuousSessionManager &manager)
+    static std::string BuildReconcileBody(const ContinuousSessionManager &manager,
+                                          const std::vector<drop::ContinuousTargetProcess> &processes = {})
     {
-        return manager.BuildReconcileBody({});
+        return manager.BuildReconcileBody(processes);
     }
 
     static void AddRuntimeReport(ContinuousSessionManager &manager,
@@ -361,6 +362,186 @@ TEST(ContinuousSessionManager, RetriesStoppedSpoolWhileAnotherSharedSessionIsAct
     EXPECT_EQ(::rmdir((root + "/" + active.sessionSID).c_str()), 0);
     EXPECT_EQ(::rmdir(binDirectory.c_str()), 0);
     EXPECT_EQ(::rmdir(root.c_str()), 0);
+}
+
+// ============================================================
+// 阶段六：selector 模型（pid_instance / exe_all_instances / cgroup /
+// container_id）
+// ============================================================
+
+TEST(ContinuousSessionManager, PidInstanceMatchesExactTripleAndRejectsPidReuse)
+{
+    std::vector<drop::ContinuousTargetProcess> processes = {
+        {42, 1000, "api", "/opt/api"},
+        // PID 复用：同 PID 但 start time 不同（新进程实例）。
+        {42, 5000, "api", "/opt/api"},
+        {43, 2000, "api", "/opt/api"},
+    };
+    ContinuousAssignment assignment;
+    assignment.scope = "process";
+    assignment.selectorMode = "pid_instance";
+    assignment.selectorPid = 42;
+    assignment.selectorProcessStartMs = 1000;
+    assignment.selectorExe = "/opt/api";
+
+    auto matches = MatchContinuousProcessesBySelector(processes, assignment);
+    ASSERT_EQ(matches.size(), 1u);
+    EXPECT_EQ(matches[0].pid, 42);
+    EXPECT_EQ(matches[0].processStartMs, 1000);
+
+    // 目标进程退出后：同 PID 的新进程（start time 不同）不得匹配。
+    std::vector<drop::ContinuousTargetProcess> afterExit = {
+        {42, 5000, "api", "/opt/api"},
+    };
+    EXPECT_TRUE(MatchContinuousProcessesBySelector(afterExit, assignment).empty());
+}
+
+TEST(ContinuousSessionManager, ExeAllInstancesFollowsNewInstances)
+{
+    std::vector<drop::ContinuousTargetProcess> processes = {
+        {42, 1000, "api", "/opt/api"},
+        {43, 2000, "api", "/opt/api"},
+    };
+    ContinuousAssignment assignment;
+    assignment.scope = "process";
+    assignment.selectorMode = "exe_all_instances";
+    assignment.selectorExe = "/opt/api";
+    auto matches = MatchContinuousProcessesBySelector(processes, assignment);
+    ASSERT_EQ(matches.size(), 2u);
+
+    // 新实例出现后自动跟随。
+    processes.push_back({44, 3000, "api", "/opt/api"});
+    matches = MatchContinuousProcessesBySelector(processes, assignment);
+    ASSERT_EQ(matches.size(), 3u);
+}
+
+TEST(ContinuousSessionManager, CgroupSelectorMatchesGroupMembers)
+{
+    std::vector<drop::ContinuousTargetProcess> processes = {
+        {42, 1000, "python", "/usr/bin/python3", "/system.slice/docker-abc123.scope", "abc123def456"},
+        {43, 2000, "python", "/usr/bin/python3", "/system.slice/docker-abc123.scope", "abc123def456"},
+        {44, 3000, "nginx", "/usr/sbin/nginx", "/system.slice/nginx.service", ""},
+    };
+    ContinuousAssignment assignment;
+    assignment.scope = "process";
+    assignment.selectorMode = "cgroup";
+    assignment.selectorCgroup = "/system.slice/docker-abc123.scope";
+    auto matches = MatchContinuousProcessesBySelector(processes, assignment);
+    ASSERT_EQ(matches.size(), 2u);
+    EXPECT_EQ(matches[0].pid, 42);
+    EXPECT_EQ(matches[1].pid, 43);
+
+    // A nested cgroup remains part of the selected cgroup subtree.
+    processes.push_back({45, 4000, "worker", "/usr/bin/worker", "/system.slice/docker-abc123.scope/child", "abc123def456"});
+    matches = MatchContinuousProcessesBySelector(processes, assignment);
+    ASSERT_EQ(matches.size(), 3u);
+}
+
+TEST(ContinuousSessionManager, ContainerIdSelectorMatchesParsedContainer)
+{
+    std::vector<drop::ContinuousTargetProcess> processes = {
+        {42, 1000, "python", "/usr/bin/python3", "/docker/abc123def456", "abc123def456"},
+        {43, 2000, "nginx", "/usr/sbin/nginx", "/system.slice/nginx.service", ""},
+    };
+    ContinuousAssignment assignment;
+    assignment.scope = "process";
+    assignment.selectorMode = "container_id";
+    assignment.selectorContainerId = "abc123def456";
+    auto matches = MatchContinuousProcessesBySelector(processes, assignment);
+    ASSERT_EQ(matches.size(), 1u);
+    EXPECT_EQ(matches[0].pid, 42);
+}
+
+// 阶段六：ParseAssignments 解析 selector_mode 与 base64 的 selector_params。
+TEST(ContinuousSessionManager, ParsesSelectorModeAndParams)
+{
+    AgentConfig config;
+    config.ipAddr = "127.0.0.1";
+    config.hostname = "test-host";
+    config.uid = "agent-test";
+    std::atomic<bool> agentRunning{true};
+    ContinuousSessionManager manager(config, "http://127.0.0.1:8191", "agent-test", agentRunning);
+    // selector_params 是 Go []byte jsonb 的 base64（{"pid":42,"process_start_ms":1000,"exe":"/opt/api"}）。
+    const std::string paramsB64 = "eyJwaWQiOjQyLCJwcm9jZXNzX3N0YXJ0X21zIjoxMDAwLCJleGUiOiIvb3B0L2FwaSJ9";
+    const std::string response =
+        R"({"code":0,"data":{"revision":11,"assignments":[{"sid":"cps-sel","scope":"process","selector_exe":"/opt/api","selector_mode":"pid_instance","selector_params":")" +
+        paramsB64 +
+        R"(","desired_state":"running","revision":11}]}})";
+    std::vector<ContinuousAssignment> assignments;
+    uint64_t revision = 0;
+    ASSERT_TRUE(ContinuousSessionManagerTestAccess::ParseAssignments(manager, response, &assignments, &revision));
+    ASSERT_EQ(assignments.size(), 1u);
+    EXPECT_EQ(assignments[0].selectorMode, "pid_instance");
+    EXPECT_EQ(assignments[0].selectorPid, 42);
+    EXPECT_EQ(assignments[0].selectorProcessStartMs, 1000);
+    EXPECT_EQ(assignments[0].selectorExe, "/opt/api");
+}
+
+// 阶段六：历史 all_instances 归一化为 exe_all_instances。
+TEST(ContinuousSessionManager, NormalizesLegacyAllInstancesMode)
+{
+    AgentConfig config;
+    config.ipAddr = "127.0.0.1";
+    config.hostname = "test-host";
+    config.uid = "agent-test";
+    std::atomic<bool> agentRunning{true};
+    ContinuousSessionManager manager(config, "http://127.0.0.1:8191", "agent-test", agentRunning);
+    const std::string response =
+        R"({"code":0,"data":{"revision":12,"assignments":[{"sid":"cps-legacy","scope":"process","selector_exe":"/opt/api","selector_mode":"all_instances","desired_state":"running","revision":12}]}})";
+    std::vector<ContinuousAssignment> assignments;
+    uint64_t revision = 0;
+    ASSERT_TRUE(ContinuousSessionManagerTestAccess::ParseAssignments(manager, response, &assignments, &revision));
+    ASSERT_EQ(assignments.size(), 1u);
+    EXPECT_EQ(assignments[0].selectorMode, "exe_all_instances");
+}
+
+// 阶段六：Reconcile 上报进程快照携带 cgroup/container_id。
+TEST(ContinuousSessionManager, ReconcileBodyCarriesCgroupAndContainerId)
+{
+    AgentConfig config;
+    config.ipAddr = "127.0.0.1";
+    config.hostname = "test-host";
+    config.uid = "agent-test";
+    std::atomic<bool> agentRunning{true};
+    ContinuousSessionManager manager(config, "http://127.0.0.1:8191", "agent-test", agentRunning);
+    ContinuousSessionManagerTestAccess::AddRuntimeReport(manager, "cps-cg", "running", "strict", "");
+    std::vector<drop::ContinuousTargetProcess> processes = {
+        {42, 1000, "python", "/usr/bin/python3", "/system.slice/docker-abc123def456.scope", "abc123def456"},
+        {43, 2000, "nginx", "/usr/sbin/nginx", "/system.slice/nginx.service", ""},
+    };
+    const std::string body = ContinuousSessionManagerTestAccess::BuildReconcileBody(manager, processes);
+    // 进程条目必须携带 cgroup_path / container_id（Agent 上报契约）。
+    EXPECT_NE(body.find("\"cgroup_path\":\"/system.slice/docker-abc123def456.scope\""), std::string::npos);
+    EXPECT_NE(body.find("\"container_id\":\"abc123def456\""), std::string::npos);
+    EXPECT_NE(body.find("\"cgroup_path\":\"/system.slice/nginx.service\""), std::string::npos);
+    EXPECT_NE(body.find("\"container_id\":\"\""), std::string::npos);
+}
+
+// 阶段六：/proc/<pid>/cgroup 解析（v2 与 v1 格式）。
+TEST(ContinuousSessionManager, ParsesCgroupPathFromProc)
+{
+    // 当前测试进程的 cgroup 一定存在且以 / 开头（v2）或可解析（v1）。
+    const std::string path = process_cgroup_path(static_cast<int>(::getpid()));
+    EXPECT_FALSE(path.empty());
+    EXPECT_EQ(path[0], '/');
+}
+
+// 阶段六：container ID 提取（docker/containerd/CRI-O/kubepods/systemd scope）。
+TEST(ContinuousSessionManager, ExtractsContainerIdFromCgroupPaths)
+{
+    EXPECT_EQ(extract_container_id("/docker/abc123def456"), "abc123def456");
+    EXPECT_EQ(extract_container_id("/kubepods/burstable/pod123/docker/abc123def456"), "abc123def456");
+    EXPECT_EQ(extract_container_id("/kubepods/burstable/pod123/containerd/abc123def456"), "abc123def456");
+    EXPECT_EQ(extract_container_id("/kubepods/burstable/pod123/cri-o-abc123def456"), "abc123def456");
+    EXPECT_EQ(extract_container_id("/system.slice/docker-abc123def456.scope"), "abc123def456");
+    EXPECT_EQ(extract_container_id("/system.slice/containerd-abc123def456.scope"), "abc123def456");
+    EXPECT_EQ(extract_container_id("/system.slice/crio-abc123def456.scope"), "abc123def456");
+    // 非容器路径 / 无法识别 → 空。
+    EXPECT_EQ(extract_container_id("/system.slice/nginx.service"), "");
+    EXPECT_EQ(extract_container_id("/user.slice/user-1000.slice/session-1.scope"), "");
+    EXPECT_EQ(extract_container_id(""), "");
+    // 过短 ID 不识别。
+    EXPECT_EQ(extract_container_id("/docker/abc"), "");
 }
 
 } // namespace drop_agent

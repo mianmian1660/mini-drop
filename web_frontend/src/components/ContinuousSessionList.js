@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { continuous } from '../api';
-import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, signalLabel } from '../utils/continuous';
+import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel, signalLabel } from '../utils/continuous';
 
 const S = {
     card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 20, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,.04)' },
@@ -168,9 +168,11 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 const hasDB = Array.isArray(dbTargets) && dbTargets.length > 0;
                 const active = decodeJSONField(session.active_processes, []);
                 const running = session.desired_state === 'running';
+                const identity = selectorIdentity(session);
+                const waitingReason = state === 'waiting' ? (session.degradation_reason || '等待匹配进程') : '';
                 return <tr key={session.sid}>
                     <td style={S.td}><div style={S.name}>{session.name}</div><span style={S.subtle}>{shortSID(session.sid)}</span></td>
-                    <td style={S.td}>{normalizedScope(session) === 'process' ? <><strong>进程 · {active.length} 个活动实例</strong><div style={S.mono} title={session.selector_exe}>{session.selector_exe}</div></> : <strong>整机</strong>}<div style={S.subtle}>样本 {formatCount(session.sample_count)}</div></td>
+                    <td style={S.td}>{normalizedScope(session) === 'process' ? <><strong>进程 · {selectorModeLabel(identity.mode)} · {active.length} 个活动实例</strong><div style={S.mono} title={identity.detail}>{identity.exe || identity.detail}</div>{identity.mode === 'pid_instance' && identity.detail && <div style={S.subtle}>{identity.detail}</div>}{waitingReason && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }} title={waitingReason}>{waitingReason}</div>}</> : <strong>整机</strong>}<div style={S.subtle}>样本 {formatCount(session.sample_count)}</div></td>
                     <td style={S.td}><span style={{ ...S.badge, background, color }}>{continuousStateLabel(state)}</span>{session.continuity_mode === 'degraded' && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }}>降级连续性</div>}</td>
                     <td style={S.td}><div style={S.chips}>{signals.map(signal => <span key={signal} style={S.chip}>{signalLabel(signal)}</span>)}{hasDB && <span style={{ ...S.chip, background: '#eef2ff', color: '#315efb' }} title={`已配置 ${dbTargets.length} 个数据库巡检目标`}>数据库 · {dbTargets.length}</span>}</div></td>
                     <td style={S.td}>{formatRelativeTime(session.last_upload_at)}</td>

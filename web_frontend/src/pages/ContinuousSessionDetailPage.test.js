@@ -31,6 +31,7 @@ test('detail route binds the SID to its host and exposes the stopping flow', asy
         data: {
             session: {
                 sid: 'cps-api', name: 'API', target_ip: '10.0.0.8', scope: 'process', selector_exe: '/opt/api',
+                selector_mode: 'pid_instance', selector_params: { pid: 42, process_start_ms: 1724160000000, exe: '/opt/api' },
                 desired_state: 'running', observed_state: 'degraded', continuity_mode: 'degraded',
                 active_processes: [{ pid: 42, process_start_ms: 1724160000000 }],
                 can_manage: true,
@@ -51,10 +52,12 @@ test('detail route binds the SID to its host and exposes the stopping flow', asy
 
     expect(container.textContent).toContain('API');
     expect(container.textContent).toContain('活动实例');
+    expect(container.textContent).toContain('单进程实例');
     const instanceDetails = Array.from(container.querySelectorAll('details')).find(details => details.textContent.includes('进程实例明细'));
     expect(instanceDetails).not.toBeNull();
     expect(instanceDetails.open).toBe(false);
     expect(instanceDetails.textContent).toContain('PID 42');
+    expect(instanceDetails.textContent).toContain('不跟随重启');
     expect(container.querySelector('[data-testid="profiling-panel"]').textContent).toBe('cps-api');
     const stop = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '停止持续采集');
     await act(async () => Simulate.click(stop));
