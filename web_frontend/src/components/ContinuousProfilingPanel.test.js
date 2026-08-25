@@ -38,6 +38,9 @@ import {
     default as ContinuousProfilingPanel,
     CoverageBand,
     coverageAlertForReliability,
+    coverageBandsFromReliability,
+    coverageStatusColor,
+    coverageStatusText,
     DiagnosticDetails,
     TopNTable,
     HistogramPanel,
@@ -341,12 +344,12 @@ test('coverage bar hover reveals segment details', () => {
             gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z' }],
         }} />);
     });
-    const gap = container.querySelector('[data-testid="coverage-gap"]');
+    const gap = container.querySelector('[data-testid="coverage-real_gap"]');
     expect(gap).not.toBeNull();
     act(() => Simulate.mouseEnter(gap));
     act(() => Simulate.mouseMove(gap));
-    expect(container.textContent).toContain('采集缺口');
-    expect(container.textContent).toContain('该时段无样本或存在上传空档');
+    expect(container.textContent).toContain('确认缺少数据');
+    expect(container.textContent).toContain('这段时间已经超过等待时间');
     act(() => root.unmount());
     container.remove();
 });
@@ -359,6 +362,161 @@ test('coverage alert summarizes large gaps clearly', () => {
     expect(alert.summary).toContain('覆盖 80.0%');
     expect(alert.summary).toContain('最长 2.0 分钟');
     expect(alert.detail).toContain('累计缺口');
+});
+
+test('coverage alert uses exact gap seconds from the signal coverage', () => {
+    const alert = coverageAlertForReliability({
+        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5 },
+        signal_coverage: {
+            cpu_profile: {
+                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5, gap_seconds: 300 },
+                gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z', duration_seconds: 120 }],
+                gap_count_total: 1,
+                status: 'real_gap',
+                coverage_bands: [],
+            },
+        },
+    }, 'cpu_profile');
+    expect(alert.summary).toContain('覆盖 50.0%');
+    // 累计缺口用精确 gap_seconds（300s = 5 分钟），而不是截断后的 120s。
+    expect(alert.detail).toContain('累计缺口 5.0 分钟');
+});
+
+test('coverage bands prefer the current signal coverage', () => {
+    const reliability = {
+        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5 },
+        gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z' }],
+        signal_coverage: {
+            cpu_profile: {
+                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 1.0 },
+                gaps: [],
+                gap_count_total: 0,
+                status: 'healthy',
+                coverage_bands: [
+                    { start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:10:00Z', status: 'healthy', duration_seconds: 600, sample_count: 100 },
+                ],
+                status_summary: { status: 'healthy', label: '数据正常', explanation: '这段时间已经收到有效采集数据', suggestion: '' },
+            },
+            io_latency: {
+                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0 },
+                gaps: [{ start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:10:00Z', duration_seconds: 600 }],
+                gap_count_total: 1,
+                status: 'real_gap',
+                coverage_bands: [
+                    { start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:10:00Z', status: 'real_gap', duration_seconds: 600, sample_count: 0 },
+                ],
+                status_summary: { status: 'real_gap', label: '确认缺少数据', explanation: '这段时间已经超过等待时间，仍没有收到数据', suggestion: '请检查 Agent 状态与网络上传' },
+            },
+        },
+    };
+    const cpu = coverageBandsFromReliability(reliability, 'cpu_profile');
+    expect(cpu.ratio).toBe(1.0);
+    expect(cpu.bands[0].status).toBe('healthy');
+    expect(cpu.gapCountTotal).toBe(0);
+    const io = coverageBandsFromReliability(reliability, 'io_latency');
+    expect(io.ratio).toBe(0);
+    expect(io.bands[0].status).toBe('real_gap');
+    expect(io.gapCountTotal).toBe(1);
+});
+
+test('coverage status colors map red/yellow/gray/green correctly', () => {
+    expect(coverageStatusColor('healthy')).toBe('#12b76a');
+    expect(coverageStatusColor('real_gap')).toBe('#d92d20');
+    expect(coverageStatusColor('collector_failed')).toBe('#b42318');
+    expect(coverageStatusColor('pending_upload')).toBe('#f79009');
+    expect(coverageStatusColor('target_idle')).toBe('#98a2b3');
+    expect(coverageStatusColor('startup_grace')).toBe('#98a2b3');
+    expect(coverageStatusColor('shutdown_grace')).toBe('#98a2b3');
+    expect(coverageStatusColor('unknown')).toBe('#98a2b3');
+});
+
+test('coverage status text provides Chinese labels and explanations', () => {
+    expect(coverageStatusText('healthy').label).toBe('数据正常');
+    expect(coverageStatusText('real_gap').label).toBe('确认缺少数据');
+    expect(coverageStatusText('pending_upload').label).toBe('数据整理中');
+    expect(coverageStatusText('target_idle').label).toBe('目标暂时空闲');
+    expect(coverageStatusText('startup_grace').label).toBe('正在启动采集');
+    expect(coverageStatusText('shutdown_grace').label).toBe('停止收尾中');
+    expect(coverageStatusText('collector_failed').label).toBe('采集异常');
+    expect(coverageStatusText('unknown').label).toBe('状态未知');
+    expect(coverageStatusText('real_gap').explanation).toContain('超过等待时间');
+});
+
+test('coverage band renders gray for idle and yellow for pending without red gaps', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<CoverageBand reliability={{
+            coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 1.0 },
+            status_summary: { status: 'mixed', label: '部分异常', explanation: '部分时段缺少数据或状态异常', suggestion: '请查看下方色带定位具体时段' },
+            signal_coverage: {
+                cpu_profile: {
+                    coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 1.0 },
+                    gaps: [],
+                    gap_count_total: 0,
+                    status: 'pending_upload',
+                    coverage_bands: [
+                        { start: '2026-08-19T10:00:00Z', end: '2026-08-19T10:02:00Z', status: 'startup_grace', duration_seconds: 120, sample_count: 0 },
+                        { start: '2026-08-19T10:02:00Z', end: '2026-08-19T10:08:00Z', status: 'target_idle', duration_seconds: 360, sample_count: 0 },
+                        { start: '2026-08-19T10:08:00Z', end: '2026-08-19T10:10:00Z', status: 'pending_upload', duration_seconds: 120, sample_count: 0 },
+                    ],
+                    status_summary: { status: 'pending_upload', label: '数据整理中', explanation: '采集器已经工作，数据还在上传或整理', suggestion: '稍后刷新；如果持续超过上传周期，请检查 Agent 状态' },
+                },
+            },
+        }} signal="cpu_profile" />);
+    });
+    expect(container.querySelector('[data-testid="coverage-startup_grace"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="coverage-target_idle"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="coverage-pending_upload"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="coverage-real_gap"]')).toBeNull();
+    expect(container.textContent).toContain('数据整理中');
+    expect(container.textContent).toContain('CPU');
+    // Session 总体状态概览独立展示。
+    expect(container.textContent).toContain('Session 总体');
+    expect(container.textContent).toContain('部分异常');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('coverage band falls back to legacy coverage/gaps when no bands exist', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<CoverageBand reliability={{
+            coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.8 },
+            gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z', duration_seconds: 120 }],
+        }} />);
+    });
+    expect(container.querySelector('[data-testid="coverage-real_gap"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="coverage-healthy"]')).not.toBeNull();
+    expect(container.textContent).toContain('80.0%');
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('coverage band renders server bands without generating extra DOM', () => {
+    const bands = Array.from({ length: 600 }, (_, i) => ({
+        start: new Date(2026, 7, 19, 10, 0, 0, i * 1000).toISOString(),
+        end: new Date(2026, 7, 19, 10, 0, 0, (i + 1) * 1000).toISOString(),
+        status: i % 2 === 0 ? 'healthy' : 'real_gap',
+        duration_seconds: 1,
+        sample_count: i % 2 === 0 ? 10 : 0,
+    }));
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+        root.render(<CoverageBand reliability={{
+            coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5 },
+            coverage_bands: bands,
+            gaps: [],
+        }} />);
+    });
+    expect(container.querySelectorAll('[data-testid^="coverage-"]').length).toBe(600);
+    act(() => root.unmount());
+    container.remove();
 });
 
 test('stable target fields prevent parent polling from re-querying profiles', async () => {
