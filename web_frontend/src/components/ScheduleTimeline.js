@@ -2,7 +2,7 @@
 // components/ScheduleTimeline.js — 单个周期任务的时间轴工作区
 // ============================================================
 // 由 ScheduleDetailPage 使用，输入 sid（周期任务 SID），渲染：
-//   - 时间范围查询：全部窗口 / 快捷区间 / 自定义区间 / 按时刻回溯
+//   - 时间范围查询：全部窗口 / 快捷区间 / 自定义区间
 //   - 状态 / task_kind / 结果筛选
 //   - 时间轴图 + 趋势统计
 //   - 窗口列表：查看、取消、设为基线 / 与基线对比（内嵌 Diff 面板）
@@ -54,10 +54,8 @@ export default function ScheduleTimeline({ sid }) {
     const [points, setPoints] = useState([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
-    const [atInput, setAtInput] = useState('');        // datetime-local 输入值
-    const [spanInput, setSpanInput] = useState('30m'); // 回溯时刻前后取多长区间
     const [baselineTid, setBaselineTid] = useState('');
-    const [queryMode, setQueryMode] = useState('list'); // 'list' 全部窗口 | 'at' 按时刻回溯 | 'range' 时间区间
+    const [queryMode, setQueryMode] = useState('list'); // 'list' 全部窗口 | 'range' 时间区间
     const [fromInput, setFromInput] = useState('');
     const [toInput, setToInput] = useState('');
     const [showCustom, setShowCustom] = useState(false);
@@ -102,21 +100,6 @@ export default function ScheduleTimeline({ sid }) {
         if (sid) loadTimeline(sid);
     }, [sid]);
 
-    // 按时刻回溯：返回 [at-span, at+span] 内的全部窗口
-    const loadAt = useCallback(async (silent = false) => {
-        if (!sid || !atInput) return;
-        setQueryMode('at'); setActiveRange(0);
-        if (!silent) { setLoading(true); setPage(1); }
-        setError('');
-        try {
-            const atISO = new Date(atInput).toISOString();
-            const r = await tasks.timeline(sid, { at: atISO, span: spanInput, ...timelineFilters() });
-            if (r.code === 0) { setPoints(r.data?.points || []); setTrends(r.data?.trends || null); }
-            else if (!silent) setError(r.message || '查询失败');
-        } catch (e) { if (!silent) setError('请求失败: ' + (e.message || '')); }
-        finally { if (!silent) setLoading(false); }
-    }, [sid, atInput, spanInput, timelineFilters]);
-
     // 区间查询：返回 [from, to] 内触发的全部采集窗口
     const loadRange = useCallback(async (fromISO, toISO, silent = false) => {
         if (!sid) return;
@@ -152,22 +135,20 @@ export default function ScheduleTimeline({ sid }) {
 
     const reloadCurrent = useCallback(() => {
         // 用户显式触发（应用筛选 / 停止后刷新）：非静默，展示 loading
-        if (queryMode === 'at') loadAt();
-        else if (queryMode === 'range') { if (rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo); }
+        if (queryMode === 'range') { if (rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo); }
         else loadTimeline(sid, { resetMode: false });
-    }, [queryMode, rangeFrom, rangeTo, loadAt, loadRange, loadTimeline, sid]);
+    }, [queryMode, rangeFrom, rangeTo, loadRange, loadTimeline, sid]);
 
     // 自动轮询：有运行中窗口时沿用当前查询模式静默刷新（不塌缩内容）
     useEffect(() => {
         const hasRunning = points.some(p => isActiveTask(p.status));
         if (!hasRunning || !sid) return undefined;
         const iv = setInterval(() => {
-            if (queryMode === 'at') loadAt(true);
-            else if (queryMode === 'range') { if (rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo, true); }
+            if (queryMode === 'range') { if (rangeFrom && rangeTo) loadRange(rangeFrom, rangeTo, true); }
             else loadTimeline(sid, { resetMode: false, silent: true });
         }, 5000);
         return () => clearInterval(iv);
-    }, [points, sid, queryMode, rangeFrom, rangeTo, loadTimeline, loadAt, loadRange]);
+    }, [points, sid, queryMode, rangeFrom, rangeTo, loadTimeline, loadRange]);
 
     // 窗口数据变化后钳制页码（如静默刷新后总窗口数减少、当前页越界时回到最后一页）
     useEffect(() => {
@@ -226,20 +207,6 @@ export default function ScheduleTimeline({ sid }) {
                     </select>
                     <button style={S.btnSm} onClick={reloadCurrent}>应用筛选</button>
                 </div>
-
-                <div style={{ borderTop: '1px solid #edf0f3', paddingTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <span style={{ ...S.label, marginBottom: 0 }}>🕐 按时刻回溯</span>
-                    <input type="datetime-local" style={{ ...S.input, width: 220 }} value={atInput} onChange={e => setAtInput(e.target.value)} aria-label="回溯时刻" />
-                    <select style={S.input} value={spanInput} onChange={e => setSpanInput(e.target.value)} aria-label="回溯区间">
-                        <option value="10m">前后 ±10 分钟</option>
-                        <option value="30m">前后 ±30 分钟</option>
-                        <option value="2h">前后 ±2 小时</option>
-                    </select>
-                    <button style={S.btn} onClick={loadAt} disabled={!atInput}>回溯到该时刻</button>
-                    <div style={{ ...S.hint, flexBasis: '100%' }}>
-                        返回该时刻前后区间内的全部采集窗口；当时正在生效的那个会标注「当时生效」。
-                    </div>
-                </div>
             </section>
 
             {/* 时间轴 */}
@@ -250,9 +217,8 @@ export default function ScheduleTimeline({ sid }) {
                 <section style={S.card}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 }}>
                         <h3 style={{ margin: '0 0 4px' }}>
-                            {queryMode === 'at' ? `回溯结果 (${points.length} 个窗口)`
-                                : queryMode === 'range' ? `区间结果 (${points.length} 个窗口)`
-                                    : `历史采集 (${points.length} 个窗口)`} — {sid}
+                            {queryMode === 'range' ? `区间结果 (${points.length} 个窗口)`
+                                : `历史采集 (${points.length} 个窗口)`} — {sid}
                         </h3>
                         <span style={S.hint}>滚轮缩放 · 拖动平移 · 点击色块查看详情</span>
                     </div>
@@ -291,7 +257,6 @@ export default function ScheduleTimeline({ sid }) {
                                             </td>
                                             <td style={S.td}>
                                                 <span style={{ ...S.badge, background: statusColor(p.status), color: '#fff' }}>{ST[p.status] || '未知'}</span>
-                                                {p.is_effective && <div style={{ color: '#315efb', fontSize: 11, marginTop: 4, fontWeight: 700 }}>当时生效</div>}
                                             </td>
                                             <td style={S.td}>
                                                 {p.frequency_hz ? `${p.frequency_hz}Hz` : '-'}
@@ -352,8 +317,7 @@ export default function ScheduleTimeline({ sid }) {
             {!loading && sid && points.length === 0 && !error && (
                 <div style={S.empty}>
                     {queryMode === 'range' ? '该时间区间内没有采集窗口'
-                        : queryMode === 'at' ? '该时刻之前没有已触发的采集窗口'
-                            : '该周期任务暂无采集窗口记录'}
+                        : '该周期任务暂无采集窗口记录'}
                 </div>
             )}
         </>

@@ -1299,6 +1299,21 @@ func (s *APIServer) fetchLocalTopFunctions(tid string) []map[string]interface{} 
 	return normalizeTopFunctions(topData)
 }
 
+// fetchTopFunctionsForDiff 按任务当前 active generation 解析 top.json，供
+// GetTaskDiff 的表格/火焰图两条对比路径共用。产物存储早就从最初的扁平
+// "{tid}/top.json" 升级成按 analysis job 分层（taskDetailPayload 用的
+// fetchTopFunctionsForJob 同一套，见 stage4.go），继续用 fetchTopFunctions
+// 猜扁平路径在有 active job 的任务上总是 404。只有真正没有 active job 的
+// 旧任务（legacyFallback 那种）才退回扁平路径，兼容历史数据。
+func (s *APIServer) fetchTopFunctionsForDiff(task *model.HotmethodTask) []map[string]interface{} {
+	if job, err := s.resolveSelectedAnalysisJob(task, ""); err == nil && job != nil {
+		if top := s.fetchTopFunctionsForJob(task.TID, job); len(top) > 0 {
+			return top
+		}
+	}
+	return s.fetchTopFunctions(task.TID)
+}
+
 // fetchTopFunctions 从 MinIO 读取 {tid}/top.json 并解析 TopN
 func (s *APIServer) fetchTopFunctions(tid string) []map[string]interface{} {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2518,7 +2533,7 @@ func (s *APIServer) GetTaskDiff(c *gin.Context) {
 
 	// 缺产物时说明是哪一侧、为什么缺，而不是回空表让用户自己猜
 	fetchSide := func(t *model.HotmethodTask, field string) ([]map[string]interface{}, bool) {
-		top := s.fetchTopFunctions(t.TID)
+		top := s.fetchTopFunctionsForDiff(t)
 		if len(top) > 0 {
 			return top, true
 		}

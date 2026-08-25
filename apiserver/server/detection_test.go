@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mini-drop/apiserver/model"
+	"github.com/mini-drop/apiserver/util"
 )
 
 // detectionSeedSchedWindow 构造一个含 sched_latency 直方图的窗口，P99 可指定，
@@ -96,6 +97,15 @@ func TestDetectionFiresWhenObservedExceedsFloor(t *testing.T) {
 	}
 	if len(task.TriggerContext) == 0 {
 		t.Fatalf("triggered task should carry trigger_context")
+	}
+	// 回归测试：RequestParams 必须能被 pollRunningTasks（server.go）正确解析出来，
+	// 否则该任务永远无法被"Agent 回调丢失时的自愈轮询"推进状态，会永久卡在 RUNNING。
+	var params PerfParams
+	if err := util.UnmarshalJSONB(task.RequestParams, &params); err != nil {
+		t.Fatalf("triggered task request_params should be parseable by pollRunningTasks, got error: %v", err)
+	}
+	if params.Duration != detectionDiagnosisDurationSec {
+		t.Fatalf("expected request_params.duration=%d, got %d", detectionDiagnosisDurationSec, params.Duration)
 	}
 
 	var outboxCount int64

@@ -515,6 +515,20 @@ func (s *APIServer) triggerDetectionDiagnosis(rule model.SentinelRule, taskKind 
 		return "", err
 	}
 
+	// RequestParams 必须和 TaskService.CreateTask（task_service.go:87-98）填的一样：
+	// pollRunningTasks（server.go:317-333）靠解析这里的 Duration 算出任务该在什么时候
+	// 推进到 UPLOADING/DONE，是 Agent 完成回调丢失/延迟时唯一的自愈机制。漏填这个字段
+	// 会导致该任务被轮询器每次都在 UnmarshalJSONB 报错后 continue 跳过，一旦 Agent 侧
+	// 回调没有正常送达，任务就永久卡在 RUNNING，没有任何补救路径。
+	paramsJSON, err := util.MarshalJSONB(PerfParams{
+		Duration:  detectionDiagnosisDurationSec,
+		Frequency: 1,
+		Event:     detectionSignalEvent[rule.Signal],
+	})
+	if err != nil {
+		return "", err
+	}
+
 	task := &model.HotmethodTask{
 		TID:            tid,
 		Name:           rule.Name + "（哨兵触发）",
@@ -522,6 +536,7 @@ func (s *APIServer) triggerDetectionDiagnosis(rule model.SentinelRule, taskKind 
 		Type:           TaskTypeBPF,
 		ProfilerType:   ProfilerBPF,
 		TargetIP:       rule.TargetIP,
+		RequestParams:  paramsJSON,
 		Status:         0,
 		StatusInfo:     "哨兵规则触发",
 		AnalysisStatus: 0,
