@@ -141,6 +141,10 @@ namespace drop_server
                 // apiserver 据此返回 host:null
                 if (info.hasHostStats)
                     response->mutable_host_stats()->CopyFrom(info.lastHostStats);
+                // 主机身份与系统信息（可选）：旧 Agent 未上报时不返回该字段，
+                // apiserver 据此返回 host_metadata:null
+                if (info.hasHostMetadata)
+                    response->mutable_host_metadata()->CopyFrom(info.lastHostMetadata);
                 response->set_agent_id(info.agentID);
                 response->set_hostname(info.hostname);
                 response->set_version(info.version);

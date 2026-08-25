@@ -56,6 +56,15 @@ namespace drop
         common::HostStats *hostStatsOut = nullptr,
         const std::string &diskMountPath = "/");
 
+    /// 采集宿主机身份与系统信息（/etc/os-release、uname、/proc/cpuinfo、
+    /// /proc/uptime）并填充 common::HostMetadata。
+    /// 单个字段失败不影响其他字段；失败字段留空或为 0，不伪造默认值。
+    /// 路径可注入用于单元测试；默认读取真实系统文件。
+    void collect_host_metadata(common::HostMetadata *out,
+                               const std::string &osReleasePath = "/etc/os-release",
+                               const std::string &cpuInfoPath = "/proc/cpuinfo",
+                               const std::string &uptimePath = "/proc/uptime");
+
     /// 遍历 /proc 找到 PPID=当前进程的子进程，返回其 PidStats
     std::vector<common::PidStats> collect_children_pidstats();
 

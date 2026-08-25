@@ -41,6 +41,7 @@ message HealthCheckRequest {
   repeated common.AttemptStatus running_attempts = 12;
   repeated common.AttemptStatus completed_attempts = 13;
   common.HostStats host_stats = 14; // 整机资源（可选；旧 Agent 不填，Server 视为不支持）
+  common.HostMetadata host_metadata = 15; // 主机身份与系统信息（可选；旧 Agent 不填，Server 视为不支持）
 }
 
 // ----------------------------------------------------------

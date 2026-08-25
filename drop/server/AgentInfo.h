@@ -34,6 +34,10 @@ namespace drop_server
         // "已上报但部分指标不可用"（true，靠各 *_available 标志降级）
         common::HostStats lastHostStats;
         bool hasHostStats = false;
+        // 主机身份与系统信息：hasHostMetadata 区分"旧 Agent 未上报"（false）与
+        // "已上报但部分字段缺失"（true，靠空字段降级）
+        common::HostMetadata lastHostMetadata;
+        bool hasHostMetadata = false;
         std::vector<common::AttemptStatus> runningAttempts;
         std::vector<common::AttemptStatus> completedAttempts;
     };

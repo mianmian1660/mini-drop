@@ -7,7 +7,7 @@ import ContinuousSessionList from '../components/ContinuousSessionList';
 import ScheduleList from '../components/ScheduleList';
 import Pagination from '../components/Pagination';
 import TaskCancelButton from '../components/TaskCancelButton';
-import { capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
+import { capabilityDescription, capabilityLabel, collectorLabelFromTask, parseStringList } from '../utils/collectors';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel, signalLabel } from '../utils/continuous';
 import { clampPercent, formatCapacity, formatCollectedAt, hostMetricAvailable, usageColor } from '../utils/hostMetrics';
 import { computeStorageAlert, resolveStorageAlert } from '../utils/storageStatus';
@@ -24,6 +24,9 @@ const S = {
     contextItemWide: { gridColumn: '1 / -1' },
     contextLabel: { color: '#667085', fontSize: 12, marginBottom: 5 },
     contextValue: { color: '#111827', fontSize: 14, fontWeight: 650, wordBreak: 'break-word', lineHeight: 1.45 },
+    // 主机身份（操作系统/内核/架构/CPU 型号/核数）常显网格
+    hostIdentityGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px 24px', padding: '14px', borderTop: '1px solid #f2f4f7' },
+    identityTitle: { color: '#475467', fontSize: 12, fontWeight: 700, margin: '14px 0 0', padding: '0 14px' },
     // 主机上下文常显摘要卡 + 整机资源块
     contextCard: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: '16px 18px', marginBottom: 16, boxShadow: '0 1px 2px rgba(16,24,40,0.04)' },
     contextHeader: { display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' },
@@ -45,6 +48,13 @@ const S = {
     storageAlertDanger: { marginTop: 12, background: '#fff6f5', border: '1px solid #fda29b', color: '#b42318', borderRadius: 6, padding: '8px 12px', fontSize: 12, lineHeight: 1.5 },
     contextFooter: { display: 'flex', justifyContent: 'flex-end', marginTop: 12, borderTop: '1px solid #f2f4f7', paddingTop: 10 },
     contextToggle: { background: '#f8fafc', color: '#315efb', border: '1px solid #d0d7de', padding: '5px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 700 },
+    // 采集能力：胶囊标签 + 能力说明紧凑网格
+    capabilityPills: { display: 'flex', flexWrap: 'wrap', gap: '6px' },
+    capabilityPill: { display: 'inline-flex', alignItems: 'center', padding: '2px 10px', borderRadius: 999, background: '#eef2ff', color: '#3730a3', fontSize: 12, lineHeight: '20px', whiteSpace: 'nowrap' },
+    capabilityList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '4px 24px' },
+    capabilityListItem: { fontSize: 12, lineHeight: '20px', minWidth: 0 },
+    capabilityListName: { color: '#111827', fontWeight: 650 },
+    capabilityListUsage: { color: '#667085' },
     tabBar: { display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 16, borderBottom: '1px solid #e5e7eb' },
     tab: (active) => ({ padding: '10px 0 11px', borderRadius: 0, border: 'none', borderBottom: active ? '2px solid #315efb' : '2px solid transparent', background: 'transparent', color: active ? '#315efb' : '#667085', cursor: 'pointer', fontSize: 14, fontWeight: 700 }),
     sectionHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 },
@@ -60,7 +70,6 @@ const S = {
     metric: { background: '#f8fafc', border: '1px solid #edf0f3', borderRadius: 6, padding: 12 },
     metricLabel: { color: '#667085', fontSize: 12, marginBottom: 6 },
     metricValue: { fontSize: 18, fontWeight: 700, wordBreak: 'break-word' },
-    capWrap: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 12 },
     capPill: { display: 'inline-flex', alignItems: 'center', padding: '2px 7px', borderRadius: 999, background: '#eef2ff', color: '#315efb', fontSize: 11, fontWeight: 700 },
     auditList: { display: 'grid', gap: 10 },
     auditItem: { display: 'grid', gridTemplateColumns: '150px 90px minmax(0, 1fr)', gap: 12, padding: '10px 12px', background: '#fbfcfe', border: '1px solid #edf0f3', borderRadius: 6, fontSize: 13 },
@@ -253,9 +262,7 @@ export default function HostDetailPage() {
                     agent={agent}
                     stat={stat}
                     detailLoading={detailLoading}
-                    capabilities={capabilities}
                     tasks={hostTasks}
-                    schedules={hostSchedules}
                     onRefresh={() => {
                         loadAgentDetail(target.ip);
                         loadHostTasks(target.ip);
@@ -309,8 +316,8 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
     const [expanded, setExpanded] = useState(false);
     const storageAlert = useStorageStatus();
     const host = stat?.host || null;
+    const hostMetadata = stat?.host_metadata || null;
     const online = agent?.online === true || target?.drop_agent_status === 'online';
-    const sourceLabel = stat?.source === 'grpc' ? '实时 gRPC' : '数据库快照';
     const collectedAt = host ? formatCollectedAt(host.collected_at) : '--';
 
     // 每个维度独立降级：后端 *_available=false 时该维度显示 "--"，
@@ -323,24 +330,30 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
     const missingReason = host
         ? null
         : (online
-            ? '当前 Agent 版本暂不支持整机资源上报，升级 drop_agent 后即可查看 CPU / 内存 / 系统盘。'
-            : 'Agent 离线，暂无整机资源。');
+            ? '当前 Agent 版本暂不支持整机资源上报，升级按需采集器后即可查看 CPU / 内存 / 系统盘。'
+            : '按需采集器离线，暂无整机资源。');
 
-    const capabilitySummary = capabilities?.length
-        ? capabilities.map(cap => capabilityLabel(cap)).join('、')
-        : '未声明采集能力';
+    // 主机元数据缺失：显示明确原因，不显示 0 冒充有效值
+    const metaMissingReason = hostMetadata
+        ? null
+        : (online
+            ? '当前 Agent 版本暂未上报主机信息（操作系统 / 内核 / CPU 型号）。'
+            : '按需采集器离线，主机信息为最后已知值或暂未上报。');
+
+    const osLabel = hostMetadata
+        ? [hostMetadata.os_name, hostMetadata.os_version].filter(Boolean).join(' ') || '--'
+        : '--';
 
     return (
         <section style={S.contextCard}>
             <div style={S.contextHeader}>
                 <div style={{ minWidth: 0 }}>
-                    <div style={S.contextHeaderTitle}>主机上下文</div>
+                    <div style={S.contextHeaderTitle}>主机信息</div>
                     <div style={S.contextHeaderMeta}>
                         <span style={S.contextMetaItem} title="主机名">{target.hostname || target.ip || '-'}</span>
                         <span style={S.contextMetaItem} title="IP">{target.ip || '-'}</span>
-                        <span style={S.contextMetaItem} title="环境">{target.environment || 'environment'}</span>
-                        <span style={S.contextMetaItem} title="按需采样 drop_agent 状态">drop_agent <StatusPill value={target.drop_agent_status} kind="drop" /></span>
-                        <span style={S.contextMetaItem} title="Native Continuous Profiling 状态">Native Profiling <StatusPill value={target.profile_status} kind="profile" /></span>
+                        <span style={S.contextMetaItem} title="按需采集器（drop_agent）状态">按需采集器 <StatusPill value={target.drop_agent_status} kind="drop" /></span>
+                        <span style={S.contextMetaItem} title="持续采集状态">持续采集 <StatusPill value={target.profile_status} kind="profile" /></span>
                     </div>
                 </div>
                 <div style={S.contextLiveInfo}>
@@ -352,25 +365,37 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
             {/* 阶段 0：服务端存储压力紧凑提示（normal 时 computeStorageAlert 返回 null，不渲染） */}
             {storageAlert && <StoragePressureBanner alert={storageAlert} />}
 
-            {/* 整机资源块：无数据时保留稳定布局，数值显示 "--" */}
+            {/* 主机身份：操作系统 / 内核 / 架构 / CPU 型号 / 核数 */}
+            <div style={S.identityTitle}>主机身份</div>
+            <div style={S.hostIdentityGrid}>
+                <ContextItem label="操作系统" value={osLabel} />
+                <ContextItem label="内核版本" value={hostMetadata?.kernel_version || '--'} />
+                <ContextItem label="架构" value={hostMetadata?.architecture || '--'} />
+                <ContextItem label="CPU 型号" value={hostMetadata?.cpu_model || '--'} />
+                <ContextItem label="CPU 核数" value={hostMetadata?.cpu_cores ? `${hostMetadata.cpu_cores} 核` : '--'} />
+            </div>
+            {metaMissingReason && <div style={S.hostMissingNote}>{metaMissingReason}</div>}
+
+            {/* 主机资源块：无数据时保留稳定布局，数值显示 "--" */}
+            <div style={S.identityTitle}>主机资源</div>
             <div style={S.hostResourceGrid}>
                 <HostResourceBlock
                     title="整机 CPU"
                     percent={host?.cpu_percent}
                     available={cpuAvailable}
-                    detail={cpuAvailable ? '使用率（0–100%）' : null}
+                    detail={cpuAvailable ? `使用率（0–100%）· 采集于 ${collectedAt}` : null}
                 />
                 <HostResourceBlock
                     title="整机内存"
                     percent={host?.memory_percent}
                     available={memAvailable}
-                    detail={memAvailable ? `已用 ${formatCapacity(host.memory_used_bytes)} / 总量 ${formatCapacity(host.memory_total_bytes)}` : null}
+                    detail={memAvailable ? `已用 ${formatCapacity(host.memory_used_bytes)} / 总量 ${formatCapacity(host.memory_total_bytes)} · 采集于 ${collectedAt}` : null}
                 />
                 <HostResourceBlock
-                    title="系统盘 /"
+                    title={`系统盘 ${host?.disk_mount || '/'}`}
                     percent={host?.disk_percent}
                     available={diskAvailable}
-                    detail={diskAvailable ? `已用 ${formatCapacity(host.disk_used_bytes)} / 总量 ${formatCapacity(host.disk_total_bytes)}` : null}
+                    detail={diskAvailable ? `已用 ${formatCapacity(host.disk_used_bytes)} / 总量 ${formatCapacity(host.disk_total_bytes)} · 采集于 ${collectedAt}` : null}
                 />
             </div>
 
@@ -378,23 +403,72 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
 
             <div style={S.contextFooter}>
                 <button style={S.contextToggle} onClick={() => setExpanded(prev => !prev)}>
-                    {expanded ? '收起主机详情' : '展开主机详情'}
+                    {expanded ? '收起采集器状态' : '展开采集器状态'}
                 </button>
             </div>
 
             {expanded && (
                 <div style={S.contextGrid}>
-                    <ContextItem label="服务" value={target.service_name || '-'} />
-                    <ContextItem label="环境" value={target.environment || '-'} />
-                    <ContextItem label="按需采样 drop_agent" value={<StatusPill value={target.drop_agent_status} kind="drop" />} />
-                    <ContextItem label="Native Continuous Profiling" value={<StatusPill value={target.profile_status} kind="profile" />} />
-                    <ContextItem label="采集能力" value={capabilitySummary} wide />
-                    <ContextItem label="标签" value={labelSummary(target.labels)} wide />
-                    <ContextItem label="时间范围" value={activeTab === 'profiling' ? 'Tab 内选择' : '当前主机上下文'} />
-                    <ContextItem label="数据来源" value={sourceLabel} />
+                    <ContextItem label="Agent 版本" value={agent.version || '-'} />
+                    <ContextItem label="在线状态" value={online ? '在线' : '离线'} />
+                    <ContextItem label="最近心跳" value={agent.last_seen ? formatRelativeTime(agent.last_seen) : '--'} />
+                    <ContextItem label="按需采集器" value={<StatusPill value={target.drop_agent_status} kind="drop" />} />
+                    <ContextItem label="持续采集" value={<StatusPill value={target.profile_status} kind="profile" />} />
+                    <ContextItem label="采集能力" value={<CapabilityPills capabilities={capabilities} />} wide />
+                    <ContextItem label="能力说明" value={<CapabilityList capabilities={capabilities} />} wide />
                 </div>
             )}
         </section>
+    );
+}
+
+// 采集能力：胶囊标签流式布局，每个能力一个标签，hover 显示用途说明。
+// 多个内部字段映射到同一中文名时去重（如 async_profiler_java 与 java）。
+function CapabilityPills({ capabilities }) {
+    const list = Array.isArray(capabilities) ? capabilities : [];
+    if (list.length === 0) return '未声明采集能力';
+    const seen = new Set();
+    const items = [];
+    for (const cap of list) {
+        const desc = capabilityDescription(cap);
+        const label = desc ? desc.name : capabilityLabel(cap);
+        if (seen.has(label)) continue;
+        seen.add(label);
+        items.push({ cap, label, desc });
+    }
+    return (
+        <div style={S.capabilityPills}>
+            {items.map(item => (
+                <span key={item.cap} style={S.capabilityPill} title={item.desc ? `${item.desc.name} — ${item.desc.usage}` : item.label}>
+                    {item.label}
+                </span>
+            ))}
+        </div>
+    );
+}
+
+// 能力说明：按中文名去重后的紧凑网格列表（"名称 — 用途"）。
+function CapabilityList({ capabilities }) {
+    const list = Array.isArray(capabilities) ? capabilities : [];
+    if (list.length === 0) return '未声明采集能力';
+    const seen = new Set();
+    const items = [];
+    for (const cap of list) {
+        const desc = capabilityDescription(cap);
+        const name = desc ? desc.name : capabilityLabel(cap);
+        if (seen.has(name)) continue;
+        seen.add(name);
+        items.push(desc ? { name, usage: desc.usage } : { name, usage: '' });
+    }
+    return (
+        <div style={S.capabilityList}>
+            {items.map(item => (
+                <div key={item.name} style={S.capabilityListItem}>
+                    <span style={S.capabilityListName}>{item.name}</span>
+                    {item.usage ? <span style={S.capabilityListUsage}> — {item.usage}</span> : null}
+                </div>
+            ))}
+        </div>
     );
 }
 
@@ -432,41 +506,107 @@ function DropAgentNotice({ target, activeTab }) {
     if (activeTab === 'profiling' && profileReady) {
         return (
             <div style={S.info}>
-                drop_agent 离线只影响按需采样创建；Native Continuous Profiling session 仍可查看整机 CPU 占用时长。
+                按需采集器离线只影响按需采样创建；持续采集 session 仍可查看整机 CPU 占用时长。
             </div>
         );
     }
     return (
         <div style={S.warn}>
-            drop_agent 离线，暂不能新建按需采样；Native Continuous Profiling 是否可看取决于 session 状态。
+            按需采集器离线，暂不能新建按需采样；持续采集是否可看取决于 session 状态。
         </div>
     );
 }
 
-function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks: taskItems, schedules: scheduleItems, onRefresh, onTab }) {
+function OverviewPanel({ target, agent, stat, detailLoading, tasks: taskItems, onRefresh, onTab }) {
+    const [diagOpen, setDiagOpen] = useState(false);
+    const [sessions, setSessions] = useState([]);
+    const [sessionsLoading, setSessionsLoading] = useState(true);
+    const [stopping, setStopping] = useState('');
+
+    const loadSessions = useCallback(async (silent = false) => {
+        if (!target?.ip) return;
+        if (!silent) setSessionsLoading(true);
+        try {
+            const res = await continuous.sessions({ target_ip: target.ip, page_size: 20 });
+            if (res.code === 0) {
+                setSessions(res.data?.sessions || []);
+            }
+        } catch (err) {
+            console.error('加载运行中的持续采集失败:', err);
+        } finally {
+            if (!silent) setSessionsLoading(false);
+        }
+    }, [target?.ip]);
+
+    useEffect(() => { loadSessions(); }, [loadSessions]);
+    useEffect(() => {
+        const timer = window.setInterval(() => loadSessions(true), 10000);
+        return () => window.clearInterval(timer);
+    }, [loadSessions]);
+
+    const stopSession = async (session) => {
+        if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
+        setStopping(session.sid);
+        try {
+            const res = await continuous.stopSession(session.sid);
+            if (res.code !== 0) throw new Error(res.message || '停止失败');
+            await loadSessions(true);
+        } catch (err) {
+            console.error('停止持续采集失败:', err);
+        } finally {
+            setStopping('');
+        }
+    };
+
+    // 运行状态：指标新鲜度（主机指标 90 秒内视为新鲜）
+    const hostCollectedMs = stat?.host?.collected_at ? new Date(stat.host.collected_at).getTime() : null;
+    const hostFresh = hostCollectedMs ? (Date.now() - hostCollectedMs) <= 90000 : null;
+    const runningSessions = sessions.filter(session => session.desired_state === 'running');
+    const successCount = taskItems.filter(t => t.status === 2).length;
+    const failedCount = taskItems.filter(t => t.status === 3).length;
+
     return (
         <>
             <section style={S.card}>
                 <div style={S.sectionHead}>
-                    <h3 style={S.sectionTitle}>性能状态概览</h3>
+                    <h3 style={S.sectionTitle}>运行状态</h3>
                     <button style={S.btnSecondary} onClick={onRefresh} disabled={detailLoading}>{detailLoading ? '刷新中' : '刷新'}</button>
                 </div>
                 <div style={S.metricGrid}>
                     <Metric
-                        label="Agent 在线"
+                        label="当前是否可采集"
                         value={
                             <span style={{ color: agent.online ? '#16a34a' : (target.drop_agent_status === 'offline' ? '#dc2626' : '#64748b'), fontWeight: 700 }}>
-                                {agent.online ? '在线' : statusLabel(target.drop_agent_status, 'drop')}
+                                {agent.online ? '可采集' : statusLabel(target.drop_agent_status, 'drop')}
                             </span>
                         }
                     />
-                    <Metric label="资源数据源" value={stat.source === 'grpc' ? '实时 gRPC' : '数据库快照'} />
-                    <Metric label="Agent CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
-                    <Metric label="Agent 内存" value={formatCapacity(stat.memory_kb * 1024)} />
-                    <Metric label="深度采样计划" value={scheduleItems.length} />
+                    <Metric label="Agent 版本" value={agent.version || '--'} />
+                    <Metric label="最近心跳" value={agent.last_seen ? formatRelativeTime(agent.last_seen) : '--'} />
+                    <Metric label="主机指标采集" value={hostCollectedMs ? formatRelativeTime(stat.host.collected_at) : '--'} />
+                    <Metric
+                        label="指标新鲜度"
+                        value={hostFresh === null ? '--' : <span style={{ color: hostFresh ? '#16a34a' : '#dc2626', fontWeight: 700 }}>{hostFresh ? '数据新鲜' : '数据已过期'}</span>}
+                    />
+                    <Metric label="最近单次任务" value={taskItems.length} />
+                    <Metric label="运行中持续采集" value={runningSessions.length} />
+                    <Metric label="任务成功 / 失败" value={`${successCount} / ${failedCount}`} />
                 </div>
-                <div style={S.capWrap}>
-                    {capabilities.length === 0 ? <span style={S.subtle}>未声明采集能力</span> : capabilities.map(cap => <span key={cap} style={S.capPill}>{capabilityLabel(cap)}</span>)}
+                <div style={{ ...S.subtle, marginTop: 10 }}>数据来源：{stat.source === 'grpc' ? '实时 gRPC' : '数据库快照'}</div>
+
+                {/* 采集器诊断：Agent 自身资源不再作为主指标，折叠展示 */}
+                <div style={{ marginTop: 12, borderTop: '1px solid #f2f4f7', paddingTop: 10 }}>
+                    <button style={S.contextToggle} onClick={() => setDiagOpen(prev => !prev)}>
+                        {diagOpen ? '收起采集器诊断' : '展开采集器诊断'}
+                    </button>
+                    {diagOpen && (
+                        <div style={S.metricGrid}>
+                            <Metric label="采集器进程 CPU" value={`${formatMetric(stat.cpu_percent, 1)}%`} />
+                            <Metric label="采集器进程内存" value={formatCapacity(stat.memory_kb * 1024)} />
+                            <Metric label="读取吞吐" value={`${formatMetric(stat.read_kb_per_s, 0)} KB/s`} />
+                            <Metric label="写入吞吐" value={`${formatMetric(stat.write_kb_per_s, 0)} KB/s`} />
+                        </div>
+                    )}
                 </div>
             </section>
 
@@ -491,7 +631,14 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
                 />
             </section>
 
-            <RunningSessionsCard target={target} onTab={onTab} />
+            <RunningSessionsCard
+                target={target}
+                onTab={onTab}
+                sessions={sessions}
+                loading={sessionsLoading}
+                stopping={stopping}
+                onStop={stopSession}
+            />
         </>
     );
 }
@@ -499,57 +646,18 @@ function OverviewPanel({ target, agent, stat, detailLoading, capabilities, tasks
 // ============================================================
 // 概览卡：运行中的持续采集任务（仅概览页使用，不改动"持续采集"Tab）
 // 数据与字段格式与持续采集页（ContinuousSessionList）保持一致。
+// 数据加载由 OverviewPanel 统一负责，本组件为纯展示。
 // ============================================================
-function RunningSessionsCard({ target, onTab }) {
-    const [sessions, setSessions] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [stopping, setStopping] = useState('');
-
-    const load = useCallback(async (silent = false) => {
-        if (!target?.ip) return;
-        if (!silent) setLoading(true);
-        try {
-            const res = await continuous.sessions({ target_ip: target.ip, page_size: 20 });
-            if (res.code === 0) {
-                const all = res.data?.sessions || [];
-                // 仅运行中（含降级运行）：degraded 的 desired_state 也是 running
-                setSessions(all.filter(session => session.desired_state === 'running'));
-            }
-        } catch (err) {
-            console.error('加载运行中的持续采集失败:', err);
-        } finally {
-            if (!silent) setLoading(false);
-        }
-    }, [target?.ip]);
-
-    useEffect(() => { load(); }, [load]);
-    useEffect(() => {
-        const timer = window.setInterval(() => load(true), 10000);
-        return () => window.clearInterval(timer);
-    }, [load]);
-
-    const stop = async (session) => {
-        if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
-        setStopping(session.sid);
-        try {
-            const res = await continuous.stopSession(session.sid);
-            if (res.code !== 0) throw new Error(res.message || '停止失败');
-            await load(true);
-        } catch (err) {
-            console.error('停止持续采集失败:', err);
-        } finally {
-            setStopping('');
-        }
-    };
-
-    const running = sessions.slice(0, 5);
+function RunningSessionsCard({ target, onTab, sessions, loading, stopping, onStop }) {
+    const activeSessions = sessions.filter(session => session.desired_state === 'running');
+    const running = activeSessions.slice(0, 5);
 
     return (
         <section style={S.card}>
             <div style={S.sectionHead}>
                 <h3 style={S.sectionTitle}>运行中的持续采集</h3>
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <span style={S.subtle}>共 {sessions.length} 个</span>
+                    <span style={S.subtle}>共 {activeSessions.length} 个</span>
                     <button style={S.btnSm} onClick={() => onTab('profiling')}>进入持续采集</button>
                 </div>
             </div>
@@ -607,7 +715,7 @@ function RunningSessionsCard({ target, onTab }) {
                                         <td style={S.td}>
                                             <Link style={S.linkStrong} to={detailUrl}>查看</Link>
                                             {session.desired_state === 'running' && session.can_manage && (
-                                                <button style={{ ...S.btnDangerSm, marginLeft: 8 }} disabled={stopping === session.sid} onClick={() => stop(session)}>
+                                                <button style={{ ...S.btnDangerSm, marginLeft: 8 }} disabled={stopping === session.sid} onClick={() => onStop(session)}>
                                                     {stopping === session.sid ? '停止中' : '停止'}
                                                 </button>
                                             )}
@@ -787,12 +895,6 @@ function statusLabel(status, kind = '') {
     if (status === 'stopped') return '已停止';
     if (status === 'query_unsupported') return '查询不兼容';
     return status || '未知';
-}
-
-function labelSummary(labels) {
-    const entries = Object.entries(labels || {});
-    if (entries.length === 0) return 'node/job/env/instance 待接入';
-    return entries.slice(0, 4).map(([k, v]) => `${k}=${v}`).join(', ');
 }
 
 function formatTime(value) {

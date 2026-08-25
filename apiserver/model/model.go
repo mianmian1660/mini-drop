@@ -46,7 +46,12 @@ type AgentInfo struct {
 	Capabilities   []byte    `gorm:"column:capabilities;type:jsonb" json:"capabilities"`
 	Labels         []byte    `gorm:"column:labels;type:jsonb" json:"labels"`
 	ResourceBudget []byte    `gorm:"column:resource_budget;type:jsonb" json:"resource_budget"`
-	SupportedOS    string    `gorm:"column:supported_os;size:64" json:"supported_os"`
+	// HostMetadata 主机身份与系统信息（JSONB，Agent 心跳上报后持久化）。
+	// 结构见 common.proto HostMetadata：os_name/os_version/kernel_version/
+	// architecture/cpu_model/cpu_cores/uptime_seconds/collected_at_unix_ms。
+	// Agent 离线或旧版本不覆盖已有值；为 NULL 表示从未上报。
+	HostMetadata []byte `gorm:"column:host_metadata;type:jsonb" json:"host_metadata"`
+	SupportedOS  string `gorm:"column:supported_os;size:64" json:"supported_os"`
 	Status         string    `gorm:"column:status;size:32;default:online" json:"status"`
 	LastSeen       time.Time `gorm:"column:last_seen" json:"last_seen"`
 	CreatedAt      time.Time `gorm:"column:created_at" json:"created_at"`
