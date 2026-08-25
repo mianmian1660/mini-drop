@@ -318,7 +318,6 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
     const host = stat?.host || null;
     const hostMetadata = stat?.host_metadata || null;
     const online = agent?.online === true || target?.drop_agent_status === 'online';
-    const sourceLabel = stat?.source === 'grpc' ? '实时 gRPC' : '数据库快照';
     const collectedAt = host ? formatCollectedAt(host.collected_at) : '--';
 
     // 每个维度独立降级：后端 *_available=false 时该维度显示 "--"，
@@ -417,8 +416,6 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
                     <ContextItem label="持续采集" value={<StatusPill value={target.profile_status} kind="profile" />} />
                     <ContextItem label="采集能力" value={<CapabilityPills capabilities={capabilities} />} wide />
                     <ContextItem label="能力说明" value={<CapabilityList capabilities={capabilities} />} wide />
-                    <ContextItem label="时间范围" value={activeTab === 'profiling' ? 'Tab 内选择' : '当前主机上下文'} />
-                    <ContextItem label="数据来源" value={sourceLabel} />
                 </div>
             )}
         </section>
@@ -426,20 +423,26 @@ function HostContext({ target, activeTab, agent, stat, capabilities }) {
 }
 
 // 采集能力：胶囊标签流式布局，每个能力一个标签，hover 显示用途说明。
+// 多个内部字段映射到同一中文名时去重（如 async_profiler_java 与 java）。
 function CapabilityPills({ capabilities }) {
     const list = Array.isArray(capabilities) ? capabilities : [];
     if (list.length === 0) return '未声明采集能力';
+    const seen = new Set();
+    const items = [];
+    for (const cap of list) {
+        const desc = capabilityDescription(cap);
+        const label = desc ? desc.name : capabilityLabel(cap);
+        if (seen.has(label)) continue;
+        seen.add(label);
+        items.push({ cap, label, desc });
+    }
     return (
         <div style={S.capabilityPills}>
-            {list.map((cap, idx) => {
-                const desc = capabilityDescription(cap);
-                const label = desc ? desc.name : capabilityLabel(cap);
-                return (
-                    <span key={`${cap}-${idx}`} style={S.capabilityPill} title={desc ? `${desc.name} — ${desc.usage}` : label}>
-                        {label}
-                    </span>
-                );
-            })}
+            {items.map(item => (
+                <span key={item.cap} style={S.capabilityPill} title={item.desc ? `${item.desc.name} — ${item.desc.usage}` : item.label}>
+                    {item.label}
+                </span>
+            ))}
         </div>
     );
 }
