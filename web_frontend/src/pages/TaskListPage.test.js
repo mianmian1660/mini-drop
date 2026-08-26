@@ -7,7 +7,7 @@
 
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { act } from 'react-dom/test-utils';
+import { act, Simulate } from 'react-dom/test-utils';
 
 jest.mock('react-router-dom', () => ({
     Link: ({ children, to }) => <a href={to}>{children}</a>,
@@ -51,7 +51,7 @@ test('单次任务列表请求 task_scope=single 且渲染普通/重试任务', 
     await act(async () => { await Promise.resolve(); });
 
     // 请求携带 task_scope=single（周期窗口不会出现在单次列表，由后端过滤）
-    expect(tasks.list).toHaveBeenCalledWith(expect.objectContaining({ task_scope: 'single' }));
+    expect(tasks.list).toHaveBeenCalledWith(expect.objectContaining({ task_scope: 'single', owner_filter: 'mine' }));
 
     // 页面标题与任务渲染
     expect(container.textContent).toContain('单次任务');
@@ -59,6 +59,33 @@ test('单次任务列表请求 task_scope=single 且渲染普通/重试任务', 
     expect(container.textContent).toContain('人工重试');
     // 已完成的普通任务显示"已完成"状态
     expect(container.textContent).toContain('已完成');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('取消任务显示已取消并可按取消状态筛选', async () => {
+    tasks.list.mockResolvedValue({
+        code: 0,
+        data: { tasks: [{ ...singleTasks[0], tid: 't-canceled', name: '已取消任务', status: 5 }], total: 1 },
+    });
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<TaskListPage />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(container.textContent).toContain('已取消任务');
+    expect(container.textContent).toContain('已取消');
+    const statusSelect = Array.from(container.querySelectorAll('select')).find(select =>
+        Array.from(select.options).some(option => option.value === '5' && option.textContent === '已取消'));
+    expect(statusSelect).toBeTruthy();
+    await act(async () => Simulate.change(statusSelect, { target: { value: '5' } }));
+    await act(async () => { await Promise.resolve(); });
+    expect(tasks.list).toHaveBeenLastCalledWith(expect.objectContaining({ status: '5' }));
 
     act(() => root.unmount());
     container.remove();
