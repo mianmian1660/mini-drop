@@ -1,7 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { act, Simulate } from 'react-dom/test-utils';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { continuous } from '../api';
 import ContinuousSessionList, { sessionDataAvailability } from './ContinuousSessionList';
 
@@ -13,6 +13,11 @@ jest.mock('../api', () => ({
 }));
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
+
+function LocationProbe() {
+    const location = useLocation();
+    return <span data-testid="location-search">{location.search}</span>;
+}
 
 test('session data availability describes uploads without trusting deprecated sample_count', () => {
     expect(sessionDataAvailability({}, new Date('2026-08-26T10:00:00Z')).label).toBe('尚无上传');
@@ -99,6 +104,43 @@ test('list uses server pagination so every shared session remains reachable', as
 
     expect(continuous.sessions).toHaveBeenLastCalledWith(expect.objectContaining({ page: 2, page_size: 20 }));
     expect(container.textContent).toContain('Second page');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('bottom page jump updates the URL and does not bounce back to the previous page', async () => {
+    continuous.sessions.mockImplementation(({ page }) => Promise.resolve({
+        code: 0,
+        data: {
+            total: 41,
+            sessions: [{ sid: `page-${page}`, name: `Page ${page}`, scope: 'host', desired_state: 'stopped' }],
+        },
+    }));
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<MemoryRouter initialEntries={['/?tab=profiling&cpage=1']}>
+            <ContinuousSessionList target={{ id: 'target', ip: '10.0.0.8' }} />
+            <LocationProbe />
+        </MemoryRouter>);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    const input = container.querySelector('input[aria-label="持续采集跳转页码"]');
+    await act(async () => Simulate.change(input, { target: { value: '3' } }));
+    const jump = container.querySelector('button[aria-label="持续采集跳转"]');
+    await act(async () => Simulate.click(jump));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(continuous.sessions).toHaveBeenLastCalledWith(expect.objectContaining({ page: 3, page_size: 20 }));
+    expect(container.textContent).toContain('Page 3');
+    expect(container.textContent).toContain('第 3 / 3 页');
+    expect(container.querySelector('[data-testid="location-search"]').textContent).toContain('cpage=3');
+
+    await act(async () => { await Promise.resolve(); });
+    expect(continuous.sessions).toHaveBeenLastCalledWith(expect.objectContaining({ page: 3 }));
 
     act(() => root.unmount());
     container.remove();

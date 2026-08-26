@@ -42,11 +42,9 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [searchParams, setSearchParams] = useSearchParams();
     const [sessions, setSessions] = useState([]);
     const [total, setTotal] = useState(0);
-    // 页码初始值从 URL 的 cpage 读取，刷新后仍停留在原页。
-    const [page, setPage] = useState(() => {
-        const raw = Number(searchParams.get('cpage'));
-        return Number.isInteger(raw) && raw >= 1 ? raw : 1;
-    });
+    // URL 是页码的唯一数据源，避免本地 state 与 cpage 双向同步时互相覆盖。
+    const rawPage = Number(searchParams.get('cpage'));
+    const page = Number.isInteger(rawPage) && rawPage >= 1 ? rawPage : 1;
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [keyword, setKeyword] = useState('');
@@ -59,6 +57,15 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [cleaning, setCleaning] = useState(false);
     const [jumpInput, setJumpInput] = useState('');
     const requestSequence = useRef(0);
+
+    const setPage = useCallback(nextPage => {
+        const resolved = typeof nextPage === 'function' ? nextPage(page) : nextPage;
+        const normalized = Number.isInteger(resolved) && resolved >= 1 ? resolved : 1;
+        const params = new URLSearchParams(searchParams);
+        if (params.get('cpage') === String(normalized)) return;
+        params.set('cpage', String(normalized));
+        setSearchParams(params, { replace: true });
+    }, [page, searchParams, setSearchParams]);
 
     const load = useCallback(async (silent = false) => {
         const requestID = ++requestSequence.current;
@@ -91,7 +98,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         } finally {
             if (!silent && requestID === requestSequence.current) setLoading(false);
         }
-	}, [target.ip, ownerFilter, showTestSessions, keyword, status, scope, page]);
+	}, [target.ip, ownerFilter, showTestSessions, keyword, status, scope, page, setPage]);
 
     useEffect(() => { load(); }, [load, refreshToken]);
     useEffect(() => {
@@ -99,14 +106,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         return () => window.clearInterval(timer);
     }, [load]);
 
-	// 浏览器后退 / 前进或直接改地址栏 cpage 时，同步到 page state。
-	// （原实现只在组件挂载时读一次 URL，后退会失效，且 replace 会把 URL 强制写回旧页。）
-	useEffect(() => {
-		const raw = Number(searchParams.get('cpage'));
-		if (Number.isInteger(raw) && raw >= 1 && raw !== page) setPage(raw);
-	}, [searchParams, page]);
-
-	// 页码和测试任务开关同步到 URL，刷新或重新进入页面时保持当前视图。
+    // 测试任务开关同步到 URL；页码由 setPage 直接写入，避免双向 effect 抢写。
     useEffect(() => {
         const params = new URLSearchParams(searchParams);
 		let changed = false;
