@@ -44,7 +44,10 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [keyword, setKeyword] = useState('');
     const [status, setStatus] = useState('');
     const [scope, setScope] = useState('');
-    const [ownerFilter, setOwnerFilter] = useState('all');
+    // 默认聚焦当前用户创建的 Session，避免管理员视角下大量已过保留期的
+    // continuous-e2e 历史任务排在前面，让真实业务任务看起来“没有旧数据”。
+    // 需要协作排查时仍可手动切换到“全部创建者”。
+    const [ownerFilter, setOwnerFilter] = useState('mine');
     const [stopping, setStopping] = useState('');
     const [cleaning, setCleaning] = useState(false);
     const requestSequence = useRef(0);

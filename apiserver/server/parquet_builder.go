@@ -502,6 +502,9 @@ func (s *APIServer) pqBuildRawHour(ctx context.Context, tenant string, hourStart
 			if w.ObjectKey == "" {
 				continue // v1 查询同样跳过空对象窗口
 			}
+			if !pqWindowRequiresDataLineage(w) {
+				continue // target_idle/no_events 等零数据窗口只参与覆盖率，不产生 v2 数据行
+			}
 			mapped := ""
 			for _, t := range types {
 				if w.SignalType == t {
@@ -1591,6 +1594,9 @@ func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.Con
 		if w.ObjectKey == "" {
 			continue
 		}
+		if !pqWindowRequiresDataLineage(w) {
+			continue
+		}
 		if failedWindows["window-"+strconv.FormatUint(uint64(w.ID), 10)] {
 			continue // 已登记缺失/不匹配的审计缺口
 		}
@@ -1636,6 +1642,26 @@ func (s *APIServer) pqShadowReconcileBlock(ctx context.Context, block *model.Con
 		return err
 	}
 	return nil
+}
+
+// pqWindowRequiresDataLineage 判断一个 v1 窗口是否应在 v2 数据块中留下数据
+// 行/lineage。v4 会为 target_idle、no_events、unavailable、failed 等状态写入
+// ProfileWindow，供 timeline 展示采集覆盖率；这些行明确没有信号数据，不能在
+// Parquet 完整性校验中反过来要求 builder “消费”它们。否则一个正常批次只要夹带
+// 任意空闲窗口，整个小时块就会永久重建失败。
+//
+// 非零 SampleCount 始终按有数据处理，兼容异常/历史状态值；旧协议的 unknown/空
+// 状态也保留原来的 fail-closed 行为，避免把真正的 payload 漏解析静默放过。
+func pqWindowRequiresDataLineage(window model.ProfileWindow) bool {
+	if window.SampleCount > 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(window.SignalStatus)) {
+	case "target_idle", "no_events", "unavailable", "failed":
+		return false
+	default:
+		return true
+	}
 }
 
 // minInt 返回两 int 较小值（Go 1.22 前无内置 min）。

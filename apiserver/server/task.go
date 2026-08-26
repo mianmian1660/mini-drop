@@ -2174,9 +2174,9 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			return
 		}
 		if hasResult {
-			query = query.Where("status = ? AND analysis_status >= ?", TaskStatusDone, 2)
+			query = query.Where("status = ? AND analysis_status = ?", TaskStatusDone, 2)
 		} else {
-			query = query.Where("NOT (status = ? AND analysis_status >= ?)", TaskStatusDone, 2)
+			query = query.Where("NOT (status = ? AND analysis_status = ?)", TaskStatusDone, 2)
 		}
 	}
 
@@ -2287,12 +2287,14 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
 	trends := gin.H{
-		"total":        len(tasks),
-		"success":      0,
-		"failed":       0,
-		"running":      0,
-		"has_result":   0,
-		"by_task_kind": gin.H{},
+		"total":           len(tasks),
+		"success":         0,
+		"failed":          0,
+		"analysis_failed": 0,
+		"canceled":        0,
+		"running":         0,
+		"has_result":      0,
+		"by_task_kind":    gin.H{},
 	}
 	byKind := map[string]int{}
 	for _, t := range tasks {
@@ -2319,17 +2321,23 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		if t.EndTime != nil {
 			tp.EndTime = t.EndTime
 		}
-		// DONE 且 analysis_status >= 2 (分析完成) 视为有结果，UPLOADING 仍需继续轮询。
-		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus >= 2
+		// DONE 且 analysis_status=2（分析成功）才视为有结果；3 是分析失败，不能提供火焰图。
+		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus == 2
 		if tp.HasResult {
 			tp.ResultURL = "/task/result?tid=" + t.TID
 			trends["has_result"] = trends["has_result"].(int) + 1
 		}
 		switch t.Status {
 		case TaskStatusDone:
-			trends["success"] = trends["success"].(int) + 1
+			if t.AnalysisStatus == 3 {
+				trends["analysis_failed"] = trends["analysis_failed"].(int) + 1
+			} else {
+				trends["success"] = trends["success"].(int) + 1
+			}
 		case TaskStatusFailed:
 			trends["failed"] = trends["failed"].(int) + 1
+		case TaskStatusCanceled:
+			trends["canceled"] = trends["canceled"].(int) + 1
 		case TaskStatusRunning, TaskStatusUploading, TaskStatusCreated:
 			trends["running"] = trends["running"].(int) + 1
 		}
@@ -2541,14 +2549,26 @@ func (s *APIServer) GetTaskDiff(c *gin.Context) {
 
 	// 缺产物时说明是哪一侧、为什么缺，而不是回空表让用户自己猜
 	fetchSide := func(t *model.HotmethodTask, field string) ([]map[string]interface{}, bool) {
+		if t.AnalysisStatus == 3 {
+			c.JSON(http.StatusConflict, gin.H{
+				"code":    409,
+				"message": field + "（" + t.TID + "）分析失败，无法生成热点函数对比",
+			})
+			return nil, false
+		}
+		if t.AnalysisStatus < 2 {
+			c.JSON(http.StatusConflict, gin.H{
+				"code":    409,
+				"message": field + "（" + t.TID + "）分析尚未完成（analysis_status=" + strconv.Itoa(t.AnalysisStatus) + "）",
+			})
+			return nil, false
+		}
 		top := s.fetchTopFunctionsForTask(t)
 		if len(top) > 0 {
 			return top, true
 		}
 		reason := "没有可对比的热点函数产物（top.json）"
-		if t.AnalysisStatus < 2 {
-			reason = "分析尚未完成（analysis_status=" + strconv.Itoa(t.AnalysisStatus) + "）"
-		} else if t.ProfilerType == ProfilerBPF {
+		if t.ProfilerType == ProfilerBPF {
 			reason = "eBPF 直方图任务产出的是延迟分布而非函数列表，无法做热点对比"
 		}
 		c.JSON(http.StatusConflict, gin.H{

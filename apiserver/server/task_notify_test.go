@@ -1453,6 +1453,7 @@ func TestTimelineFiltersAndResultMetadata(t *testing.T) {
 	fixtures := []model.HotmethodTask{
 		{TID: "tl-ok", Name: "ok", TaskKind: TaskKindPerfCPU, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: base},
 		{TID: "tl-running", Name: "running", TaskKind: TaskKindEBPFIO, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusRunning, AnalysisStatus: 0, CreateTime: base.Add(time.Minute)},
+		{TID: "tl-analysis-failed", Name: "analysis failed", TaskKind: TaskKindPerfCPU, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusDone, AnalysisStatus: 3, CreateTime: base.Add(2 * time.Minute)},
 	}
 	if err := s.DB.Create(&fixtures).Error; err != nil {
 		t.Fatalf("create timeline fixtures: %v", err)
@@ -1471,6 +1472,36 @@ func TestTimelineFiltersAndResultMetadata(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, `"total":1`) || !strings.Contains(body, `"result_url":"/task/result?tid=tl-ok"`) || !strings.Contains(body, `"duration_seconds":60`) {
 		t.Fatalf("timeline body missing filter metadata: %s", body)
+	}
+	if strings.Contains(body, "tl-analysis-failed") {
+		t.Fatalf("analysis failure must not match has_result=true: %s", body)
+	}
+}
+
+func TestTimelineTrendsCountCanceledWindows(t *testing.T) {
+	s := newTestAPIServer(t)
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	fixtures := []model.HotmethodTask{
+		{TID: "tl-canceled", Name: "canceled", MasterTaskTID: "sch-canceled", Status: TaskStatusCanceled, CreateTime: base},
+		{TID: "tl-failed", Name: "failed", MasterTaskTID: "sch-canceled", Status: TaskStatusFailed, CreateTime: base.Add(time.Minute)},
+		{TID: "tl-analysis-failed", Name: "analysis failed", MasterTaskTID: "sch-canceled", Status: TaskStatusDone, AnalysisStatus: 3, CreateTime: base.Add(2 * time.Minute)},
+	}
+	if err := s.DB.Create(&fixtures).Error; err != nil {
+		t.Fatalf("create timeline fixtures: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks/timeline", s.GetTimeline)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/timeline?master_tid=sch-canceled", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("timeline status=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"canceled":1`) || !strings.Contains(body, `"failed":1`) || !strings.Contains(body, `"analysis_failed":1`) || !strings.Contains(body, `"success":0`) {
+		t.Fatalf("timeline trends missing terminal status counts: %s", body)
 	}
 }
 
@@ -1529,22 +1560,55 @@ func TestOutboxAndPollerCoordinatorBranches(t *testing.T) {
 		TID: "tid-poller-upload", Name: "poll upload", RequestParams: params,
 		Status: TaskStatusUploading, UID: "owner", CreateTime: runningStart, BeginTime: &runningStart,
 	}
+	timedOutStart := time.Now().Add(-40 * time.Second)
+	timedOut := model.HotmethodTask{
+		TID: "tid-poller-timeout", Name: "poll timeout", RequestParams: params,
+		Status: TaskStatusUploading, UID: "owner", CreateTime: timedOutStart, BeginTime: &timedOutStart,
+	}
 	if err := s.DB.Create(&running).Error; err != nil {
 		t.Fatalf("create running: %v", err)
 	}
 	if err := s.DB.Create(&uploading).Error; err != nil {
 		t.Fatalf("create uploading: %v", err)
 	}
+	if err := s.DB.Create(&timedOut).Error; err != nil {
+		t.Fatalf("create timed out: %v", err)
+	}
 	s.pollRunningTasks()
 
-	var gotRunning, gotUploading model.HotmethodTask
+	var gotRunning, gotUploading, gotTimedOut model.HotmethodTask
 	_ = s.DB.Where("tid = ?", running.TID).First(&gotRunning).Error
 	_ = s.DB.Where("tid = ?", uploading.TID).First(&gotUploading).Error
+	_ = s.DB.Where("tid = ?", timedOut.TID).First(&gotTimedOut).Error
 	if gotRunning.Status != TaskStatusUploading {
 		t.Fatalf("running status=%d, want uploading", gotRunning.Status)
 	}
 	if gotUploading.Status != TaskStatusUploading {
 		t.Fatalf("uploading status=%d, want still uploading before deadline", gotUploading.Status)
+	}
+	if gotTimedOut.Status != TaskStatusFailed || gotTimedOut.AnalysisStatus != 3 || gotTimedOut.EndTime == nil {
+		t.Fatalf("timed out task=%#v, want failed with analysis_status=3 and end_time", gotTimedOut)
+	}
+	if !strings.Contains(gotTimedOut.StatusInfo, "未收到采集产物") {
+		t.Fatalf("timed out status_info=%q, want missing artifact reason", gotTimedOut.StatusInfo)
+	}
+	legacyEnd := time.Now().Add(-time.Hour).Truncate(time.Second)
+	legacyNoArtifact := model.HotmethodTask{
+		TID: "tid-legacy-no-artifact", Name: "legacy no artifact", RequestParams: params,
+		Status: TaskStatusDone, AnalysisStatus: 0, StatusInfo: "上传等待窗口结束，任务自动标记完成",
+		UID: "owner", CreateTime: legacyEnd, EndTime: &legacyEnd,
+	}
+	if err := s.DB.Create(&legacyNoArtifact).Error; err != nil {
+		t.Fatalf("create legacy no-artifact task: %v", err)
+	}
+	s.backfillAnalysisQueueForCompletedTasks()
+	var gotLegacy model.HotmethodTask
+	_ = s.DB.Where("tid = ?", legacyNoArtifact.TID).First(&gotLegacy).Error
+	if gotLegacy.Status != TaskStatusFailed || gotLegacy.AnalysisStatus != 3 {
+		t.Fatalf("legacy no-artifact task=%#v, want reconciled failure", gotLegacy)
+	}
+	if gotLegacy.EndTime == nil || !gotLegacy.EndTime.Equal(legacyEnd) {
+		t.Fatalf("legacy no-artifact end_time=%v, want preserved %v", gotLegacy.EndTime, legacyEnd)
 	}
 	if s.taskHasArtifacts("") {
 		t.Fatal("empty tid must not have artifacts")

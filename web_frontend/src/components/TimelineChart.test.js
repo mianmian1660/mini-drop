@@ -1,6 +1,6 @@
 jest.mock('d3', () => ({}));
 
-import { clampTooltipX } from './TimelineChart';
+import { clampTooltipX, statusColor } from './TimelineChart';
 
 test('timeline tooltip is clamped inside both chart edges', () => {
     expect(clampTooltipX(0, 320, 240)).toBe(128);
@@ -11,4 +11,12 @@ test('timeline tooltip is clamped inside both chart edges', () => {
 test('timeline tooltip width is bounded by a narrow chart', () => {
     expect(clampTooltipX(0, 100, 320)).toBe(50);
     expect(clampTooltipX(100, 100, 320)).toBe(50);
+});
+
+test('canceled windows use the neutral canceled color', () => {
+    expect(statusColor(5)).toBe('#64748b');
+});
+
+test('collection done with failed analysis uses the failure color', () => {
+    expect(statusColor(2, 3)).toBe('#f44336');
 });

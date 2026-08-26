@@ -143,6 +143,15 @@ func normalizeTreeToPercent(node *continuousTreeNode, total float64) {
 // reason 非空时表示不能生成（缺产物/任务类型不支持），调用方应该把它当作
 // 409 返回给前端，引导退回表格 diff 视图。
 func (s *APIServer) buildTaskDiffFlamegraph(baselineTask, compareTask *model.HotmethodTask, maxNodes int) (ProfileDiffFlamegraph, string) {
+	analysisReasonFor := func(t *model.HotmethodTask) string {
+		if t.AnalysisStatus == 3 {
+			return "分析失败，无法生成差分火焰图"
+		}
+		if t.AnalysisStatus < 2 {
+			return "分析尚未完成，无法生成差分火焰图"
+		}
+		return ""
+	}
 	reasonFor := func(t *model.HotmethodTask) string {
 		if t.ProfilerType == ProfilerBPF {
 			return "eBPF 直方图任务产出的是延迟分布而非调用栈，无法做火焰图对比"
@@ -150,6 +159,12 @@ func (s *APIServer) buildTaskDiffFlamegraph(baselineTask, compareTask *model.Hot
 		return "没有可对比的调用栈产物（folded.txt）"
 	}
 
+	if reason := analysisReasonFor(baselineTask); reason != "" {
+		return ProfileDiffFlamegraph{}, "基线任务（" + baselineTask.TID + "）" + reason
+	}
+	if reason := analysisReasonFor(compareTask); reason != "" {
+		return ProfileDiffFlamegraph{}, "对比任务（" + compareTask.TID + "）" + reason
+	}
 	baseText, baseOK := s.fetchFoldedStacksForTask(baselineTask)
 	if !baseOK {
 		return ProfileDiffFlamegraph{}, "基线任务（" + baselineTask.TID + "）" + reasonFor(baselineTask)

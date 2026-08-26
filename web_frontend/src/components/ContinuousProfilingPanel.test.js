@@ -38,10 +38,10 @@ jest.mock('./HistogramTrendChart', () => ({
 import {
     default as ContinuousProfilingPanel,
     CoverageBand,
-    coverageAlertForReliability,
     coverageBandsFromReliability,
     coverageStatusColor,
     coverageStatusText,
+    historicalWindowForSession,
     DiagnosticDetails,
     TopNTable,
     HistogramPanel,
@@ -65,12 +65,35 @@ import {
     storageSourceLabel,
     resolutionLabel,
 } from './ContinuousProfilingPanel';
+
 import { continuous, profiles, sentinelRules } from '../api';
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
 beforeEach(() => {
     jest.clearAllMocks();
+});
+
+test('stopped session opens directly on its retained historical window', () => {
+    expect(historicalWindowForSession({
+        started_at: '2026-08-25T15:02:53.697Z',
+        stopped_at: '2026-08-25T15:11:24.278Z',
+        retention_hours: 24,
+    })).toEqual({
+        from: '2026-08-25T15:02:53.697Z',
+        to: '2026-08-25T15:11:24.278Z',
+    });
+});
+
+test('stopped session historical window is capped by retention', () => {
+    expect(historicalWindowForSession({
+        started_at: '2026-08-25T10:00:00.000Z',
+        stopped_at: '2026-08-25T15:00:00.000Z',
+        retention_hours: 1,
+    })).toEqual({
+        from: '2026-08-25T14:00:00.000Z',
+        to: '2026-08-25T15:00:00.000Z',
+    });
 });
 
 test('diagnostic JSON uses two-space indentation for nested values', () => {
@@ -354,34 +377,6 @@ test('coverage bar hover reveals segment details', () => {
     container.remove();
 });
 
-test('coverage alert summarizes large gaps clearly', () => {
-    const alert = coverageAlertForReliability({
-        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.8 },
-        gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z', duration_seconds: 120 }],
-    });
-    expect(alert.summary).toContain('覆盖 80.0%');
-    expect(alert.summary).toContain('最长 2.0 分钟');
-    expect(alert.detail).toContain('累计缺口');
-});
-
-test('coverage alert uses exact gap seconds from the signal coverage', () => {
-    const alert = coverageAlertForReliability({
-        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5 },
-        signal_coverage: {
-            cpu_profile: {
-                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5, gap_seconds: 300 },
-                gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z', duration_seconds: 120 }],
-                gap_count_total: 1,
-                status: 'real_gap',
-                coverage_bands: [],
-            },
-        },
-    }, 'cpu_profile');
-    expect(alert.summary).toContain('覆盖 50.0%');
-    // 累计缺口用精确 gap_seconds（300s = 5 分钟），而不是截断后的 120s。
-    expect(alert.detail).toContain('累计缺口 5.0 分钟');
-});
-
 test('coverage bands prefer the current signal coverage', () => {
     const reliability = {
         coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5 },
@@ -610,6 +605,90 @@ test('stable target fields prevent parent polling from re-querying profiles', as
     });
     await act(async () => { await Promise.resolve(); });
     expect(profiles.flamegraph).toHaveBeenCalledTimes(1);
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('stopped session first profile request uses historical data window', async () => {
+    profiles.flamegraph.mockResolvedValue({
+        code: 0,
+        data: { nodes: [{ name: 'main', value: 43, self: 43 }], empty: false, total: 43 },
+    });
+    profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
+    continuous.timeline.mockResolvedValue({ code: 0, data: null });
+
+    const session = {
+        sid: 'cps-stopped',
+        name: 'Stopped historical session',
+        scope: 'host',
+        observed_state: 'stopped',
+        desired_state: 'stopped',
+        signals: ['cpu_profile'],
+        retention_hours: 24,
+        started_at: '2026-08-25T15:02:53.697Z',
+        stopped_at: '2026-08-25T15:11:24.278Z',
+    };
+    const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(profiles.flamegraph).toHaveBeenCalledTimes(1);
+    expect(profiles.flamegraph).toHaveBeenCalledWith(expect.objectContaining({
+        session_sid: 'cps-stopped',
+        from: '2026-08-25T15:02:53.697Z',
+        to: '2026-08-25T15:11:24.278Z',
+    }));
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('stopped session diff windows are anchored at stop time instead of current time', async () => {
+    profiles.flamegraph.mockResolvedValue({ code: 0, data: { nodes: [], empty: true } });
+    profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
+    profiles.diff.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    continuous.timeline.mockResolvedValue({ code: 0, data: null });
+
+    const session = {
+        sid: 'cps-old-diff',
+        name: 'Stopped diff session',
+        scope: 'host',
+        observed_state: 'stopped',
+        desired_state: 'stopped',
+        signals: ['cpu_profile'],
+        retention_hours: 24,
+        started_at: '2026-08-24T01:30:48.891Z',
+        stopped_at: '2026-08-24T10:28:01.851Z',
+    };
+    const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    const expand = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '展开');
+    await act(async () => Simulate.click(expand));
+    const execute = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '执行 Diff');
+    await act(async () => Simulate.click(execute));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(profiles.diff).toHaveBeenCalledTimes(1);
+    const params = profiles.diff.mock.calls[0][0];
+    expect(new Date(params.compare_to).getTime()).toBe(new Date('2026-08-24T10:28:00.000Z').getTime());
+    expect(new Date(params.compare_from).getTime()).toBe(new Date('2026-08-24T10:13:00.000Z').getTime());
+    expect(new Date(params.base_to).getTime()).toBe(new Date('2026-08-24T10:13:00.000Z').getTime());
+    expect(new Date(params.base_from).getTime()).toBe(new Date('2026-08-24T09:58:00.000Z').getTime());
 
     act(() => root.unmount());
     container.remove();

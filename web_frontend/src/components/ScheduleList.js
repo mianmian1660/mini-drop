@@ -47,6 +47,9 @@ export default function ScheduleList({ targetIp, detailPrefix, compact = false, 
     const [error, setError] = useState('');
     const [keyword, setKeyword] = useState('');
     const [enabled, setEnabled] = useState('');
+    // 完整列表默认只看本人，避免系统/E2E 账号的计划淹没用户数据；
+    // 主机概览 compact 列表保留全员最近计划，继续反映整台主机的采集活动。
+    const [ownerFilter, setOwnerFilter] = useState(compact ? 'all' : 'mine');
     const [busySid, setBusySid] = useState('');
     const requestSequence = useRef(0);
 
@@ -64,6 +67,7 @@ export default function ScheduleList({ targetIp, detailPrefix, compact = false, 
                 page_size: pageSize,
                 keyword: keyword.trim() || undefined,
                 enabled: enabled || undefined,
+                owner_filter: ownerFilter,
             });
             if (requestID !== requestSequence.current) return;
             if (response.code !== 0) throw new Error(response.message || '加载周期任务失败');
@@ -74,7 +78,7 @@ export default function ScheduleList({ targetIp, detailPrefix, compact = false, 
         } finally {
             if (!silent && requestID === requestSequence.current) setLoading(false);
         }
-    }, [targetIp, page, pageSize, keyword, enabled]);
+    }, [targetIp, page, pageSize, keyword, enabled, ownerFilter]);
 
     useEffect(() => { load(); }, [load]);
     useEffect(() => {
@@ -133,6 +137,10 @@ export default function ScheduleList({ targetIp, detailPrefix, compact = false, 
                         <option value="">全部状态</option>
                         <option value="true">启用</option>
                         <option value="false">停用</option>
+                    </select>
+                    <select style={S.select} value={ownerFilter} onChange={e => { setOwnerFilter(e.target.value); setPage(1); }} aria-label="周期任务归属筛选">
+                        <option value="all">全部创建者</option>
+                        <option value="mine">我创建的</option>
                     </select>
                 </div>
             )}

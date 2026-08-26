@@ -21,15 +21,17 @@ const PAD_L = 20;
 const PAD_R = 20;
 
 // 状态配色的唯一来源，页面的徽章和这里的色块共用，避免两处颜色语义漂移
-export const statusColor = (status) => {
+export const statusColor = (status, analysisStatus) => {
+    if (status === 2 && analysisStatus === 3) return '#f44336'; // 采集完成但分析失败
     if (status === 2) return '#4caf50';  // 已完成
     if (status === 3) return '#f44336';  // 失败
     if (status === 4) return '#7c3aed';  // 上传中
     if (status === 1) return '#2196f3';  // 执行中
+    if (status === 5) return '#64748b';  // 已取消
     return '#ffc107';                    // 待处理
 };
 
-const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
+const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
 
 export function clampTooltipX(x, containerWidth, tooltipWidth, edgePadding = 8) {
     const width = Math.max(0, Number(containerWidth) || 0);
@@ -122,7 +124,7 @@ export default function TimelineChart({ points }) {
                 .attr('y', (d) => (d.is_effective ? BAR_TOP - 4 : BAR_TOP))
                 .attr('height', (d) => (d.is_effective ? BAR_H + 8 : BAR_H))
                 .attr('rx', 2)
-                .attr('fill', (d) => statusColor(d.status))
+                .attr('fill', (d) => statusColor(d.status, d.analysis_status))
                 .attr('stroke', (d) => (d.is_effective ? '#1a1a1a' : 'none'))
                 .attr('stroke-width', (d) => (d.is_effective ? 1.5 : 0))
                 .style('cursor', 'pointer')
@@ -134,7 +136,7 @@ export default function TimelineChart({ points }) {
                         y: py,
                         lines: [
                             d.name || d.tid,
-                            `${ST[d.status] || '未知'}${d.is_effective ? ' · 当时生效' : ''}`,
+                            `${d.status === 2 && d.analysis_status === 3 ? '分析失败' : (ST[d.status] || '未知')}${d.is_effective ? ' · 当时生效' : ''}`,
                             `${formatDateTime(startOf(d))} → ${formatDateTime(endOf(d))}`,
                         ],
                     });
@@ -168,7 +170,7 @@ export default function TimelineChart({ points }) {
             <svg ref={svgRef} width="100%" height={HEIGHT} style={{ display: 'block' }} />
 
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 4, fontSize: 12, color: '#666' }}>
-                {[2, 3, 1, 4, 0].map((st) => (
+                {[2, 3, 5, 1, 4, 0].map((st) => (
                     <span key={st}>
                         <span style={{
                             display: 'inline-block', width: 9, height: 9, borderRadius: 2,

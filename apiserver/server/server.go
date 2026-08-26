@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -353,26 +354,32 @@ func (s *APIServer) pollRunningTasks() {
 
 		if task.Status == TaskStatusUploading {
 			rawKey, rawSize, hasArtifacts := s.findRawCollectionArtifact(task.TID)
-			if hasArtifacts || now.After(deadline) {
-				reason := "采集产物已上传，任务完成"
-				if !hasArtifacts {
-					reason = "上传等待窗口结束，任务自动标记完成"
-				}
+			if hasArtifacts {
 				endTime := now
-				_ = s.transitionTaskStatus(&task, TaskStatusDone, reason, "task_poller", map[string]interface{}{"end_time": &endTime})
-				if hasArtifacts {
-					if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {
-						s.Logger.Warn("轮询补建分析任务失败",
-							zap.String("tid", task.TID),
-							zap.String("raw_key", rawKey),
-							zap.Error(err),
-						)
-					}
+				_ = s.transitionTaskStatus(&task, TaskStatusDone, "采集产物已上传，任务完成", "task_poller", map[string]interface{}{"end_time": &endTime})
+				if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {
+					s.Logger.Warn("轮询补建分析任务失败",
+						zap.String("tid", task.TID),
+						zap.String("raw_key", rawKey),
+						zap.Error(err),
+					)
 				}
 				s.Logger.Info("任务自动标记为完成",
 					zap.String("tid", task.TID),
 					zap.String("name", task.Name),
-					zap.Bool("has_artifacts", hasArtifacts),
+				)
+				continue
+			}
+			if now.After(deadline) {
+				endTime := now
+				reason := formatErrorReason(ErrCodeTaskExecutionFailed, "上传等待窗口结束，未收到采集产物")
+				_ = s.transitionTaskStatus(&task, TaskStatusFailed, reason, "task_poller", map[string]interface{}{
+					"end_time":        &endTime,
+					"analysis_status": 3,
+				})
+				s.Logger.Warn("任务上传超时且无采集产物，标记为失败",
+					zap.String("tid", task.TID),
+					zap.String("name", task.Name),
 				)
 			}
 		}
@@ -392,6 +399,22 @@ func (s *APIServer) backfillAnalysisQueueForCompletedTasks() {
 	for _, task := range tasks {
 		rawKey, rawSize, ok := s.findRawCollectionArtifact(task.TID)
 		if !ok {
+			// 旧版本在上传截止后即使没有原始采集产物，也会把任务写成 DONE。
+			// 只修复带有该精确旧状态文案的记录，避免把已经按保留策略清理过
+			// 产物的正常历史任务误判为失败。
+			if strings.Contains(task.StatusInfo, "上传等待窗口结束，任务自动标记完成") {
+				endTime := time.Now()
+				if task.EndTime != nil {
+					endTime = *task.EndTime
+				}
+				reason := formatErrorReason(ErrCodeTaskExecutionFailed, "上传等待窗口结束，未收到采集产物")
+				if err := s.transitionTaskStatus(&task, TaskStatusFailed, reason, "startup_reconciler", map[string]interface{}{
+					"end_time":        &endTime,
+					"analysis_status": 3,
+				}); err != nil && err != ErrTaskStatusStale {
+					s.Logger.Warn("修复历史无产物完成任务失败", zap.String("tid", task.TID), zap.Error(err))
+				}
+			}
 			continue
 		}
 		if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {

@@ -91,7 +91,7 @@ async function renderAt(path) {
 
 test('主机入口加载对应 SID 的时间轴并展示计划参数', async () => {
     schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
-    tasks.timeline.mockResolvedValue({ code: 0, data: { points, trends: { total: 2 } } });
+    tasks.timeline.mockResolvedValue({ code: 0, data: { points, trends: { total: 2, success: 1, analysis_failed: 1 } } });
     tasks.diff.mockResolvedValue({ code: 0, data: { baseline: {}, compare: {}, functions: [] } });
 
     const { container, root } = await renderAt('/hosts/host-1/schedules/sch-1');
@@ -114,6 +114,8 @@ test('主机入口加载对应 SID 的时间轴并展示计划参数', async () 
     expect(tasks.timeline).toHaveBeenCalledWith('sch-1', expect.anything());
     expect(container.textContent).toContain('窗口1');
     expect(container.textContent).toContain('窗口2');
+    expect(container.textContent).toContain('成功 1');
+    expect(container.textContent).toContain('分析失败 1');
 
     // 时间轴窗口提供"设为基线"
     const baselineBtns = Array.from(container.querySelectorAll('button')).filter(b => b.textContent.includes('设为基线'));
@@ -158,6 +160,38 @@ test('运行中的窗口保留"停止"取消能力', async () => {
     await act(async () => { Simulate.click(cancelBtn); });
     await act(async () => { await Promise.resolve(); });
     expect(tasks.cancel).toHaveBeenCalledWith('t3');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('已取消窗口显示明确状态而不是未知', async () => {
+    schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
+    tasks.timeline.mockResolvedValue({
+        code: 0,
+        data: { points: [{ tid: 't-canceled', name: '取消窗口', status: 5, has_result: false, window_start: '2026-08-22T00:10:00Z' }], trends: { total: 1, canceled: 1 } },
+    });
+
+    const { container, root } = await renderAt('/schedules/sch-1');
+
+    expect(container.querySelector('table tbody').textContent).toContain('已取消');
+    expect(container.querySelector('table tbody').textContent).not.toContain('未知');
+    expect(container.textContent).toContain('已取消 1');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('采集完成但分析失败的窗口显示分析失败', async () => {
+    schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
+    tasks.timeline.mockResolvedValue({
+        code: 0,
+        data: { points: [{ tid: 't-analysis-failed', name: '失败窗口', status: 2, analysis_status: 3, has_result: false, window_start: '2026-08-22T00:10:00Z' }], trends: { total: 1, failed: 0 } },
+    });
+
+    const { container, root } = await renderAt('/schedules/sch-1');
+    expect(container.querySelector('table tbody').textContent).toContain('分析失败');
+    expect(container.querySelector('table tbody').textContent).not.toContain('已完成');
 
     act(() => root.unmount());
     container.remove();

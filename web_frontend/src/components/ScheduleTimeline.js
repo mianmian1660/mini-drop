@@ -45,7 +45,7 @@ const S = {
     empty: { textAlign: 'center', color: '#667085', padding: 38, border: '1px dashed #d0d5dd', borderRadius: 8 },
 };
 
-const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
+const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
 const isActiveTask = (status) => status === 0 || status === 1 || status === 4;
 // 时间轴窗口列表每页条数
 const PAGE_SIZE = 20;
@@ -230,6 +230,8 @@ export default function ScheduleTimeline({ sid }) {
                             <span style={S.btnSm}>窗口 {trends.total || 0}</span>
                             <span style={S.btnSm}>成功 {trends.success || 0}</span>
                             <span style={S.btnSm}>失败 {trends.failed || 0}</span>
+                            <span style={S.btnSm}>分析失败 {trends.analysis_failed || 0}</span>
+                            <span style={S.btnSm}>已取消 {trends.canceled || 0}</span>
                             <span style={S.btnSm}>进行中 {trends.running || 0}</span>
                             <span style={S.btnSm}>有结果 {trends.has_result || 0}</span>
                         </div>
@@ -256,7 +258,9 @@ export default function ScheduleTimeline({ sid }) {
                                                 <span style={{ color: '#667085', fontSize: 12 }}>{p.tid}</span>
                                             </td>
                                             <td style={S.td}>
-                                                <span style={{ ...S.badge, background: statusColor(p.status), color: '#fff' }}>{ST[p.status] || '未知'}</span>
+                                                <span style={{ ...S.badge, background: statusColor(p.status, p.analysis_status), color: '#fff' }}>
+                                                    {p.status === 2 && p.analysis_status === 3 ? '分析失败' : (ST[p.status] || '未知')}
+                                                </span>
                                             </td>
                                             <td style={S.td}>
                                                 {p.frequency_hz ? `${p.frequency_hz}Hz` : '-'}

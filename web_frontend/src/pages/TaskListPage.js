@@ -30,15 +30,17 @@ const styles = {
     totalInfo: { fontSize: 13, color: '#999' },
 };
 
-const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed' };
-const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
+const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed', 5: '#64748b' };
+const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
+const taskStatusColor = (task) => Number(task.status) === 2 && Number(task.analysis_status) === 3 ? '#f44336' : (statusColors[task.status] || '#999');
+const taskStatusName = (task) => Number(task.status) === 2 && Number(task.analysis_status) === 3 ? '分析失败' : (statusNames[task.status] || '未知');
 
 export default function TaskListPage() {
     const [taskList, setTaskList] = useState([]);
     const [keyword, setKeyword] = useState('');       // 搜索输入框的值
     const [searchText, setSearchText] = useState(''); // 实际发起搜索的值（按回车触发）
     const [statusFilter, setStatusFilter] = useState('');
-    const [ownerFilter, setOwnerFilter] = useState('all');
+    const [ownerFilter, setOwnerFilter] = useState('mine');
     const [page, setPage] = useState(1);
     const [pageSize] = useState(10);                  // 每页 10 条，方便看到分页效果
     const [total, setTotal] = useState(0);
@@ -144,6 +146,7 @@ export default function TaskListPage() {
                         <option value="4">上传中</option>
                         <option value="2">已完成</option>
                         <option value="3">失败</option>
+                        <option value="5">已取消</option>
                     </select>
                     <select style={styles.select} value={ownerFilter} onChange={handleOwnerChange} aria-label="任务归属筛选">
                         <option value="all">全部创建者</option>
@@ -192,8 +195,8 @@ export default function TaskListPage() {
                                     <td style={styles.td}>{t.target_ip}</td>
                                     <td style={styles.td}>{collectorLabelFromTask(t)}</td>
                                     <td style={styles.td}>
-                                        <span style={{ ...styles.badge, background: statusColors[t.status] || '#999', color: '#fff' }}>
-                                            {statusNames[t.status] || '未知'}
+                                        <span style={{ ...styles.badge, background: taskStatusColor(t), color: '#fff' }}>
+                                            {taskStatusName(t)}
                                         </span>
                                     </td>
                                     <td style={styles.td}>{t.create_time}</td>

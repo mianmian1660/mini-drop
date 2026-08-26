@@ -976,7 +976,12 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 	// 阶段一 v3：batch 级幂等。同 batch_id 重传必须携带相同 content_sha256；
 	// 摘要不同 = 内容冲突（不可重试，禁止换 ID 绕过）。
 	var existing model.ProfileBatch
-	if err := s.DB.Where("bid = ?", req.BatchID).First(&existing).Error; err == nil {
+	batchLookup := s.DB.Where("bid = ?", req.BatchID).Limit(1).Find(&existing)
+	if batchLookup.Error != nil {
+		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 ProfileBatch 失败")
+		return
+	}
+	if batchLookup.RowsAffected > 0 {
 		if existing.SessionSID != req.SessionSID || !existing.StartTime.Equal(req.StartTime) || !existing.EndTime.Equal(req.EndTime) {
 			s.respondContinuousConflict(c, req, "batch_id 已被不同采集批次使用")
 			return
@@ -987,9 +992,6 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 		}
 		s.updateContinuousAgentClock(req.SessionSID, clockOffsetMS, clockStatus, clockObserved)
 		s.respondContinuousBatchACK(c, req, true)
-		return
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		s.RespondHTTPError(c, http.StatusInternalServerError, ErrCodeDependencyUnavailable, "查询 ProfileBatch 失败")
 		return
 	}
 	req.SignalTypes = normalizeContinuousSignalTypes(req)
@@ -1125,16 +1127,17 @@ func (s *APIServer) IngestContinuousBatch(c *gin.Context) {
 				// 已存在时：内容摘要相同 → 跳过（不重复计数）；不同 → 内容冲突。
 				if isV3 && in.WindowID != "" {
 					var existingWindow model.ProfileWindow
-					ewErr := tx.Where("session_sid = ? AND window_id = ? AND signal_type = ?",
-						req.SessionSID, in.WindowID, signal.SignalType).First(&existingWindow).Error
-					if ewErr == nil {
+					windowLookup := tx.Where("session_sid = ? AND window_id = ? AND signal_type = ?",
+						req.SessionSID, in.WindowID, signal.SignalType).Limit(1).Find(&existingWindow)
+					if windowLookup.Error != nil {
+						return windowLookup.Error
+					}
+					if windowLookup.RowsAffected > 0 {
 						if existingWindow.ContentSHA256 != "" && in.ContentSHA256 != "" &&
 							existingWindow.ContentSHA256 != in.ContentSHA256 {
 							return errContinuousConflict
 						}
 						continue
-					} else if !errors.Is(ewErr, gorm.ErrRecordNotFound) {
-						return ewErr
 					}
 				}
 				if err := tx.Create(&window).Error; err != nil {
@@ -2305,13 +2308,16 @@ func (s *APIServer) mergeContinuousWindowSummary(ctx context.Context, sessionSID
 
 func (s *APIServer) mergeContinuousWindowSummaryLocked(ctx context.Context, tx *gorm.DB, sessionSID, signalType string, bucketStart, bucketEnd time.Time, agg *continuousAggregate) error {
 	var existing model.ContinuousWindowSummary
-	lookupErr := tx.WithContext(ctx).
+	lookup := tx.WithContext(ctx).
 		Where("session_sid = ? AND signal_type = ? AND bucket_start = ?", sessionSID, signalType, bucketStart).
-		First(&existing).Error
+		Limit(1).Find(&existing)
+	if lookup.Error != nil {
+		return lookup.Error
+	}
 
 	merged := map[string]float64{}
 	var sampleCount uint64
-	if lookupErr == nil {
+	if lookup.RowsAffected > 0 {
 		var oldItems []ProfileTopItem
 		if len(existing.TopSelfJSON) > 0 {
 			if unmarshalErr := json.Unmarshal(existing.TopSelfJSON, &oldItems); unmarshalErr != nil {
@@ -2324,8 +2330,6 @@ func (s *APIServer) mergeContinuousWindowSummaryLocked(ctx context.Context, tx *
 			merged[item.Name] += item.Self
 		}
 		sampleCount = existing.SampleCount
-	} else if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
-		return lookupErr
 	}
 
 	for name, item := range agg.Top {

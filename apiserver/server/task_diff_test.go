@@ -2,9 +2,13 @@ package server
 
 import (
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/mini-drop/apiserver/model"
 )
 
@@ -25,6 +29,38 @@ func findEntry(entries []DiffEntry, function string) (DiffEntry, bool) {
 		}
 	}
 	return DiffEntry{}, false
+}
+
+func TestTaskDiffFlamegraphExplainsAnalysisFailure(t *testing.T) {
+	s := newTestAPIServer(t)
+	failed := &model.HotmethodTask{TID: "failed-side", AnalysisStatus: 3}
+	ready := &model.HotmethodTask{TID: "ready-side", AnalysisStatus: 2}
+
+	_, reason := s.buildTaskDiffFlamegraph(failed, ready, 100)
+	if reason != "基线任务（failed-side）分析失败，无法生成差分火焰图" {
+		t.Fatalf("analysis failure reason=%q", reason)
+	}
+}
+
+func TestTaskDiffTableExplainsAnalysisFailure(t *testing.T) {
+	s := newTestAPIServer(t)
+	tasks := []model.HotmethodTask{
+		{TID: "failed-side", Status: TaskStatusDone, AnalysisStatus: 3},
+		{TID: "ready-side", Status: TaskStatusDone, AnalysisStatus: 2},
+	}
+	if err := s.DB.Create(&tasks).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks/diff", s.GetTaskDiff)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/diff?baseline_tid=failed-side&compare_tid=ready-side", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "分析失败，无法生成热点函数对比") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
 // 两侧都有的函数：算差值、定方向、原始值都要带回去

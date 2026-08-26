@@ -11,7 +11,7 @@ jest.mock('../components/InteractiveFlamegraph', () => ({
 jest.mock('../components/JavaFlamegraphPanel', () => () => null);
 jest.mock('../components/AICard', () => () => null);
 
-import { ArtifactsPanel } from './TaskResultPage';
+import { ArtifactsPanel, buildStages } from './TaskResultPage';
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -74,4 +74,17 @@ test('固定状态展示保护说明和取消固定入口', () => {
 
     act(() => root.unmount());
     container.remove();
+});
+
+test('分析失败不会被阶段条标成成功', () => {
+    // 即使页面为兼容旧代次仍展示上一代产物，本代分析失败也不能标成功。
+    const stages = buildStages({ status: 2, analysis_status: 3 }, [], 2, 3, { name: 'previous.svg' }, []);
+    const analyzing = stages.find(stage => stage.id === 'analyzing');
+    const success = stages.find(stage => stage.id === 'success');
+    const failed = stages.find(stage => stage.id === 'failed');
+
+    expect(analyzing.detail).toBe('分析失败');
+    expect(success.state).toBe('pending');
+    expect(failed.state).toBe('failed');
+    expect(failed.detail).toBe('分析失败');
 });
