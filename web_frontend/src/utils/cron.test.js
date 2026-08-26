@@ -5,8 +5,8 @@
 import { cronHumanLabel } from './cron';
 
 test('每分钟类', () => {
-    expect(cronHumanLabel('*/1 * * * *')).toBe('每分钟');
-    expect(cronHumanLabel('* * * * *')).toBe('每分钟');
+    expect(cronHumanLabel('*/1 * * * *')).toBe('每 1 分钟');
+    expect(cronHumanLabel('* * * * *')).toBe('每 1 分钟');
     expect(cronHumanLabel('*/5 * * * *')).toBe('每 5 分钟');
     expect(cronHumanLabel('*/30 * * * *')).toBe('每 30 分钟');
 });

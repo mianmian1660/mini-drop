@@ -1,7 +1,7 @@
 // ============================================================
 // utils/cron.js — cron 表达式转中文友好描述（仅展示，兼容旧任务）
 // ============================================================
-// 把标准 5 字段 cron（分 时 日 月 周）翻译成「每分钟」「每 5 分钟」
+// 把标准 5 字段 cron（分 时 日 月 周）翻译成「每 1 分钟」「每 5 分钟」
 // 「每天 08:00」「每周一 08:00」「工作日 08:00」等易读文本。
 // 无法翻译时原样返回表达式。新任务已改用"间隔 + 开始时间"
 //（utils/schedule.js 的 intervalHumanLabel），cron 仅用于旧计划兼容展示。
@@ -21,9 +21,9 @@ export function cronHumanLabel(expr) {
     // 每分钟 / 每 N 分钟：*/n * * * *
     if (daily && hour === '*' && min.startsWith('*/')) {
         const n = Number(min.slice(2));
-        if (Number.isFinite(n) && n >= 1) return n === 1 ? '每分钟' : `每 ${n} 分钟`;
+        if (Number.isFinite(n) && n >= 1) return n === 1 ? '每 1 分钟' : `每 ${n} 分钟`;
     }
-    if (daily && hour === '*' && min === '*') return '每分钟';
+    if (daily && hour === '*' && min === '*') return '每 1 分钟';
 
     // 每小时 / 每 N 小时：0 */n * * *
     if (daily && min === '0' && hour.startsWith('*/')) {

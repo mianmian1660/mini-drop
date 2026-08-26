@@ -188,10 +188,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 <input style={S.input} value={keyword} onChange={event => { setKeyword(event.target.value); setPage(1); }} placeholder="搜索名称 / exe" />
                 <select style={S.select} value={status} onChange={event => { setStatus(event.target.value); setPage(1); }}><option value="">全部状态</option><option value="running">运行中</option><option value="waiting">等待进程</option><option value="degraded">降级运行</option><option value="pending">待启动</option><option value="stopping">停止中</option><option value="stopped">已停止</option><option value="offline">Agent 离线</option><option value="error">异常</option></select>
                 <select style={S.select} value={scope} onChange={event => { setScope(event.target.value); setPage(1); }}><option value="">全部范围</option><option value="host">整机</option><option value="process">进程</option></select>
-                <span style={{ display: 'inline-flex', alignItems: 'center' }}>
-                    <select aria-label="持续采集归属筛选" style={S.select} value={ownerFilter} onChange={event => { setOwnerFilter(event.target.value); setPage(1); }}><option value="all">全部创建者</option><option value="mine">我创建的</option></select>
-                    <InfoTooltip label="查看持续采集归属筛选说明">默认显示这台主机上全部创建者的任务和完整分页；需要聚焦个人任务时可切换到“我创建的”。</InfoTooltip>
-                </span>
+                <select aria-label="持续采集归属筛选" style={S.select} value={ownerFilter} onChange={event => { setOwnerFilter(event.target.value); setPage(1); }}><option value="all">全部创建者</option><option value="mine">我创建的</option></select>
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
 				<button aria-pressed={showTestSessions} style={S.button} onClick={() => { setShowTestSessions(value => !value); setPage(1); }}>

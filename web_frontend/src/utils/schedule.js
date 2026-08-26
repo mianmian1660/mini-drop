@@ -38,15 +38,15 @@ export function schedulePeriodLabel(sch) {
     return cronHumanLabel(sch.cron_expr) || '周期计划';
 }
 
-// schedulePeriodTitle 计划执行周期的悬停说明：解释"这个设置意味着什么"
-// 并提供原始值（间隔秒数 / 原始 cron）作为诊断信息。
+// schedulePeriodTitle 计划执行周期的悬停说明：统一为"每 X 分钟自动触发一次
+// 深度采样"，并提供原始值（间隔秒数 / 原始 cron）作为诊断信息。
 export function schedulePeriodTitle(sch) {
+    const label = schedulePeriodLabel(sch);
     if (scheduleUsesInterval(sch)) {
-        const label = intervalHumanLabel(sch.interval_seconds) || '';
         return `${label}自动触发一次深度采样（间隔 ${sch.interval_seconds} 秒）`;
     }
     const raw = String(sch?.cron_expr || '').trim();
-    return raw ? `旧版 Cron 表达式（${raw}），兼容保留` : '周期计划';
+    return raw ? `${label}自动触发一次深度采样（旧版 Cron 表达式 ${raw}）` : '周期计划';
 }
 
 // scheduleStatusText 计划启停状态的中文解释（含可执行建议）。

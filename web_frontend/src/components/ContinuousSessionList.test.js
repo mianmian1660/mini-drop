@@ -68,9 +68,6 @@ test('list renders waiting process tasks and stop writes desired state through t
 	await act(async () => Simulate.click(showTests));
 	await act(async () => { await Promise.resolve(); });
 	expect(continuous.sessions).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, test_filter: 'all' }));
-    const ownerHelp = container.querySelector('button[aria-label="查看持续采集归属筛选说明"]');
-    await act(async () => Simulate.mouseEnter(ownerHelp));
-    expect(container.textContent).toContain('默认显示这台主机上全部创建者的任务和完整分页');
     const stop = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '停止');
     await act(async () => Simulate.click(stop));
     expect(window.confirm).toHaveBeenCalled();

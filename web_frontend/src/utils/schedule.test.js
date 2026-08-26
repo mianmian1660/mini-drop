@@ -35,6 +35,7 @@ test('schedulePeriodTitle 提供原始值与含义说明', () => {
     expect(interval).toContain('间隔 300 秒');
 
     const cron = schedulePeriodTitle({ cron_expr: '*/5 * * * *' });
+    expect(cron).toContain('每 5 分钟自动触发一次深度采样');
     expect(cron).toContain('旧版 Cron 表达式');
     expect(cron).toContain('*/5 * * * *');
 });
