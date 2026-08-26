@@ -44,6 +44,10 @@ func TestPQAggregatesAndRestoresRuntimeDiagnostics(t *testing.T) {
 
 func TestPQLegacyBlockDoesNotInferCollectorReady(t *testing.T) {
 	agg := continuousAggregate{
+		Top:                           map[string]*ProfileTopItem{},
+		Root:                          &continuousTreeNode{Name: "root", Children: map[string]*continuousTreeNode{}},
+		LabelValue:                    map[string]map[string]bool{},
+		Backends:                      map[string]bool{},
 		RuntimeDiagnostics:            map[string]*runtimeDiagnosticAccumulator{},
 		DisableLegacyRuntimeInference: true,
 	}
