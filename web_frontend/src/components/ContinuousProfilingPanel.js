@@ -1778,9 +1778,40 @@ export function TopNTable({ data, loading, profileURL, filterText = '' }) {
     const isSamples = profileUnitLabel(data?.unit) === 'samples';
     const cumLabel = isSamples ? '累计样本数' : metricColumnLabel(data.unit, '累计');
     const selfLabel = isSamples ? '自身样本数' : metricColumnLabel(data.unit, '自身');
+	const resolvedItems = items.filter(item => !item.unresolved);
+	const unresolvedItems = items.filter(item => item.unresolved);
+	const unresolvedSelf = unresolvedItems.reduce((total, item) => total + (Number(item.self) || 0), 0);
+	const unresolvedPercent = Number(data?.total) > 0 ? unresolvedSelf / Number(data.total) * 100 : 0;
+	const nodeDiagnostic = data?.runtime_diagnostics?.node;
+	const nodeReasons = Array.isArray(nodeDiagnostic?.reasons) ? nodeDiagnostic.reasons : [];
+	const nodeMissingPerfMap = (nodeDiagnostic?.collector_status === 'missing' || nodeDiagnostic?.status === 'missing')
+		&& nodeReasons.some(reason => String(reason).includes('--perf-basic-prof'));
     return (
-        <div className="table-scroll" style={S.tableWrap}>
-            <table style={S.table}>
+		<div>
+			{nodeMissingPerfMap && <div style={S.warn}>
+				该 Node 进程未启用 <code>--perf-basic-prof</code>，V8 JIT/JavaScript 函数无法事后解析。请在 systemd、Docker、Kubernetes 或启动脚本中添加该参数并重启业务进程；Mini-Drop 不会自动重启业务。
+			</div>}
+			{resolvedItems.length > 0 ? <TopNItemsTable data={data} items={resolvedItems} cumLabel={cumLabel} selfLabel={selfLabel} /> : (
+				<div style={S.warn}>当前结果没有可解析的业务函数。可展开下方未解析热点查看原始地址与模块信息。</div>
+			)}
+			{unresolvedItems.length > 0 && <details style={{ ...S.details, marginTop: 12 }}>
+				<summary style={S.detailsSummary}>未解析热点（{unresolvedItems.length} 项，自身样本 {formatMetricValue(unresolvedSelf, data.unit)}，占 {formatPercent(unresolvedPercent)}）</summary>
+				<div style={{ marginTop: 10 }}>
+					<TopNItemsTable data={data} items={unresolvedItems} cumLabel={cumLabel} selfLabel={selfLabel} unresolved />
+				</div>
+			</details>}
+            {data?.total > 0 && (
+				<div style={{ ...S.subtle, marginTop: 8, lineHeight: 1.5 }}>
+					占比分母为当前窗口总样本数（{formatMetricValue(data.total, data.unit)}）。自身 = 该函数自己（栈顶）被采样次数；累计 = 含其调用的子函数；每组保持后端按自身样本数给出的顺序。
+				</div>
+			)}
+		</div>
+	);
+}
+
+function TopNItemsTable({ data, items, cumLabel, selfLabel, unresolved = false }) {
+	return <div className="table-scroll" style={S.tableWrap}>
+		<table style={S.table}>
                 <thead>
                     <tr>
                         <th style={{ ...S.th, width: '44%' }}>函数</th>
@@ -1793,7 +1824,7 @@ export function TopNTable({ data, loading, profileURL, filterText = '' }) {
                 <tbody>
                     {items.slice(0, 20).map((item, index) => (
                         <tr key={`${item.name}-${index}`}>
-                            <td style={{ ...S.td, ...(item.unresolved ? S.tdMuted : {}) }} title={item.name}>
+							<td style={{ ...S.td, ...((unresolved || item.unresolved) ? S.tdMuted : {}) }} title={item.name}>
                                 {truncate(item.display_name || item.name, 72)}
                             </td>
                             <td style={S.td} title="累计：含自身执行及所有子函数调用">{formatMetricValue(item.value, item.unit || data.unit)}</td>
@@ -1804,13 +1835,7 @@ export function TopNTable({ data, loading, profileURL, filterText = '' }) {
                     ))}
                 </tbody>
             </table>
-            {data?.total > 0 && (
-                <div style={{ ...S.subtle, marginTop: 8, lineHeight: 1.5 }}>
-                    占比分母为当前窗口总样本数（{formatMetricValue(data.total, data.unit)}）。自身 = 该函数自己（栈顶）被采样次数；累计 = 含其调用的子函数；表格按自身样本数降序排序。
-                </div>
-            )}
-        </div>
-    );
+		</div>;
 }
 
 function ProfileEmpty({ message, url }) {

@@ -53,6 +53,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [scope, setScope] = useState('');
     // 默认展示整台主机上的全部 Session；需要聚焦个人任务时可手动切换。
     const [ownerFilter, setOwnerFilter] = useState('all');
+	const [showTestSessions, setShowTestSessions] = useState(() => searchParams.get('ctest') === '1');
     const [stopping, setStopping] = useState('');
     const [cleaning, setCleaning] = useState(false);
     const [jumpInput, setJumpInput] = useState('');
@@ -68,6 +69,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 page,
                 page_size: PAGE_SIZE,
                 owner_filter: ownerFilter,
+				test_filter: showTestSessions ? 'all' : 'exclude',
                 keyword: keyword.trim() || undefined,
                 observed_state: status || undefined,
                 scope: scope || undefined,
@@ -88,7 +90,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         } finally {
             if (!silent && requestID === requestSequence.current) setLoading(false);
         }
-    }, [target.ip, ownerFilter, keyword, status, scope, page]);
+	}, [target.ip, ownerFilter, showTestSessions, keyword, status, scope, page]);
 
     useEffect(() => { load(); }, [load, refreshToken]);
     useEffect(() => {
@@ -96,14 +98,18 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         return () => window.clearInterval(timer);
     }, [load]);
 
-    // 页码同步到 URL（cpage），刷新或重新进入页面时仍停留在原页。
+	// 页码和测试任务开关同步到 URL，刷新或重新进入页面时保持当前视图。
     useEffect(() => {
         const params = new URLSearchParams(searchParams);
-        if (params.get('cpage') !== String(page)) {
-            params.set('cpage', String(page));
-            setSearchParams(params, { replace: true });
-        }
-    }, [page, searchParams, setSearchParams]);
+		let changed = false;
+		if (params.get('cpage') !== String(page)) { params.set('cpage', String(page)); changed = true; }
+		if (showTestSessions) {
+			if (params.get('ctest') !== '1') { params.set('ctest', '1'); changed = true; }
+		} else if (params.has('ctest')) {
+			params.delete('ctest'); changed = true;
+		}
+		if (changed) setSearchParams(params, { replace: true });
+	}, [page, showTestSessions, searchParams, setSearchParams]);
 
     const stop = async session => {
         if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
@@ -181,6 +187,9 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 </span>
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+				<button aria-pressed={showTestSessions} style={S.button} onClick={() => { setShowTestSessions(value => !value); setPage(1); }}>
+					{showTestSessions ? '隐藏测试任务' : '显示测试任务'}
+				</button>
                 {cleanableSessions.length > 0 && <span style={{ display: 'inline-flex', alignItems: 'center' }}>
                     <button style={S.dangerButton} onClick={cleanupTestSessions} disabled={cleaning}>{cleaning ? '清理中...' : `清理测试残留（${cleanableSessions.length}）`}</button>
                     <InfoTooltip label="查看清理测试残留说明">仅清理本页中名称明确带有测试标记、已经停止或异常、且没有任何样本和采集记录的空任务。后端会再次校验，不会删除有采集数据的任务。</InfoTooltip>

@@ -573,6 +573,18 @@ func (s *APIServer) ListContinuousSessions(c *gin.Context) {
 	auth := s.AuthContext(c)
 	var sessions []model.ContinuousSession
 	query := s.DB.Model(&model.ContinuousSession{})
+	testPredicate := `(LOWER(COALESCE(name, '')) LIKE ? OR LOWER(COALESCE(name, '')) LIKE ? OR LOWER(COALESCE(name, '')) LIKE ? OR LOWER(COALESCE(name, '')) LIKE ? OR LOWER(COALESCE(name, '')) LIKE ?)`
+	testArgs := []interface{}{"%boundary-%", "%multilang-%", "%test%", "%smoke%", "%测试%"}
+	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("test_filter", "all"))) {
+	case "", "all":
+	case "exclude":
+		query = query.Where("NOT "+testPredicate, testArgs...)
+	case "only":
+		query = query.Where(testPredicate, testArgs...)
+	default:
+		s.RespondHTTPError(c, http.StatusBadRequest, ErrCodeTaskInvalidArgument, "test_filter 仅支持 all/exclude/only")
+		return
+	}
 	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("owner_filter", "all"))) {
 	case "", "all":
 	case "mine":

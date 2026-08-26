@@ -48,7 +48,11 @@ test('list renders waiting process tasks and stop writes desired state through t
     expect(container.querySelector('.table-scroll').style.maxWidth).toBe('100%');
     expect(container.textContent).toContain('共 1 条');
     expect(container.textContent).toContain('全部创建者');
-    expect(continuous.sessions).toHaveBeenCalledWith(expect.objectContaining({ page: 1, page_size: 20, owner_filter: 'all' }));
+	expect(continuous.sessions).toHaveBeenCalledWith(expect.objectContaining({ page: 1, page_size: 20, owner_filter: 'all', test_filter: 'exclude' }));
+	const showTests = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '显示测试任务');
+	await act(async () => Simulate.click(showTests));
+	await act(async () => { await Promise.resolve(); });
+	expect(continuous.sessions).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, test_filter: 'all' }));
     const ownerHelp = container.querySelector('button[aria-label="查看持续采集归属筛选说明"]');
     await act(async () => Simulate.mouseEnter(ownerHelp));
     expect(container.textContent).toContain('默认显示这台主机上全部创建者的任务和完整分页');

@@ -34,6 +34,7 @@ func TestSharedReadListsAndOwnerFilter(t *testing.T) {
 	for _, session := range []model.ContinuousSession{
 		{SID: "cps-owner", Name: "owner session", UID: "owner", UserName: "Owner", StartedAt: now, CreatedAt: now, UpdatedAt: now},
 		{SID: "cps-other", Name: "other session", UID: "other", UserName: "Other", StartedAt: now, CreatedAt: now.Add(time.Second), UpdatedAt: now},
+		{SID: "cps-test", Name: "multilang-node-plain", UID: "owner", UserName: "Owner", StartedAt: now, CreatedAt: now.Add(2 * time.Second), UpdatedAt: now},
 	} {
 		if err := s.DB.Create(&session).Error; err != nil {
 			t.Fatal(err)
@@ -74,8 +75,18 @@ func TestSharedReadListsAndOwnerFilter(t *testing.T) {
 	}
 	assertTotal("/api/v1/schedule/tasks", "reader", 2)
 	assertTotal("/api/v1/schedule/tasks?owner_filter=mine", "owner", 1)
-	assertTotal("/api/v1/continuous/sessions?page_size=10", "reader", 2)
-	assertTotal("/api/v1/continuous/sessions?page_size=10&owner_filter=mine", "owner", 1)
+	assertTotal("/api/v1/continuous/sessions?page_size=10", "reader", 3)
+	assertTotal("/api/v1/continuous/sessions?page_size=10&owner_filter=mine", "owner", 2)
+	assertTotal("/api/v1/continuous/sessions?page_size=10&test_filter=exclude", "reader", 2)
+	assertTotal("/api/v1/continuous/sessions?page_size=10&test_filter=only", "reader", 1)
+
+	badFilter := httptest.NewRequest(http.MethodGet, "/api/v1/continuous/sessions?test_filter=bad", nil)
+	badFilter.Header.Set("Drop-User-Uid", "reader")
+	badFilterResponse := httptest.NewRecorder()
+	router.ServeHTTP(badFilterResponse, badFilter)
+	if badFilterResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid test_filter status=%d body=%s", badFilterResponse.Code, badFilterResponse.Body.String())
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/continuous/sessions/cps-other", nil)
 	req.Header.Set("Drop-User-Uid", "reader")

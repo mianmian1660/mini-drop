@@ -273,7 +273,7 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 				blockSamples[row.SessionSID] = append(blockSamples[row.SessionSID], sample)
 				agg.WindowCount++
 			}
-			if err := s.pqMergeDiagnosticsForQuery(ctx, block, hFrom, hTo, blockSamples, &agg); err != nil {
+			if err := s.pqMergeDiagnosticsForQuery(ctx, block, block.BucketStart, block.BucketEnd, blockSamples, &agg); err != nil {
 				incParquetQueryError()
 				return agg, true, err
 			}

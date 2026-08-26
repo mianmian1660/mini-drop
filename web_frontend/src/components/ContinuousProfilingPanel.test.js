@@ -153,18 +153,41 @@ test('TopN table labels cumulative and self columns with percentages', () => {
         root.render(<TopNTable data={{
             unit: 'samples',
             total: 4,
-            items: [{ name: '0x57f4 [postgres]', display_name: '[未解析] postgres', value: 2, self: 1, percent: 50, self_percent: 25, unresolved: true, unit: 'samples' }],
+			items: [
+				{ name: 'hot_a', value: 3, self: 3, percent: 75, self_percent: 75, unit: 'samples' },
+				{ name: '0x57f4 [postgres]', display_name: '[未解析] postgres', value: 2, self: 1, percent: 50, self_percent: 25, unresolved: true, unit: 'samples' },
+			],
         }} />);
     });
 
     expect(container.textContent).toContain('累计占比');
     expect(container.textContent).toContain('自身占比');
     expect(container.textContent).toContain('[未解析] postgres');
+	expect(container.textContent).toContain('未解析热点（1 项，自身样本 1，占 25.0%）');
+	expect(container.querySelector('details').open).toBe(false);
     expect(container.textContent).toContain('50.0%');
     expect(container.textContent).toContain('25.0%');
 
     act(() => root.unmount());
     container.remove();
+});
+
+test('TopN all-unresolved Node result explains restart requirement', () => {
+	const container = document.createElement('div');
+	document.body.appendChild(container);
+	const root = createRoot(container);
+	act(() => {
+		root.render(<TopNTable data={{
+			unit: 'samples', total: 5,
+			items: [{ name: '0x123456', value: 5, self: 5, unresolved: true, unit: 'samples' }],
+			runtime_diagnostics: { node: { status: 'missing', collector_status: 'missing', reasons: ['missing --perf-basic-prof flag'] } },
+		}} />);
+	});
+	expect(container.textContent).toContain('当前结果没有可解析的业务函数');
+	expect(container.textContent).toContain('Mini-Drop 不会自动重启业务');
+	expect(container.textContent).toContain('--perf-basic-prof');
+	act(() => root.unmount());
+	container.remove();
 });
 
 test('TopN loading state does not render an empty no-sample message first', () => {
