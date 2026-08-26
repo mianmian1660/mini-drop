@@ -82,6 +82,10 @@ if [[ "$*" == "compose ps -q "* ]]; then
   fi
   exit 0
 fi
+if [[ "$*" == "compose exec -T postgres psql "* ]]; then
+  if [[ "${FAIL_AT:-}" == AGENT_IDLE ]]; then printf 'busy\n'; else printf 'ready\n'; fi
+  exit 0
+fi
 if [[ "$1" == "inspect" && "$2" == "--format" ]]; then
   container_id="${!#}"
   if [[ "${MUTATE_NON_FRONTEND_START:-}" == "1" && -f "${DEPLOY_DOCKER_STATE}" && "${container_id}" == "container-drop_agent" ]]; then
@@ -237,6 +241,14 @@ grep -q '\[STAGE:E2E_MULTILANG\] SKIP service_scope=agent' <<<"${OUT}" \
 new_sandbox agent_container_changed
 run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=agent MUTATE_NON_AGENT=1
 expect_failure NON_AGENT_UNCHANGED "非 Agent 容器变化会使 Agent 部署失败"
+
+new_sandbox agent_busy
+run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=agent \
+  DEPLOY_AGENT_IDLE_TIMEOUT=1 DEPLOY_AGENT_IDLE_INTERVAL=0 FAIL_AT=AGENT_IDLE
+expect_failure AGENT_IDLE "存在活动任务时不替换 Agent"
+! grep -qx 'compose up -d --no-deps drop_agent' "${DOCKER_LOG}" \
+  && ok "Agent 空档门禁失败后未执行 Compose 更新" \
+  || bad "Agent 空档门禁失败后仍更新了容器" "$(cat "${DOCKER_LOG}")"
 
 new_sandbox invalid
 OUT="$(cd "${LOCAL_REPO}" && ./deploy.sh 'bad..branch' 2>&1)"

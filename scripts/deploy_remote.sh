@@ -15,6 +15,11 @@ HEALTH_URL="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8191}"
 FRONTEND_URL="${DEPLOY_FRONTEND_URL:-http://127.0.0.1}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-30}"
 HEALTH_INTERVAL="${DEPLOY_HEALTH_INTERVAL:-2}"
+AGENT_IDLE_TIMEOUT="${DEPLOY_AGENT_IDLE_TIMEOUT:-900}"
+AGENT_IDLE_INTERVAL="${DEPLOY_AGENT_IDLE_INTERVAL:-1}"
+AGENT_IDLE_GUARD_SECONDS="${DEPLOY_AGENT_IDLE_GUARD_SECONDS:-5}"
+DB_USER="${DEPLOY_DB_USER:-postgres}"
+DB_NAME="${DEPLOY_DB_NAME:-drop}"
 
 fail() {
   printf '[STAGE:%s] FAIL %s\n' "$1" "$2" >&2
@@ -43,6 +48,9 @@ case "${SERVICE_SCOPE}" in
   full|frontend|agent) ;;
   *) fail CONFIG "未知 SERVICE_SCOPE=${SERVICE_SCOPE}" 2 ;;
 esac
+[[ "${AGENT_IDLE_TIMEOUT}" =~ ^[0-9]+$ && "${AGENT_IDLE_INTERVAL}" =~ ^[0-9]+$ && \
+   "${AGENT_IDLE_GUARD_SECONDS}" =~ ^[0-9]+$ ]] \
+  || fail CONFIG "Agent 空档门禁参数必须是非负整数" 2
 
 command -v flock >/dev/null 2>&1 || fail CONFIG "服务器缺少 flock"
 exec 9>"${LOCK_FILE}"
@@ -172,6 +180,22 @@ verify_non_agent_unchanged() {
   fi
 }
 
+wait_for_agent_idle() {
+  local deadline state
+  deadline=$((SECONDS + AGENT_IDLE_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    state="$(docker compose exec -T postgres psql -U "${DB_USER}" -d "${DB_NAME}" -Atc \
+      "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM hotmethod_tasks WHERE status IN (0,1,4)) AND NOT EXISTS (SELECT 1 FROM schedule_tasks WHERE enabled = true AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_run_at <= NOW() + make_interval(secs => ${AGENT_IDLE_GUARD_SECONDS})) THEN 'ready' ELSE 'busy' END;" 2>/dev/null || true)"
+    if [[ "${state}" == "ready" ]]; then
+      printf 'Agent 更新空档已确认：无活动任务，且近期无周期触发\n'
+      return 0
+    fi
+    sleep "${AGENT_IDLE_INTERVAL}"
+  done
+  printf '等待 Agent 更新空档超时；保留当前 Agent，不执行容器替换\n' >&2
+  return 1
+}
+
 if [[ "${SERVICE_SCOPE}" == "frontend" ]]; then
   case "${TEST_SCOPE}" in
     full)
@@ -201,6 +225,7 @@ elif [[ "${SERVICE_SCOPE}" == "agent" ]]; then
   esac
   NON_AGENT_BEFORE="$(snapshot_non_agent_containers)"
   run_stage BUILD docker compose build drop_agent
+  run_stage AGENT_IDLE wait_for_agent_idle
   run_stage UP docker compose up -d --no-deps drop_agent
   run_stage HEALTH health_check
   run_stage NON_AGENT_UNCHANGED verify_non_agent_unchanged
