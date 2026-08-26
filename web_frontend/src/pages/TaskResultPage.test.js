@@ -9,7 +9,6 @@ jest.mock('../components/InteractiveFlamegraph', () => ({
     foldedTextToFlamegraph: jest.fn(),
 }));
 jest.mock('../components/JavaFlamegraphPanel', () => () => null);
-jest.mock('../components/AICard', () => () => null);
 
 import { ArtifactsPanel, buildStages } from './TaskResultPage';
 

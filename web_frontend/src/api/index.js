@@ -137,17 +137,6 @@ export const analysisResults = {
         const response = await tasks.detail(tid);
         return { code: response.code, message: response.message, data: response.data?.suggestions || [] };
     },
-    attribution: async (tid) => {
-        const response = await tasks.detail(tid);
-        return {
-            code: response.code,
-            message: response.message,
-            data: {
-                suggestions: response.data?.suggestions || [],
-                files: response.data?.files || [],
-            },
-        };
-    },
 };
 
 // ---------- 周期性深度采样 / Periodic Deep Sampling ----------

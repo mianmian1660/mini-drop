@@ -33,6 +33,7 @@ const S = {
     pageButton: { height: 32, padding: '0 10px', color: '#315efb', background: '#fff', border: '1px solid #c7d2fe', borderRadius: 6, fontWeight: 700, cursor: 'pointer' },
     pageButtonDisabled: { color: '#98a2b3', background: '#f8fafc', border: '1px solid #e5e7eb', cursor: 'not-allowed' },
     jumpInput: { width: 52, height: 32, padding: '0 8px', border: '1px solid #d0d5dd', borderRadius: 6, background: '#fff', fontSize: 13, textAlign: 'center', boxSizing: 'border-box' },
+    pageInfo: { fontSize: 13, color: '#475467', fontWeight: 600, whiteSpace: 'nowrap' },
 };
 
 const PAGE_SIZE = 20;
@@ -97,6 +98,13 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         const timer = window.setInterval(() => load(true), 5000);
         return () => window.clearInterval(timer);
     }, [load]);
+
+	// 浏览器后退 / 前进或直接改地址栏 cpage 时，同步到 page state。
+	// （原实现只在组件挂载时读一次 URL，后退会失效，且 replace 会把 URL 强制写回旧页。）
+	useEffect(() => {
+		const raw = Number(searchParams.get('cpage'));
+		if (Number.isInteger(raw) && raw >= 1 && raw !== page) setPage(raw);
+	}, [searchParams, page]);
 
 	// 页码和测试任务开关同步到 URL，刷新或重新进入页面时保持当前视图。
     useEffect(() => {
@@ -197,7 +205,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 <button style={S.button} onClick={() => load()} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
             </div>
         </div>
-        {loading ? <div style={S.empty}>正在加载持续采集任务...</div> : sessions.length === 0 ? <div style={S.empty}>{total ? '当前页暂无持续采集任务' : '暂无匹配的持续采集任务。'}</div> : <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
+        {sessions.length === 0 ? <div style={S.empty}>{loading ? '正在加载持续采集任务...' : (total ? '当前页暂无持续采集任务' : '暂无匹配的持续采集任务。')}</div> : <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
             <thead><tr><th style={S.th}>名称</th><th style={S.th}>范围与目标</th><th style={S.th} title="会话当前所处阶段：运行中 / 等待进程 / 已停止 / 离线等">状态</th><th style={S.th} title="这个持续采集会话采集了哪些数据（CPU / 块 IO / 调度延迟等）">信号</th><th style={S.th} title="距上一次成功把数据上传到服务器的时间；如果很久没更新，说明采集或上传可能有问题">最近上传</th><th style={S.th} title="会话已运行/已存在的时间，以及创建它的账号">持续时间 / 创建人</th><th style={S.th}>操作</th></tr></thead>
             <tbody>{sessions.map(session => {
                 const state = session.observed_state || 'pending';
@@ -219,10 +227,10 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 </tr>;
             })}</tbody>
         </table></div>}
-        {!loading && total > 0 && <div style={S.pagination}>
+        {!loading && total > 0 && pageCount > 1 && <div style={S.pagination}>
             <button aria-label="持续采集第一页" style={{ ...S.pageButton, ...(page <= 1 ? S.pageButtonDisabled : {}) }} disabled={page <= 1} onClick={() => setPage(1)}>首页</button>
             <button aria-label="持续采集上一页" style={{ ...S.pageButton, ...(page <= 1 ? S.pageButtonDisabled : {}) }} disabled={page <= 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button>
-            <span style={S.subtle}>第 {page} / {pageCount} 页</span>
+            <span style={S.pageInfo}>第 {page} / {pageCount} 页</span>
             <button aria-label="持续采集下一页" style={{ ...S.pageButton, ...(page >= pageCount ? S.pageButtonDisabled : {}) }} disabled={page >= pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button>
             <button aria-label="持续采集最后一页" style={{ ...S.pageButton, ...(page >= pageCount ? S.pageButtonDisabled : {}) }} disabled={page >= pageCount} onClick={() => setPage(pageCount)}>末页</button>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>

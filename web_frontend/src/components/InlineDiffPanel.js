@@ -8,7 +8,7 @@
 // 切 tab 不会互相清空——和 ContinuousProfilingPanel 的 diff 区块同一个做法。
 // ============================================================
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { tasks } from '../api';
 import InteractiveFlamegraph from './InteractiveFlamegraph';
@@ -70,8 +70,16 @@ export default function InlineDiffPanel({ baselineTid, compareTid, onClose }) {
 
     // 火焰图 tab 惰性加载：第一次切进去才发请求，避免每次展开面板都多打一次
     // 后端（folded.txt 读取+建树比 top.json 表格对比重，没必要总跑）。
+    // ⚠️ 依赖数组里不能放 flameLoading/flameResult：setFlameLoading(true) 触发重渲染后
+    // effect 会在运行新副作用前先执行旧 effect 的 cleanup（cancelled=true），请求返回时
+    // 结果被丢弃、loading 永远不结束（表现：差分火焰图一直停在“正在生成”）。
+    // 改用 ref 记录已请求的 tid 对，保持“只发一次”的惰性加载语义。
+    const flameRequestedPair = useRef('');
     useEffect(() => {
-        if (viewMode !== 'flamegraph' || !baselineTid || !compareTid || flameResult || flameLoading) return undefined;
+        if (viewMode !== 'flamegraph' || !baselineTid || !compareTid) return undefined;
+        const pair = `${baselineTid}|${compareTid}`;
+        if (flameRequestedPair.current === pair) return undefined;
+        flameRequestedPair.current = pair;
         let cancelled = false;
         setFlameLoading(true); setFlameError('');
         tasks.diffFlamegraph(baselineTid, compareTid)
@@ -86,10 +94,13 @@ export default function InlineDiffPanel({ baselineTid, compareTid, onClose }) {
             })
             .finally(() => { if (!cancelled) setFlameLoading(false); });
         return () => { cancelled = true; };
-    }, [viewMode, baselineTid, compareTid, flameResult, flameLoading]);
+    }, [viewMode, baselineTid, compareTid]);
 
     // 重新对比阈值只影响表格；两个 tid 变化时火焰图缓存也要失效重新拉。
-    useEffect(() => { setFlameResult(null); setFlameError(''); }, [baselineTid, compareTid]);
+    useEffect(() => {
+        setFlameResult(null); setFlameError('');
+        flameRequestedPair.current = '';
+    }, [baselineTid, compareTid]);
 
     // 把 ProfileDiffFlamegraph.root.children 铺成 InteractiveFlamegraph 期待的
     // nodes 数组，width 取 max(base_value,compare_value) 保证消失的函数仍可见

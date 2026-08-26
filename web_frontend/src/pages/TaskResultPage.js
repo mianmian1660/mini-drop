@@ -9,7 +9,6 @@ import { useNavigate } from 'react-router-dom';
 import { tasks, cosfiles } from '../api';
 import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
 import InteractiveFlamegraph, { foldedTextToFlamegraph } from '../components/InteractiveFlamegraph';
-import AICard from '../components/AICard';
 import { collectorLabelFromTask, collectorLabelByKind, parseRequestParams } from '../utils/collectors';
 import createFlamegraphWorker from '../workers/createFlamegraphWorker';
 
@@ -106,7 +105,6 @@ export default function TaskResultPage() {
     const [topFunctions, setTopFunctions] = useState([]);
     const [bpfHistogram, setBpfHistogram] = useState(null);
     const [suggestions, setSuggestions] = useState([]);
-    const [attribution, setAttribution] = useState(null);
     const [statusEvents, setStatusEvents] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -156,7 +154,6 @@ export default function TaskResultPage() {
         setTopFunctions(Array.isArray(data.top_functions) ? data.top_functions : []);
         setBpfHistogram(data.bpf_histogram || null);
         setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
-        setAttribution(readEmbeddedAttribution(data.suggestions));
         setStatusEvents(Array.isArray(data.status_events) ? data.status_events : []);
         setArtifacts(Array.isArray(data.artifacts) ? data.artifacts : []);
         setCleanedArtifacts(Array.isArray(data.cleaned_artifacts) ? data.cleaned_artifacts : []);
@@ -243,19 +240,6 @@ export default function TaskResultPage() {
         }
     }, [tid, reanalyzeAttempt, loadTask]);
 
-    useEffect(() => {
-        if (attribution) return;
-        const file = files.find(item => String(item?.name || '').endsWith('attribution.json'));
-        const url = file?.view_url || file?.download_url;
-        if (!url) return;
-        let cancelled = false;
-        fetch(url)
-            .then(response => response.ok ? response.json() : null)
-            .then(data => { if (!cancelled && data && typeof data === 'object') setAttribution(data); })
-            .catch(() => {});
-        return () => { cancelled = true; };
-    }, [files, attribution]);
-
     const loadFiles = useCallback(async () => {
         if (!tid) return;
         try {
@@ -327,8 +311,6 @@ export default function TaskResultPage() {
                     const payload = JSON.parse(evt.data || '{}');
                     if (Array.isArray(payload.suggestions)) {
                         setSuggestions(payload.suggestions);
-                        const embedded = readEmbeddedAttribution(payload.suggestions);
-                        if (embedded) setAttribution(embedded);
                     }
                 } catch (_) {}
             };
@@ -637,8 +619,6 @@ export default function TaskResultPage() {
                 <TopFunctionsPanel topFunctions={topFunctions} status={status} title="热点 TopN" />
             )}
 
-            <AICard attribution={attribution} />
-
             <SuggestionsPanel
                 suggestions={suggestions}
                 bpfHistogram={bpfHistogram}
@@ -668,22 +648,6 @@ export default function TaskResultPage() {
             />
         </div>
     );
-}
-
-function readEmbeddedAttribution(items) {
-    if (!Array.isArray(items)) return null;
-    for (const item of items) {
-        const value = item?.ai_suggestion;
-        if (!value) continue;
-        if (typeof value === 'object') return value;
-        try {
-            const parsed = JSON.parse(value);
-            if (parsed && typeof parsed === 'object') return parsed;
-        } catch (_) {
-            // Historical rows can contain prose rather than structured B3 output.
-        }
-    }
-    return null;
 }
 
 const jobStatusMeta = {
