@@ -194,7 +194,7 @@ test('TopN table labels cumulative and self columns with percentages', () => {
     expect(container.textContent).toContain('累计占比');
     expect(container.textContent).toContain('自身占比');
     expect(container.textContent).toContain('[未解析] postgres');
-	expect(container.textContent).toContain('未解析热点（1 项，自身样本 1，占 25.0%）');
+	expect(container.textContent).toContain('未解析热点（1 项，自身样本 1 samples，占 25.0%）');
 	expect(container.querySelector('details').open).toBe(false);
     expect(container.textContent).toContain('50.0%');
     expect(container.textContent).toContain('25.0%');
