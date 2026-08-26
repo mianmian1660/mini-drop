@@ -45,10 +45,8 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [keyword, setKeyword] = useState('');
     const [status, setStatus] = useState('');
     const [scope, setScope] = useState('');
-    // 默认聚焦当前用户创建的 Session，避免管理员视角下大量已过保留期的
-    // continuous-e2e 历史任务排在前面，让真实业务任务看起来“没有旧数据”。
-    // 需要协作排查时仍可手动切换到“全部创建者”。
-    const [ownerFilter, setOwnerFilter] = useState('mine');
+    // 默认展示整台主机上的全部 Session；需要聚焦个人任务时可手动切换。
+    const [ownerFilter, setOwnerFilter] = useState('all');
     const [stopping, setStopping] = useState('');
     const [cleaning, setCleaning] = useState(false);
     const requestSequence = useRef(0);
@@ -155,7 +153,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 <select style={S.select} value={scope} onChange={event => { setScope(event.target.value); setPage(1); }}><option value="">全部范围</option><option value="host">整机</option><option value="process">进程</option></select>
                 <span style={{ display: 'inline-flex', alignItems: 'center' }}>
                     <select aria-label="持续采集归属筛选" style={S.select} value={ownerFilter} onChange={event => { setOwnerFilter(event.target.value); setPage(1); }}><option value="all">全部创建者</option><option value="mine">我创建的</option></select>
-                    <InfoTooltip label="查看持续采集归属筛选说明">默认只显示当前账号创建的任务，因此可能只有一页。切换到“全部创建者”可查看这台主机上的其他任务和分页。</InfoTooltip>
+                    <InfoTooltip label="查看持续采集归属筛选说明">默认显示这台主机上全部创建者的任务和完整分页；需要聚焦个人任务时可切换到“我创建的”。</InfoTooltip>
                 </span>
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>

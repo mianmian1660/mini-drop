@@ -47,9 +47,8 @@ export default function ScheduleList({ targetIp, detailPrefix, compact = false, 
     const [error, setError] = useState('');
     const [keyword, setKeyword] = useState('');
     const [enabled, setEnabled] = useState('');
-    // 完整列表默认只看本人，避免系统/E2E 账号的计划淹没用户数据；
-    // 主机概览 compact 列表保留全员最近计划，继续反映整台主机的采集活动。
-    const [ownerFilter, setOwnerFilter] = useState(compact ? 'all' : 'mine');
+    // 完整列表和主机概览都默认展示全部创建者的计划。
+    const [ownerFilter, setOwnerFilter] = useState('all');
     const [busySid, setBusySid] = useState('');
     const requestSequence = useRef(0);
 

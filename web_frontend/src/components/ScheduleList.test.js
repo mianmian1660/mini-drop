@@ -55,7 +55,7 @@ test('全局周期列表渲染周期计划，查看链接指向 /schedules/:sid'
     });
     await act(async () => { await Promise.resolve(); });
 
-    expect(schedules.list).toHaveBeenCalledWith(expect.objectContaining({ owner_filter: 'mine' }));
+    expect(schedules.list).toHaveBeenCalledWith(expect.objectContaining({ owner_filter: 'all' }));
 
     // 只展示周期计划（来自 schedules.list），包含名称 / SID / 状态 / cron / 创建者
     expect(container.textContent).toContain('CPU 计划');
@@ -76,7 +76,7 @@ test('全局周期列表渲染周期计划，查看链接指向 /schedules/:sid'
     container.remove();
 });
 
-test('完整列表可从默认本人计划切换到全部创建者', async () => {
+test('完整列表可从默认全部创建者切换到本人计划', async () => {
     schedules.list.mockResolvedValue({ code: 0, data: { schedules: seedSchedules, total: 2 } });
 
     const container = document.createElement('div');
@@ -88,13 +88,13 @@ test('完整列表可从默认本人计划切换到全部创建者', async () =>
     await act(async () => { await Promise.resolve(); });
 
     const ownerSelect = container.querySelector('[aria-label="周期任务归属筛选"]');
-    expect(ownerSelect.value).toBe('mine');
+    expect(ownerSelect.value).toBe('all');
     await act(async () => {
-        Simulate.change(ownerSelect, { target: { value: 'all' } });
+        Simulate.change(ownerSelect, { target: { value: 'mine' } });
     });
     await act(async () => { await Promise.resolve(); });
 
-    expect(schedules.list).toHaveBeenLastCalledWith(expect.objectContaining({ owner_filter: 'all' }));
+    expect(schedules.list).toHaveBeenLastCalledWith(expect.objectContaining({ owner_filter: 'mine' }));
 
     act(() => root.unmount());
     container.remove();
