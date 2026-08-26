@@ -1474,6 +1474,31 @@ func TestTimelineFiltersAndResultMetadata(t *testing.T) {
 	}
 }
 
+func TestTimelineTrendsCountCanceledWindows(t *testing.T) {
+	s := newTestAPIServer(t)
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	fixtures := []model.HotmethodTask{
+		{TID: "tl-canceled", Name: "canceled", MasterTaskTID: "sch-canceled", Status: TaskStatusCanceled, CreateTime: base},
+		{TID: "tl-failed", Name: "failed", MasterTaskTID: "sch-canceled", Status: TaskStatusFailed, CreateTime: base.Add(time.Minute)},
+	}
+	if err := s.DB.Create(&fixtures).Error; err != nil {
+		t.Fatalf("create timeline fixtures: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/v1/tasks/timeline", s.GetTimeline)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/timeline?master_tid=sch-canceled", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("timeline status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"canceled":1`) || !strings.Contains(w.Body.String(), `"failed":1`) {
+		t.Fatalf("timeline trends missing canceled count: %s", w.Body.String())
+	}
+}
+
 func TestOutboxAndPollerCoordinatorBranches(t *testing.T) {
 	s := newTestAPIServer(t)
 	now := time.Now().Add(-time.Minute)

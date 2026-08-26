@@ -167,13 +167,14 @@ test('已取消窗口显示明确状态而不是未知', async () => {
     schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
     tasks.timeline.mockResolvedValue({
         code: 0,
-        data: { points: [{ tid: 't-canceled', name: '取消窗口', status: 5, has_result: false, window_start: '2026-08-22T00:10:00Z' }], trends: null },
+        data: { points: [{ tid: 't-canceled', name: '取消窗口', status: 5, has_result: false, window_start: '2026-08-22T00:10:00Z' }], trends: { total: 1, canceled: 1 } },
     });
 
     const { container, root } = await renderAt('/schedules/sch-1');
 
     expect(container.querySelector('table tbody').textContent).toContain('已取消');
     expect(container.querySelector('table tbody').textContent).not.toContain('未知');
+    expect(container.textContent).toContain('已取消 1');
 
     act(() => root.unmount());
     container.remove();

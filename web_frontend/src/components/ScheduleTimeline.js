@@ -230,6 +230,7 @@ export default function ScheduleTimeline({ sid }) {
                             <span style={S.btnSm}>窗口 {trends.total || 0}</span>
                             <span style={S.btnSm}>成功 {trends.success || 0}</span>
                             <span style={S.btnSm}>失败 {trends.failed || 0}</span>
+                            <span style={S.btnSm}>已取消 {trends.canceled || 0}</span>
                             <span style={S.btnSm}>进行中 {trends.running || 0}</span>
                             <span style={S.btnSm}>有结果 {trends.has_result || 0}</span>
                         </div>

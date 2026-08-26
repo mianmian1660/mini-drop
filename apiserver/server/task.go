@@ -2290,6 +2290,7 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		"total":        len(tasks),
 		"success":      0,
 		"failed":       0,
+		"canceled":     0,
 		"running":      0,
 		"has_result":   0,
 		"by_task_kind": gin.H{},
@@ -2330,6 +2331,8 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			trends["success"] = trends["success"].(int) + 1
 		case TaskStatusFailed:
 			trends["failed"] = trends["failed"].(int) + 1
+		case TaskStatusCanceled:
+			trends["canceled"] = trends["canceled"].(int) + 1
 		case TaskStatusRunning, TaskStatusUploading, TaskStatusCreated:
 			trends["running"] = trends["running"].(int) + 1
 		}
