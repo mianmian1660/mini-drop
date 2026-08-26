@@ -55,6 +55,8 @@ test('全局周期列表渲染周期计划，查看链接指向 /schedules/:sid'
     });
     await act(async () => { await Promise.resolve(); });
 
+    expect(schedules.list).toHaveBeenCalledWith(expect.objectContaining({ owner_filter: 'mine' }));
+
     // 只展示周期计划（来自 schedules.list），包含名称 / SID / 状态 / cron / 创建者
     expect(container.textContent).toContain('CPU 计划');
     expect(container.textContent).toContain('IO 计划');
@@ -69,6 +71,48 @@ test('全局周期列表渲染周期计划，查看链接指向 /schedules/:sid'
     const viewLink = Array.from(container.querySelectorAll('a')).find(a => a.textContent.includes('CPU 计划'));
     expect(viewLink).toBeTruthy();
     expect(viewLink.getAttribute('href')).toBe('/schedules/sch-1');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('完整列表可从默认本人计划切换到全部创建者', async () => {
+    schedules.list.mockResolvedValue({ code: 0, data: { schedules: seedSchedules, total: 2 } });
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ScheduleList detailPrefix="/schedules" />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    const ownerSelect = container.querySelector('[aria-label="周期任务归属筛选"]');
+    expect(ownerSelect.value).toBe('mine');
+    await act(async () => {
+        Simulate.change(ownerSelect, { target: { value: 'all' } });
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(schedules.list).toHaveBeenLastCalledWith(expect.objectContaining({ owner_filter: 'all' }));
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('主机概览 compact 列表保持查看全部创建者', async () => {
+    schedules.list.mockResolvedValue({ code: 0, data: { schedules: [seedSchedules[0]], total: 1 } });
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ScheduleList compact targetIp="1.2.3.4" detailPrefix="/hosts/host-1/schedules" />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(schedules.list).toHaveBeenCalledWith(expect.objectContaining({ owner_filter: 'all' }));
+    expect(container.querySelector('[aria-label="周期任务归属筛选"]')).toBeNull();
 
     act(() => root.unmount());
     container.remove();
