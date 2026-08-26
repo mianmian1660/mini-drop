@@ -106,18 +106,17 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         return () => window.clearInterval(timer);
     }, [load]);
 
-    // 测试任务开关同步到 URL；页码由 setPage 直接写入，避免双向 effect 抢写。
+    // 测试任务开关同步到 URL；页码只在用户翻页时由 setPage 写入。
     useEffect(() => {
         const params = new URLSearchParams(searchParams);
 		let changed = false;
-		if (params.get('cpage') !== String(page)) { params.set('cpage', String(page)); changed = true; }
 		if (showTestSessions) {
 			if (params.get('ctest') !== '1') { params.set('ctest', '1'); changed = true; }
 		} else if (params.has('ctest')) {
 			params.delete('ctest'); changed = true;
 		}
 		if (changed) setSearchParams(params, { replace: true });
-	}, [page, showTestSessions, searchParams, setSearchParams]);
+	}, [showTestSessions, searchParams, setSearchParams]);
 
     const stop = async session => {
         if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
