@@ -8,6 +8,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom';
 import { tasks, cosfiles } from '../api';
 import JavaFlamegraphPanel from '../components/JavaFlamegraphPanel';
+import InfoTooltip from '../components/InfoTooltip';
 import InteractiveFlamegraph, { foldedTextToFlamegraph } from '../components/InteractiveFlamegraph';
 import { collectorLabelFromTask, collectorLabelByKind, parseRequestParams } from '../utils/collectors';
 import createFlamegraphWorker from '../workers/createFlamegraphWorker';
@@ -659,7 +660,7 @@ const jobStatusMeta = {
 };
 
 // 阶段 4：分析版本区域（当前代次 / 历史代次 / 重分析入口）
-function AnalysisVersionPanel({ jobs, activeJobId, selectedJobId, onSelect, canManage, onReanalyze, hasCandidates }) {
+export function AnalysisVersionPanel({ jobs, activeJobId, selectedJobId, onSelect, canManage, onReanalyze, hasCandidates }) {
     const list = Array.isArray(jobs) ? jobs : [];
     if (list.length === 0 && !canManage) return null;
     const active = Number(activeJobId) || null;
@@ -669,7 +670,12 @@ function AnalysisVersionPanel({ jobs, activeJobId, selectedJobId, onSelect, canM
     return (
         <div style={{ ...styles.card, background: '#fbfcfe' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
-                <h3 style={{ ...styles.sectionTitle, margin: 0 }}>分析版本</h3>
+                <h3 style={{ ...styles.sectionTitle, margin: 0 }}>
+                    分析版本
+                    <InfoTooltip label="查看分析版本说明">
+                        每次分析都会生成一个独立版本。人工重分析会新增版本，不会覆盖旧结果；“当前结果”是系统默认展示的最新成功版本，也可以点击其他版本查看历史结果。
+                    </InfoTooltip>
+                </h3>
                 {canManage && hasCandidates && (
                     <button style={{ ...styles.button, ...styles.primaryButton }} onClick={onReanalyze}>
                         重分析

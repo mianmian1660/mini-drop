@@ -7,7 +7,7 @@ TARGET_IP ?= 127.0.0.1
 DURATION ?= 15
 FREQUENCY ?= 99
 
-.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof health test test-drop web-frontend-test coverage e2e verify
+.PHONY: demo demo-cpu demo-ebpf-io demo-ebpf-sched demo-pprof health test test-drop web-frontend-test web-frontend-unit-test web-frontend-coverage coverage e2e verify
 
 health:
 	@echo "[health] API: $(API)"
@@ -76,6 +76,13 @@ test:
 # 按需安装一次；已有依赖时直接复用，保证 make test 在全新 checkout 可用。
 web-frontend-test:
 	cd web_frontend && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npm run build
+
+web-frontend-unit-test:
+	cd web_frontend && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && CI=true npm test -- --watchAll=false --runInBand
+
+# 覆盖率产物写入服务器 /tmp，不污染 Git 工作树。
+web-frontend-coverage:
+	cd web_frontend && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && CI=true npm test -- --watchAll=false --runInBand --coverage --coverageDirectory=/tmp/mini-drop-web-coverage
 
 test-drop:
 	docker build --target test -t mini-drop-drop-tests drop

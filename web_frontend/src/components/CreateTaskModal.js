@@ -141,6 +141,11 @@ const FIELD_TOOLTIPS = {
             目标 Go 应用必须已启用 <code>net/http/pprof</code>。
         </>
     ),
+    'perf_cpu:callgraph': (
+        <>
+            调用图模式决定 perf 如何还原调用栈。fp 开销较低，但要求程序保留帧指针；dwarf 通常能获得更完整的调用栈，但采集开销更高；lbr 依赖 CPU 硬件支持且调用深度有限。一般优先使用 fp，调用栈缺失较多时再选择 dwarf。
+        </>
+    ),
 };
 
 function fieldTooltip(kind, field) {
@@ -424,10 +429,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
         <div style={S.overlay} onClick={onClose}>
             <div style={S.card} onClick={e => e.stopPropagation()}>
                 <div style={S.header}>
-                    <div>
-						<h3 style={S.title}>新建单次采样</h3>
-                        <div style={S.hint}>任务类型与参数由后端 TaskKind 契约加载。</div>
-                    </div>
+                    <h3 style={S.title}>新建单次采样</h3>
                     <button style={S.close} onClick={onClose} disabled={sub} aria-label="关闭">×</button>
                 </div>
 
@@ -514,7 +516,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                 <div style={{ ...S.section, background: f.continuous ? '#e8f0ff' : '#fafafa', border: f.continuous ? '1px solid #4a6cf7' : '1px solid #e0e0e0' }}>
                     <label style={S.chk}>
                         <input type="checkbox" checked={f.continuous} onChange={e => up('continuous', e.target.checked)} />
-                        <span style={{ fontWeight: 'bold', fontSize: 14 }}>周期性深度采样 (Periodic Deep Sampling)</span>
+                        <span style={{ fontWeight: 'bold', fontSize: 14 }}>周期性深度采样</span>
                     </label>
                     {f.continuous && (
                         <div>
@@ -538,7 +540,7 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                                 </span>
                             </div>
 
-                            <label style={S.label}>开始时间<InfoTooltip>选择立即开始，或指定第一次采集的时间；选择过去的时间会尽快开始。</InfoTooltip></label>
+                            <label style={S.label}>开始时间</label>
                             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
                                 <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: 13 }}>
                                     <input type="radio" name="start-mode" checked={f.start_mode === 'now'} onChange={() => up('start_mode', 'now')} />立即开始

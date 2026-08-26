@@ -8,8 +8,10 @@ DEPLOY_BRANCH="${DEPLOY_BRANCH:?DEPLOY_BRANCH required}"
 TARGET_SHA="${TARGET_SHA:?TARGET_SHA required}"
 FETCH_TIMEOUT="${FETCH_TIMEOUT:-60}"
 TEST_SCOPE="${TEST_SCOPE:-full}"
+SERVICE_SCOPE="${SERVICE_SCOPE:-full}"
 LOCK_FILE="${DEPLOY_LOCK_FILE:-/tmp/mini-drop-deploy.lock}"
 HEALTH_URL="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8191}"
+FRONTEND_URL="${DEPLOY_FRONTEND_URL:-http://127.0.0.1}"
 HEALTH_TRIES="${DEPLOY_HEALTH_TRIES:-30}"
 HEALTH_INTERVAL="${DEPLOY_HEALTH_INTERVAL:-2}"
 
@@ -35,6 +37,10 @@ git check-ref-format --branch "${DEPLOY_BRANCH}" >/dev/null 2>&1 \
 case "${TEST_SCOPE}" in
   full|smoke|none) ;;
   *) fail CONFIG "未知 TEST_SCOPE=${TEST_SCOPE}" 2 ;;
+esac
+case "${SERVICE_SCOPE}" in
+  full|frontend) ;;
+  *) fail CONFIG "未知 SERVICE_SCOPE=${SERVICE_SCOPE}" 2 ;;
 esac
 
 command -v flock >/dev/null 2>&1 || fail CONFIG "服务器缺少 flock"
@@ -86,22 +92,6 @@ run_stage() {
   fi
 }
 
-case "${TEST_SCOPE}" in
-  full)
-    run_stage TESTS make test
-    run_stage COVERAGE make coverage
-    ;;
-  smoke)
-    printf '[STAGE:TESTS] SKIP scope=smoke\n'
-    ;;
-  none)
-    printf '[STAGE:TESTS] SKIP scope=none\n'
-    ;;
-esac
-
-run_stage BUILD docker compose build
-run_stage UP docker compose up -d
-
 health_check() {
   local attempt exited
   for attempt in $(seq 1 "${HEALTH_TRIES}"); do
@@ -118,14 +108,80 @@ health_check() {
   return 1
 }
 
-run_stage HEALTH health_check
-run_stage E2E bash scripts/e2e_smoke.sh
-# 阶段四：TEST_SCOPE=full 时在健康检查后运行多语言持续采集 E2E
-# （Native/Go/Java/Node/Python 业务热点、v2 语言状态、runtime 筛选一致性、
-# 窗口幂等）。任何质量门槛失败都使部署失败。
-if [[ "${TEST_SCOPE}" == "full" ]]; then
+frontend_health_check() {
+  local attempt
+  for attempt in $(seq 1 "${HEALTH_TRIES}"); do
+    if curl -fsS "${FRONTEND_URL}/" >/dev/null 2>&1 && \
+       curl -fsS "${HEALTH_URL}/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${HEALTH_INTERVAL}"
+  done
+  return 1
+}
+
+NON_FRONTEND_SERVICES=(drop_agent drop_server apiserver analysis postgres minio pprof_demo)
+snapshot_non_frontend_containers() {
+  local service container_id started_at
+  for service in "${NON_FRONTEND_SERVICES[@]}"; do
+    container_id="$(docker compose ps -q "${service}")"
+    started_at=""
+    if [[ -n "${container_id}" ]]; then
+      started_at="$(docker inspect --format '{{.State.StartedAt}}' "${container_id}")"
+    fi
+    printf '%s=%s|%s\n' "${service}" "${container_id}" "${started_at}"
+  done
+}
+
+verify_non_frontend_unchanged() {
+  local after
+  after="$(snapshot_non_frontend_containers)"
+  if [[ "${NON_FRONTEND_BEFORE}" != "${after}" ]]; then
+    printf '非前端容器在前端部署期间发生变化:\n' >&2
+    diff -u <(printf '%s\n' "${NON_FRONTEND_BEFORE}") <(printf '%s\n' "${after}") >&2 || true
+    return 1
+  fi
+}
+
+if [[ "${SERVICE_SCOPE}" == "frontend" ]]; then
+  case "${TEST_SCOPE}" in
+    full)
+      run_stage TESTS make web-frontend-unit-test
+      run_stage COVERAGE make web-frontend-coverage
+      ;;
+    smoke|none)
+      printf '[STAGE:TESTS] SKIP scope=%s service_scope=frontend\n' "${TEST_SCOPE}"
+      ;;
+  esac
+  NON_FRONTEND_BEFORE="$(snapshot_non_frontend_containers)"
+  run_stage BUILD docker compose build web_frontend
+  run_stage UP docker compose up -d --no-deps web_frontend
+  run_stage HEALTH frontend_health_check
+  run_stage NON_FRONTEND_UNCHANGED verify_non_frontend_unchanged
+  printf '[STAGE:E2E] SKIP service_scope=frontend (avoid creating tasks or restarting Agent)\n'
+  printf '[STAGE:E2E_MULTILANG] SKIP service_scope=frontend\n'
+else
+  case "${TEST_SCOPE}" in
+    full)
+      run_stage TESTS make test
+      run_stage COVERAGE make coverage
+      ;;
+    smoke)
+      printf '[STAGE:TESTS] SKIP scope=smoke\n'
+      ;;
+    none)
+      printf '[STAGE:TESTS] SKIP scope=none\n'
+      ;;
+  esac
+
+  run_stage BUILD docker compose build
+  run_stage UP docker compose up -d
+  run_stage HEALTH health_check
+  run_stage E2E bash scripts/e2e_smoke.sh
   # full 验收同时验证 Agent 容器重建后的 Session 原地恢复。
-  run_stage E2E_MULTILANG env RESTART_AGENT=1 bash scripts/continuous_process_multilang_e2e.sh
+  if [[ "${TEST_SCOPE}" == "full" ]]; then
+    run_stage E2E_MULTILANG env RESTART_AGENT=1 bash scripts/continuous_process_multilang_e2e.sh
+  fi
 fi
 check_clean_tree
 printf '[STAGE:ALL] PASS branch=%s sha=%s\n' "${DEPLOY_BRANCH}" "${TARGET_SHA:0:12}"

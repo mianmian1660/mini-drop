@@ -81,9 +81,30 @@ test('周期模式不渲染 Cron 输入，展示间隔预设与下一次采集�
     expect(container.textContent).toContain('每 30 分钟');
     expect(container.textContent).toContain('立即开始');
     expect(container.textContent).toContain('指定时间');
+    expect(container.textContent).not.toContain('Periodic Deep Sampling');
+    expect(container.textContent).not.toContain('任务类型与参数由后端 TaskKind 契约加载');
+    const startLabel = Array.from(container.querySelectorAll('label')).find(label => label.textContent === '开始时间');
+    expect(startLabel?.querySelector('button')).toBeNull();
     // 默认每 5 分钟 → 下一次采集预估
     expect(container.textContent).toMatch(/下一次采集/);
     expect(container.textContent).toContain('每 5 分钟');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('perf 调用图模式展示 fp、dwarf 和 lbr 说明', async () => {
+    const { container, root } = await renderModal();
+    const callgraphLabel = Array.from(container.querySelectorAll('label'))
+        .find(label => label.textContent.includes('调用栈模式'));
+    const tooltipButton = callgraphLabel?.querySelector('button[aria-label="查看说明"]');
+
+    expect(tooltipButton).not.toBeNull();
+    act(() => Simulate.mouseEnter(tooltipButton));
+    const tooltip = container.querySelector('[role="tooltip"]');
+    expect(tooltip.textContent).toContain('fp');
+    expect(tooltip.textContent).toContain('dwarf');
+    expect(tooltip.textContent).toContain('lbr');
 
     act(() => root.unmount());
     container.remove();

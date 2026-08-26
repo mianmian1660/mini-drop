@@ -8,6 +8,7 @@ REMOTE_EXECUTOR="${ROOT}/scripts/deploy_remote.sh"
 SSH_CMD="${DEPLOY_SSH_CMD:-${SYNC_SSH_CMD:-ssh}}"
 FETCH_TIMEOUT="${DEPLOY_FETCH_TIMEOUT:-${SYNC_FETCH_TIMEOUT:-60}}"
 TEST_SCOPE="${DEPLOY_TEST_SCOPE:-full}"
+SERVICE_SCOPE="${DEPLOY_SERVICE_SCOPE:-full}"
 
 die() {
   printf '[STAGE:%s] FAIL %s\n' "$1" "$2" >&2
@@ -34,6 +35,10 @@ case "${TEST_SCOPE}" in
   full|smoke|none) ;;
   *) die CONFIG "未知 DEPLOY_TEST_SCOPE=${TEST_SCOPE}" 2 ;;
 esac
+case "${SERVICE_SCOPE}" in
+  full|frontend) ;;
+  *) die CONFIG "未知 DEPLOY_SERVICE_SCOPE=${SERVICE_SCOPE}" 2 ;;
+esac
 
 [[ -n "${REMOTE_HOST}" ]] || die CONFIG "请在 sync.env 中设置 SYNC_REMOTE_HOST"
 [[ -f "${REMOTE_EXECUTOR}" ]] || die CONFIG "缺少 ${REMOTE_EXECUTOR}"
@@ -56,10 +61,11 @@ TARGET_SHA="${REMOTE_LINE%%[[:space:]]*}"
   || die REMOTE_BRANCH "无法解析 origin/${DEPLOY_BRANCH} 的 SHA"
 
 printf '==> 部署 origin/%s @ %s\n' "${DEPLOY_BRANCH}" "${TARGET_SHA:0:12}"
-printf '==> 目标服务器: %s:%s，测试范围: %s\n' "${REMOTE_HOST}" "${REMOTE_PATH}" "${TEST_SCOPE}"
+printf '==> 目标服务器: %s:%s，测试范围: %s，服务范围: %s\n' \
+  "${REMOTE_HOST}" "${REMOTE_PATH}" "${TEST_SCOPE}" "${SERVICE_SCOPE}"
 
-REMOTE_ENV="$(printf 'REMOTE_PATH=%q DEPLOY_BRANCH=%q TARGET_SHA=%q FETCH_TIMEOUT=%q TEST_SCOPE=%q' \
-  "${REMOTE_PATH}" "${DEPLOY_BRANCH}" "${TARGET_SHA}" "${FETCH_TIMEOUT}" "${TEST_SCOPE}")"
+REMOTE_ENV="$(printf 'REMOTE_PATH=%q DEPLOY_BRANCH=%q TARGET_SHA=%q FETCH_TIMEOUT=%q TEST_SCOPE=%q SERVICE_SCOPE=%q' \
+  "${REMOTE_PATH}" "${DEPLOY_BRANCH}" "${TARGET_SHA}" "${FETCH_TIMEOUT}" "${TEST_SCOPE}" "${SERVICE_SCOPE}")"
 
 "${SSH_CMD}" "${REMOTE_HOST}" "${REMOTE_ENV} bash -s" < "${REMOTE_EXECUTOR}" \
   || die DEPLOY "origin/${DEPLOY_BRANCH}@${TARGET_SHA:0:12} 部署失败"

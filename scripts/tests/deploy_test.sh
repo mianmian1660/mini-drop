@@ -27,6 +27,8 @@ new_sandbox() {
   SERVER_REPO="${SB}/server"
   SHIMS="${SB}/shims"
   LOCK_FILE="${SB}/deploy.lock"
+  DOCKER_LOG="${SB}/docker.log"
+  DOCKER_STATE="${SB}/docker.state"
   mkdir -p "${SB}" "${SHIMS}"
 
   git init --quiet --bare -b main "${ORIGIN}"
@@ -68,8 +70,30 @@ exit 0
 SHIM
   cat > "${SHIMS}/docker" <<'SHIM'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${DEPLOY_DOCKER_LOG}"
+if [[ "$*" == "compose ps -q "* ]]; then
+  service="${!#}"
+  if [[ "${MUTATE_NON_FRONTEND:-}" == "1" && -f "${DEPLOY_DOCKER_STATE}" && "${service}" == "drop_agent" ]]; then
+    printf 'container-%s-changed\n' "${service}"
+  else
+    printf 'container-%s\n' "${service}"
+  fi
+  exit 0
+fi
+if [[ "$1" == "inspect" && "$2" == "--format" ]]; then
+  container_id="${!#}"
+  if [[ "${MUTATE_NON_FRONTEND_START:-}" == "1" && -f "${DEPLOY_DOCKER_STATE}" && "${container_id}" == "container-drop_agent" ]]; then
+    printf '2026-08-27T00:01:00Z\n'
+  else
+    printf '2026-08-27T00:00:00Z\n'
+  fi
+  exit 0
+fi
 if [[ "${FAIL_AT:-}" == BUILD && "$*" == *"compose build"* ]]; then exit 90; fi
 if [[ "${FAIL_AT:-}" == UP && "$*" == *"compose up"* ]]; then exit 91; fi
+if [[ ( "${MUTATE_NON_FRONTEND:-}" == "1" || "${MUTATE_NON_FRONTEND_START:-}" == "1" ) && "$*" == "compose up -d --no-deps web_frontend" ]]; then
+  : > "${DEPLOY_DOCKER_STATE}"
+fi
 exit 0
 SHIM
   cat > "${SHIMS}/curl" <<'SHIM'
@@ -86,6 +110,8 @@ SHIM
   export DEPLOY_REMOTE_HOST="fake@server"
   export DEPLOY_REMOTE_PATH="${SERVER_REPO}"
   export DEPLOY_LOCK_FILE="${LOCK_FILE}"
+  export DEPLOY_DOCKER_LOG="${DOCKER_LOG}"
+  export DEPLOY_DOCKER_STATE="${DOCKER_STATE}"
   export DEPLOY_HEALTH_TRIES=2
   export DEPLOY_HEALTH_INTERVAL=0
   export DEPLOY_FETCH_TIMEOUT=10
@@ -122,6 +148,9 @@ printf '== 任意远程分支部署测试 ==\n'
 new_sandbox switch
 run_deploy main DEPLOY_TEST_SCOPE=none
 expect_success "同分支快进 main"
+grep -qx 'compose build' "${DOCKER_LOG}" && grep -qx 'compose up -d' "${DOCKER_LOG}" \
+  && ok "默认 full 范围保持完整 Compose 构建与启动" \
+  || bad "默认 full 范围命令发生变化" "$(cat "${DOCKER_LOG}")"
 [[ "$(git -C "${SERVER_REPO}" rev-parse HEAD)" == "$(git --git-dir="${ORIGIN}" rev-parse refs/heads/main)" ]] \
   && ok "服务器 main 精确等于 origin/main" || bad "main SHA 不一致" "${OUT}"
 run_deploy feature/example DEPLOY_TEST_SCOPE=none
@@ -156,10 +185,33 @@ new_sandbox health_failure
 run_deploy main DEPLOY_TEST_SCOPE=none FAIL_AT=HEALTH
 expect_failure HEALTH "健康检查失败被报告"
 
+new_sandbox frontend
+run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=frontend
+expect_success "前端独立部署成功"
+grep -qx 'compose build web_frontend' "${DOCKER_LOG}" \
+  && grep -qx 'compose up -d --no-deps web_frontend' "${DOCKER_LOG}" \
+  && ! grep -qx 'compose build' "${DOCKER_LOG}" \
+  && ! grep -qx 'compose up -d' "${DOCKER_LOG}" \
+  && ok "前端范围仅构建和更新 web_frontend" \
+  || bad "前端范围触发了其他 Compose 命令" "$(cat "${DOCKER_LOG}")"
+grep -q '\[STAGE:E2E_MULTILANG\] SKIP service_scope=frontend' <<<"${OUT}" \
+  && ok "前端范围跳过重启 Agent 的多语言 E2E" \
+  || bad "前端范围未明确跳过多语言 E2E" "${OUT}"
+
+new_sandbox frontend_container_changed
+run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=frontend MUTATE_NON_FRONTEND=1
+expect_failure NON_FRONTEND_UNCHANGED "非前端容器变化会使前端部署失败"
+
+new_sandbox frontend_container_restarted
+run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=frontend MUTATE_NON_FRONTEND_START=1
+expect_failure NON_FRONTEND_UNCHANGED "非前端容器启动时间变化会使前端部署失败"
+
 new_sandbox invalid
 OUT="$(cd "${LOCAL_REPO}" && ./deploy.sh 'bad..branch' 2>&1)"
 RC=$?
 expect_failure CONFIG "非法分支名被拒绝"
+run_deploy main DEPLOY_SERVICE_SCOPE=backend
+expect_failure CONFIG "非法服务范围被拒绝"
 
 printf '结果: PASS=%d FAIL=%d\n' "${PASS}" "${FAIL}"
 (( FAIL == 0 ))

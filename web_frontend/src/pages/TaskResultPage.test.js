@@ -10,7 +10,7 @@ jest.mock('../components/InteractiveFlamegraph', () => ({
 }));
 jest.mock('../components/JavaFlamegraphPanel', () => () => null);
 
-import { ArtifactsPanel, buildStages } from './TaskResultPage';
+import { AnalysisVersionPanel, ArtifactsPanel, buildStages } from './TaskResultPage';
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -86,4 +86,26 @@ test('分析失败不会被阶段条标成成功', () => {
     expect(success.state).toBe('pending');
     expect(failed.state).toBe('failed');
     expect(failed.detail).toBe('分析失败');
+});
+
+test('分析版本提示支持鼠标和键盘查看', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(
+        <AnalysisVersionPanel jobs={[]} canManage={true} hasCandidates={false} />
+    ));
+
+    const button = container.querySelector('button[aria-label="查看分析版本说明"]');
+    expect(button).not.toBeNull();
+    act(() => Simulate.mouseEnter(button));
+    expect(container.querySelector('[role="tooltip"]')?.textContent).toContain('人工重分析会新增版本');
+    act(() => Simulate.mouseLeave(button));
+    expect(container.querySelector('[role="tooltip"]')).toBeNull();
+
+    act(() => Simulate.focus(button));
+    expect(container.querySelector('[role="tooltip"]')?.textContent).toContain('最新成功版本');
+
+    act(() => root.unmount());
+    container.remove();
 });
