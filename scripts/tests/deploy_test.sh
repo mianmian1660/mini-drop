@@ -75,6 +75,8 @@ if [[ "$*" == "compose ps -q "* ]]; then
   service="${!#}"
   if [[ "${MUTATE_NON_FRONTEND:-}" == "1" && -f "${DEPLOY_DOCKER_STATE}" && "${service}" == "drop_agent" ]]; then
     printf 'container-%s-changed\n' "${service}"
+  elif [[ "${MUTATE_NON_AGENT:-}" == "1" && -f "${DEPLOY_DOCKER_STATE}" && "${service}" == "drop_server" ]]; then
+    printf 'container-%s-changed\n' "${service}"
   else
     printf 'container-%s\n' "${service}"
   fi
@@ -92,6 +94,9 @@ fi
 if [[ "${FAIL_AT:-}" == BUILD && "$*" == *"compose build"* ]]; then exit 90; fi
 if [[ "${FAIL_AT:-}" == UP && "$*" == *"compose up"* ]]; then exit 91; fi
 if [[ ( "${MUTATE_NON_FRONTEND:-}" == "1" || "${MUTATE_NON_FRONTEND_START:-}" == "1" ) && "$*" == "compose up -d --no-deps web_frontend" ]]; then
+  : > "${DEPLOY_DOCKER_STATE}"
+fi
+if [[ "${MUTATE_NON_AGENT:-}" == "1" && "$*" == "compose up -d --no-deps drop_agent" ]]; then
   : > "${DEPLOY_DOCKER_STATE}"
 fi
 exit 0
@@ -205,6 +210,23 @@ expect_failure NON_FRONTEND_UNCHANGED "非前端容器变化会使前端部署�
 new_sandbox frontend_container_restarted
 run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=frontend MUTATE_NON_FRONTEND_START=1
 expect_failure NON_FRONTEND_UNCHANGED "非前端容器启动时间变化会使前端部署失败"
+
+new_sandbox agent
+run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=agent
+expect_success "Agent 独立部署成功"
+grep -qx 'compose build drop_agent' "${DOCKER_LOG}" \
+  && grep -qx 'compose up -d --no-deps drop_agent' "${DOCKER_LOG}" \
+  && ! grep -qx 'compose build' "${DOCKER_LOG}" \
+  && ! grep -qx 'compose up -d' "${DOCKER_LOG}" \
+  && ok "Agent 范围仅构建和更新 drop_agent" \
+  || bad "Agent 范围触发了其他 Compose 命令" "$(cat "${DOCKER_LOG}")"
+grep -q '\[STAGE:E2E_MULTILANG\] SKIP service_scope=agent' <<<"${OUT}" \
+  && ok "Agent 范围跳过会创建任务的多语言 E2E" \
+  || bad "Agent 范围未明确跳过多语言 E2E" "${OUT}"
+
+new_sandbox agent_container_changed
+run_deploy main DEPLOY_TEST_SCOPE=none DEPLOY_SERVICE_SCOPE=agent MUTATE_NON_AGENT=1
+expect_failure NON_AGENT_UNCHANGED "非 Agent 容器变化会使 Agent 部署失败"
 
 new_sandbox invalid
 OUT="$(cd "${LOCAL_REPO}" && ./deploy.sh 'bad..branch' 2>&1)"

@@ -10,6 +10,11 @@
 #include <string>
 #include <cstdint>
 
+namespace common
+{
+    class File;
+}
+
 namespace drop_agent
 {
 
@@ -31,5 +36,10 @@ namespace drop_agent
 
     /// 读取字符串型环境变量，未设置或为空时返回 fallback
     std::string EnvString(const char *name, const std::string &fallback = "");
+
+    /// 对象存储上传成功后，gRPC 完成通知只传文件元数据，不重复内嵌产物内容。
+    void SetUploadedArtifactMetadata(common::File &file,
+                                     const std::string &name,
+                                     int64_t size);
 
 } // namespace drop_agent

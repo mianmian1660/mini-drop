@@ -39,7 +39,7 @@ case "${TEST_SCOPE}" in
   *) fail CONFIG "未知 TEST_SCOPE=${TEST_SCOPE}" 2 ;;
 esac
 case "${SERVICE_SCOPE}" in
-  full|frontend) ;;
+  full|frontend|agent) ;;
   *) fail CONFIG "未知 SERVICE_SCOPE=${SERVICE_SCOPE}" 2 ;;
 esac
 
@@ -143,6 +143,29 @@ verify_non_frontend_unchanged() {
   fi
 }
 
+NON_AGENT_SERVICES=(drop_server apiserver analysis postgres minio pprof_demo web_frontend)
+snapshot_non_agent_containers() {
+  local service container_id started_at
+  for service in "${NON_AGENT_SERVICES[@]}"; do
+    container_id="$(docker compose ps -q "${service}")"
+    started_at=""
+    if [[ -n "${container_id}" ]]; then
+      started_at="$(docker inspect --format '{{.State.StartedAt}}' "${container_id}")"
+    fi
+    printf '%s=%s|%s\n' "${service}" "${container_id}" "${started_at}"
+  done
+}
+
+verify_non_agent_unchanged() {
+  local after
+  after="$(snapshot_non_agent_containers)"
+  if [[ "${NON_AGENT_BEFORE}" != "${after}" ]]; then
+    printf '非 Agent 容器在 Agent 部署期间发生变化:\n' >&2
+    diff -u <(printf '%s\n' "${NON_AGENT_BEFORE}") <(printf '%s\n' "${after}") >&2 || true
+    return 1
+  fi
+}
+
 if [[ "${SERVICE_SCOPE}" == "frontend" ]]; then
   case "${TEST_SCOPE}" in
     full)
@@ -160,6 +183,23 @@ if [[ "${SERVICE_SCOPE}" == "frontend" ]]; then
   run_stage NON_FRONTEND_UNCHANGED verify_non_frontend_unchanged
   printf '[STAGE:E2E] SKIP service_scope=frontend (avoid creating tasks or restarting Agent)\n'
   printf '[STAGE:E2E_MULTILANG] SKIP service_scope=frontend\n'
+elif [[ "${SERVICE_SCOPE}" == "agent" ]]; then
+  case "${TEST_SCOPE}" in
+    full)
+      run_stage TESTS make test
+      run_stage COVERAGE make coverage
+      ;;
+    smoke|none)
+      printf '[STAGE:TESTS] SKIP scope=%s service_scope=agent\n' "${TEST_SCOPE}"
+      ;;
+  esac
+  NON_AGENT_BEFORE="$(snapshot_non_agent_containers)"
+  run_stage BUILD docker compose build drop_agent
+  run_stage UP docker compose up -d --no-deps drop_agent
+  run_stage HEALTH health_check
+  run_stage NON_AGENT_UNCHANGED verify_non_agent_unchanged
+  printf '[STAGE:E2E] SKIP service_scope=agent (avoid creating demo tasks)\n'
+  printf '[STAGE:E2E_MULTILANG] SKIP service_scope=agent\n'
 else
   case "${TEST_SCOPE}" in
     full)

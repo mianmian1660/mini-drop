@@ -1,4 +1,5 @@
 #include "agent/AgentUtils.h"
+#include "common/proto/common.pb.h"
 
 #include <cstdlib>
 #include <algorithm>
@@ -81,6 +82,13 @@ namespace drop_agent
         if (v && *v)
             return v;
         return fallback;
+    }
+
+    void SetUploadedArtifactMetadata(common::File &file, const string &name, int64_t size)
+    {
+        file.set_name(name);
+        file.clear_content();
+        file.set_size(size);
     }
 
 } // namespace drop_agent

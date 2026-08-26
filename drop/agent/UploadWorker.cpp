@@ -333,8 +333,8 @@ namespace drop_agent
             if (outcome.resultCode == 0 || outcome.partial)
             {
                 string actualPath = outcome.outputPath;
-                string fileContent = drop::read_file_content(actualPath);
-                if (!fileContent.empty())
+                int64_t artifactSize = FileSize(actualPath);
+                if (artifactSize > 0)
                 {
                     string fileName = actualPath;
                     size_t slashPos = fileName.rfind('/');
@@ -393,16 +393,16 @@ namespace drop_agent
                         taskResult.set_error_code("ARTIFACT_UPLOAD_FAILED");
                         taskResult.set_partial(true);
                     }
-                    taskResult.set_artifact_size(FileSize(actualPath));
+                    taskResult.set_artifact_size(artifactSize);
                     taskResult.set_artifact_sha256(sha256);
 
+                    // 原始产物已经上传到对象存储，完成通知只携带定位和校验元数据。
+                    // 不再把 perf.data 重复塞进 gRPC，避免超过默认 4 MiB 消息上限。
                     auto *file = taskResult.mutable_file();
-                    file->set_name(fileName);
-                    file->set_content(fileContent);
-                    file->set_size(fileContent.size());
+                    SetUploadedArtifactMetadata(*file, fileName, artifactSize);
                     cout << "[agent] 采集成功，采集器=" << outcome.profilerName
                          << " 文件=" << fileName
-                         << " 大小=" << fileContent.size() << " bytes" << endl;
+                         << " 大小=" << artifactSize << " bytes" << endl;
                 }
                 else
                 {

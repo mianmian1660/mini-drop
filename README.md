@@ -340,6 +340,7 @@ make verify
 - 服务器参数保存在本地 `sync.env`（`SYNC_REMOTE_HOST` / `SYNC_REMOTE_PATH`，不入库）；服务器 Git 禁止 commit/push。
 - 可用环境变量：`DEPLOY_TEST_SCOPE=full|smoke|none` 控制测试范围；模拟测试见 `bash scripts/tests/deploy_test.sh`。
 - `DEPLOY_SERVICE_SCOPE=frontend` 用于受控的纯前端发布：服务器仅执行前端测试、覆盖率、构建和 `docker compose up -d --no-deps web_frontend`，并校验所有非前端容器 ID 与启动时间不变；默认 `full` 行为不变。
+- `DEPLOY_SERVICE_SCOPE=agent` 用于受控的 Agent 发布：服务器执行完整测试和覆盖率后，仅构建并更新 `drop_agent`，校验其他容器 ID 与启动时间不变，并跳过会创建采样任务的 E2E。
 - `sync.sh` 仅为兼容旧命令的转发入口，也必须显式传入分支；推荐统一使用 `deploy.sh`。
 
 ## 安全、可观测性与部署

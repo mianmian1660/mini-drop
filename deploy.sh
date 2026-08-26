@@ -36,7 +36,7 @@ case "${TEST_SCOPE}" in
   *) die CONFIG "未知 DEPLOY_TEST_SCOPE=${TEST_SCOPE}" 2 ;;
 esac
 case "${SERVICE_SCOPE}" in
-  full|frontend) ;;
+  full|frontend|agent) ;;
   *) die CONFIG "未知 DEPLOY_SERVICE_SCOPE=${SERVICE_SCOPE}" 2 ;;
 esac
 
