@@ -144,6 +144,12 @@ func normalizeTreeToPercent(node *continuousTreeNode, total float64) {
 // 409 返回给前端，引导退回表格 diff 视图。
 func (s *APIServer) buildTaskDiffFlamegraph(baselineTask, compareTask *model.HotmethodTask, maxNodes int) (ProfileDiffFlamegraph, string) {
 	reasonFor := func(t *model.HotmethodTask) string {
+		if t.AnalysisStatus == 3 {
+			return "分析失败，无法生成差分火焰图"
+		}
+		if t.AnalysisStatus < 2 {
+			return "分析尚未完成，无法生成差分火焰图"
+		}
 		if t.ProfilerType == ProfilerBPF {
 			return "eBPF 直方图任务产出的是延迟分布而非调用栈，无法做火焰图对比"
 		}

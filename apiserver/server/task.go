@@ -2554,7 +2554,9 @@ func (s *APIServer) GetTaskDiff(c *gin.Context) {
 			return top, true
 		}
 		reason := "没有可对比的热点函数产物（top.json）"
-		if t.AnalysisStatus < 2 {
+		if t.AnalysisStatus == 3 {
+			reason = "分析失败，无法生成热点函数对比"
+		} else if t.AnalysisStatus < 2 {
 			reason = "分析尚未完成（analysis_status=" + strconv.Itoa(t.AnalysisStatus) + "）"
 		} else if t.ProfilerType == ProfilerBPF {
 			reason = "eBPF 直方图任务产出的是延迟分布而非函数列表，无法做热点对比"
