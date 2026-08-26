@@ -135,14 +135,13 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     // Keep legacy links/query state on the supported CPU view.
     const [profileType, setProfileType] = useState('cpu');
     const [signalTab, setSignalTab] = useState('cpu');
-    const [stackScope, setStackScope] = useState(() => initialQuery?.stackScope || 'all');
+    const [stackScope] = useState(() => initialQuery?.stackScope || 'all');
     const [flamegraph, setFlamegraph] = useState(null);
     const [topn, setTopn] = useState(null);
     const [histogram, setHistogram] = useState(null);
     const [querying, setQuerying] = useState(false);
     const [error, setError] = useState('');
     const [reliability, setReliability] = useState(null);
-    const [resetKey, setResetKey] = useState(0);
     const [scope, setScope] = useState('host');
     const [selectedComm, setSelectedComm] = useState(() => String(initialFilters.comm || ''));
 	const [selectedInstance, setSelectedInstance] = useState('');
@@ -195,8 +194,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         const parsed = fixedSession?.stopped_at ? new Date(fixedSession.stopped_at) : new Date();
         return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
     }, [fixedSession?.stopped_at]);
-    const targetProfileURL = target?.profile_url || '';
-    const profileURL = flamegraph?.profile_url || topn?.profile_url || targetProfileURL;
     const hasFlamegraph = flamegraph && !flamegraph.empty && Array.isArray(flamegraph.nodes) && flamegraph.nodes.length > 0;
 	const sampleState = sampleStateForTarget(target, flamegraph, topn, fixedSession);
 	const sessionMeta = continuousSessionMeta(target, fixedSession);
@@ -709,8 +706,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                         <p style={S.subtitle}>{targetTitle} · {targetService}</p>
                     </div>
                     <div style={S.actions}>
-                        {profileURL && <a href={profileURL} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Profile</a>}
-                        <button style={S.btnSecondary} onClick={() => setResetKey(v => v + 1)} disabled={!hasFlamegraph}>重置缩放</button>
                         <button style={S.btn} onClick={refresh} disabled={querying}>{querying ? '刷新中' : '刷新'}</button>
                     </div>
                 </div>
@@ -763,15 +758,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                             ))}
                         </span>
                     </Field>
-                    {signalTab === 'cpu' && (
-                        <Field label="栈视图">
-                            <span style={S.segmented}>
-                                <button type="button" style={S.segment(stackScope === 'all')} onClick={() => setStackScope('all')}>混合栈</button>
-                                <button type="button" style={S.segment(stackScope === 'user')} onClick={() => setStackScope('user')}>用户栈</button>
-                                <button type="button" style={{ ...S.segment(stackScope === 'kernel'), borderRight: 'none' }} onClick={() => setStackScope('kernel')}>内核栈</button>
-                            </span>
-                        </Field>
-                    )}
 					{taskScope === 'host' && <Field label="查询范围">
 						<span style={S.segmented}>
 							<button type="button" style={S.segment(scope === 'host')} onClick={() => setScope('host')}>全部进程</button>
@@ -886,11 +872,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     </div>
                 </div>
                 <InteractiveFlamegraph
-                    key={resetKey}
                     data={flamegraphView}
                     loading={querying}
-                    externalUrl={profileURL}
-                    externalLabel="打开 Profile"
                     filterText={activeFilterText}
                     emptyMessage={emptyProfileMessage}
                     loadingMessage="正在查询 Native profiling..."
@@ -921,7 +904,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <h3 style={S.title}>热点 TopN</h3>
                     <span style={S.subtle}>{topn?.items?.length || 0} 个函数 · {profileUnitLabel(topn?.unit || unit)}</span>
                 </div>
-                <TopNTable data={topn} loading={querying} profileURL={profileURL} filterText={activeFilterText} emptyMessage={emptyProfileMessage} />
+                <TopNTable data={topn} loading={querying} filterText={activeFilterText} emptyMessage={emptyProfileMessage} />
                 {topn?.truncated && (
                     <div style={{ ...S.warn, marginTop: 8 }}>
                         TopN 结果超过 {maxNodes} 条上限，已截断展示。
@@ -1822,11 +1805,11 @@ function LabelChips({ target }) {
     );
 }
 
-export function TopNTable({ data, loading, profileURL, filterText = '', emptyMessage = '' }) {
+export function TopNTable({ data, loading, filterText = '', emptyMessage = '' }) {
     if (loading && !data) return <div style={S.empty}>正在查询 TopN...</div>;
     const items = data?.items || [];
     if (data?.empty || items.length === 0) {
-        return <ProfileEmpty message={emptyMessage || data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} url={data?.profile_url || profileURL} />;
+        return <ProfileEmpty message={emptyMessage || data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} />;
     }
     // samples 口径下把列头明确写成"累计/自身样本数"并给出悬浮说明，避免两列
     // 都叫 Samples 让人看不出差异（累计=含子调用，自身=栈顶）。
@@ -1893,11 +1876,10 @@ function TopNItemsTable({ data, items, cumLabel, selfLabel, unresolved = false }
 		</div>;
 }
 
-function ProfileEmpty({ message, url }) {
+function ProfileEmpty({ message }) {
     return (
         <div style={S.empty}>
             <div style={{ fontWeight: 700, color: '#475467', marginBottom: 6 }}>{message}</div>
-            {url && <a href={url} target="_blank" rel="noreferrer" style={S.btnSecondary}>打开 Profile</a>}
         </div>
     );
 }
@@ -1930,7 +1912,7 @@ export function HistogramPanel({ data, loading, title, targetIP, signal, timeWin
                 <span style={S.subtle}>总事件 {formatEventCount(data?.event_count || 0)}</span>
             </div>
             {data?.empty || buckets.length === 0 ? (
-                <ProfileEmpty message={data?.message || `${title} 暂无 histogram 样本`} url={data?.profile_url} />
+                <ProfileEmpty message={data?.message || `${title} 暂无 histogram 样本`} />
             ) : (
                 <>
                     <div style={S.summaryGrid}>

@@ -592,8 +592,6 @@ export default function TaskResultPage() {
                 </div>
             </div>
 
-            <StatusEventsPanel events={statusEvents} />
-
             <div style={styles.card}>
                 <h3 style={styles.sectionTitle}>{isBpfHistogramTask ? 'eBPF 直方图' : isBpfCpuTask ? 'eBPF CPU 火焰图' : isJavaTask ? 'Java 火焰图' : isPprofHeapTask ? 'Go pprof Heap 火焰图' : isPprofTask ? 'Go pprof CPU 调用图' : '火焰图'}</h3>
                 <VisualResult
@@ -986,42 +984,6 @@ function ResultStatePanel({ task, files, artifact, foldedArtifact }) {
                     <span style={styles.paramValue}>{value}</span>
                 </div>
             ))}
-        </div>
-    );
-}
-
-function StatusEventsPanel({ events }) {
-    return (
-        <div style={styles.card}>
-            <h3 style={styles.sectionTitle}>状态迁移 Reason</h3>
-            {events.length > 0 ? (
-                <div className="table-scroll">
-                    <table style={styles.table}>
-                        <thead>
-                            <tr>
-                                <th style={styles.th}>时间</th>
-                                <th style={styles.th}>迁移</th>
-                                <th style={styles.th}>来源</th>
-                                <th style={styles.th}>Reason</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {events.map(event => (
-                                <tr key={event.id}>
-                                    <td style={styles.td}>{formatTime(event.created_at)}</td>
-                                    <td style={styles.td}>{statusLabel(event.from_status)} -> {statusLabel(event.to_status)}</td>
-                                    <td style={styles.td}>{safeText(event.source || event.source_module) || '-'}</td>
-                                    <td style={styles.td}>{safeText(event.reason) || '-'}</td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                </div>
-            ) : (
-                <p style={{ textAlign: 'center', padding: 24, color: '#667085', margin: 0 }}>
-                    旧任务暂无迁移审计；新建任务会记录每次状态变化及 reason。
-                </p>
-            )}
         </div>
     );
 }
@@ -1503,18 +1465,6 @@ function isActiveTaskStatus(status) {
 
 function isFinalTaskStatus(status) {
     return status === 2 || status === 3 || status === 5;
-}
-
-function statusLabel(status) {
-    const n = Number(status);
-    if (n < 0) return 'INIT';
-    if (n === 0) return 'PENDING';
-    if (n === 1) return 'RUNNING';
-    if (n === 2) return 'DONE';
-    if (n === 3) return 'FAILED';
-    if (n === 4) return 'UPLOADING';
-    if (n === 5) return 'CANCELED';
-    return String(status);
 }
 
 function resolveUrl(url) {
