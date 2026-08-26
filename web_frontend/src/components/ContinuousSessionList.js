@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { continuous } from '../api';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel, signalLabel } from '../utils/continuous';
 import InfoTooltip from './InfoTooltip';
@@ -32,14 +32,20 @@ const S = {
     pagination: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 },
     pageButton: { height: 32, padding: '0 10px', color: '#315efb', background: '#fff', border: '1px solid #c7d2fe', borderRadius: 6, fontWeight: 700, cursor: 'pointer' },
     pageButtonDisabled: { color: '#98a2b3', background: '#f8fafc', border: '1px solid #e5e7eb', cursor: 'not-allowed' },
+    jumpInput: { width: 52, height: 32, padding: '0 8px', border: '1px solid #d0d5dd', borderRadius: 6, background: '#fff', fontSize: 13, textAlign: 'center', boxSizing: 'border-box' },
 };
 
 const PAGE_SIZE = 20;
 
 export default function ContinuousSessionList({ target, refreshToken = 0 }) {
+    const [searchParams, setSearchParams] = useSearchParams();
     const [sessions, setSessions] = useState([]);
     const [total, setTotal] = useState(0);
-    const [page, setPage] = useState(1);
+    // 页码初始值从 URL 的 cpage 读取，刷新后仍停留在原页。
+    const [page, setPage] = useState(() => {
+        const raw = Number(searchParams.get('cpage'));
+        return Number.isInteger(raw) && raw >= 1 ? raw : 1;
+    });
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [keyword, setKeyword] = useState('');
@@ -49,6 +55,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const [ownerFilter, setOwnerFilter] = useState('all');
     const [stopping, setStopping] = useState('');
     const [cleaning, setCleaning] = useState(false);
+    const [jumpInput, setJumpInput] = useState('');
     const requestSequence = useRef(0);
 
     const load = useCallback(async (silent = false) => {
@@ -88,6 +95,15 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
         const timer = window.setInterval(() => load(true), 5000);
         return () => window.clearInterval(timer);
     }, [load]);
+
+    // 页码同步到 URL（cpage），刷新或重新进入页面时仍停留在原页。
+    useEffect(() => {
+        const params = new URLSearchParams(searchParams);
+        if (params.get('cpage') !== String(page)) {
+            params.set('cpage', String(page));
+            setSearchParams(params, { replace: true });
+        }
+    }, [page, searchParams, setSearchParams]);
 
     const stop = async session => {
         if (!window.confirm(`停止持续采集“${session.name}”？停止后不会自动恢复。`)) return;
@@ -142,6 +158,14 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
 
     const degradedCount = sessions.filter(session => session.continuity_mode === 'degraded' && session.desired_state === 'running').length;
     const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+    const jumpTo = () => {
+        if (!String(jumpInput).trim()) { setJumpInput(''); return; }
+        const raw = Number(jumpInput);
+        if (!Number.isInteger(raw)) { setJumpInput(''); return; }
+        setPage(Math.min(Math.max(1, raw), pageCount));
+        setJumpInput('');
+    };
     return <section style={S.card}>
         <div style={S.head}><div><h3 style={S.title}>持续采集</h3><span style={S.subtle}>任务按用户期望持续运行；等待进程和 Agent 离线不会自动终止任务</span></div><span style={S.subtle}>共 {total} 条{ownerFilter === 'mine' ? '（仅我创建的）' : '（全部创建者）'}</span></div>
         {degradedCount > 0 && <div style={S.warn}>本页有 {degradedCount} 个活动任务正在降级运行。任务仍严格限制采集范围，但滚动采集窗口可能存在短暂空档。</div>}
@@ -186,9 +210,15 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
             })}</tbody>
         </table></div>}
         {!loading && total > 0 && <div style={S.pagination}>
+            <button aria-label="持续采集第一页" style={{ ...S.pageButton, ...(page <= 1 ? S.pageButtonDisabled : {}) }} disabled={page <= 1} onClick={() => setPage(1)}>首页</button>
             <button aria-label="持续采集上一页" style={{ ...S.pageButton, ...(page <= 1 ? S.pageButtonDisabled : {}) }} disabled={page <= 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button>
             <span style={S.subtle}>第 {page} / {pageCount} 页</span>
             <button aria-label="持续采集下一页" style={{ ...S.pageButton, ...(page >= pageCount ? S.pageButtonDisabled : {}) }} disabled={page >= pageCount} onClick={() => setPage(value => Math.min(pageCount, value + 1))}>下一页</button>
+            <button aria-label="持续采集最后一页" style={{ ...S.pageButton, ...(page >= pageCount ? S.pageButtonDisabled : {}) }} disabled={page >= pageCount} onClick={() => setPage(pageCount)}>末页</button>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <input aria-label="持续采集跳转页码" style={S.jumpInput} type="number" min={1} max={pageCount} value={jumpInput} placeholder="页码" onChange={event => setJumpInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') jumpTo(); }} />
+                <button aria-label="持续采集跳转" style={S.pageButton} onClick={jumpTo}>跳转</button>
+            </span>
         </div>}
     </section>;
 }
