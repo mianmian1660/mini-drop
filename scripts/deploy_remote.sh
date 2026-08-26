@@ -6,6 +6,7 @@ set -euo pipefail
 REMOTE_PATH="${REMOTE_PATH:?REMOTE_PATH required}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:?DEPLOY_BRANCH required}"
 TARGET_SHA="${TARGET_SHA:?TARGET_SHA required}"
+SOURCE_REMOTE_URL="${SOURCE_REMOTE_URL:-}"
 FETCH_TIMEOUT="${FETCH_TIMEOUT:-60}"
 TEST_SCOPE="${TEST_SCOPE:-full}"
 SERVICE_SCOPE="${SERVICE_SCOPE:-full}"
@@ -63,8 +64,13 @@ check_clean_tree() {
 check_clean_tree
 
 REFSPEC="+refs/heads/${DEPLOY_BRANCH}:refs/remotes/origin/${DEPLOY_BRANCH}"
-run_with_timeout "${FETCH_TIMEOUT}" git fetch --prune origin "${REFSPEC}" \
-  || fail SERVER_FETCH "无法从 origin 拉取 ${DEPLOY_BRANCH}；禁止使用本地传输回退"
+if ! run_with_timeout "${FETCH_TIMEOUT}" git fetch --prune origin "${REFSPEC}"; then
+  [[ -n "${SOURCE_REMOTE_URL}" ]] \
+    || fail SERVER_FETCH "无法从服务器 origin 拉取 ${DEPLOY_BRANCH}，且没有可用的源仓库地址"
+  printf '服务器 origin 拉取失败，改用已验证目标 SHA 的源仓库地址重试\n' >&2
+  run_with_timeout "${FETCH_TIMEOUT}" git fetch --prune "${SOURCE_REMOTE_URL}" "${REFSPEC}" \
+    || fail SERVER_FETCH "无法从服务器 origin 或源仓库地址拉取 ${DEPLOY_BRANCH}"
+fi
 
 ORIGIN_SHA="$(git rev-parse "refs/remotes/origin/${DEPLOY_BRANCH}")"
 [[ "${ORIGIN_SHA}" == "${TARGET_SHA}" ]] \

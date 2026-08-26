@@ -59,13 +59,17 @@ REMOTE_LINE="$(git ls-remote --exit-code --heads origin "refs/heads/${DEPLOY_BRA
 TARGET_SHA="${REMOTE_LINE%%[[:space:]]*}"
 [[ "${TARGET_SHA}" =~ ^[0-9a-fA-F]{40,64}$ ]] \
   || die REMOTE_BRANCH "无法解析 origin/${DEPLOY_BRANCH} 的 SHA"
+SOURCE_REMOTE_URL="$(git remote get-url origin)" \
+  || die REMOTE_BRANCH "无法读取本地 origin 地址"
+[[ -n "${SOURCE_REMOTE_URL}" ]] \
+  || die REMOTE_BRANCH "本地 origin 地址为空"
 
 printf '==> 部署 origin/%s @ %s\n' "${DEPLOY_BRANCH}" "${TARGET_SHA:0:12}"
 printf '==> 目标服务器: %s:%s，测试范围: %s，服务范围: %s\n' \
   "${REMOTE_HOST}" "${REMOTE_PATH}" "${TEST_SCOPE}" "${SERVICE_SCOPE}"
 
-REMOTE_ENV="$(printf 'REMOTE_PATH=%q DEPLOY_BRANCH=%q TARGET_SHA=%q FETCH_TIMEOUT=%q TEST_SCOPE=%q SERVICE_SCOPE=%q' \
-  "${REMOTE_PATH}" "${DEPLOY_BRANCH}" "${TARGET_SHA}" "${FETCH_TIMEOUT}" "${TEST_SCOPE}" "${SERVICE_SCOPE}")"
+REMOTE_ENV="$(printf 'REMOTE_PATH=%q DEPLOY_BRANCH=%q TARGET_SHA=%q SOURCE_REMOTE_URL=%q FETCH_TIMEOUT=%q TEST_SCOPE=%q SERVICE_SCOPE=%q' \
+  "${REMOTE_PATH}" "${DEPLOY_BRANCH}" "${TARGET_SHA}" "${SOURCE_REMOTE_URL}" "${FETCH_TIMEOUT}" "${TEST_SCOPE}" "${SERVICE_SCOPE}")"
 
 "${SSH_CMD}" "${REMOTE_HOST}" "${REMOTE_ENV} bash -s" < "${REMOTE_EXECUTOR}" \
   || die DEPLOY "origin/${DEPLOY_BRANCH}@${TARGET_SHA:0:12} 部署失败"

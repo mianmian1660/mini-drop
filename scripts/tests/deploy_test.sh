@@ -182,6 +182,16 @@ rm "${SERVER_REPO}/untracked.go"
 run_deploy main DEPLOY_TEST_SCOPE=none
 expect_success "失败退出后部署锁自动释放"
 
+new_sandbox fetch_fallback
+git -C "${SERVER_REPO}" remote set-url origin "${SB}/unavailable-origin.git"
+run_deploy main DEPLOY_TEST_SCOPE=none
+expect_success "服务器 origin 失败后使用源仓库地址拉取"
+grep -q '源仓库地址重试' <<<"${OUT}" \
+  && ok "fetch 回退路径被明确记录" \
+  || bad "fetch 回退路径未被记录" "${OUT}"
+[[ "$(git -C "${SERVER_REPO}" rev-parse HEAD)" == "$(git --git-dir="${ORIGIN}" rev-parse refs/heads/main)" ]] \
+  && ok "fetch 回退后仍精确锁定目标 SHA" || bad "fetch 回退后的 SHA 不一致" "${OUT}"
+
 new_sandbox build_failure
 run_deploy main DEPLOY_TEST_SCOPE=none FAIL_AT=BUILD
 expect_failure BUILD "镜像构建失败被报告"

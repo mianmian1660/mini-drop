@@ -334,6 +334,7 @@ make verify
 ```
 
 - `./deploy.sh main`、`./deploy.sh feature/<name>` 和 `./deploy.sh fix/<name>` 均从真正的 `origin/<branch>` 部署；不上传本地源码或 Git bundle。
+- 服务器配置的 `origin` 拉取失败时，部署器会使用本地已验证的 `origin` 地址让服务器重新 fetch；该回退仍由服务器从远程 Git 获取源码，并严格校验部署前锁定的目标 SHA。
 - 切换前同时检查本地与服务器工作树；服务器存在任何未提交或未跟踪源码时立即停止，不自动 stash、clean 或修改。
 - 服务器端按顺序执行：fetch origin -> 精确切换指定分支并校验 SHA -> `make test` + 覆盖率 -> 镜像构建 -> Compose 启动等待 healthy -> 健康检查 -> `scripts/e2e_smoke.sh`。
 - 测试发现问题后，回到本地创建并 push `fix/*` 或 `feature/*`，再部署该分支；通过后在本地合入 `main`，最后重新部署 `main`。
