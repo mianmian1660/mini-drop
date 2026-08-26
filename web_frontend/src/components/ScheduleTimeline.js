@@ -45,7 +45,7 @@ const S = {
     empty: { textAlign: 'center', color: '#667085', padding: 38, border: '1px dashed #d0d5dd', borderRadius: 8 },
 };
 
-const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
+const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
 const isActiveTask = (status) => status === 0 || status === 1 || status === 4;
 // 时间轴窗口列表每页条数
 const PAGE_SIZE = 20;

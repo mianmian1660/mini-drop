@@ -163,6 +163,22 @@ test('运行中的窗口保留"停止"取消能力', async () => {
     container.remove();
 });
 
+test('已取消窗口显示明确状态而不是未知', async () => {
+    schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
+    tasks.timeline.mockResolvedValue({
+        code: 0,
+        data: { points: [{ tid: 't-canceled', name: '取消窗口', status: 5, has_result: false, window_start: '2026-08-22T00:10:00Z' }], trends: null },
+    });
+
+    const { container, root } = await renderAt('/schedules/sch-1');
+
+    expect(container.querySelector('table tbody').textContent).toContain('已取消');
+    expect(container.querySelector('table tbody').textContent).not.toContain('未知');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
 test('时间轴筛选应用后携带状态参数重新查询', async () => {
     schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
     tasks.timeline.mockResolvedValue({ code: 0, data: { points, trends: null } });

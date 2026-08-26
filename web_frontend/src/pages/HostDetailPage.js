@@ -107,8 +107,8 @@ const tabs = [
 	{ id: 'profiling', label: '持续采集' },
     { id: 'logs', label: 'Agent 日志' },
 ];
-const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed' };
-const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
+const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed', 5: '#64748b' };
+const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
 
 export default function HostDetailPage() {
     const { targetId: rawTargetId } = useParams();

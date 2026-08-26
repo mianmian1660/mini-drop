@@ -26,10 +26,11 @@ export const statusColor = (status) => {
     if (status === 3) return '#f44336';  // 失败
     if (status === 4) return '#7c3aed';  // 上传中
     if (status === 1) return '#2196f3';  // 执行中
+    if (status === 5) return '#64748b';  // 已取消
     return '#ffc107';                    // 待处理
 };
 
-const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中' };
+const ST = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
 
 export function clampTooltipX(x, containerWidth, tooltipWidth, edgePadding = 8) {
     const width = Math.max(0, Number(containerWidth) || 0);
@@ -168,7 +169,7 @@ export default function TimelineChart({ points }) {
             <svg ref={svgRef} width="100%" height={HEIGHT} style={{ display: 'block' }} />
 
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 4, fontSize: 12, color: '#666' }}>
-                {[2, 3, 1, 4, 0].map((st) => (
+                {[2, 3, 5, 1, 4, 0].map((st) => (
                     <span key={st}>
                         <span style={{
                             display: 'inline-block', width: 9, height: 9, borderRadius: 2,
