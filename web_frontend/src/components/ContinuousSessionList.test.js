@@ -47,7 +47,7 @@ test('list renders waiting process tasks and stop writes desired state through t
     expect(container.querySelector('.table-scroll')).not.toBeNull();
     expect(container.querySelector('.table-scroll').style.maxWidth).toBe('100%');
     expect(container.textContent).toContain('共 1 条');
-    expect(continuous.sessions).toHaveBeenCalledWith(expect.objectContaining({ page: 1, page_size: 20, owner_filter: 'all' }));
+    expect(continuous.sessions).toHaveBeenCalledWith(expect.objectContaining({ page: 1, page_size: 20, owner_filter: 'mine' }));
     const stop = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '停止');
     await act(async () => Simulate.click(stop));
     expect(window.confirm).toHaveBeenCalled();

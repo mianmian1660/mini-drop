@@ -41,6 +41,7 @@ import {
     coverageBandsFromReliability,
     coverageStatusColor,
     coverageStatusText,
+    historicalWindowForSession,
     DiagnosticDetails,
     TopNTable,
     HistogramPanel,
@@ -64,12 +65,35 @@ import {
     storageSourceLabel,
     resolutionLabel,
 } from './ContinuousProfilingPanel';
+
 import { continuous, profiles, sentinelRules } from '../api';
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
 beforeEach(() => {
     jest.clearAllMocks();
+});
+
+test('stopped session opens directly on its retained historical window', () => {
+    expect(historicalWindowForSession({
+        started_at: '2026-08-25T15:02:53.697Z',
+        stopped_at: '2026-08-25T15:11:24.278Z',
+        retention_hours: 24,
+    })).toEqual({
+        from: '2026-08-25T15:02:53.697Z',
+        to: '2026-08-25T15:11:24.278Z',
+    });
+});
+
+test('stopped session historical window is capped by retention', () => {
+    expect(historicalWindowForSession({
+        started_at: '2026-08-25T10:00:00.000Z',
+        stopped_at: '2026-08-25T15:00:00.000Z',
+        retention_hours: 1,
+    })).toEqual({
+        from: '2026-08-25T14:00:00.000Z',
+        to: '2026-08-25T15:00:00.000Z',
+    });
 });
 
 test('diagnostic JSON uses two-space indentation for nested values', () => {
@@ -581,6 +605,46 @@ test('stable target fields prevent parent polling from re-querying profiles', as
     });
     await act(async () => { await Promise.resolve(); });
     expect(profiles.flamegraph).toHaveBeenCalledTimes(1);
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('stopped session first profile request uses historical data window', async () => {
+    profiles.flamegraph.mockResolvedValue({
+        code: 0,
+        data: { nodes: [{ name: 'main', value: 43, self: 43 }], empty: false, total: 43 },
+    });
+    profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
+    continuous.timeline.mockResolvedValue({ code: 0, data: null });
+
+    const session = {
+        sid: 'cps-stopped',
+        name: 'Stopped historical session',
+        scope: 'host',
+        observed_state: 'stopped',
+        desired_state: 'stopped',
+        signals: ['cpu_profile'],
+        retention_hours: 24,
+        started_at: '2026-08-25T15:02:53.697Z',
+        stopped_at: '2026-08-25T15:11:24.278Z',
+    };
+    const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(profiles.flamegraph).toHaveBeenCalledTimes(1);
+    expect(profiles.flamegraph).toHaveBeenCalledWith(expect.objectContaining({
+        session_sid: 'cps-stopped',
+        from: '2026-08-25T15:02:53.697Z',
+        to: '2026-08-25T15:11:24.278Z',
+    }));
 
     act(() => root.unmount());
     container.remove();

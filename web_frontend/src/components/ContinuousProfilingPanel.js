@@ -122,11 +122,13 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const initialWindow = initialQuery?.from && initialQuery?.to
         ? { from: initialQuery.from, to: initialQuery.to }
         : null;
+    const stoppedSessionWindow = initialWindow ? null : historicalWindowForSession(fixedSession);
+    const initialDisplayWindow = initialWindow || stoppedSessionWindow;
     const initialFilters = initialQuery?.filters || {};
-    const [range, setRange] = useState(() => initialWindow ? 'custom' : '30m');
-    const [timeWindow, setTimeWindow] = useState(() => initialWindow || makeTimeWindow('30m'));
-    const [customFrom, setCustomFrom] = useState(() => initialWindow ? toLocalDateTimeInput(initialWindow.from) : '');
-    const [customTo, setCustomTo] = useState(() => initialWindow ? toLocalDateTimeInput(initialWindow.to) : '');
+    const [range, setRange] = useState(() => initialDisplayWindow ? 'custom' : '30m');
+    const [timeWindow, setTimeWindow] = useState(() => initialDisplayWindow || makeTimeWindow('30m'));
+    const [customFrom, setCustomFrom] = useState(() => initialDisplayWindow ? toLocalDateTimeInput(initialDisplayWindow.from) : '');
+    const [customTo, setCustomTo] = useState(() => initialDisplayWindow ? toLocalDateTimeInput(initialDisplayWindow.to) : '');
     const [customAnchorNow, setCustomAnchorNow] = useState(() => new Date().toISOString());
     const [appliedCustomWindow, setAppliedCustomWindow] = useState(null);
     // Memory profiling is not currently supported by continuous collection.
@@ -184,7 +186,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const [heapTasks, setHeapTasks] = useState([]);
     const [heapTasksLoading, setHeapTasksLoading] = useState(false);
     const querySequence = useRef(0);
-    const initializedSessionWindow = useRef('');
+    const initializedSessionWindow = useRef(stoppedSessionWindow && fixedSession?.sid ? fixedSession.sid : '');
     const targetKey = target?.id || '';
     const targetHost = target?.ip || '';
     const targetService = target?.service_name || 'hotmethod';
@@ -230,16 +232,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     // 已停止的历史 session 默认查看其自身的最后保留窗口，而不是“最近 30 分钟”。
     // 否则任务详情打开在很久以后时，查询时间段已经落在 session 结束之后，历史样本会看起来像丢失。
     useEffect(() => {
-        const stoppedAt = fixedSession?.stopped_at;
-        if (!sessionSID || !stoppedAt || initializedSessionWindow.current === sessionSID || initialWindow) return;
-        const end = new Date(stoppedAt);
-        if (Number.isNaN(end.getTime())) return;
-        const retentionHours = Math.max(1, numberOrDefault(fixedSession?.retention_hours, 24));
-        const started = fixedSession?.started_at ? new Date(fixedSession.started_at) : null;
-        const retentionStart = new Date(end.getTime() - retentionHours * 60 * 60 * 1000);
-        const start = started && !Number.isNaN(started.getTime()) && started > retentionStart ? started : retentionStart;
-        if (!(start < end)) return;
-        const historicalWindow = { from: start.toISOString(), to: end.toISOString() };
+        if (!sessionSID || initializedSessionWindow.current === sessionSID || initialWindow) return;
+        const historicalWindow = historicalWindowForSession(fixedSession);
+        if (!historicalWindow) return;
         initializedSessionWindow.current = sessionSID;
         setRange('custom');
         setTimeWindow(historicalWindow);
@@ -2095,6 +2090,21 @@ export function makeTimeWindow(range, now = new Date()) {
     const minutes = rangeMinutes(range) || 30;
     const from = new Date(to.getTime() - minutes * 60 * 1000);
     return { from: from.toISOString(), to: to.toISOString() };
+}
+
+// 已停止 Session 首屏必须直接锚定到它自身的最后保留窗口。若等到 effect 再
+// 修正，组件会先用“当前 30 分钟”发出一次必然失败/空结果的请求，页面短暂显示
+// 400 或“无样本”，并可能误导用户认为历史数据已经丢失。
+export function historicalWindowForSession(session) {
+    if (!session?.stopped_at) return null;
+    const end = new Date(session.stopped_at);
+    if (Number.isNaN(end.getTime())) return null;
+    const retentionHours = Math.max(1, numberOrDefault(session.retention_hours, 24));
+    const retentionStart = new Date(end.getTime() - retentionHours * 60 * 60 * 1000);
+    const started = session.started_at ? new Date(session.started_at) : null;
+    const start = started && !Number.isNaN(started.getTime()) && started > retentionStart ? started : retentionStart;
+    if (!(start < end)) return null;
+    return { from: start.toISOString(), to: end.toISOString() };
 }
 
 export function makeSequentialDiffWindows(range, now = new Date()) {
