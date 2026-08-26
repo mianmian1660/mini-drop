@@ -1561,6 +1561,24 @@ func TestOutboxAndPollerCoordinatorBranches(t *testing.T) {
 	if !strings.Contains(gotTimedOut.StatusInfo, "未收到采集产物") {
 		t.Fatalf("timed out status_info=%q, want missing artifact reason", gotTimedOut.StatusInfo)
 	}
+	legacyEnd := time.Now().Add(-time.Hour).Truncate(time.Second)
+	legacyNoArtifact := model.HotmethodTask{
+		TID: "tid-legacy-no-artifact", Name: "legacy no artifact", RequestParams: params,
+		Status: TaskStatusDone, AnalysisStatus: 0, StatusInfo: "上传等待窗口结束，任务自动标记完成",
+		UID: "owner", CreateTime: legacyEnd, EndTime: &legacyEnd,
+	}
+	if err := s.DB.Create(&legacyNoArtifact).Error; err != nil {
+		t.Fatalf("create legacy no-artifact task: %v", err)
+	}
+	s.backfillAnalysisQueueForCompletedTasks()
+	var gotLegacy model.HotmethodTask
+	_ = s.DB.Where("tid = ?", legacyNoArtifact.TID).First(&gotLegacy).Error
+	if gotLegacy.Status != TaskStatusFailed || gotLegacy.AnalysisStatus != 3 {
+		t.Fatalf("legacy no-artifact task=%#v, want reconciled failure", gotLegacy)
+	}
+	if gotLegacy.EndTime == nil || !gotLegacy.EndTime.Equal(legacyEnd) {
+		t.Fatalf("legacy no-artifact end_time=%v, want preserved %v", gotLegacy.EndTime, legacyEnd)
+	}
 	if s.taskHasArtifacts("") {
 		t.Fatal("empty tid must not have artifacts")
 	}

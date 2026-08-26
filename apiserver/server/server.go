@@ -398,6 +398,22 @@ func (s *APIServer) backfillAnalysisQueueForCompletedTasks() {
 	for _, task := range tasks {
 		rawKey, rawSize, ok := s.findRawCollectionArtifact(task.TID)
 		if !ok {
+			// 旧版本在上传截止后即使没有原始采集产物，也会把任务写成 DONE。
+			// 只修复带有该精确旧状态文案的记录，避免把已经按保留策略清理过
+			// 产物的正常历史任务误判为失败。
+			if strings.Contains(task.StatusInfo, "上传等待窗口结束，任务自动标记完成") {
+				endTime := time.Now()
+				if task.EndTime != nil {
+					endTime = *task.EndTime
+				}
+				reason := formatErrorReason(ErrCodeTaskExecutionFailed, "上传等待窗口结束，未收到采集产物")
+				if err := s.transitionTaskStatus(&task, TaskStatusFailed, reason, "startup_reconciler", map[string]interface{}{
+					"end_time":        &endTime,
+					"analysis_status": 3,
+				}); err != nil && err != ErrTaskStatusStale {
+					s.Logger.Warn("修复历史无产物完成任务失败", zap.String("tid", task.TID), zap.Error(err))
+				}
+			}
 			continue
 		}
 		if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {
