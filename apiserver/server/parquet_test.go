@@ -762,6 +762,24 @@ func TestPQShadowMismatchNeverBecomesActive(t *testing.T) {
 	}
 }
 
+func TestPQWindowRequiresDataLineageSkipsExplicitEmptyStatuses(t *testing.T) {
+	for _, status := range []string{"target_idle", "no_events", "unavailable", "failed"} {
+		window := model.ProfileWindow{SignalStatus: status}
+		if pqWindowRequiresDataLineage(window) {
+			t.Fatalf("zero-sample %s window must not require v2 data lineage", status)
+		}
+		window.SampleCount = 1
+		if !pqWindowRequiresDataLineage(window) {
+			t.Fatalf("non-empty %s window must still require v2 data lineage", status)
+		}
+	}
+	for _, status := range []string{"", "unknown", "collected"} {
+		if !pqWindowRequiresDataLineage(model.ProfileWindow{SignalStatus: status}) {
+			t.Fatalf("legacy/collected %q window must preserve fail-closed lineage", status)
+		}
+	}
+}
+
 func TestPQQueryRequiresFullCoverageAndAuthorizedSession(t *testing.T) {
 	s := pqTestServer(t)
 	s.Config.ContinuousParquet.Mode = "prefer"
