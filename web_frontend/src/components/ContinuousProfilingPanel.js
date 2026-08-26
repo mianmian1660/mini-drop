@@ -445,8 +445,8 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     // format=flamegraph 上分叉，不要各写一份容易漂移。
     const buildDiffParams = useCallback(() => {
         if (!targetKey || !targetHost) return { error: '缺少观测对象' };
-        const baseResult = validateCustomTimeWindow(diffBaseFrom, diffBaseTo, sessionMeta.retentionHours, 'Baseline');
-        const compareResult = validateCustomTimeWindow(diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, 'Compare');
+        const baseResult = validateCustomTimeWindow(diffBaseFrom, diffBaseTo, sessionMeta.retentionHours, 'Baseline', sessionTimeAnchor);
+        const compareResult = validateCustomTimeWindow(diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, 'Compare', sessionTimeAnchor);
         if (baseResult.error || compareResult.error) {
             return { error: baseResult.error || compareResult.error };
         }
@@ -476,7 +476,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         if (stackScope !== 'all') params.stack_scope = stackScope;
         if (Object.keys(parsedFilters).length > 0) params.filters = activeFiltersKey;
         return { params };
-    }, [targetKey, targetHost, targetService, sessionSID, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, maxNodes, stackScope, activeFiltersKey]);
+    }, [targetKey, targetHost, targetService, sessionSID, diffBaseFrom, diffBaseTo, diffCompareFrom, diffCompareTo, sessionMeta.retentionHours, sessionTimeAnchor, maxNodes, stackScope, activeFiltersKey]);
 
     const runDiff = useCallback(async () => {
         if (!targetKey) return;
@@ -579,9 +579,9 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     }, []);
 
     useEffect(() => {
-        const windows = appliedDiffCustomWindows || makeSequentialDiffWindows(diffRange);
+        const windows = appliedDiffCustomWindows || makeSequentialDiffWindows(diffRange, sessionTimeAnchor);
         applyDiffWindows(windows);
-    }, [diffRange, applyDiffWindows, appliedDiffCustomWindows]);
+    }, [diffRange, applyDiffWindows, appliedDiffCustomWindows, sessionTimeAnchor]);
 
     useEffect(() => {
         setSelectedComm('');
@@ -932,6 +932,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                                 diffRange={diffRange}
                                 diffRangeOptions={diffRangeOptions}
                                 retentionHours={sessionMeta.retentionHours}
+                                timeAnchor={sessionTimeAnchor}
                                 baseFromInput={diffBaseFrom}
                                 compareToInput={diffCompareTo}
                                 onRangeChange={setDiffRange}
@@ -1172,9 +1173,9 @@ function TimeRangeSlider({ fromInput, toInput, retentionHours, anchorNow, onChan
     );
 }
 
-function DiffWindowSlider({ diffRange, diffRangeOptions, retentionHours, baseFromInput, compareToInput, onRangeChange, onChange, onManualInput }) {
+function DiffWindowSlider({ diffRange, diffRangeOptions, retentionHours, timeAnchor, baseFromInput, compareToInput, onRangeChange, onChange, onManualInput }) {
     const duration = rangeMinutes(diffRange) || 15;
-    const bounds = retentionBounds(retentionHours);
+    const bounds = retentionBounds(retentionHours, timeAnchor);
     const maxMinute = Math.max(2, Math.round((bounds.to.getTime() - bounds.from.getTime()) / 60000));
     const currentStart = localInputToMinuteOffset(baseFromInput, bounds);
     const currentEnd = localInputToMinuteOffset(compareToInput, bounds);

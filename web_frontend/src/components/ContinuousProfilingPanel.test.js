@@ -650,6 +650,50 @@ test('stopped session first profile request uses historical data window', async 
     container.remove();
 });
 
+test('stopped session diff windows are anchored at stop time instead of current time', async () => {
+    profiles.flamegraph.mockResolvedValue({ code: 0, data: { nodes: [], empty: true } });
+    profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    profiles.labelValues.mockResolvedValue({ code: 0, data: { values: [], available: false } });
+    profiles.diff.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
+    continuous.timeline.mockResolvedValue({ code: 0, data: null });
+
+    const session = {
+        sid: 'cps-old-diff',
+        name: 'Stopped diff session',
+        scope: 'host',
+        observed_state: 'stopped',
+        desired_state: 'stopped',
+        signals: ['cpu_profile'],
+        retention_hours: 24,
+        started_at: '2026-08-24T01:30:48.891Z',
+        stopped_at: '2026-08-24T10:28:01.851Z',
+    };
+    const target = { id: 'target-1', ip: '10.0.0.8', hostname: 'node', service_name: 'hotmethod' };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ContinuousProfilingPanel target={target} fixedSession={session} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    const expand = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '展开');
+    await act(async () => Simulate.click(expand));
+    const execute = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '执行 Diff');
+    await act(async () => Simulate.click(execute));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(profiles.diff).toHaveBeenCalledTimes(1);
+    const params = profiles.diff.mock.calls[0][0];
+    expect(new Date(params.compare_to).getTime()).toBe(new Date('2026-08-24T10:28:00.000Z').getTime());
+    expect(new Date(params.compare_from).getTime()).toBe(new Date('2026-08-24T10:13:00.000Z').getTime());
+    expect(new Date(params.base_to).getTime()).toBe(new Date('2026-08-24T10:13:00.000Z').getTime());
+    expect(new Date(params.base_from).getTime()).toBe(new Date('2026-08-24T09:58:00.000Z').getTime());
+
+    act(() => root.unmount());
+    container.remove();
+});
+
 test('session signal tabs only show signals configured on the session', async () => {
     profiles.flamegraph.mockResolvedValue({ code: 0, data: { nodes: [], empty: true } });
     profiles.topn.mockResolvedValue({ code: 0, data: { items: [], empty: true } });
