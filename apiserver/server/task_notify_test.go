@@ -1453,6 +1453,7 @@ func TestTimelineFiltersAndResultMetadata(t *testing.T) {
 	fixtures := []model.HotmethodTask{
 		{TID: "tl-ok", Name: "ok", TaskKind: TaskKindPerfCPU, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: base},
 		{TID: "tl-running", Name: "running", TaskKind: TaskKindEBPFIO, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusRunning, AnalysisStatus: 0, CreateTime: base.Add(time.Minute)},
+		{TID: "tl-analysis-failed", Name: "analysis failed", TaskKind: TaskKindPerfCPU, MasterTaskTID: "sch-filter", RequestParams: params, Status: TaskStatusDone, AnalysisStatus: 3, CreateTime: base.Add(2 * time.Minute)},
 	}
 	if err := s.DB.Create(&fixtures).Error; err != nil {
 		t.Fatalf("create timeline fixtures: %v", err)
@@ -1471,6 +1472,9 @@ func TestTimelineFiltersAndResultMetadata(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, `"total":1`) || !strings.Contains(body, `"result_url":"/task/result?tid=tl-ok"`) || !strings.Contains(body, `"duration_seconds":60`) {
 		t.Fatalf("timeline body missing filter metadata: %s", body)
+	}
+	if strings.Contains(body, "tl-analysis-failed") {
+		t.Fatalf("analysis failure must not match has_result=true: %s", body)
 	}
 }
 

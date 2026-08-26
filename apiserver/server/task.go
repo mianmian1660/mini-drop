@@ -2174,9 +2174,9 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 			return
 		}
 		if hasResult {
-			query = query.Where("status = ? AND analysis_status >= ?", TaskStatusDone, 2)
+			query = query.Where("status = ? AND analysis_status = ?", TaskStatusDone, 2)
 		} else {
-			query = query.Where("NOT (status = ? AND analysis_status >= ?)", TaskStatusDone, 2)
+			query = query.Where("NOT (status = ? AND analysis_status = ?)", TaskStatusDone, 2)
 		}
 	}
 
@@ -2320,8 +2320,8 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		if t.EndTime != nil {
 			tp.EndTime = t.EndTime
 		}
-		// DONE 且 analysis_status >= 2 (分析完成) 视为有结果，UPLOADING 仍需继续轮询。
-		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus >= 2
+		// DONE 且 analysis_status=2（分析成功）才视为有结果；3 是分析失败，不能提供火焰图。
+		tp.HasResult = t.Status == TaskStatusDone && t.AnalysisStatus == 2
 		if tp.HasResult {
 			tp.ResultURL = "/task/result?tid=" + t.TID
 			trends["has_result"] = trends["has_result"].(int) + 1
