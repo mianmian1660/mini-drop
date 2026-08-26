@@ -67,9 +67,6 @@ const S = {
     coverageSummaryLabel: { color: '#111827', marginRight: 6 },
     coverageTooltip: { position: 'absolute', top: 22, zIndex: 5, minWidth: 220, maxWidth: 320, padding: 10, color: '#344054', background: '#fff', border: '1px solid #d0d5dd', borderRadius: 6, boxShadow: '0 8px 20px rgba(16,24,40,.12)', fontSize: 12, lineHeight: 1.45, pointerEvents: 'none' },
     coverageTooltipTitle: { color: '#111827', fontWeight: 700, marginBottom: 5 },
-    coverageAlert: { marginTop: 12, borderRadius: 6, border: '1px solid #fedf89', background: '#fffaeb', padding: '10px 12px', color: '#92400e', fontSize: 13, lineHeight: 1.5 },
-    coverageAlertWarn: { borderColor: '#fecd6f', background: '#fff7e6' },
-    coverageAlertTitle: { fontWeight: 700, marginBottom: 4 },
     gapList: { display: 'grid', gap: 5, marginTop: 8, color: '#b42318', fontSize: 12 },
     gapToggle: { background: 'none', border: 'none', color: '#315efb', cursor: 'pointer', fontSize: 12, padding: 0, textAlign: 'left' },
     timeSlider: { minWidth: 0, display: 'grid', gap: 10 },
@@ -186,9 +183,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     // Memory tab: recent Go pprof heap tasks
     const [heapTasks, setHeapTasks] = useState([]);
     const [heapTasksLoading, setHeapTasksLoading] = useState(false);
-    const [symbolCheck, setSymbolCheck] = useState(null);
-    const [symbolChecking, setSymbolChecking] = useState(false);
-    const [symbolCheckError, setSymbolCheckError] = useState('');
     const querySequence = useRef(0);
     const initializedSessionWindow = useRef('');
     const targetKey = target?.id || '';
@@ -220,8 +214,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     const unit = flamegraph?.unit || topn?.unit || '';
     const profileData = flamegraph || topn;
     const sampleNotice = lowSampleGuidance(profileData, sessionMeta, querying);
-    const symbolStatus = flamegraph?.symbol_status || topn?.symbol_status || '';
-    const symbolNeedsCheck = symbolStatus === 'partial' || symbolStatus === 'missing';
 	const activeFilters = useMemo(() => ({
 		...(taskScope === 'process' && fixedSession?.selector_exe ? { exe: fixedSession.selector_exe } : {}),
 		...(taskScope === 'process' && selectedInstance ? instanceFilters(selectedInstance) : {}),
@@ -256,7 +248,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     }, [fixedSession?.retention_hours, fixedSession?.started_at, fixedSession?.stopped_at, initialWindow, sessionSID]);
     // 阶段九：当前选中信号（v1 signal_type），timeline 按信号独立计算覆盖率。
     const currentSignal = SIGNAL_TAB_OPTIONS.find(option => option.tab === signalTab)?.signal;
-    const coverageAlert = useMemo(() => coverageAlertForReliability(reliability, currentSignal), [reliability, currentSignal]);
 
     useEffect(() => {
         const timer = setTimeout(() => setFlameSearchText(flameSearchInput.trim()), 250);
@@ -286,8 +277,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
         setQuerying(true);
         setError('');
         setReliability(null);
-        setSymbolCheck(null);
-        setSymbolCheckError('');
         if (signalTab === 'cpu') {
             setFlamegraph(null);
             setTopn(null);
@@ -366,21 +355,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
             if (requestID === querySequence.current) setQuerying(false);
         }
     }, [targetKey, targetHost, targetService, profileType, activeFiltersKey, signalTab, stackScope, maxNodes, sessionSID]);
-
-    const checkSymbols = useCallback(async () => {
-        if (!sessionSID || symbolChecking) return;
-        setSymbolChecking(true);
-        setSymbolCheckError('');
-        try {
-            const response = await continuous.symbolCheck(sessionSID, { from: timeWindow.from, to: timeWindow.to });
-            if (response.code !== 0) throw new Error(response.message || '符号检查失败');
-            setSymbolCheck(response.data?.symbol_check || null);
-        } catch (err) {
-            setSymbolCheckError(err?.response?.data?.message || err?.message || '符号检查失败');
-        } finally {
-            setSymbolChecking(false);
-        }
-    }, [sessionSID, symbolChecking, timeWindow.from, timeWindow.to]);
 
     useEffect(() => {
         queryProfiles(timeWindow);
@@ -922,7 +896,6 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     onSearchStats={setSearchStats}
                 />
                 {sampleNotice && <div style={{ ...S.info, marginTop: 12 }}>{sampleNotice}</div>}
-                {coverageAlert && <CoverageAlert alert={coverageAlert} />}
 			</section> : <HistogramPanel
                     data={histogram} loading={querying}
                     title={signalTab === 'io' ? '块 IO 延迟' : signalTab === 'io_syscall' ? '系统调用 IO 延迟' : '调度延迟'}
@@ -931,26 +904,11 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     timeWindow={timeWindow}
                 />}
 
-            {signalTab === 'cpu' && profileType === 'cpu' && (flamegraph?.truncated || flamegraph?.symbol_status) && (
+            {signalTab === 'cpu' && profileType === 'cpu' && flamegraph?.truncated && (
                 <div style={{ ...S.warn, marginTop: 10 }}>
-                    {flamegraph?.truncated && <span>火焰图节点数超过 {maxNodes} 上限，已截断展示。请缩小时间范围或提高最大节点数以查看完整栈。</span>}
-                    {flamegraph?.truncated && flamegraph?.symbol_status && ' · '}
-                    {flamegraph?.symbol_status && flamegraph?.symbol_status !== 'not_applicable' && (
-                        <span>
-                            符号状态：{symbolStatusLabel(flamegraph.symbol_status, flamegraph.symbol_diagnostics)}
-                            {symbolNeedsCheck && sessionSID && (
-                                <button type="button" style={{ ...S.diagnosticCopy, marginLeft: 10 }} onClick={checkSymbols} disabled={symbolChecking}>
-                                    {symbolChecking ? '检查中...' : '重新检查符号'}
-                                </button>
-                            )}
-                            {symbolCheck && <div style={{ marginTop: 8, color: '#475467' }}>{symbolCheckSummary(symbolCheck)}</div>}
-                            {symbolCheckError && <div style={{ marginTop: 8 }}>{symbolCheckError}</div>}
-                        </span>
-                    )}
+                    <span>火焰图节点数超过 {maxNodes} 上限，已截断展示。请缩小时间范围或提高最大节点数以查看完整栈。</span>
                 </div>
             )}
-
-            {signalTab === 'cpu' && <RuntimeDiagnostics diagnostics={flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics} />}
 
             {profileType === 'memory' && signalTab === 'cpu' && <RSSTrend series={rssSeries} meta={rssMeta} loading={querying} />}
 
@@ -1608,141 +1566,6 @@ function CoverageTooltip({ hover }) {
     );
 }
 
-function CoverageAlert({ alert }) {
-    return (
-        <div style={{ ...S.coverageAlert, ...(alert.severity === 'warn' ? S.coverageAlertWarn : {}) }}>
-            <div style={S.coverageAlertTitle}>采集缺口</div>
-            <div>{alert.summary}</div>
-            <div style={{ marginTop: 2 }}>{alert.detail}</div>
-        </div>
-    );
-}
-
-export function coverageAlertForReliability(reliability, signal) {
-    if (!reliability?.coverage) return null;
-    const view = coverageBandsFromReliability(reliability, signal);
-    const gaps = view.gaps;
-    if (gaps.length === 0) return null;
-    const ratio = Math.max(0, Math.min(1, Number(view.ratio) || 0));
-    const longest = gaps.reduce((max, gap) => Math.max(max, Number(gap?.duration_seconds) || 0), 0);
-    // 累计缺口优先用后端精确统计（gap_seconds），避免详细缺口截断后低估。
-    const total = Number(view.gapSeconds) || gaps.reduce((sum, gap) => sum + (Number(gap?.duration_seconds) || 0), 0);
-    const severity = ratio < 0.97 || longest >= 15 ? 'warn' : 'info';
-    return {
-        severity,
-        summary: `覆盖 ${(ratio * 100).toFixed(1)}% · ${view.gapCountTotal} 个缺口 · 最长 ${formatGapDuration(longest)}`,
-        detail: `累计缺口 ${formatGapDuration(total)}，常见于 agent 短暂卡顿、上传滞后或当前窗口内进程空闲。`,
-    };
-}
-
-function RuntimeDiagnostics({ diagnostics }) {
-    const entries = Object.entries(diagnostics || {});
-    if (entries.length === 0) return null;
-    return (
-        <section style={S.card}>
-            <div style={S.sectionHead}><h3 style={S.title}>语言采集状态</h3><span style={S.subtle}>{entries.length} runtimes</span></div>
-            <div className="table-scroll" style={S.tableWrap}><table style={S.table}>
-                <thead><tr><th style={S.th}>语言</th><th style={S.th}>采集状态</th><th style={S.th}>模式</th><th style={S.th}>覆盖率 / 未解析</th><th style={S.th}>进程</th><th style={S.th}>诊断与修复建议</th></tr></thead>
-                <tbody>{entries.map(([runtime, item]) => (
-                    <tr key={runtime}>
-                        <td style={S.td}>{runtimeLabel(runtime)}</td>
-                        <td style={S.td}>{runtimeStatusLabel(item)}</td>
-                        <td style={S.td}>{((item.collector_modes || []).length ? item.collector_modes : item.modes || []).join(', ') || '-'}</td>
-                        <td style={S.td}>{runtimeCoverageLabel(runtime, item)}</td>
-                        <td style={S.td}>{runtimeProcessLabel(item)}</td>
-                        <td style={S.td}>{runtimeReasonWithAdvice(runtime, item)}</td>
-                    </tr>
-                ))}</tbody>
-            </table></div>
-        </section>
-    );
-}
-
-// 阶段四：v2 collector_status（ready/partial/missing/pending/failed）文案。
-// 旧数据（无 diagnostics_version）继续走 detected/missing 计数推导。
-function runtimeStatusLabel(item = {}) {
-    if (item.diagnostics_version >= 2 && item.collector_status) {
-        return ({
-            ready: '就绪',
-            partial: '部分可用',
-            missing: '缺少采集能力',
-            pending: '处理中',
-            failed: '采集失败',
-            not_applicable: '未检测到',
-        })[item.collector_status] || item.collector_status;
-    }
-    const detected = Number(item.detected_count) || 0;
-    const ready = Number(item.ready_count) || 0;
-    const missing = Number(item.missing_count) || 0;
-    const limited = Number(item.limited_count) || 0;
-    if (detected === 0) return '未检测到进程';
-    if (ready === detected && limited === 0) return '已检测';
-    if (ready > 0 && (missing > 0 || limited > 0)) return '部分可用';
-    return '缺少采集能力';
-}
-
-function runtimeCoverageLabel(runtime, item = {}) {
-    if (item.diagnostics_version >= 2 && item.sample_count > 0) {
-        const semanticSample = Number(item.semantic_sample_percent) || 0;
-        const semanticFrame = Number(item.semantic_frame_percent) || 0;
-        const unresolved = Number(item.unresolved_frame_percent) || 0;
-        const targetUnresolved = Number(item.target_module_unresolved_percent) || 0;
-        const unresolvedLabel = runtime === 'native'
-            ? `目标模块未解析 ${targetUnresolved.toFixed(1)}%`
-            : `未解析 ${unresolved.toFixed(1)}%`;
-        return `语义样本 ${semanticSample.toFixed(1)}% · 语义帧 ${semanticFrame.toFixed(1)}% · ${unresolvedLabel}`;
-    }
-    return '-';
-}
-
-// 阶段四：按状态/reason 给出可执行修复建议（不再只显示"缺少能力"）。
-function runtimeFixAdvice(runtime, item = {}) {
-    const reasonsText = (item.reasons || []).join(' ');
-    if (item.diagnostics_version >= 2 && item.collector_status === 'failed')
-        return reasonsText.includes('permission') ? '检查 Agent 容器权限（--privileged 或 SYS_PTRACE）后重试'
-            : '查看 Agent 日志中该语言的确定性失败原因';
-    if (item.collector_status === 'pending' || (item.reasons || []).some(r => r.includes('GoReSym background')))
-        return 'GoReSym 正在后台提取符号，稍后刷新；结果会在后续窗口生效';
-    switch (runtime) {
-        case 'node':
-            return '使用 --perf-basic-prof 启动 Node.js 以生成 JIT perf map';
-        case 'python':
-            if (reasonsText.includes('-X perf'))
-                return 'Python 3.12+ 使用 -X perf 启动可直接生成 perf map，否则自动回退 py-spy';
-            return '确认 py-spy 已安装且 Agent 有 ptrace 权限';
-        case 'java':
-            return '确认 asprof 可用且 Agent 对 JVM 有 attach 权限（同 UID 或 SYS_PTRACE）';
-        case 'go':
-            return 'stripped Go 程序依赖 GoReSym 提取符号；保持 DROP_CONTINUOUS_GORESYM 开启并等待缓存生成';
-        case 'native':
-            if ((item.reasons || []).some(r => r.includes('frame pointer')))
-                return '目标程序需保留 frame pointer（-fno-omit-frame-pointer），或将 DROP_NATIVE_CP_CALL_GRAPH 设为 dwarf';
-            return '上传对应 build-id 的二进制到符号库可降低未解析率';
-        default:
-            return '';
-    }
-}
-
-function runtimeReasonWithAdvice(runtime, item = {}) {
-    const reasons = (item.reasons || []).join('; ');
-    const advice = runtimeFixAdvice(runtime, item);
-    if (!reasons && !advice) return '-';
-    return [reasons, advice].filter(Boolean).join('。建议：');
-}
-
-function runtimeProcessLabel(item = {}) {
-    const detected = Number(item.detected_count) || 0;
-    const ready = Number(item.ready_count) || 0;
-    const missing = Number(item.missing_count) || 0;
-    const limited = Number(item.limited_count) || 0;
-    if (detected === 0) {
-        if (item.diagnostics_version >= 2 && item.runtime_detection === 'detected' && Number(item.sample_count) > 0)
-            return `已采样 ${Math.round(Number(item.sample_count))}`;
-        return '未检测到进程';
-    }
-    return `已检测 ${detected} · 可采集 ${ready}${missing ? ` · 缺少 ${missing}` : ''}${limited ? ` · 受限 ${limited}` : ''}`;
-}
-
 function lowSampleGuidance(data, sessionMeta, querying) {
     if (querying || !data || data.empty) return '';
     const total = Number(data.total) || 0;
@@ -1760,19 +1583,6 @@ function formatCompactCount(value) {
 
 function formatEventCount(value) {
     return `${formatCompactCount(value)} 个`;
-}
-
-function symbolCheckSummary(check = {}) {
-    const missing = Array.isArray(check.missing) ? check.missing : [];
-    const buildIDs = Object.keys(check.build_ids || {});
-    const presentCount = buildIDs.filter(key => check.build_ids[key]).length;
-    const reasons = Array.isArray(check.reasons) ? check.reasons : [];
-    const parts = [`符号存储状态：${symbolStatusLabel(check.symbol_status || 'unknown', {})}`];
-    if (buildIDs.length > 0) parts.push(`build-id ${presentCount}/${buildIDs.length} 可用`);
-    if (check.kallsyms !== undefined) parts.push(`kallsyms ${check.kallsyms ? '可用' : '缺失'}`);
-    if (missing.length > 0) parts.push(`缺失：${missing.slice(0, 3).join(', ')}${missing.length > 3 ? '…' : ''}`);
-    if (reasons.length > 0) parts.push(`原因：${reasons.slice(0, 3).join('；')}${reasons.length > 3 ? '…' : ''}`);
-    return parts.join(' · ');
 }
 
 function RSSTrend({ series = [], meta = null, loading }) {
@@ -2269,40 +2079,6 @@ export function diagnosticText({ target, flamegraph, topn, timeWindow, profileTy
         diagnosticJSONField('runtime_diagnostics', flamegraph?.runtime_diagnostics || topn?.runtime_diagnostics || {}),
         `truncated: ${flamegraph?.truncated || topn?.truncated || false}`,
     ].join('\n');
-}
-
-function symbolStatusLabel(status, diagnostics = {}) {
-    const percent = Number(diagnostics?.unresolved_percent || 0);
-    const unresolved = Number(diagnostics?.unresolved_frame_weight || 0);
-    const totalWeight = Number(diagnostics?.total_frame_weight || 0);
-    const moduleUnresolved = Number(diagnostics?.module_unresolved_frame_weight || 0);
-    const noModule = Number(diagnostics?.no_module_frame_weight || 0);
-    const goState = diagnostics?.go_symbol_state;
-    const suffix = goState === 'pending'
-        ? ' · Go 符号正在后台预热'
-        : goState === 'failed'
-            ? ` · Go 符号提取失败${diagnostics?.reasons?.length ? `：${diagnostics.reasons[0]}` : ''}`
-            : '';
-    // 未解析帧拆两类：模块未解析（符号库可补 build-id）与无模块（疑似 JIT/
-    // 匿名内存，本质无解），成因和修法不同，混称"裸地址帧"会误导。
-    // 仅在 total_weight 存在时展示占比，避免符号存储检查（空 diagnostics）
-    // 场景下误报 0%。
-    const hasBreakdown = totalWeight > 0;
-    const modulePct = hasBreakdown ? moduleUnresolved * 100 / totalWeight : 0;
-    const noModulePct = hasBreakdown ? noModule * 100 / totalWeight : 0;
-    switch (status) {
-        case 'complete': return `完整（当前范围未检测到未解析帧）${suffix}`;
-        case 'partial':
-            return hasBreakdown
-                ? `部分解析（未解析 ${percent.toFixed(1)}%：模块未解析 ${modulePct.toFixed(1)}%、无模块 ${noModulePct.toFixed(1)}%，权重 ${formatNum(unresolved)}）${suffix}`
-                : `部分解析${suffix}`;
-        case 'missing':
-            return hasBreakdown
-                ? `缺失（未解析权重 ${formatNum(unresolved)}：模块未解析 ${modulePct.toFixed(1)}%、无模块 ${noModulePct.toFixed(1)}%）${suffix}`
-                : `缺失${suffix}`;
-        case 'not_applicable': return '不适用';
-        default: return status || '未知';
-    }
 }
 
 function formatNum(n) {

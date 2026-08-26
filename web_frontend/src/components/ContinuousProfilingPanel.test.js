@@ -38,7 +38,6 @@ jest.mock('./HistogramTrendChart', () => ({
 import {
     default as ContinuousProfilingPanel,
     CoverageBand,
-    coverageAlertForReliability,
     coverageBandsFromReliability,
     coverageStatusColor,
     coverageStatusText,
@@ -352,34 +351,6 @@ test('coverage bar hover reveals segment details', () => {
     expect(container.textContent).toContain('这段时间已经超过等待时间');
     act(() => root.unmount());
     container.remove();
-});
-
-test('coverage alert summarizes large gaps clearly', () => {
-    const alert = coverageAlertForReliability({
-        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.8 },
-        gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z', duration_seconds: 120 }],
-    });
-    expect(alert.summary).toContain('覆盖 80.0%');
-    expect(alert.summary).toContain('最长 2.0 分钟');
-    expect(alert.detail).toContain('累计缺口');
-});
-
-test('coverage alert uses exact gap seconds from the signal coverage', () => {
-    const alert = coverageAlertForReliability({
-        coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5 },
-        signal_coverage: {
-            cpu_profile: {
-                coverage: { from: '2026-08-19T10:00:00Z', to: '2026-08-19T10:10:00Z', ratio: 0.5, gap_seconds: 300 },
-                gaps: [{ start: '2026-08-19T10:04:00Z', end: '2026-08-19T10:06:00Z', duration_seconds: 120 }],
-                gap_count_total: 1,
-                status: 'real_gap',
-                coverage_bands: [],
-            },
-        },
-    }, 'cpu_profile');
-    expect(alert.summary).toContain('覆盖 50.0%');
-    // 累计缺口用精确 gap_seconds（300s = 5 分钟），而不是截断后的 120s。
-    expect(alert.detail).toContain('累计缺口 5.0 分钟');
 });
 
 test('coverage bands prefer the current signal coverage', () => {
