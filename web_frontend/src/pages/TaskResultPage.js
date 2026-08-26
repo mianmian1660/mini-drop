@@ -356,6 +356,7 @@ export default function TaskResultPage() {
 
     useEffect(() => {
         if (!task || Number(task.status) !== 2) return;
+        if (Number(task.analysis_status) === 3) return;
         if (streamState === 'live' && Number(task.analysis_status) < 2) return;
         if (hasVisual(files)) return;
         const timer = setInterval(() => {
@@ -1383,11 +1384,11 @@ export function buildStages(task, events, status, analysisStatus, artifact, file
         collected: hasEvent('collected') || status === 2 || analysisStatus > 0 || rawArtifact,
         analyzing: hasEvent('analyzing') || analysisStatus > 0 || Boolean(artifact),
         success: status === 2 && (analysisStatus === 2 || Boolean(artifact)),
-        failed: status === 3,
+        failed: status === 3 || analysisStatus === 3,
         canceled: status === 5,
     };
     const activeOrder = ['created', 'queued', 'delivered', 'running', 'uploading', 'collected', 'analyzing', 'success'];
-    const currentID = status === 5 ? 'canceled' : status === 3 ? 'failed' : [...activeOrder].reverse().find(id => stateByID[id]) || 'created';
+    const currentID = status === 5 ? 'canceled' : (status === 3 || analysisStatus === 3) ? 'failed' : [...activeOrder].reverse().find(id => stateByID[id]) || 'created';
 
     return stageDefinitions.map((definition) => {
         let state = 'pending';
@@ -1434,7 +1435,7 @@ function stageDetail(stageId, task, status, analysisStatus, available) {
     if (stageId === 'collected') return status >= 2 ? '采集结果已登记' : '等待采集结果';
     if (stageId === 'analyzing') return analysisStatus === 1 ? '分析器正在处理' : analysisStatus === 2 ? '分析已完成' : analysisStatus === 3 ? '分析失败' : '等待分析器领取';
     if (stageId === 'success') return available ? '结果与产物已可查看' : '等待成功终态';
-    if (stageId === 'failed') return status === 3 ? safeText(task.status_info) || '任务失败' : '未失败';
+    if (stageId === 'failed') return status === 3 ? safeText(task.status_info) || '任务失败' : analysisStatus === 3 ? '分析失败' : '未失败';
     if (stageId === 'canceled') return status === 5 ? '任务已取消' : '未取消';
     return '';
 }
