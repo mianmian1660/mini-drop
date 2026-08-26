@@ -333,6 +333,9 @@ type continuousAggregate struct {
 	RuntimeDiagnostics          map[string]*runtimeDiagnosticAccumulator
 	SeenProfileIDs              map[string]bool
 	SeenProfileSamples          map[string]int64
+	// Parquet v2 在伴随诊断缺失时不能仅凭普通 perf 样本推断运行时采集器
+	// ready；v1 历史窗口仍保留兼容推断。
+	DisableLegacyRuntimeInference bool
 }
 
 type runtimeDiagnosticAccumulator struct {
@@ -355,6 +358,9 @@ type runtimeDiagnosticAccumulator struct {
 	TargetModuleFrameWeight      float64
 	TargetModuleUnresolvedWeight float64
 	V2SampleCount                float64
+	DiagnosticsVersion           int
+	DiagnosticSource             string
+	ObservedAt                   time.Time
 }
 
 type continuousTreeNode struct {
@@ -2932,6 +2938,10 @@ func continuousAggregateLanguageStatusV2(agg *continuousAggregate, refs map[stri
 			continue
 		}
 		acc := continuousRuntimeAccumulator(agg, name)
+		acc.DiagnosticsVersion = 2
+		if acc.DiagnosticSource == "" {
+			acc.DiagnosticSource = "profile_window_v1"
+		}
 		// 状态/进程/原因描述当前（最新）窗口；覆盖率权重仍在下方跨窗
 		// 累加。这样 PID 重启或瞬态缺图恢复后不会被旧身份永久拖成 partial。
 		acc.Modes = map[string]bool{}
@@ -3064,6 +3074,7 @@ func continuousRuntimeDiagnostics(agg continuousAggregate) map[string]ProfileRun
 		diag := ProfileRuntimeDiagnostic{
 			Status: status, Modes: modes, DetectedCount: len(item.Detected), ReadyCount: len(item.Ready),
 			MissingCount: len(item.Missing), LimitedCount: item.Limited, Reasons: reasons, Processes: processes,
+			DiagnosticSource: item.DiagnosticSource,
 		}
 		// 阶段四：优先输出 v2 口径。原始帧/样本权重跨窗精确求和，
 		// 避免用 sample_count 平均不同栈深的帧百分比。
@@ -3074,7 +3085,10 @@ func continuousRuntimeDiagnostics(agg continuousAggregate) map[string]ProfileRun
 				// API 不应把它们显示成虚假语言状态。
 				continue
 			}
-			diag.DiagnosticsVersion = 2
+			diag.DiagnosticsVersion = item.DiagnosticsVersion
+			if diag.DiagnosticsVersion == 0 {
+				diag.DiagnosticsVersion = 2
+			}
 			if item.RuntimeDetection != "" {
 				diag.RuntimeDetection = item.RuntimeDetection
 			}
@@ -3136,6 +3150,8 @@ func v2CollectorToLegacyStatus(collector string) string {
 		return "partial"
 	case "missing", "failed", "not_applicable":
 		return "missing"
+	case "unknown":
+		return "unknown"
 	default:
 		return "missing"
 	}
@@ -3786,7 +3802,7 @@ func continuousAddSample(agg *continuousAggregate, sample ContinuousStackSample,
 	// ready.  Adding a synthetic perf_rolling/ready row here used to turn an
 	// explicit "missing --perf-basic-prof" state into the misleading "partial".
 	// Keep the sample-derived fallback only for historical v1 windows.
-	if !diag.HasV2 {
+	if !diag.HasV2 && !agg.DisableLegacyRuntimeInference {
 		processKey := strconv.Itoa(sample.PID) + "|" + sample.Exe
 		process := ProfileRuntimeProcessDiagnostic{PID: sample.PID, Comm: sample.Comm, Exe: sample.Exe, Mode: sample.Backend, Status: "ready"}
 		diag.Detected[processKey] = process

@@ -282,6 +282,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&ContinuousParquetBlock{},
 		&ContinuousParquetBlockFile{},
 		&ContinuousParquetBlockMember{},
+		&ContinuousParquetRuntimeDiagnostic{},
 		&ContinuousMigrationReceipt{},
 		&ContinuousCoverageSegment{},
 		&ContinuousMigrationFailure{},

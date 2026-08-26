@@ -188,13 +188,14 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 			"comm": {}, "pid": {}, "process_start_ms": {}, "process_instance": {},
 			"exe": {}, "runtime": {},
 		},
-		Backends:           map[string]bool{},
-		SymbolStatus:       "not_applicable",
-		SymbolReasons:      map[string]bool{},
-		Unit:               map[bool]string{true: "bytes", false: "samples"}[q.ProfileType == "memory"],
-		RuntimeDiagnostics: map[string]*runtimeDiagnosticAccumulator{},
-		SeenProfileIDs:     map[string]bool{},
-		SeenProfileSamples: map[string]int64{},
+		Backends:                      map[string]bool{},
+		SymbolStatus:                  "not_applicable",
+		SymbolReasons:                 map[string]bool{},
+		Unit:                          map[bool]string{true: "bytes", false: "samples"}[q.ProfileType == "memory"],
+		RuntimeDiagnostics:            map[string]*runtimeDiagnosticAccumulator{},
+		SeenProfileIDs:                map[string]bool{},
+		SeenProfileSamples:            map[string]int64{},
+		DisableLegacyRuntimeInference: true,
 	}
 
 	hours := pqHourlyRange(q.From, q.To)
@@ -222,7 +223,9 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 		if block == nil {
 			// 该小时无 v2 → v1 staging 回退（当前小时/热窗口）
 			incParquetV1Fallback()
+			agg.DisableLegacyRuntimeInference = false
 			found, v1Err := s.aggregateV1WindowsInto(ctx, q, hFrom, hTo, &agg)
+			agg.DisableLegacyRuntimeInference = true
 			if v1Err != nil {
 				incParquetQueryError()
 				return agg, true, fmt.Errorf("hour %s v1 fallback 失败: %w", hour.UTC().Format(time.RFC3339), v1Err)
@@ -233,6 +236,7 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 			continue
 		}
 		rows, _, readErr := pqReadBlockRows[pqCPURow](s, ctx, block.BlockID, hFrom.UnixMilli(), hTo.UnixMilli())
+		blockSamples := map[string][]ContinuousStackSample{}
 		if readErr == nil {
 			for i := range rows {
 				row := &rows[i]
@@ -266,14 +270,21 @@ func (s *APIServer) pqQueryAggregateMixed(ctx context.Context, q ProfileQuery) (
 					}
 				}
 				continuousAddSample(&agg, sample, pqLabelsInterface(row.Labels))
+				blockSamples[row.SessionSID] = append(blockSamples[row.SessionSID], sample)
 				agg.WindowCount++
+			}
+			if err := s.pqMergeDiagnosticsForQuery(ctx, block, hFrom, hTo, blockSamples, &agg); err != nil {
+				incParquetQueryError()
+				return agg, true, err
 			}
 		}
 		if readErr != nil {
 			// Parquet 读取失败：热表仍存在则仅该小时回退 v1；热表已清理则
 			// 返回明确的部分覆盖/依赖错误。
 			incParquetQueryError()
+			agg.DisableLegacyRuntimeInference = false
 			found, v1Err := s.aggregateV1WindowsInto(ctx, q, hFrom, hTo, &agg)
+			agg.DisableLegacyRuntimeInference = true
 			if v1Err == nil && found {
 				incParquetV1Fallback()
 				anyData = true

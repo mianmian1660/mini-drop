@@ -124,14 +124,15 @@ type ProfileRuntimeProcessDiagnostic struct {
 }
 
 type ProfileRuntimeDiagnostic struct {
-	Status        string                            `json:"status"`
-	Modes         []string                          `json:"modes"`
-	DetectedCount int                               `json:"detected_count"`
-	ReadyCount    int                               `json:"ready_count"`
-	MissingCount  int                               `json:"missing_count"`
-	LimitedCount  int                               `json:"limited_count"`
-	Reasons       []string                          `json:"reasons"`
-	Processes     []ProfileRuntimeProcessDiagnostic `json:"processes"`
+	Status           string                            `json:"status"`
+	DiagnosticSource string                            `json:"diagnostic_source,omitempty"`
+	Modes            []string                          `json:"modes"`
+	DetectedCount    int                               `json:"detected_count"`
+	ReadyCount       int                               `json:"ready_count"`
+	MissingCount     int                               `json:"missing_count"`
+	LimitedCount     int                               `json:"limited_count"`
+	Reasons          []string                          `json:"reasons"`
+	Processes        []ProfileRuntimeProcessDiagnostic `json:"processes"`
 	// 阶段四：v2 语言诊断契约字段（Agent language_status）。历史窗口没有
 	// v2 数据时保持零值，前端按 diagnostics_version 判断展示口径。
 	DiagnosticsVersion            int     `json:"diagnostics_version,omitempty"`

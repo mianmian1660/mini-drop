@@ -749,7 +749,12 @@ func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourS
 			}
 		}
 	}
-	if err := s.pqRegisterActiveBlockMulti(ctx, key, blockID, hourEnd, version, results, stats, members, reconcileStatus); err != nil {
+	diagnostics, err := s.pqRuntimeDiagnosticsForNewBlock(ctx, signalType, resolution, sourceBlockID, hourStart, hourEnd, members)
+	if err != nil {
+		_ = s.pqMarkBlockFailed(ctx, blockID, "diagnostics_failed")
+		return false, fmt.Errorf("构建运行时诊断失败: %w", err)
+	}
+	if err := s.pqRegisterActiveBlockMulti(ctx, key, blockID, hourEnd, version, results, stats, members, diagnostics, reconcileStatus); err != nil {
 		_ = s.pqMarkBlockFailed(ctx, blockID, "register_failed")
 		// 登记失败不删对象（由 sweep 按 block_id 前缀回收）
 		return false, err
@@ -767,7 +772,8 @@ func (s *APIServer) pqWriteSignalBlock(ctx context.Context, tenant string, hourS
 // 行更新为 active，并登记全部 part 文件与 members。reconcileStatus 写入
 // reconcile_status（raw 对账通过为 passed；降采样继承来源链）。
 func (s *APIServer) pqRegisterActiveBlockMulti(ctx context.Context, key pqBlockKey, blockID string, bucketEnd time.Time,
-	version int, results []parquetWriteResult, stats pqBlockStats, members []model.ContinuousParquetBlockMember, reconcileStatus string) error {
+	version int, results []parquetWriteResult, stats pqBlockStats, members []model.ContinuousParquetBlockMember,
+	diagnostics []model.ContinuousParquetRuntimeDiagnostic, reconcileStatus string) error {
 	now := time.Now()
 	if reconcileStatus == "" {
 		reconcileStatus = model.ContinuousParquetReconcilePassed
@@ -847,6 +853,9 @@ func (s *APIServer) pqRegisterActiveBlockMulti(ctx context.Context, key pqBlockK
 			if err := tx.Create(&members[i]).Error; err != nil {
 				return err
 			}
+		}
+		if err := pqPersistRuntimeDiagnosticsTx(tx, blockID, diagnostics); err != nil {
+			return fmt.Errorf("登记运行时诊断失败: %w", err)
 		}
 		if err := s.pqPersistMigrationReceiptsTx(tx, key, blockID, bucketEnd, members); err != nil {
 			return fmt.Errorf("登记永久 migration receipt 失败: %w", err)

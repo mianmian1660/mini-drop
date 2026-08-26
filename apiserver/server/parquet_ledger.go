@@ -410,6 +410,10 @@ func (s *APIServer) pqTombstoneBlock(ctx context.Context, blk *model.ContinuousP
 			Updates(map[string]interface{}{"deleted_at": now}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("block_id = ?", blk.BlockID).
+			Delete(&model.ContinuousParquetRuntimeDiagnostic{}).Error; err != nil {
+			return err
+		}
 		return tx.Model(&model.ContinuousParquetBlockMember{}).
 			Where("block_id = ?", blk.BlockID).Delete(&model.ContinuousParquetBlockMember{}).Error
 	})

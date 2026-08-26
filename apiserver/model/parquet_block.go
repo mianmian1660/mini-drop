@@ -153,6 +153,38 @@ type ContinuousParquetBlockMember struct {
 
 func (ContinuousParquetBlockMember) TableName() string { return "continuous_parquet_block_members" }
 
+// ContinuousParquetRuntimeDiagnostic 是 CPU Parquet Block 的运行时诊断伴随
+// 元数据。样本行只保存可聚合的栈与标签；collector 能力、缺失原因和语义帧
+// 覆盖率按 block + session + runtime 单独保存，避免每个样本重复一份 JSON。
+type ContinuousParquetRuntimeDiagnostic struct {
+	ID                           uint      `gorm:"primaryKey" json:"id"`
+	BlockID                      string    `gorm:"column:block_id;size:64;index;uniqueIndex:uq_cpq_runtime_diag,priority:1" json:"block_id"`
+	SessionSID                   string    `gorm:"column:session_sid;size:64;index;uniqueIndex:uq_cpq_runtime_diag,priority:2" json:"session_sid"`
+	Runtime                      string    `gorm:"column:runtime;size:32;index;uniqueIndex:uq_cpq_runtime_diag,priority:3" json:"runtime"`
+	Version                      int       `gorm:"column:diagnostics_version;default:2" json:"diagnostics_version"`
+	Detection                    string    `gorm:"column:runtime_detection;size:32" json:"runtime_detection"`
+	Collector                    string    `gorm:"column:collector_status;size:32" json:"collector_status"`
+	SymbolStatus                 string    `gorm:"column:symbol_status;size:32" json:"symbol_status"`
+	Modes                        []byte    `gorm:"column:collector_modes;type:jsonb" json:"collector_modes"`
+	Reasons                      []byte    `gorm:"column:reasons;type:jsonb" json:"reasons"`
+	Processes                    []byte    `gorm:"column:processes;type:jsonb" json:"processes"`
+	LimitedCount                 int       `gorm:"column:limited_count" json:"limited_count"`
+	FrameWeight                  float64   `gorm:"column:frame_weight" json:"frame_weight"`
+	SemanticFrameWeight          float64   `gorm:"column:semantic_frame_weight" json:"semantic_frame_weight"`
+	UnresolvedFrameWeight        float64   `gorm:"column:unresolved_frame_weight" json:"unresolved_frame_weight"`
+	SampleWeight                 float64   `gorm:"column:sample_weight" json:"sample_weight"`
+	SemanticSampleWeight         float64   `gorm:"column:semantic_sample_weight" json:"semantic_sample_weight"`
+	TargetModuleFrameWeight      float64   `gorm:"column:target_module_frame_weight" json:"target_module_frame_weight"`
+	TargetModuleUnresolvedWeight float64   `gorm:"column:target_module_unresolved_weight" json:"target_module_unresolved_weight"`
+	ObservedAt                   time.Time `gorm:"column:observed_at;index" json:"observed_at"`
+	CreatedAt                    time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt                    time.Time `gorm:"column:updated_at" json:"updated_at"`
+}
+
+func (ContinuousParquetRuntimeDiagnostic) TableName() string {
+	return "continuous_parquet_runtime_diagnostics"
+}
+
 // ContinuousMigrationReceipt 是不会随 raw Block 生命周期删除的迁移凭证。
 // 每行表示一个 source batch 的某个信号已完整写入并通过对账的 raw Block。
 // Block member 用于物理块 lineage；receipt 用于细粒度元数据 GC 的长期证明。

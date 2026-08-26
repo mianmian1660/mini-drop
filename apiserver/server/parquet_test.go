@@ -383,6 +383,11 @@ func TestPQBlockStateMachine(t *testing.T) {
 	if superseded.Status != model.ContinuousParquetStatusSuperseded || superseded.ReplacedBy != blockID2 {
 		t.Errorf("旧块状态: %s replaced_by=%s", superseded.Status, superseded.ReplacedBy)
 	}
+	if err := s.DB.Create(&model.ContinuousParquetRuntimeDiagnostic{
+		BlockID: blockID2, SessionSID: "s1", Runtime: "node", Version: 2,
+	}).Error; err != nil {
+		t.Fatalf("seed runtime diagnostic: %v", err)
+	}
 
 	// 墓碑化
 	if err := s.pqTombstoneBlock(ctx, active2, "test"); err != nil {
@@ -394,6 +399,14 @@ func TestPQBlockStateMachine(t *testing.T) {
 	}
 	if tomb.Status != model.ContinuousParquetStatusDeleted || tomb.TombstoneAt == nil {
 		t.Errorf("墓碑状态: %s", tomb.Status)
+	}
+	var diagnosticCount int64
+	if err := s.DB.Model(&model.ContinuousParquetRuntimeDiagnostic{}).
+		Where("block_id = ?", blockID2).Count(&diagnosticCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if diagnosticCount != 0 {
+		t.Fatalf("墓碑化后仍残留 %d 条运行时诊断", diagnosticCount)
 	}
 }
 
