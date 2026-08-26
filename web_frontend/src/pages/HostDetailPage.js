@@ -209,7 +209,6 @@ export default function HostDetailPage() {
 
     const agent = agentDetail?.agent || {};
     const stat = agentDetail?.stat || {};
-    const audits = agentDetail?.audits || [];
     const capabilities = parseStringList(agent.capabilities);
 
     return (
@@ -277,7 +276,7 @@ export default function HostDetailPage() {
             {activeTab === 'tasks' && <HostTasksPanel target={target} />}
             {activeTab === 'timeline' && <HostTimelinePanel target={target} />}
 			{activeTab === 'profiling' && <HostProfilingPanel target={target} refreshToken={continuousRefreshToken} />}
-            {activeTab === 'logs' && <AgentLogsPanel audits={audits} detailLoading={detailLoading} onRefresh={() => loadAgentDetail(target.ip)} />}
+            {activeTab === 'logs' && <AgentLogsPanel target={target} />}
         </div>
     );
 }
@@ -806,16 +805,43 @@ function HostProfilingPanel({ target, refreshToken }) {
 	return <ContinuousSessionList target={target} refreshToken={refreshToken} />;
 }
 
-function AgentLogsPanel({ audits, detailLoading, onRefresh }) {
+function AgentLogsPanel({ target }) {
+    const pageSize = 20;
+    const [audits, setAudits] = useState([]);
+    const [page, setPage] = useState(1);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+    const total = audits.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const pageAudits = audits.slice((page - 1) * pageSize, page * pageSize);
+
+    const load = useCallback(async () => {
+        setLoading(true);
+        setError('');
+        try {
+            const response = await agents.audits({ limit: 100 });
+            if (response.code !== 0) throw new Error(response.message || '加载 Agent 日志失败');
+            setAudits((response.data?.audits || []).filter(item => item.ip_addr === target.ip));
+            setPage(1);
+        } catch (err) {
+            setError(err?.message || '加载 Agent 日志失败');
+        } finally {
+            setLoading(false);
+        }
+    }, [target.ip]);
+
+    useEffect(() => { load(); }, [load]);
+
     return (
         <section style={S.card}>
             <div style={S.sectionHead}>
-                <h3 style={S.sectionTitle}>该主机 Agent 日志</h3>
-                <button style={S.btnSecondary} onClick={onRefresh} disabled={detailLoading}>{detailLoading ? '刷新中' : '刷新'}</button>
+                <div><h3 style={S.sectionTitle}>该主机 Agent 日志</h3><span style={S.subtle}>最近 {total} 条{total >= 100 ? '（当前接口上限 100 条）' : ''}</span></div>
+                <button style={S.btnSecondary} onClick={load} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
             </div>
-            {audits.length === 0 ? <div style={S.empty}>暂无该主机审计日志</div> : (
+            {error && <div style={S.error}>{error}</div>}
+            {loading && audits.length === 0 ? <div style={S.empty}>正在加载 Agent 日志...</div> : audits.length === 0 ? <div style={S.empty}>暂无该主机审计日志</div> : (
                 <div style={S.auditList}>
-                    {audits.slice(0, 20).map(item => (
+                    {pageAudits.map(item => (
                         <div key={item.id} style={S.auditItem}>
                             <span>{formatTime(item.created_at)}</span>
                             <span style={{ ...S.badge, background: auditColor(item.event), color: '#fff', justifyContent: 'center' }}>{auditName(item.event)}</span>
@@ -824,6 +850,9 @@ function AgentLogsPanel({ audits, detailLoading, onRefresh }) {
                     ))}
                 </div>
             )}
+            {!loading && total > pageSize && <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 14 }}>
+                <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
+            </div>}
         </section>
     );
 }

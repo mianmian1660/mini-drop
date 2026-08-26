@@ -8,7 +8,7 @@
 
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { act } from 'react-dom/test-utils';
+import { act, Simulate } from 'react-dom/test-utils';
 
 const mockSearchParams = new URLSearchParams();
 
@@ -19,7 +19,7 @@ jest.mock('react-router-dom', () => ({
 }));
 
 jest.mock('../api', () => ({
-    agents: { detail: jest.fn() },
+    agents: { detail: jest.fn(), audits: jest.fn() },
     continuous: { sessions: jest.fn(), stopSession: jest.fn() },
     profiles: { targets: jest.fn() },
     schedules: { list: jest.fn() },
@@ -30,7 +30,9 @@ jest.mock('../api', () => ({
 jest.mock('../components/CreateTaskModal', () => () => null);
 jest.mock('../components/CreateContinuousSessionModal', () => () => null);
 jest.mock('../components/ContinuousSessionList', () => () => null);
-jest.mock('../components/Pagination', () => () => null);
+jest.mock('../components/Pagination', () => ({ page, totalPages, onPageChange }) => (
+    <button data-testid="pagination" onClick={() => onPageChange(page + 1)}>{page}/{totalPages}</button>
+));
 jest.mock('../components/ScheduleList', () => ({ detailPrefix, targetIp }) => (
     <div data-testid="schedule-list" data-prefix={detailPrefix} data-target={targetIp || ''} />
 ));
@@ -69,6 +71,7 @@ async function setupApiMocks() {
             audits: [],
         },
     });
+    agents.audits.mockResolvedValue({ code: 0, data: { audits: [], total: 0, page: 1, page_size: 20 } });
     tasks.list.mockResolvedValue({ code: 0, data: { tasks: singleTasks, total: 3 } });
     schedules.list.mockResolvedValue({ code: 0, data: { schedules: hostSchedules, total: 1 } });
     continuous.sessions.mockResolvedValue({ code: 0, data: { sessions: [] } });
@@ -122,6 +125,36 @@ test('周期任务 Tab 只展示当前主机的周期任务列表', async () => 
     expect(list).toBeTruthy();
     expect(list.getAttribute('data-prefix')).toBe('/hosts/target-1/schedules');
     expect(list.getAttribute('data-target')).toBe('1.2.3.4');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
+test('Agent 日志读取最近 100 条并在前端分页', async () => {
+    mockSearchParams.set('tab', 'logs');
+    await setupApiMocks();
+    const auditItems = Array.from({ length: 41 }, (_, index) => ({
+        id: index + 1,
+        ip_addr: target.ip,
+        event: 'heartbeat',
+        reason: `日志-${index + 1}`,
+        created_at: `2026-08-25T10:${String(index).padStart(2, '0')}:00Z`,
+    }));
+    agents.audits.mockResolvedValue({ code: 0, data: { audits: auditItems, total: 41 } });
+
+    const { container, root } = await renderHost();
+    await act(async () => { await Promise.resolve(); });
+
+    expect(agents.audits).toHaveBeenCalledWith({ limit: 100 });
+    expect(container.textContent).toContain('最近 41 条');
+    expect(container.textContent).toContain('日志-1');
+    expect(container.textContent).not.toContain('日志-21');
+    const pagination = container.querySelector('[data-testid="pagination"]');
+    expect(pagination.textContent).toBe('1/3');
+
+    await act(async () => Simulate.click(pagination));
+    expect(container.textContent).toContain('日志-21');
+    expect(container.querySelector('[data-testid="pagination"]').textContent).toBe('2/3');
 
     act(() => root.unmount());
     container.remove();
