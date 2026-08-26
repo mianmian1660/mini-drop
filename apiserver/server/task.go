@@ -2549,16 +2549,26 @@ func (s *APIServer) GetTaskDiff(c *gin.Context) {
 
 	// 缺产物时说明是哪一侧、为什么缺，而不是回空表让用户自己猜
 	fetchSide := func(t *model.HotmethodTask, field string) ([]map[string]interface{}, bool) {
+		if t.AnalysisStatus == 3 {
+			c.JSON(http.StatusConflict, gin.H{
+				"code":    409,
+				"message": field + "（" + t.TID + "）分析失败，无法生成热点函数对比",
+			})
+			return nil, false
+		}
+		if t.AnalysisStatus < 2 {
+			c.JSON(http.StatusConflict, gin.H{
+				"code":    409,
+				"message": field + "（" + t.TID + "）分析尚未完成（analysis_status=" + strconv.Itoa(t.AnalysisStatus) + "）",
+			})
+			return nil, false
+		}
 		top := s.fetchTopFunctionsForTask(t)
 		if len(top) > 0 {
 			return top, true
 		}
 		reason := "没有可对比的热点函数产物（top.json）"
-		if t.AnalysisStatus == 3 {
-			reason = "分析失败，无法生成热点函数对比"
-		} else if t.AnalysisStatus < 2 {
-			reason = "分析尚未完成（analysis_status=" + strconv.Itoa(t.AnalysisStatus) + "）"
-		} else if t.ProfilerType == ProfilerBPF {
+		if t.ProfilerType == ProfilerBPF {
 			reason = "eBPF 直方图任务产出的是延迟分布而非函数列表，无法做热点对比"
 		}
 		c.JSON(http.StatusConflict, gin.H{
