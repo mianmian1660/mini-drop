@@ -91,10 +91,10 @@ export default function HomePage() {
             </div>
 
             <div style={styles.metricGrid}>
-                <Metric label="可观测对象" value={targets.length} />
-                <Metric label="drop_agent 在线" value={`${onlineDropAgents}/${targets.length}`} />
-                <Metric label="pprof scrape 可用" value={`${pprofScrapeReady}/${targets.length}`} />
-                <Metric label="Native profiling 可用" value={`${nativeProfileReady}/${targets.length}`} />
+                <Metric label="可观测对象" value={visibleTargets.length} />
+                <Metric label="drop_agent 在线" value={`${onlineDropAgents}/${visibleTargets.length}`} />
+                <Metric label="pprof scrape 可用" value={`${pprofScrapeReady}/${visibleTargets.length}`} />
+                <Metric label="Native profiling 可用" value={`${nativeProfileReady}/${visibleTargets.length}`} />
             </div>
 
             {error && <div style={styles.error}>{error}</div>}
