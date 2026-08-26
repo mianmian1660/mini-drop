@@ -104,6 +104,50 @@ function kindNeedsPID(kind) {
     return (kind?.schema || []).some(field => field.name === 'target_pid' && field.required);
 }
 
+// 字段标题覆盖：后端 schema 标题较泛化，按 TaskKind + 字段名显示更明确的标题。
+const FIELD_LABEL_OVERRIDES = {
+    'async_profiler_java:target_pid': 'Java 宿主机 PID',
+    'java_heap:target_pid': 'Java 宿主机 PID',
+    'go_pprof:pprof_url': 'Go CPU Profile URL',
+    'go_pprof_heap:pprof_url': 'Go Heap Profile URL',
+};
+
+function fieldLabel(kind, field) {
+    return FIELD_LABEL_OVERRIDES[`${kind?.id}:${field.name}`] || field.label;
+}
+
+// 单次采样关键字段的悬停提示，内容根据当前 TaskKind 显示。
+const FIELD_TOOLTIPS = {
+    'async_profiler_java:target_pid': (
+        <>
+            Java 单次采样使用 async-profiler 附加到指定 JVM，因此必须填写目标 Java 进程的宿主机 PID。
+            请勿填写容器内 PID；JVM 重启后 PID 可能变化，需要重新确认。
+        </>
+    ),
+    'java_heap:target_pid': (
+        <>
+            Java 单次采样使用 async-profiler 附加到指定 JVM，因此必须填写目标 Java 进程的宿主机 PID。
+            请勿填写容器内 PID；JVM 重启后 PID 可能变化，需要重新确认。
+        </>
+    ),
+    'go_pprof:pprof_url': (
+        <>
+            Go 单次采样通过 HTTP 拉取应用暴露的 pprof CPU Profile，因此需要填写 Agent 能访问的完整 URL，例如 <code>http://目标地址:6060/debug/pprof/profile</code>。
+            系统无法仅通过 PID 判断 pprof 的监听地址和端口。
+        </>
+    ),
+    'go_pprof_heap:pprof_url': (
+        <>
+            Go Heap 通过 HTTP 获取当前堆快照，因此需要填写 Agent 能访问的完整 URL，例如 <code>http://目标地址:6060/debug/pprof/heap</code>。
+            目标 Go 应用必须已启用 <code>net/http/pprof</code>。
+        </>
+    ),
+};
+
+function fieldTooltip(kind, field) {
+    return FIELD_TOOLTIPS[`${kind?.id}:${field.name}`] || null;
+}
+
 function capabilityMatches(kind, capabilities) {
     if (!kind) return true;
     const capSet = new Set(capabilities.map(cap => String(cap).toLowerCase()));
@@ -428,7 +472,6 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                                                 <span style={S.pill}>{kind.runner || 'runner'}</span>
                                                 {kindNeedsPID(kind) && <span style={{ ...S.pill, background: '#ecfdf3', color: '#027a48' }}>需要 PID</span>}
                                                 {kindNeedsURL(kind) && <span style={{ ...S.pill, background: '#fff7ed', color: '#c2410c' }}>需要 URL</span>}
-                                                {kind.analysis_pipeline && <span style={S.pill}>{kind.analysis_pipeline}</span>}
                                             </div>
                                             <p style={S.kindDesc}>{kindDescription(kind)}</p>
                                         </button>
@@ -450,18 +493,23 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                                         </button>
                                     ))}
                                 </div>
-                                <select style={S.select} value={f.task_kind} onChange={e => up('task_kind', e.target.value)} aria-label="任务类型兼容选择">
-                                    {kindList.map(kind => <option key={kind.id} value={kind.id}>{kind.display_name}</option>)}
-                                </select>
                             </>
                         )}
                         {!kload && !taskKindError && f.target_ip && kindList.length === 0 && (
                             <p style={S.warn}>目标 Agent {f.target_ip} 没有匹配的 TaskKind。请切换 Agent，或检查 drop_agent capability 上报。</p>
                         )}
                     </div>
-                    {(selectedKind?.schema || []).map(field => (
+                    {(selectedKind?.schema || [])
+                        // 前端不再展示"包含子进程"字段（后端 schema 仍保留，提交参数不变）
+                        .filter(field => field.name !== 'subprocess')
+                        .map(field => (
                         <div key={field.name}>
-                            {field.type !== 'boolean' && <label style={S.label}>{field.label}{field.required ? ' *' : ''}</label>}
+                            {field.type !== 'boolean' && (
+                                <label style={S.label}>
+                                    {fieldLabel(selectedKind, field)}{field.required ? ' *' : ''}
+                                    {fieldTooltip(selectedKind, field) && <InfoTooltip>{fieldTooltip(selectedKind, field)}</InfoTooltip>}
+                                </label>
+                            )}
                             {renderField(field)}
                         </div>
                     ))}
