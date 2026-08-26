@@ -109,6 +109,8 @@ const tabs = [
 ];
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed', 5: '#64748b' };
 const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
+const taskStatusColor = (task) => Number(task.status) === 2 && Number(task.analysis_status) === 3 ? '#f44336' : (statusColors[task.status] || '#999');
+const taskStatusName = (task) => Number(task.status) === 2 && Number(task.analysis_status) === 3 ? '分析失败' : (statusNames[task.status] || '未知');
 
 export default function HostDetailPage() {
     const { targetId: rawTargetId } = useParams();
@@ -853,7 +855,7 @@ function TaskTable({ tasks: taskItems, compact = false, onCancelled }) {
                         <td style={{ ...S.td, color: '#667085', fontSize: 12 }}>{task.tid}</td>
                         <td style={S.td}>{task.name}</td>
                         {!compact && <td style={S.td}>{collectorLabelFromTask(task)}</td>}
-                        <td style={S.td}><span style={{ ...S.badge, background: statusColors[task.status] || '#999', color: '#fff' }}>{statusNames[task.status] || '未知'}</span></td>
+                        <td style={S.td}><span style={{ ...S.badge, background: taskStatusColor(task), color: '#fff' }}>{taskStatusName(task)}</span></td>
                         <td style={S.td}>{formatTime(task.create_time)}</td>
                         <td style={S.td}>{task.user_name || '系统'}</td>
                         <td style={S.td}>

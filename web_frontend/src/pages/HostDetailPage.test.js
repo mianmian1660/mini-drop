@@ -44,6 +44,7 @@ const target = { id: 'target-1', ip: '1.2.3.4', hostname: 'node', service_name: 
 const singleTasks = [
     { tid: 't1', name: '普通任务', task_kind: 'perf_cpu', status: 2, create_time: '2026-08-22T00:00:00Z', user_name: 'user-a', target_ip: '1.2.3.4' },
     { tid: 't2', name: '取消任务', task_kind: 'perf_cpu', status: 5, create_time: '2026-08-22T00:01:00Z', user_name: 'user-a', target_ip: '1.2.3.4' },
+    { tid: 't3', name: '分析失败任务', task_kind: 'perf_cpu', status: 2, analysis_status: 3, create_time: '2026-08-22T00:02:00Z', user_name: 'user-a', target_ip: '1.2.3.4' },
 ];
 const hostSchedules = [
     { sid: 'sch-1', name: 'CPU 计划', target_ip: '1.2.3.4', cron_expr: '*/5 * * * *', enabled: true, user_name: 'user-a' },
@@ -68,7 +69,7 @@ async function setupApiMocks() {
             audits: [],
         },
     });
-    tasks.list.mockResolvedValue({ code: 0, data: { tasks: singleTasks, total: 2 } });
+    tasks.list.mockResolvedValue({ code: 0, data: { tasks: singleTasks, total: 3 } });
     schedules.list.mockResolvedValue({ code: 0, data: { schedules: hostSchedules, total: 1 } });
     continuous.sessions.mockResolvedValue({ code: 0, data: { sessions: [] } });
     storage.status.mockResolvedValue({ code: 0, data: { level: 'normal', available_bytes: 20 * 1024 * 1024 * 1024 } });
@@ -99,6 +100,8 @@ test('概览最近单次任务请求 task_scope=single，周期区域渲染主�
     expect(container.textContent).toContain('最近单次任务');
     expect(container.textContent).toContain('取消任务');
     expect(container.textContent).toContain('已取消');
+    expect(container.textContent).toContain('分析失败任务');
+    expect(container.textContent).toContain('分析失败');
 
     // 概览周期区域渲染 ScheduleList：目标为该主机、详情前缀为 /hosts/:id/schedules
     const list = container.querySelector('[data-testid="schedule-list"]');

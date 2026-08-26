@@ -32,6 +32,8 @@ const styles = {
 
 const statusColors = { 0: '#ffc107', 1: '#2196f3', 2: '#4caf50', 3: '#f44336', 4: '#7c3aed', 5: '#64748b' };
 const statusNames = { 0: '待处理', 1: '执行中', 2: '已完成', 3: '失败', 4: '上传中', 5: '已取消' };
+const taskStatusColor = (task) => Number(task.status) === 2 && Number(task.analysis_status) === 3 ? '#f44336' : (statusColors[task.status] || '#999');
+const taskStatusName = (task) => Number(task.status) === 2 && Number(task.analysis_status) === 3 ? '分析失败' : (statusNames[task.status] || '未知');
 
 export default function TaskListPage() {
     const [taskList, setTaskList] = useState([]);
@@ -193,8 +195,8 @@ export default function TaskListPage() {
                                     <td style={styles.td}>{t.target_ip}</td>
                                     <td style={styles.td}>{collectorLabelFromTask(t)}</td>
                                     <td style={styles.td}>
-                                        <span style={{ ...styles.badge, background: statusColors[t.status] || '#999', color: '#fff' }}>
-                                            {statusNames[t.status] || '未知'}
+                                        <span style={{ ...styles.badge, background: taskStatusColor(t), color: '#fff' }}>
+                                            {taskStatusName(t)}
                                         </span>
                                     </td>
                                     <td style={styles.td}>{t.create_time}</td>

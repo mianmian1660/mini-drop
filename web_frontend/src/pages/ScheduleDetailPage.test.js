@@ -180,6 +180,21 @@ test('已取消窗口显示明确状态而不是未知', async () => {
     container.remove();
 });
 
+test('采集完成但分析失败的窗口显示分析失败', async () => {
+    schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
+    tasks.timeline.mockResolvedValue({
+        code: 0,
+        data: { points: [{ tid: 't-analysis-failed', name: '失败窗口', status: 2, analysis_status: 3, has_result: false, window_start: '2026-08-22T00:10:00Z' }], trends: { total: 1, failed: 0 } },
+    });
+
+    const { container, root } = await renderAt('/schedules/sch-1');
+    expect(container.querySelector('table tbody').textContent).toContain('分析失败');
+    expect(container.querySelector('table tbody').textContent).not.toContain('已完成');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
 test('时间轴筛选应用后携带状态参数重新查询', async () => {
     schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
     tasks.timeline.mockResolvedValue({ code: 0, data: { points, trends: null } });

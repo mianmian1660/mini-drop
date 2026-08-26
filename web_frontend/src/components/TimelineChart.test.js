@@ -16,3 +16,7 @@ test('timeline tooltip width is bounded by a narrow chart', () => {
 test('canceled windows use the neutral canceled color', () => {
     expect(statusColor(5)).toBe('#64748b');
 });
+
+test('collection done with failed analysis uses the failure color', () => {
+    expect(statusColor(2, 3)).toBe('#f44336');
+});

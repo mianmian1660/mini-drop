@@ -91,6 +91,20 @@ test('取消任务显示已取消并可按取消状态筛选', async () => {
     container.remove();
 });
 
+test('采集完成但分析失败显示分析失败', async () => {
+    tasks.list.mockResolvedValue({
+        code: 0,
+        data: { tasks: [{ ...singleTasks[0], tid: 't-analysis-failed', name: '分析失败任务', status: 2, analysis_status: 3 }], total: 1 },
+    });
+
+    const { container, root } = await renderPage();
+    expect(container.textContent).toContain('分析失败任务');
+    expect(container.textContent).toContain('分析失败');
+
+    act(() => root.unmount());
+    container.remove();
+});
+
 test('无任务时展示空态提示', async () => {
     tasks.list.mockResolvedValue({ code: 0, data: { tasks: [], total: 0 } });
 

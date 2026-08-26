@@ -257,7 +257,9 @@ export default function ScheduleTimeline({ sid }) {
                                                 <span style={{ color: '#667085', fontSize: 12 }}>{p.tid}</span>
                                             </td>
                                             <td style={S.td}>
-                                                <span style={{ ...S.badge, background: statusColor(p.status), color: '#fff' }}>{ST[p.status] || '未知'}</span>
+                                                <span style={{ ...S.badge, background: statusColor(p.status, p.analysis_status), color: '#fff' }}>
+                                                    {p.status === 2 && p.analysis_status === 3 ? '分析失败' : (ST[p.status] || '未知')}
+                                                </span>
                                             </td>
                                             <td style={S.td}>
                                                 {p.frequency_hz ? `${p.frequency_hz}Hz` : '-'}
