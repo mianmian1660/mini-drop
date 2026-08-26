@@ -91,7 +91,7 @@ async function renderAt(path) {
 
 test('主机入口加载对应 SID 的时间轴并展示计划参数', async () => {
     schedules.detail.mockResolvedValue({ code: 0, data: scheduleDetail });
-    tasks.timeline.mockResolvedValue({ code: 0, data: { points, trends: { total: 2 } } });
+    tasks.timeline.mockResolvedValue({ code: 0, data: { points, trends: { total: 2, success: 1, analysis_failed: 1 } } });
     tasks.diff.mockResolvedValue({ code: 0, data: { baseline: {}, compare: {}, functions: [] } });
 
     const { container, root } = await renderAt('/hosts/host-1/schedules/sch-1');
@@ -114,6 +114,8 @@ test('主机入口加载对应 SID 的时间轴并展示计划参数', async () 
     expect(tasks.timeline).toHaveBeenCalledWith('sch-1', expect.anything());
     expect(container.textContent).toContain('窗口1');
     expect(container.textContent).toContain('窗口2');
+    expect(container.textContent).toContain('成功 1');
+    expect(container.textContent).toContain('分析失败 1');
 
     // 时间轴窗口提供"设为基线"
     const baselineBtns = Array.from(container.querySelectorAll('button')).filter(b => b.textContent.includes('设为基线'));

@@ -1484,6 +1484,7 @@ func TestTimelineTrendsCountCanceledWindows(t *testing.T) {
 	fixtures := []model.HotmethodTask{
 		{TID: "tl-canceled", Name: "canceled", MasterTaskTID: "sch-canceled", Status: TaskStatusCanceled, CreateTime: base},
 		{TID: "tl-failed", Name: "failed", MasterTaskTID: "sch-canceled", Status: TaskStatusFailed, CreateTime: base.Add(time.Minute)},
+		{TID: "tl-analysis-failed", Name: "analysis failed", MasterTaskTID: "sch-canceled", Status: TaskStatusDone, AnalysisStatus: 3, CreateTime: base.Add(2 * time.Minute)},
 	}
 	if err := s.DB.Create(&fixtures).Error; err != nil {
 		t.Fatalf("create timeline fixtures: %v", err)
@@ -1498,8 +1499,9 @@ func TestTimelineTrendsCountCanceledWindows(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("timeline status=%d body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"canceled":1`) || !strings.Contains(w.Body.String(), `"failed":1`) {
-		t.Fatalf("timeline trends missing canceled count: %s", w.Body.String())
+	body := w.Body.String()
+	if !strings.Contains(body, `"canceled":1`) || !strings.Contains(body, `"failed":1`) || !strings.Contains(body, `"analysis_failed":1`) || !strings.Contains(body, `"success":0`) {
+		t.Fatalf("timeline trends missing terminal status counts: %s", body)
 	}
 }
 

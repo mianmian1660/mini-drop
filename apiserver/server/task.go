@@ -2287,13 +2287,14 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 
 	timeline := make([]TimelinePoint, 0, len(tasks))
 	trends := gin.H{
-		"total":        len(tasks),
-		"success":      0,
-		"failed":       0,
-		"canceled":     0,
-		"running":      0,
-		"has_result":   0,
-		"by_task_kind": gin.H{},
+		"total":           len(tasks),
+		"success":         0,
+		"failed":          0,
+		"analysis_failed": 0,
+		"canceled":        0,
+		"running":         0,
+		"has_result":      0,
+		"by_task_kind":    gin.H{},
 	}
 	byKind := map[string]int{}
 	for _, t := range tasks {
@@ -2328,7 +2329,11 @@ func (s *APIServer) GetTimeline(c *gin.Context) {
 		}
 		switch t.Status {
 		case TaskStatusDone:
-			trends["success"] = trends["success"].(int) + 1
+			if t.AnalysisStatus == 3 {
+				trends["analysis_failed"] = trends["analysis_failed"].(int) + 1
+			} else {
+				trends["success"] = trends["success"].(int) + 1
+			}
 		case TaskStatusFailed:
 			trends["failed"] = trends["failed"].(int) + 1
 		case TaskStatusCanceled:
