@@ -1529,22 +1529,37 @@ func TestOutboxAndPollerCoordinatorBranches(t *testing.T) {
 		TID: "tid-poller-upload", Name: "poll upload", RequestParams: params,
 		Status: TaskStatusUploading, UID: "owner", CreateTime: runningStart, BeginTime: &runningStart,
 	}
+	timedOutStart := time.Now().Add(-40 * time.Second)
+	timedOut := model.HotmethodTask{
+		TID: "tid-poller-timeout", Name: "poll timeout", RequestParams: params,
+		Status: TaskStatusUploading, UID: "owner", CreateTime: timedOutStart, BeginTime: &timedOutStart,
+	}
 	if err := s.DB.Create(&running).Error; err != nil {
 		t.Fatalf("create running: %v", err)
 	}
 	if err := s.DB.Create(&uploading).Error; err != nil {
 		t.Fatalf("create uploading: %v", err)
 	}
+	if err := s.DB.Create(&timedOut).Error; err != nil {
+		t.Fatalf("create timed out: %v", err)
+	}
 	s.pollRunningTasks()
 
-	var gotRunning, gotUploading model.HotmethodTask
+	var gotRunning, gotUploading, gotTimedOut model.HotmethodTask
 	_ = s.DB.Where("tid = ?", running.TID).First(&gotRunning).Error
 	_ = s.DB.Where("tid = ?", uploading.TID).First(&gotUploading).Error
+	_ = s.DB.Where("tid = ?", timedOut.TID).First(&gotTimedOut).Error
 	if gotRunning.Status != TaskStatusUploading {
 		t.Fatalf("running status=%d, want uploading", gotRunning.Status)
 	}
 	if gotUploading.Status != TaskStatusUploading {
 		t.Fatalf("uploading status=%d, want still uploading before deadline", gotUploading.Status)
+	}
+	if gotTimedOut.Status != TaskStatusFailed || gotTimedOut.AnalysisStatus != 3 || gotTimedOut.EndTime == nil {
+		t.Fatalf("timed out task=%#v, want failed with analysis_status=3 and end_time", gotTimedOut)
+	}
+	if !strings.Contains(gotTimedOut.StatusInfo, "未收到采集产物") {
+		t.Fatalf("timed out status_info=%q, want missing artifact reason", gotTimedOut.StatusInfo)
 	}
 	if s.taskHasArtifacts("") {
 		t.Fatal("empty tid must not have artifacts")

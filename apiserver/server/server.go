@@ -353,26 +353,32 @@ func (s *APIServer) pollRunningTasks() {
 
 		if task.Status == TaskStatusUploading {
 			rawKey, rawSize, hasArtifacts := s.findRawCollectionArtifact(task.TID)
-			if hasArtifacts || now.After(deadline) {
-				reason := "采集产物已上传，任务完成"
-				if !hasArtifacts {
-					reason = "上传等待窗口结束，任务自动标记完成"
-				}
+			if hasArtifacts {
 				endTime := now
-				_ = s.transitionTaskStatus(&task, TaskStatusDone, reason, "task_poller", map[string]interface{}{"end_time": &endTime})
-				if hasArtifacts {
-					if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {
-						s.Logger.Warn("轮询补建分析任务失败",
-							zap.String("tid", task.TID),
-							zap.String("raw_key", rawKey),
-							zap.Error(err),
-						)
-					}
+				_ = s.transitionTaskStatus(&task, TaskStatusDone, "采集产物已上传，任务完成", "task_poller", map[string]interface{}{"end_time": &endTime})
+				if err := s.ensureAnalysisQueued(task.TID, rawKey, rawSize); err != nil {
+					s.Logger.Warn("轮询补建分析任务失败",
+						zap.String("tid", task.TID),
+						zap.String("raw_key", rawKey),
+						zap.Error(err),
+					)
 				}
 				s.Logger.Info("任务自动标记为完成",
 					zap.String("tid", task.TID),
 					zap.String("name", task.Name),
-					zap.Bool("has_artifacts", hasArtifacts),
+				)
+				continue
+			}
+			if now.After(deadline) {
+				endTime := now
+				reason := formatErrorReason(ErrCodeTaskExecutionFailed, "上传等待窗口结束，未收到采集产物")
+				_ = s.transitionTaskStatus(&task, TaskStatusFailed, reason, "task_poller", map[string]interface{}{
+					"end_time":        &endTime,
+					"analysis_status": 3,
+				})
+				s.Logger.Warn("任务上传超时且无采集产物，标记为失败",
+					zap.String("tid", task.TID),
+					zap.String("name", task.Name),
 				)
 			}
 		}
