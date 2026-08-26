@@ -248,7 +248,9 @@ test('保留时间限制为 24 小时：24h 可提交、25h 不可提交', async
     expect(retentionInput).toBeTruthy();
     expect(retentionInput.getAttribute('max')).toBe('24');
     // 悬停说明提到 1–24
-    expect(container.textContent).toContain('最长保留 24 小时');
+    const retentionTooltip = retentionInput.closest('label').querySelector('button[aria-label="查看说明"]');
+    act(() => Simulate.mouseEnter(retentionTooltip));
+    expect(container.querySelector('[role="tooltip"]')?.textContent).toContain('最长保留 24 小时');
     expect(container.textContent).not.toContain('1–720');
 
     const name = container.querySelector('input[placeholder="例如：API 服务持续剖析"]');
