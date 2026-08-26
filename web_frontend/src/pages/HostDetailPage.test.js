@@ -329,8 +329,8 @@ test('运行状态显示任务计数和数据新鲜度', async () => {
     // 标题已替换为"运行状态"，不再出现"性能状态概览"
     expect(container.textContent).toContain('运行状态');
     expect(container.textContent).not.toContain('性能状态概览');
-    // 任务计数：1 个成功 / 0 个失败
-    expect(container.textContent).toContain('1 / 0');
+    // 分析失败不计入成功，并纳入需要关注的失败数
+    expect(container.textContent).toContain('1 / 1');
     // 数据新鲜度（host 采集时间刚刚 → 新鲜）
     expect(container.textContent).toContain('数据新鲜');
 

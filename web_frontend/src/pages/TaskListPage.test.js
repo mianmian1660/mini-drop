@@ -39,6 +39,17 @@ beforeEach(() => {
     window.confirm = jest.fn(() => true);
 });
 
+async function renderPage() {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<TaskListPage />);
+    });
+    await act(async () => { await Promise.resolve(); });
+    return { container, root };
+}
+
 test('单次任务列表请求 task_scope=single 且渲染普通/重试任务', async () => {
     tasks.list.mockResolvedValue({ code: 0, data: { tasks: singleTasks, total: 2 } });
 

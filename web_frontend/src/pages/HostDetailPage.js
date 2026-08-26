@@ -568,8 +568,8 @@ function OverviewPanel({ target, agent, stat, detailLoading, tasks: taskItems, o
     const hostCollectedMs = stat?.host?.collected_at ? new Date(stat.host.collected_at).getTime() : null;
     const hostFresh = hostCollectedMs ? (Date.now() - hostCollectedMs) <= 90000 : null;
     const runningSessions = sessions.filter(session => session.desired_state === 'running');
-    const successCount = taskItems.filter(t => t.status === 2).length;
-    const failedCount = taskItems.filter(t => t.status === 3).length;
+    const successCount = taskItems.filter(t => Number(t.status) === 2 && Number(t.analysis_status) !== 3).length;
+    const failedCount = taskItems.filter(t => Number(t.status) === 3 || (Number(t.status) === 2 && Number(t.analysis_status) === 3)).length;
 
     return (
         <>
