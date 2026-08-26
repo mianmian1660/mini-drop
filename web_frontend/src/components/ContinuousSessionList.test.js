@@ -47,7 +47,11 @@ test('list renders waiting process tasks and stop writes desired state through t
     expect(container.querySelector('.table-scroll')).not.toBeNull();
     expect(container.querySelector('.table-scroll').style.maxWidth).toBe('100%');
     expect(container.textContent).toContain('共 1 条');
+    expect(container.textContent).toContain('仅我创建的');
     expect(continuous.sessions).toHaveBeenCalledWith(expect.objectContaining({ page: 1, page_size: 20, owner_filter: 'mine' }));
+    const ownerHelp = container.querySelector('button[aria-label="查看持续采集归属筛选说明"]');
+    await act(async () => Simulate.mouseEnter(ownerHelp));
+    expect(container.textContent).toContain('切换到“全部创建者”可查看这台主机上的其他任务和分页');
     const stop = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '停止');
     await act(async () => Simulate.click(stop));
     expect(window.confirm).toHaveBeenCalled();
@@ -59,7 +63,7 @@ test('list renders waiting process tasks and stop writes desired state through t
 
 test('list uses server pagination so every shared session remains reachable', async () => {
     continuous.sessions
-        .mockResolvedValueOnce({ code: 0, data: { total: 41, sessions: [{ sid: 'page-1', name: 'First page', scope: 'host', desired_state: 'stopped' }] } })
+        .mockResolvedValueOnce({ code: 0, data: { total: 41, sessions: [{ sid: 'page-1', name: 'smoke leftover', scope: 'host', desired_state: 'stopped', observed_state: 'stopped', sample_count: 0, can_manage: true }] } })
         .mockResolvedValueOnce({ code: 0, data: { total: 41, sessions: [{ sid: 'page-2', name: 'Second page', scope: 'host', desired_state: 'stopped' }] } });
     const container = document.createElement('div');
     document.body.appendChild(container);
@@ -71,6 +75,10 @@ test('list uses server pagination so every shared session remains reachable', as
 
     expect(container.textContent).toContain('共 41 条');
     expect(container.textContent).toContain('第 1 / 3 页');
+    expect(container.textContent).toContain('清理测试残留（1）');
+    const cleanupHelp = container.querySelector('button[aria-label="查看清理测试残留说明"]');
+    await act(async () => Simulate.mouseEnter(cleanupHelp));
+    expect(container.textContent).toContain('不会删除有采集数据的任务');
     const next = Array.from(container.querySelectorAll('button')).find(button => button.textContent === '下一页');
     await act(async () => Simulate.click(next));
     await act(async () => { await Promise.resolve(); });

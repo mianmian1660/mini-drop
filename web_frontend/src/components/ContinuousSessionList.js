@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { continuous } from '../api';
 import { continuousStateColor, continuousStateLabel, decodeJSONField, formatRelativeTime, selectorIdentity, selectorModeLabel, signalLabel } from '../utils/continuous';
+import InfoTooltip from './InfoTooltip';
 
 const S = {
     card: { minWidth: 0, maxWidth: '100%', background: '#fff', borderRadius: 8, padding: 20, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(16,24,40,.04)' },
@@ -144,7 +145,7 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
     const degradedCount = sessions.filter(session => session.continuity_mode === 'degraded' && session.desired_state === 'running').length;
     const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
     return <section style={S.card}>
-        <div style={S.head}><div><h3 style={S.title}>持续采集</h3><span style={S.subtle}>任务按用户期望持续运行；等待进程和 Agent 离线不会自动终止任务</span></div><span style={S.subtle}>共 {total} 条</span></div>
+        <div style={S.head}><div><h3 style={S.title}>持续采集</h3><span style={S.subtle}>任务按用户期望持续运行；等待进程和 Agent 离线不会自动终止任务</span></div><span style={S.subtle}>共 {total} 条{ownerFilter === 'mine' ? '（仅我创建的）' : '（全部创建者）'}</span></div>
         {degradedCount > 0 && <div style={S.warn}>本页有 {degradedCount} 个活动任务正在降级运行。任务仍严格限制采集范围，但滚动采集窗口可能存在短暂空档。</div>}
         {error && <div style={S.error}>{error}</div>}
         <div className="continuous-list-toolbar" style={S.toolbar}>
@@ -152,10 +153,16 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 <input style={S.input} value={keyword} onChange={event => { setKeyword(event.target.value); setPage(1); }} placeholder="搜索名称 / exe" />
                 <select style={S.select} value={status} onChange={event => { setStatus(event.target.value); setPage(1); }}><option value="">全部状态</option><option value="running">运行中</option><option value="waiting">等待进程</option><option value="degraded">降级运行</option><option value="pending">待启动</option><option value="stopping">停止中</option><option value="stopped">已停止</option><option value="offline">Agent 离线</option><option value="error">异常</option></select>
                 <select style={S.select} value={scope} onChange={event => { setScope(event.target.value); setPage(1); }}><option value="">全部范围</option><option value="host">整机</option><option value="process">进程</option></select>
-                <select aria-label="持续采集归属筛选" style={S.select} value={ownerFilter} onChange={event => { setOwnerFilter(event.target.value); setPage(1); }}><option value="all">全部创建者</option><option value="mine">我创建的</option></select>
+                <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                    <select aria-label="持续采集归属筛选" style={S.select} value={ownerFilter} onChange={event => { setOwnerFilter(event.target.value); setPage(1); }}><option value="all">全部创建者</option><option value="mine">我创建的</option></select>
+                    <InfoTooltip label="查看持续采集归属筛选说明">默认只显示当前账号创建的任务，因此可能只有一页。切换到“全部创建者”可查看这台主机上的其他任务和分页。</InfoTooltip>
+                </span>
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                {cleanableSessions.length > 0 && <button style={S.dangerButton} onClick={cleanupTestSessions} disabled={cleaning}>{cleaning ? '清理中...' : `清理测试残留（${cleanableSessions.length}）`}</button>}
+                {cleanableSessions.length > 0 && <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                    <button style={S.dangerButton} onClick={cleanupTestSessions} disabled={cleaning}>{cleaning ? '清理中...' : `清理测试残留（${cleanableSessions.length}）`}</button>
+                    <InfoTooltip label="查看清理测试残留说明">仅清理本页中名称明确带有测试标记、已经停止或异常、且没有任何样本和采集记录的空任务。后端会再次校验，不会删除有采集数据的任务。</InfoTooltip>
+                </span>}
                 <button style={S.button} onClick={() => load()} disabled={loading}>{loading ? '刷新中' : '刷新'}</button>
             </div>
         </div>
