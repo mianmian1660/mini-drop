@@ -31,7 +31,6 @@ const S = {
     ok: { color: '#4caf50', fontSize: 13, marginTop: 12 },
     hint: { fontSize: 11, color: '#888', marginTop: 2, marginBottom: 8 },
     warn: { fontSize: 12, color: '#b42318', background: '#fff6f5', border: '1px solid #fda29b', borderRadius: 6, padding: '8px 10px', margin: '0 0 12px' },
-    capabilityList: { display: 'flex', gap: 6, flexWrap: 'wrap', margin: '4px 0 12px' },
     chk: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
     presetBtn: (active) => ({
         padding: '4px 10px', fontSize: 12, borderRadius: 4, cursor: 'pointer',
@@ -454,11 +453,6 @@ export default function CreateTaskModal({ onClose, onSuccess, initialTargetIP = 
                             </p>
                         ) : (
                             <>
-                                {selectedCapabilities.length > 0 && (
-                                    <div style={S.capabilityList}>
-                                        {selectedCapabilities.map(cap => <span key={cap} style={S.pill}>{capabilityLabel(cap)}</span>)}
-                                    </div>
-                                )}
                                 <div style={S.kindGrid}>
                                     {kindList.map(kind => (
                                         <button
