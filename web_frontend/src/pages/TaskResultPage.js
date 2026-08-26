@@ -1383,7 +1383,7 @@ export function buildStages(task, events, status, analysisStatus, artifact, file
         uploading: hasEvent('uploading') || status === 4 || status === 2 || rawArtifact,
         collected: hasEvent('collected') || status === 2 || analysisStatus > 0 || rawArtifact,
         analyzing: hasEvent('analyzing') || analysisStatus > 0 || Boolean(artifact),
-        success: status === 2 && (analysisStatus === 2 || Boolean(artifact)),
+        success: status === 2 && analysisStatus !== 3 && (analysisStatus === 2 || Boolean(artifact)),
         failed: status === 3 || analysisStatus === 3,
         canceled: status === 5,
     };

@@ -77,7 +77,8 @@ test('固定状态展示保护说明和取消固定入口', () => {
 });
 
 test('分析失败不会被阶段条标成成功', () => {
-    const stages = buildStages({ status: 2, analysis_status: 3 }, [], 2, 3, null, []);
+    // 即使页面为兼容旧代次仍展示上一代产物，本代分析失败也不能标成功。
+    const stages = buildStages({ status: 2, analysis_status: 3 }, [], 2, 3, { name: 'previous.svg' }, []);
     const analyzing = stages.find(stage => stage.id === 'analyzing');
     const success = stages.find(stage => stage.id === 'success');
     const failed = stages.find(stage => stage.id === 'failed');
