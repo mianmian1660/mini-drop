@@ -243,6 +243,15 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
     }, [fixedSession?.retention_hours, fixedSession?.started_at, fixedSession?.stopped_at, initialWindow, sessionSID]);
     // 阶段九：当前选中信号（v1 signal_type），timeline 按信号独立计算覆盖率。
     const currentSignal = SIGNAL_TAB_OPTIONS.find(option => option.tab === signalTab)?.signal;
+	const emptyProfileMessage = emptyProfileGuidance({
+		reliability,
+		signal: currentSignal,
+		session: fixedSession,
+		filters: activeFilters,
+	});
+	const flamegraphView = flamegraph?.empty
+		? { ...flamegraph, message: emptyProfileMessage }
+		: flamegraph;
 
     useEffect(() => {
         const timer = setTimeout(() => setFlameSearchText(flameSearchInput.trim()), 250);
@@ -878,12 +887,12 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                 </div>
                 <InteractiveFlamegraph
                     key={resetKey}
-                    data={flamegraph}
+                    data={flamegraphView}
                     loading={querying}
                     externalUrl={profileURL}
                     externalLabel="打开 Profile"
                     filterText={activeFilterText}
-                    emptyMessage="所选时间范围没有 profile 数据"
+                    emptyMessage={emptyProfileMessage}
                     loadingMessage="正在查询 Native profiling..."
                     boxStyle={S.flameBox}
                     searchText={flameSearchText}
@@ -912,7 +921,7 @@ export default function ContinuousProfilingPanel({ target, targets = [], targetI
                     <h3 style={S.title}>热点 TopN</h3>
                     <span style={S.subtle}>{topn?.items?.length || 0} 个函数 · {profileUnitLabel(topn?.unit || unit)}</span>
                 </div>
-                <TopNTable data={topn} loading={querying} profileURL={profileURL} filterText={activeFilterText} />
+                <TopNTable data={topn} loading={querying} profileURL={profileURL} filterText={activeFilterText} emptyMessage={emptyProfileMessage} />
                 {topn?.truncated && (
                     <div style={{ ...S.warn, marginTop: 8 }}>
                         TopN 结果超过 {maxNodes} 条上限，已截断展示。
@@ -1537,6 +1546,52 @@ export const coverageStatusText = (status) => ({
     unknown: { label: '状态未知', explanation: '这段历史数据缺少足够状态信息', suggestion: '可尝试重新采集' },
 })[status] || { label: status || '状态未知', explanation: '', suggestion: '' };
 
+// Profile API 的空结果只说明“当前查询没有样本”，timeline 才能区分目标空闲、
+// 确认缺数和采集异常。前端组合现有响应给出可行动的空态说明，不猜测有效样本数。
+export function emptyProfileGuidance({ reliability, signal = 'cpu_profile', session = null, filters = {}, now = Date.now() } = {}) {
+    // 进程任务固定附带的 exe 是 selector 边界，不是用户主动筛选；它不应遮蔽
+    // timeline 给出的 target_idle/no_events 真正原因。
+    const filterEntries = Object.entries(filters || {}).filter(([key, value]) => (
+        String(value || '').trim() && !(key === 'exe' && session?.scope === 'process')
+    ));
+    if (filterEntries.length > 0) {
+        const filterText = filterEntries.map(([key, value]) => `${key}=${value}`).join(', ');
+        return `当前筛选条件（${filterText}）没有匹配样本。可先清除筛选，确认该时间范围是否有数据。`;
+    }
+
+    const view = coverageBandsFromReliability(reliability, signal);
+    const status = view.statusSummary?.status || view.status || reliability?.status_summary?.status || '';
+    if (status === 'target_idle') {
+        return '任务已上传采集窗口，但目标在所选时段没有可采集的 CPU 活动，因此没有 TopN 或火焰图。';
+    }
+    if (status === 'collector_failed') {
+        return '所选时段采集失败，没有生成有效 CPU 样本。请查看采集覆盖和 Agent 日志中的失败原因。';
+    }
+    if (status === 'real_gap') {
+        return '所选时段确认缺少上传数据。请检查 Agent 在线状态、网络和最近上传时间。';
+    }
+    if (status === 'pending_upload') {
+        return '采集窗口仍在上传或整理中，暂时没有可展示样本，请稍后刷新。';
+    }
+    if (sessionDataExpired(session, now)) {
+        const hours = Math.max(1, numberOrDefault(session?.retention_hours, 24));
+        return `该任务最后上传的数据可能已超过 ${hours} 小时原始保留期；若没有冷层摘要，就无法再生成 TopN 或火焰图。`;
+    }
+    if (session && !session.last_upload_at) {
+        return '该任务尚未完成首次数据上传，因此没有可展示的 CPU 样本。';
+    }
+    return '所选时间范围没有有效 CPU 样本。可查看上方采集覆盖，并确认时间范围包含任务的实际上传时段。';
+}
+
+function sessionDataExpired(session, now = Date.now()) {
+    if (!session?.last_upload_at) return false;
+    const lastUpload = new Date(session.last_upload_at).getTime();
+    const nowMs = now instanceof Date ? now.getTime() : Number(now);
+    if (!Number.isFinite(lastUpload) || !Number.isFinite(nowMs)) return false;
+    const retentionHours = Math.max(1, numberOrDefault(session.retention_hours, 24));
+    return lastUpload + retentionHours * 60 * 60 * 1000 < nowMs;
+}
+
 function setCoverageHover(event, segment, setHover) {
     const target = event.currentTarget;
     if (!target) return;
@@ -1767,11 +1822,11 @@ function LabelChips({ target }) {
     );
 }
 
-export function TopNTable({ data, loading, profileURL, filterText = '' }) {
+export function TopNTable({ data, loading, profileURL, filterText = '', emptyMessage = '' }) {
     if (loading && !data) return <div style={S.empty}>正在查询 TopN...</div>;
     const items = data?.items || [];
     if (data?.empty || items.length === 0) {
-        return <ProfileEmpty message={data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} url={data?.profile_url || profileURL} />;
+        return <ProfileEmpty message={emptyMessage || data?.message || (filterText ? `该时间范围内 ${filterText} 无样本` : '暂无热点函数')} url={data?.profile_url || profileURL} />;
     }
     // samples 口径下把列头明确写成"累计/自身样本数"并给出悬浮说明，避免两列
     // 都叫 Samples 让人看不出差异（累计=含子调用，自身=栈顶）。

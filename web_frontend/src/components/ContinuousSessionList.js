@@ -207,9 +207,10 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
                 const running = session.desired_state === 'running';
                 const identity = selectorIdentity(session);
                 const waitingReason = state === 'waiting' ? (session.degradation_reason || '等待匹配进程') : '';
+				const dataAvailability = sessionDataAvailability(session);
                 return <tr key={session.sid}>
                     <td style={S.td}><div style={S.name}>{session.name}</div><span style={S.subtle}>{shortSID(session.sid)}</span></td>
-                    <td style={S.td}>{normalizedScope(session) === 'process' ? <><strong>进程 · {selectorModeLabel(identity.mode)} · {active.length} 个活动实例</strong><div style={S.mono} title={identity.detail}>{identity.exe || identity.detail}</div>{identity.mode === 'pid_instance' && identity.detail && <div style={S.subtle}>{identity.detail}</div>}{waitingReason && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }} title={waitingReason}>{waitingReason}</div>}</> : <strong>整机</strong>}<div style={S.subtle}>样本 {formatCount(session.sample_count)}</div></td>
+                    <td style={S.td}>{normalizedScope(session) === 'process' ? <><strong>进程 · {selectorModeLabel(identity.mode)} · {active.length} 个活动实例</strong><div style={S.mono} title={identity.detail}>{identity.exe || identity.detail}</div>{identity.mode === 'pid_instance' && identity.detail && <div style={S.subtle}>{identity.detail}</div>}{waitingReason && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }} title={waitingReason}>{waitingReason}</div>}</> : <strong>整机</strong>}<div style={{ ...S.subtle, ...(dataAvailability.warn ? { color: '#b54708' } : {}) }} title={dataAvailability.title}>数据：{dataAvailability.label}</div></td>
                     <td style={S.td}><span style={{ ...S.badge, background, color }}>{continuousStateLabel(state)}</span>{session.continuity_mode === 'degraded' && <div style={{ ...S.subtle, color: '#b54708', marginTop: 4 }}>降级连续性</div>}</td>
                     <td style={S.td}><div style={S.chips}>{signals.map(signal => <span key={signal} style={S.chip}>{signalLabel(signal)}</span>)}</div></td>
                     <td style={S.td}>{formatRelativeTime(session.last_upload_at)}</td>
@@ -234,11 +235,20 @@ export default function ContinuousSessionList({ target, refreshToken = 0 }) {
 
 function normalizedScope(session) { return session.scope === 'process' ? 'process' : 'host'; }
 function shortSID(value) { return String(value || '').length > 18 ? `${value.slice(0, 10)}...${value.slice(-4)}` : value; }
-function formatCount(value) {
-    const count = Number(value) || 0;
-    if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
-    if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
-    return String(Math.round(count));
+export function sessionDataAvailability(session, now = Date.now()) {
+    if (!session?.last_upload_at) {
+        return { label: '尚无上传', warn: true, title: '任务记录已创建，但服务器尚未收到任何采集窗口。' };
+    }
+    const lastUpload = new Date(session.last_upload_at).getTime();
+    const nowMs = now instanceof Date ? now.getTime() : Number(now);
+    const retentionHours = Math.max(1, Number(session.retention_hours) || 24);
+    if (Number.isFinite(lastUpload) && Number.isFinite(nowMs) && lastUpload + retentionHours * 60 * 60 * 1000 < nowMs) {
+        return { label: '可能已过保留期', warn: true, title: `最后上传已超过 ${retentionHours} 小时原始保留期；是否仍可查询取决于冷层摘要。` };
+    }
+    if (session.desired_state === 'running') {
+        return { label: '已上传窗口', warn: false, title: '服务器已收到采集窗口；是否含有效样本请进入详情查看采集覆盖。' };
+    }
+    return { label: '有历史上传', warn: false, title: '该任务曾上传采集窗口；窗口可能是有效样本，也可能是目标空闲。' };
 }
 function isCleanableTestSession(session) {
     const state = session?.observed_state || '';

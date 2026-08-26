@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { act, Simulate } from 'react-dom/test-utils';
 import { MemoryRouter } from 'react-router-dom';
 import { continuous } from '../api';
-import ContinuousSessionList from './ContinuousSessionList';
+import ContinuousSessionList, { sessionDataAvailability } from './ContinuousSessionList';
 
 jest.mock('../api', () => ({
     continuous: {
@@ -13,6 +13,16 @@ jest.mock('../api', () => ({
 }));
 
 global.IS_REACT_ACT_ENVIRONMENT = true;
+
+test('session data availability describes uploads without trusting deprecated sample_count', () => {
+    expect(sessionDataAvailability({}, new Date('2026-08-26T10:00:00Z')).label).toBe('尚无上传');
+    expect(sessionDataAvailability({
+        desired_state: 'running', last_upload_at: '2026-08-26T09:59:00Z', retention_hours: 24, sample_count: 0,
+    }, new Date('2026-08-26T10:00:00Z')).label).toBe('已上传窗口');
+    expect(sessionDataAvailability({
+        desired_state: 'stopped', last_upload_at: '2026-08-24T09:00:00Z', retention_hours: 24,
+    }, new Date('2026-08-26T10:00:00Z')).label).toBe('可能已过保留期');
+});
 
 test('list renders waiting process tasks and stop writes desired state through the API', async () => {
     continuous.sessions.mockResolvedValue({

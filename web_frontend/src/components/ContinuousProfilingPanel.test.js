@@ -41,6 +41,7 @@ import {
     coverageBandsFromReliability,
     coverageStatusColor,
     coverageStatusText,
+	emptyProfileGuidance,
     historicalWindowForSession,
     DiagnosticDetails,
     TopNTable,
@@ -72,6 +73,36 @@ global.IS_REACT_ACT_ENVIRONMENT = true;
 
 beforeEach(() => {
     jest.clearAllMocks();
+});
+
+test('empty profile guidance distinguishes idle windows, filters, and expired data', () => {
+    const idle = emptyProfileGuidance({
+        reliability: {
+            coverage: { from: '2026-08-25T11:00:00Z', to: '2026-08-25T12:00:00Z', ratio: 0 },
+            signal_coverage: {
+                cpu_profile: {
+                    status: 'target_idle',
+                    status_summary: { status: 'target_idle', label: '目标暂时空闲' },
+                    coverage: { from: '2026-08-25T11:00:00Z', to: '2026-08-25T12:00:00Z', ratio: 0 },
+                },
+            },
+        },
+        signal: 'cpu_profile',
+        session: { scope: 'process', last_upload_at: '2026-08-25T11:37:00Z', retention_hours: 24 },
+        filters: { exe: '/app/drop_server' },
+        now: new Date('2026-08-25T12:30:00Z'),
+    });
+    expect(idle).toContain('目标在所选时段没有可采集的 CPU 活动');
+
+    const filtered = emptyProfileGuidance({ filters: { exe: '/app/apiserver', runtime: 'go' } });
+    expect(filtered).toContain('exe=/app/apiserver');
+    expect(filtered).toContain('清除筛选');
+
+    const expired = emptyProfileGuidance({
+        session: { last_upload_at: '2026-08-24T10:00:00Z', retention_hours: 24 },
+        now: new Date('2026-08-26T10:00:01Z'),
+    });
+    expect(expired).toContain('超过 24 小时原始保留期');
 });
 
 test('stopped session opens directly on its retained historical window', () => {
