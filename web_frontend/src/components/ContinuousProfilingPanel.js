@@ -1884,6 +1884,17 @@ function ProfileEmpty({ message }) {
     );
 }
 
+// 延迟类信号（块 IO / 系统调用 IO / 调度延迟）的直方图是怎么算出来的（与
+// drop/common/ContinuousSampler.cpp collect_bpftrace_latency_histogram 对应）。
+function histogramHint(signal) {
+    const hints = {
+        io_latency: 'eBPF 跟踪块设备层 IO 请求（block_rq_issue → block_rq_complete），记录每个请求从提交到完成的耗时（微秒），按耗时区间分桶统计事件数；P50 / P95 / P99 为对应百分位延迟。',
+        io_syscall_latency: 'eBPF 跟踪 read / write / pread64 / pwrite64 等系统调用（sys_enter → sys_exit），记录每次调用从进入到返回的耗时（微秒），按耗时区间分桶统计事件数；P50 / P95 / P99 为对应百分位延迟。',
+        sched_latency: 'eBPF 跟踪任务进入可运行队列到被调度上 CPU 的等待耗时（微秒），按耗时区间分桶统计事件数；P50 / P95 / P99 为对应百分位延迟。',
+    };
+    return hints[signal] || 'eBPF 记录每次事件的耗时（微秒），按耗时区间分桶统计事件数，得到延迟分布直方图；P50 / P95 / P99 为对应百分位延迟。';
+}
+
 export function HistogramPanel({ data, loading, title, targetIP, signal, timeWindow }) {
     const [events, setEvents] = useState([]);
     const supportsSentinel = SENTINEL_SIGNALS.includes(signal);
@@ -1906,7 +1917,7 @@ export function HistogramPanel({ data, loading, title, targetIP, signal, timeWin
         <section style={S.card}>
             <div style={S.sectionHead}>
                 <div>
-                    <h3 style={S.title}>{title} Histogram</h3>
+                    <h3 style={S.title}>{title} Histogram<InfoTooltip label="查看延迟统计说明">{histogramHint(signal)}</InfoTooltip></h3>
                     <div style={S.subtle}>{data?.source || 'mini-drop-native'} · backend {data?.backend || '-'} · unit {data?.unit || 'us'}</div>
                 </div>
                 <span style={S.subtle}>总事件 {formatEventCount(data?.event_count || 0)}</span>

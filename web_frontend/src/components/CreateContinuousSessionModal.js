@@ -4,6 +4,14 @@ import { continuous, sentinelRules } from '../api';
 import { CONTINUOUS_SIGNALS, DEFAULT_CONTINUOUS_SIGNALS, SENTINEL_SIGNALS, formatBytes, selectorModeLabel, signalLabel } from '../utils/continuous';
 import InfoTooltip from './InfoTooltip';
 
+// 采集信号的悬停说明（与 drop/common/ContinuousSampler.cpp 的采集实现对应）
+const SIGNAL_HINTS = {
+    cpu_profile: '以固定频率对 CPU 调用栈采样，统计各函数占用 CPU 的比例，用于生成火焰图与热点 TopN，定位 CPU 热点。',
+    io_latency: '通过 eBPF 跟踪块设备层 IO 请求（block_rq_issue → block_rq_complete），记录每个请求从提交到完成的耗时（微秒），统计延迟分布，定位磁盘读写延迟。',
+    io_syscall_latency: '通过 eBPF 跟踪 read / write / pread64 / pwrite64 等系统调用从进入到返回的耗时（微秒），统计延迟分布，定位 IO 相关系统调用慢在哪。',
+    sched_latency: '通过 eBPF 跟踪任务进入可运行队列到被调度上 CPU 的等待时间（微秒），统计调度/排队延迟分布，定位线程等待调度导致的延迟。',
+};
+
 const S = {
     overlay: { position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(16,24,40,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
     modal: { width: 'min(760px, 100%)', maxHeight: '90vh', overflowY: 'auto', background: '#fff', borderRadius: 8, border: '1px solid #e5e7eb', boxShadow: '0 20px 40px rgba(16,24,40,.22)', padding: 20 },
@@ -302,6 +310,7 @@ export default function CreateContinuousSessionModal({ target, onClose, onSucces
                                 onChange={() => toggleSignal(signal)}
                             />
                             <span>{signalLabel(signal)}</span>
+                            <InfoTooltip label={`查看${signalLabel(signal)}采集说明`}>{SIGNAL_HINTS[signal]}</InfoTooltip>
                         </label>
                     ))}
                 </div>

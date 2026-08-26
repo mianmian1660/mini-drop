@@ -57,10 +57,12 @@ export default function HomePage() {
         loadTargets();
     }, [loadTargets]);
 
+    // 隐藏回环地址（127.0.0.1）主机，避免评审/演示误入本机采集器
+    const visibleTargets = useMemo(() => (targets || []).filter(t => t.ip !== '127.0.0.1'), [targets]);
     const filteredTargets = useMemo(() => {
         const q = keyword.trim().toLowerCase();
-        if (!q) return targets;
-        return targets.filter(t => [
+        if (!q) return visibleTargets;
+        return visibleTargets.filter(t => [
             t.hostname,
             t.ip,
             t.service_name,
@@ -68,11 +70,11 @@ export default function HomePage() {
             t.drop_agent_status,
             t.profile_status,
         ].some(value => String(value || '').toLowerCase().includes(q)));
-    }, [targets, keyword]);
+    }, [visibleTargets, keyword]);
 
-    const onlineDropAgents = targets.filter(t => t.drop_agent_status === 'online').length;
-    const nativeProfileReady = targets.filter(t => isProfileReady(t.profile_status)).length;
-    const pprofScrapeReady = targets.filter(t => t.pprof_scrape_status === 'available').length;
+    const onlineDropAgents = visibleTargets.filter(t => t.drop_agent_status === 'online').length;
+    const nativeProfileReady = visibleTargets.filter(t => isProfileReady(t.profile_status)).length;
+    const pprofScrapeReady = visibleTargets.filter(t => t.pprof_scrape_status === 'available').length;
 
     if (loading) {
         return <div style={styles.container}><p style={styles.loading}>加载主机列表...</p></div>;
@@ -109,7 +111,7 @@ export default function HomePage() {
                 </div>
 
                 {filteredTargets.length === 0 ? (
-                    <p style={styles.empty}>{targets.length === 0 ? '暂无可观测对象。启动 drop_agent 或创建按需任务后会出现在这里。' : '没有匹配的主机或服务'}</p>
+                    <p style={styles.empty}>{visibleTargets.length === 0 ? '暂无可观测对象。启动 drop_agent 或创建按需任务后会出现在这里。' : '没有匹配的主机或服务'}</p>
                 ) : (
                     <div className="table-scroll">
                     <table style={styles.table}>
@@ -117,8 +119,6 @@ export default function HomePage() {
                             <tr>
                                 <th style={styles.th}>主机</th>
                                 <th style={styles.th}>IP 地址</th>
-                                <th style={styles.th}>服务</th>
-                                <th style={styles.th}>环境</th>
                                 <th style={styles.th}>drop_agent</th>
                                 <th style={styles.th}>Native profiling</th>
                                 <th style={styles.th}>最近活动</th>
@@ -134,8 +134,6 @@ export default function HomePage() {
                                         </Link>
                                     </td>
                                     <td style={styles.td}>{target.ip || '-'}</td>
-                                    <td style={styles.td}>{target.service_name || 'hotmethod'}</td>
-                                    <td style={styles.td}>{target.environment || '-'}</td>
                                     <td style={styles.td}><StatusPill value={target.drop_agent_status} /></td>
                                     <td style={styles.td}><StatusPill value={target.profile_status} /></td>
                                     <td style={styles.td}>{formatTime(target.last_profile_at || target.last_seen) || '-'}</td>

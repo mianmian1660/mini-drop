@@ -31,7 +31,7 @@ export function continuousStateColor(value) {
 }
 
 export function signalLabel(value) {
-    return ({ cpu_profile: 'CPU', io_latency: '块 IO', io_syscall_latency: '系统调用 IO', sched_latency: '调度' })[value] || value;
+    return ({ cpu_profile: 'CPU', io_latency: '块 IO', io_syscall_latency: '系统调用 IO', sched_latency: '调度延迟' })[value] || value;
 }
 
 export function formatRelativeTime(value) {
