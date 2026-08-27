@@ -32,6 +32,21 @@ TEST(PidRegistry, UnregisterRemovesEntry)
     EXPECT_TRUE(reg.Snapshot().empty());
 }
 
+TEST(PidRegistry, TouchRefreshesExistingEntryOnly)
+{
+    PidRegistry reg;
+    reg.Register(1234);
+    auto before = reg.Snapshot();
+    ASSERT_EQ(before.size(), 1u);
+
+    reg.Touch(1234);
+    reg.Touch(9999);
+    auto after = reg.Snapshot();
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0].first, 1234);
+    EXPECT_GE(after[0].second, before[0].second);
+}
+
 TEST(PidRegistry, UnregisterUnknownPidIsNoop)
 {
     PidRegistry reg;

@@ -1,11 +1,12 @@
 // ============================================================
 // drop_agent (Agent 主程序) — 精简入口
 // ============================================================
-// Phase 3/4/5/6 起，Agent 内部拆成四个线程 + 一个独立的 Native CP 采样器，
+// Phase 3/4/5/6 起，Agent 内部拆成采集 Worker 池、三个辅助线程
+// + 一个独立的 Native CP 采样器，
 // 通过两条队列 + 一张 pid 登记表解耦（新复刻指南 5.7 节）：
 //   agent/HeartbeatThread.h/cpp — 心跳、故障转移、把 Server 派发的任务
 //                                  塞进 TaskQueue
-//   agent/WorkerThread.h/cpp    — 消费 TaskQueue，跑 Runner 全生命周期
+//   agent/WorkerThread.h/cpp    — 两个并发 Worker 消费 TaskQueue，跑 Runner 全生命周期
 //                                  （Validate/Prepare/Start/Poll/Collect），
 //                                  把结果丢进 UploadQueue
 //   agent/UploadWorker.h/cpp    — 消费 UploadQueue，上传产物 + NotifyResult，
@@ -20,7 +21,7 @@
 //                                      CleanupWorker 兜底回收孤儿进程
 //
 // main() 现在只做：加载配置 → 首次注册（失败即退出）→ 组装上面几个对象 →
-// 启动四个线程 → 等待退出信号 → 按 Heartbeat→Worker→UploadWorker→
+// 启动各线程 → 等待退出信号 → 按 Heartbeat→Worker→UploadWorker→
 // CleanupWorker→NativeSampler 顺序收尾——这是 Phase 6 落地的最终收尾顺序，
 // 对齐新复刻指南要求。
 //
@@ -138,7 +139,10 @@ int main(int argc, char **argv)
     // stub），所以这里 std::move 转移所有权即可。
     channelHolder.Update(channel, std::move(hotmethodStub), cosConfig);
 
+    // 两个采集槽允许长周期 perf 和短时 eBPF 诊断并行，避免
+    // 590s perf 独占唯一 Worker，导致哨兵任务在队列中过 deadline。
     drop_agent::WorkerThread worker(taskQueue, uploadQueue, pidRegistry, attemptTracker, agent_running);
+    drop_agent::WorkerThread worker2(taskQueue, uploadQueue, pidRegistry, attemptTracker, agent_running);
     drop_agent::UploadWorker uploader(uploadQueue, attemptTracker, channelHolder);
     drop_agent::HeartbeatThread heartbeat(cfg, channel, cosConfig, taskQueue, attemptTracker, channelHolder, agent_running);
     drop_agent::CleanupWorker cleanup(cfg, pidRegistry, agent_running);
@@ -146,6 +150,7 @@ int main(int argc, char **argv)
     // ---------- 4. 启动 Heartbeat / Worker / UploadWorker / CleanupWorker 线程 ----------
     uploader.Start();
     worker.Start();
+    worker2.Start();
     heartbeat.Start();
     cleanup.Start();
 
@@ -168,6 +173,7 @@ int main(int argc, char **argv)
     cout << "[agent] 收到退出信号，正在关闭..." << endl;
     heartbeat.Stop();
     worker.Stop();
+    worker2.Stop();
     uploader.Stop();
     cleanup.Stop();
     heartbeat.StopSampler();

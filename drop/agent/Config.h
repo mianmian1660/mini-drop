@@ -41,7 +41,7 @@ namespace drop_agent
         // Phase 5：CleanupWorker 参数
         uint32_t cleanupIntervalSec = 60;    // CleanupWorker 扫描周期（秒）
         uint32_t taskDirRetentionSec = 3600; // 任务目录保留时长（秒），超过此时长的 /tmp/drop_agent/tasks/<taskID>/<attemptID>/ 会被清理
-        uint32_t orphanPidGraceSec = 300;    // pid 登记表宽限期（秒），远大于任何 Runner 自身的 timeoutSec+gracePeriodSec，超过仍未摘牌视为孤儿进程
+        uint32_t orphanPidGraceSec = 300;    // pid 登记表续租宽限期（秒），超过该时间没有 Poll 续租且未摘牌才视为孤儿进程
 
         // 整机磁盘采集的 statvfs 路径。Docker 部署下容器 overlay 容量没有
         // 意义，这里应指向宿主机根分区上的绑定目录（如 /tmp），页面统一

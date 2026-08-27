@@ -21,26 +21,26 @@ import (
 	"github.com/mini-drop/apiserver/model"
 )
 
-// fetchLegacyFoldedStacks 从对象存储读取旧任务的 {tid}/folded.txt。
+// fetchLegacyFoldedStacks 从对象存储读取旧任务的折叠栈。
 // 新分代任务由 fetchFoldedStacksForTask 按 active analysis job 读取。
-func (s *APIServer) fetchLegacyFoldedStacks(tid string) (string, bool) {
+func (s *APIServer) fetchLegacyFoldedStacks(tid string, logicalNames ...string) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	bucket := s.Config.Storage.Bucket
-	key := tid + "/folded.txt"
-
-	reader, err := s.Storage.GetObject(ctx, bucket, key)
-	if err != nil {
-		return "", false
+	for _, logicalName := range logicalNames {
+		reader, err := s.Storage.GetObject(ctx, bucket, tid+"/"+logicalName)
+		if err != nil {
+			continue
+		}
+		var sb strings.Builder
+		_, copyErr := io.Copy(&sb, reader)
+		_ = reader.Close()
+		if copyErr == nil && sb.Len() > 0 {
+			return sb.String(), true
+		}
 	}
-	defer reader.Close()
-
-	var sb strings.Builder
-	if _, err := io.Copy(&sb, reader); err != nil {
-		return "", false
-	}
-	return sb.String(), true
+	return "", false
 }
 
 // fetchFoldedStacksForTask 优先读取任务当前 active analysis generation 的
@@ -51,8 +51,14 @@ func (s *APIServer) fetchFoldedStacksForTask(task *model.HotmethodTask) (string,
 		return "", false
 	}
 	job, _ := s.resolveSelectedAnalysisJob(task, "")
+	logicalNames := []string{"folded.txt"}
+	if task.TaskKind == TaskKindEBPFCPU {
+		// eBPF CPU 分析器的折叠栈逻辑名为 bpf_raw.txt，格式与
+		// perf folded.txt 相同，可直接复用同一差分建树逻辑。
+		logicalNames = append(logicalNames, "bpf_raw.txt")
+	}
 	if job != nil {
-		artifacts := s.jobArtifactsByLogicalName(task.TID, job.ID, "folded.txt")
+		artifacts := s.jobArtifactsByLogicalName(task.TID, job.ID, logicalNames...)
 		if len(artifacts) > 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -70,7 +76,7 @@ func (s *APIServer) fetchFoldedStacksForTask(task *model.HotmethodTask) (string,
 			return "", false
 		}
 	}
-	return s.fetchLegacyFoldedStacks(task.TID)
+	return s.fetchLegacyFoldedStacks(task.TID, logicalNames...)
 }
 
 // foldedTextToTreeNode 把折叠栈文本（"funcA;funcB;funcC 123" 一行一条）解析成
@@ -153,7 +159,8 @@ func (s *APIServer) buildTaskDiffFlamegraph(baselineTask, compareTask *model.Hot
 		return ""
 	}
 	reasonFor := func(t *model.HotmethodTask) string {
-		if t.ProfilerType == ProfilerBPF {
+		if t.TaskKind == TaskKindEBPFIO || t.TaskKind == TaskKindEBPFSched ||
+			(t.ProfilerType == ProfilerBPF && t.TaskKind != TaskKindEBPFCPU) {
 			return "eBPF 直方图任务产出的是延迟分布而非调用栈，无法做火焰图对比"
 		}
 		return "没有可对比的调用栈产物（folded.txt）"

@@ -9,6 +9,14 @@ namespace drop
         entries_[pid] = std::chrono::steady_clock::now();
     }
 
+    void PidRegistry::Touch(pid_t pid)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(pid);
+        if (it != entries_.end())
+            it->second = std::chrono::steady_clock::now();
+    }
+
     void PidRegistry::Unregister(pid_t pid)
     {
         std::lock_guard<std::mutex> lock(mutex_);

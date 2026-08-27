@@ -105,11 +105,11 @@ namespace drop_agent
         for (const auto &entry : snapshot)
         {
             pid_t pid = entry.first;
-            auto registeredAt = entry.second;
-            if (now - registeredAt < seconds(cfg_.orphanPidGraceSec))
+            auto lastSeenAt = entry.second;
+            if (now - lastSeenAt < seconds(cfg_.orphanPidGraceSec))
                 continue;
 
-            cerr << "[cleanup] 发现孤儿进程 pid=" << pid << "，登记超过 "
+            cerr << "[cleanup] 发现孤儿进程 pid=" << pid << "，超过 "
                  << cfg_.orphanPidGraceSec << " 秒仍未被正常回收，强制 SIGKILL" << endl;
             if (::kill(pid, SIGKILL) != 0 && errno != ESRCH)
                 cerr << "[cleanup] SIGKILL pid=" << pid << " 失败: " << strerror(errno) << endl;

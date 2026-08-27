@@ -163,6 +163,11 @@ namespace drop
         if (reaped_)
             return lastOutcome_;
 
+        // CleanupWorker 的阈值判断基于“最后一次被正常采集线程照管”的时间，
+        // 不能基于进程启动时间；否则合法的长周期 perf 会在 300 秒后被误杀。
+        if (pidRegistry_)
+            pidRegistry_->Touch(handle_.pid);
+
         if (sigtermSent_)
         {
             auto o = executor_->Poll(handle_);

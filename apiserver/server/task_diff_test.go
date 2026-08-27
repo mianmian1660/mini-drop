@@ -323,3 +323,78 @@ func TestTaskDiffReadsActiveGenerationArtifacts(t *testing.T) {
 		t.Fatalf("generation-scoped flame diff mismatch: %#v", flame)
 	}
 }
+
+func TestTaskDiffFlamegraphReadsEBPFCPUCollapsedStacks(t *testing.T) {
+	s := newTestAPIServer(t)
+	store := newContinuousMemoryStorage()
+	s.Storage = store
+	now := time.Now()
+
+	baseTask := model.HotmethodTask{TID: "ebpf-cpu-base", TaskKind: TaskKindEBPFCPU, ProfilerType: ProfilerBPF, Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: now}
+	compareTask := model.HotmethodTask{TID: "ebpf-cpu-compare", TaskKind: TaskKindEBPFCPU, ProfilerType: ProfilerBPF, Status: TaskStatusDone, AnalysisStatus: 2, CreateTime: now}
+	if err := s.DB.Create(&baseTask).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&compareTask).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	baseJob := model.AnalysisJob{TaskTID: baseTask.TID, Pipeline: "bpf_flamegraph", Status: model.AnalysisJobStatusSuccess, Generation: 1, CreatedAt: now, UpdatedAt: now}
+	compareJob := model.AnalysisJob{TaskTID: compareTask.TID, Pipeline: "bpf_flamegraph", Status: model.AnalysisJobStatusSuccess, Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := s.DB.Create(&baseJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&compareJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	baseTask.ActiveAnalysisJobID = &baseJob.ID
+	compareTask.ActiveAnalysisJobID = &compareJob.ID
+	if err := s.DB.Model(&baseTask).Update("active_analysis_job_id", baseJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Model(&compareTask).Update("active_analysis_job_id", compareJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	for _, in := range []struct {
+		task *model.HotmethodTask
+		job  *model.AnalysisJob
+		body string
+	}{
+		{&baseTask, &baseJob, "root;old_hot 2\n"},
+		{&compareTask, &compareJob, "root;new_hot 5\n"},
+	} {
+		key := "tasks/" + in.task.TID + "/analysis/bpf_flamegraph/test/generation/bpf_raw.txt"
+		jobID := in.job.ID
+		artifact := model.Artifact{
+			TaskTID: in.task.TID, AnalysisJobID: &jobID, Kind: model.ArtifactKindIntermediate,
+			ObjectKey: key, LogicalName: "bpf_raw.txt", Status: model.ArtifactStatusReady,
+			Compression: model.CompressionGzip, CreatedAt: now,
+		}
+		if err := s.DB.Create(&artifact).Error; err != nil {
+			t.Fatal(err)
+		}
+		store.objects[key] = string(mustGzip(t, []byte(in.body)))
+		store.modified[key] = now
+	}
+
+	flame, reason := s.buildTaskDiffFlamegraph(&baseTask, &compareTask, 100)
+	if reason != "" {
+		t.Fatalf("eBPF CPU collapsed stacks should be comparable: %s", reason)
+	}
+	if flame.Empty || flame.BaseTotal != 2 || flame.CompareTotal != 5 {
+		t.Fatalf("eBPF CPU flame diff mismatch: %#v", flame)
+	}
+}
+
+func TestTaskDiffFlamegraphStillRejectsEBPFLatencyHistogram(t *testing.T) {
+	s := newTestAPIServer(t)
+	s.Storage = newContinuousMemoryStorage()
+	base := &model.HotmethodTask{TID: "io-base", TaskKind: TaskKindEBPFIO, ProfilerType: ProfilerBPF, AnalysisStatus: 2}
+	compare := &model.HotmethodTask{TID: "io-compare", TaskKind: TaskKindEBPFIO, ProfilerType: ProfilerBPF, AnalysisStatus: 2}
+
+	_, reason := s.buildTaskDiffFlamegraph(base, compare, 100)
+	if !strings.Contains(reason, "eBPF 直方图任务") {
+		t.Fatalf("latency histogram rejection reason=%q", reason)
+	}
+}
