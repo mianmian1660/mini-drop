@@ -20,7 +20,7 @@ const HOST_URL = window.config?.HOST_URL || '';
 const client = axios.create({
     baseURL: HOST_URL,
     withCredentials: true,           // 跨域请求也带 Cookie
-    timeout: 30000,                  // 30 秒超时
+    timeout: 120000,                 // 大范围持续剖析查询可能超过 30 秒
 });
 
 // ---------- 工具函数：读取 Cookie ----------
